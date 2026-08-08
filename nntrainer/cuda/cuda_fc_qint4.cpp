@@ -958,6 +958,222 @@ void imma_gemm_reg(const signed char *q8, const unsigned char *plain,
   }
 }
 
+// ------------------------------------------------------------- IMMA v2 ----
+// imma_gemm_reg with the memory pipeline it never had. Same fragment layout
+// (documented above), same bit-exact result -- what changes is everything
+// AROUND the mma, because v1 spends ~80 instructions per k-step to feed 4 of
+// them:
+//
+//  1. VECTOR STAGING. v1 stages 2 KB of A and 2 KB of W a BYTE at a time: 8
+//     LDG.8 + 8 STS.8 per thread for A, and for W another 8 loads each with a
+//     (kk&1) nibble select. Here a thread moves 16 B of A (one 16-byte load ->
+//     one 16-byte store) and 8 B of packed W (one 8-byte load -> 16 nibbles
+//     unpacked four at a time -> one 16-byte store): 2 loads, 2 stores, ~12
+//     ALU for the whole k-step.
+//
+//  2. NIBBLE UNPACK, FOUR AT A TIME. __byte_perm interleaves the low and high
+//     nibble planes, and the offset-binary fix is exact in plain 32-bit
+//     integer ops -- no SIMD intrinsic, no inter-byte borrow:
+//        ((x | 0x80808080) - 0x08080808) ^ 0x80808080  ==  per-byte (x - 8)
+//     Every byte of (x|0x80) is >= 128, so subtracting 8 can never borrow into
+//     the neighbour; the final XOR removes the bias. Verified both ways: for
+//     x in [0,7] the sum lands in [120,127] (bit 7 clear, XOR adds 128 -> x-8
+//     mod 256) and for x in [8,15] in [128,135] (bit 7 set, XOR subtracts 128
+//     -> x-8). cx folds in the cached path's extra XOR, exactly as v1's xr.
+//
+//  3. DOUBLE-BUFFERED SHARED + REGISTER PREFETCH. v1 runs load / sync /
+//     compute / sync, so the global load latency is fully exposed -- and with
+//     8 warps on a 16-SM part there is no occupancy to hide it behind. Here
+//     the load for tile k+1 is ISSUED BEFORE the mma work on tile k, so its
+//     several-hundred-cycle latency overlaps the compute, and ONE barrier per
+//     k-step separates "everyone finished reading buffer X" from "someone
+//     writes buffer X".
+//
+//  4. BK 32 -> 64. Halves the barrier count and doubles the bytes in flight
+//     per thread.
+//
+//  5. NO BANK CONFLICTS. Row stride is BK+16 = 80 B = 20 words. A fragment
+//     load reads (row, 4t) for row = base+g, g in 0..7, t in 0..3, so the bank
+//     is (row*20 + t) % 32 and 20*g mod 32 over g = 0..7 is 0,20,8,28,16,4,
+//     24,12 -- eight distinct 4-bank groups that exactly partition the 32
+//     banks. A stride of BK itself (16 words) collides 4 ways.
+//
+//  6. ROWSUM OFF THE MATH PATH. v1 derives the raw-path rowsum from the B
+//     fragments inside the k loop, where all FOUR warp-rows redundantly
+//     compute the same per-column sum. Here the staging thread owns the same
+//     column for every k-step, so it accumulates privately and the four
+//     threads of a column reduce once, at the end.
+//
+// Requires K % 64 == 0 (no k tail, and it makes every vector access aligned)
+// and an 8-byte-aligned payload; the caller gates on both and falls back to
+// imma_gemm_reg otherwise.
+#define IP_BM 64
+#define IP_BN 64
+#define IP_BK 64
+#define IP_LD 80 /* row stride in BYTES: BK + 16, see note 5 */
+struct alignas(16) IPv16 {
+  unsigned int a, b, c, d;
+};
+struct alignas(8) IPv8 {
+  unsigned int a, b;
+};
+// per-byte (nibble - 8) with the cached path's two's-complement fix folded in
+__device__ __forceinline__ unsigned int ip_nib2i8(unsigned int x,
+                                                  unsigned int cx) {
+  x ^= cx;
+  return (((x | 0x80808080u) - 0x08080808u) ^ 0x80808080u);
+}
+__global__ __launch_bounds__(256, 2)
+void imma_gemm_pipe(const signed char *q8, const unsigned char *plain,
+                    const float *ascale, const int *azp, const int *wrowsum,
+                    const unsigned short *wscale, float *Y, int M, int N, int K,
+                    int out_fp16, int raw) {
+  __shared__ IPv16 Asv[2][IP_BM * IP_LD / 16];
+  __shared__ IPv16 Wsv[2][IP_BN * IP_LD / 16];
+  __shared__ int rsh[IP_BN];
+  const int tid = threadIdx.x;
+  const int lane = tid & 31, warp = tid >> 5;
+  const int wm = warp >> 1, wn = warp & 1; // 4 x 2 warp grid over 64x64
+  const int g = lane >> 2, t = lane & 3;
+  const int blockM = blockIdx.y * IP_BM, blockN = blockIdx.x * IP_BN;
+  const int Kh = K >> 1;
+  const unsigned int cx = raw ? 0u : 0x08080808u;
+
+  // Staging: 4 threads per row, 16 bytes of k each. A thread keeps the SAME
+  // row for every k-step, which is what lets the rowsum stay private (note 6).
+  const int srow = tid >> 2, ssub = tid & 3;
+  const int arow = blockM + srow, wrow = blockN + srow;
+  const bool arow_ok = arow < M, wrow_ok = wrow < N;
+  const signed char *aptr = q8 + (long)arow * K + (ssub << 4);
+  const unsigned char *wptr = plain + (long)wrow * Kh + (ssub << 3);
+  const int sdst = srow * IP_LD + (ssub << 4); // byte offset, 16-B aligned
+
+  int acc[4][4];
+#pragma unroll
+  for (int s = 0; s < 4; ++s)
+#pragma unroll
+    for (int r = 0; r < 4; ++r)
+      acc[s][r] = 0;
+  int rsacc = 0;
+
+  IPv16 ra;
+  IPv8 rw;
+  IPv16 wv;
+
+#define IP_LOAD(K0)                                                            \
+  do {                                                                         \
+    if (arow_ok) {                                                             \
+      ra = *(const IPv16 *)(aptr + (K0));                                      \
+    } else {                                                                   \
+      ra.a = ra.b = ra.c = ra.d = 0u;                                          \
+    }                                                                          \
+    if (wrow_ok) {                                                             \
+      rw = *(const IPv8 *)(wptr + ((K0) >> 1));                                \
+    } else {                                                                   \
+      rw.a = rw.b = 0u;                                                        \
+    }                                                                          \
+  } while (0)
+
+  // 8 payload bytes -> 16 int8. lo/hi are the even/odd nibble planes; the two
+  // byte_perms re-interleave them into k order.
+#define IP_STORE(BUF)                                                          \
+  do {                                                                         \
+    unsigned int lo = rw.a & 0x0F0F0F0Fu;                                      \
+    unsigned int hi = (rw.a >> 4) & 0x0F0F0F0Fu;                               \
+    wv.a = ip_nib2i8(__byte_perm(lo, hi, 0x5140), cx);                         \
+    wv.b = ip_nib2i8(__byte_perm(lo, hi, 0x7362), cx);                         \
+    lo = rw.b & 0x0F0F0F0Fu;                                                   \
+    hi = (rw.b >> 4) & 0x0F0F0F0Fu;                                            \
+    wv.c = ip_nib2i8(__byte_perm(lo, hi, 0x5140), cx);                         \
+    wv.d = ip_nib2i8(__byte_perm(lo, hi, 0x7362), cx);                         \
+    if (raw) {                                                                 \
+      rsacc = __dp4a(0x01010101, (int)wv.a, rsacc);                            \
+      rsacc = __dp4a(0x01010101, (int)wv.b, rsacc);                            \
+      rsacc = __dp4a(0x01010101, (int)wv.c, rsacc);                            \
+      rsacc = __dp4a(0x01010101, (int)wv.d, rsacc);                            \
+    }                                                                          \
+    *(IPv16 *)((signed char *)Asv[BUF] + sdst) = ra;                           \
+    *(IPv16 *)((signed char *)Wsv[BUF] + sdst) = wv;                           \
+  } while (0)
+
+  IP_LOAD(0);
+  IP_STORE(0);
+  __syncthreads();
+
+  int cur = 0;
+  for (int k0 = 0; k0 < K; k0 += IP_BK) {
+    const int knext = k0 + IP_BK;
+    // Issue the next tile's global loads FIRST: they are in flight for the
+    // whole compute below.
+    if (knext < K)
+      IP_LOAD(knext);
+
+    const signed char *Ab =
+      (const signed char *)Asv[cur] + (wm * 16 + g) * IP_LD;
+    const signed char *Bb = (const signed char *)Wsv[cur] + (wn * 32 + g) * IP_LD;
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const int ko = h * 32 + 4 * t;
+      int a0 = *(const int *)(Ab + ko);
+      int a1 = *(const int *)(Ab + 8 * IP_LD + ko);
+      int a2 = *(const int *)(Ab + ko + 16);
+      int a3 = *(const int *)(Ab + 8 * IP_LD + ko + 16);
+#pragma unroll
+      for (int s = 0; s < 4; ++s) {
+        const signed char *Bs = Bb + s * 8 * IP_LD;
+        int b0 = *(const int *)(Bs + ko);
+        int b1 = *(const int *)(Bs + ko + 16);
+        asm volatile(
+          "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32.satfinite "
+          "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
+          : "=r"(acc[s][0]), "=r"(acc[s][1]), "=r"(acc[s][2]), "=r"(acc[s][3])
+          : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1),
+            "r"(acc[s][0]), "r"(acc[s][1]), "r"(acc[s][2]), "r"(acc[s][3]));
+      }
+    }
+
+    if (knext < K) {
+      // Safe without a second barrier: buffer cur^1 was last READ in the
+      // previous iteration, and that iteration's barrier already separated
+      // those reads from these writes.
+      IP_STORE(cur ^ 1);
+      __syncthreads();
+      cur ^= 1;
+    }
+  }
+#undef IP_LOAD
+#undef IP_STORE
+
+  if (raw) {
+    // The four threads of a column are consecutive lanes, so two shuffle-downs
+    // leave the whole column sum in the (tid&3)==0 lane.
+    int v = rsacc;
+    v += __shfl_down_sync(0xffffffffu, v, 1);
+    v += __shfl_down_sync(0xffffffffu, v, 2);
+    if (ssub == 0)
+      rsh[srow] = v;
+    __syncthreads();
+  }
+#pragma unroll
+  for (int s = 0; s < 4; ++s) {
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+      const int row = blockM + wm * 16 + g + ((r >> 1) ? 8 : 0);
+      const int cb = wn * 32 + s * 8 + 2 * t + (r & 1);
+      const int col = blockN + cb;
+      if (row < M && col < N) {
+        const int rsum = raw ? rsh[cb] : wrowsum[col];
+        float v = (float)(acc[s][r] - azp[row] * rsum) * ascale[row] *
+                  dp4a_h2f(wscale[col]);
+        if (out_fp16)
+          ((unsigned short *)Y)[(long)row * N + col] = dp4a_f2h(v);
+        else
+          Y[(long)row * N + col] = v;
+      }
+    }
+  }
+}
+
 __global__ void dp4a_gemv_fused_h(const unsigned short *Xh,
                                   const signed char *plain,
                                   const int *wrowsum,
@@ -1406,14 +1622,16 @@ bool dp4a_repack_and_gemm(const unsigned char *plain_w,
   // shape is right -- what is missing is enough of them per launch, which is a
   // grouped kernel (all experts in one grid), not a smaller tile.
   const bool tiled = (M >= 8);
-  // NNTR_CUDA_IMMA_TILE=1: same tile, Tensor Cores instead of the int ALU.
-  // Opt-in until it is proven bit-identical (which it must be -- int32
-  // accumulation is exact and associative).
-  static const bool imma_tile = []() {
+  // NNTR_CUDA_IMMA_TILE: same tile, Tensor Cores instead of the int ALU.
+  //   1 = imma_gemm_reg  (v1: byte staging, two barriers per k-step)
+  //   2 = imma_gemm_pipe (v2: vector staging, double-buffered, BK=64)
+  // Opt-in until measured; both are bit-identical to dp4a by construction,
+  // since int32 accumulation is exact and associative.
+  static const int imma_tile = []() {
     const char *e = std::getenv("NNTR_CUDA_IMMA_TILE");
-    return e != nullptr && e[0] == '1';
+    return (e != nullptr) ? std::atoi(e) : 0;
   }();
-  const bool use_imma = imma_tile && tiled && !gemv && !fused;
+  const bool use_imma = imma_tile > 0 && tiled && !gemv && !fused;
   // NNTR_CUDA_FC_NOCACHE=1: skip the DevWeightQ cache entirely for the decode
   // GEMV and read the QS4CX payload in place. That cache is a byte-for-byte
   // XOR copy of the weights plus an N-int rowsum, so on this model it is 15.1
@@ -1438,10 +1656,21 @@ bool dp4a_repack_and_gemm(const unsigned char *plain_w,
                        g_dp4a_plain_cache.find(plain_w) ==
                          g_dp4a_plain_cache.end();
   const bool raw = nocache && gemv;
+  // v2 has no k tail and assumes every vector access is aligned: K a multiple
+  // of BK=64 makes each A row 16-B aligned and each payload row 32-B aligned,
+  // and the payload BASE must be 8-B aligned. The cached copy is a cudaMalloc
+  // so it always qualifies; the in-place QS4CX payload is whatever the loader
+  // gave it, hence the check on the pointer actually passed. Every K in these
+  // models (512/1024/2048/4096) qualifies; anything else falls back to v1.
+  const void *w_gate = nocache ? (const void *)plain_w : nullptr;
+  const bool use_pipe =
+    use_imma && imma_tile >= 2 && (K % 64u) == 0u &&
+    (!nocache || (reinterpret_cast<uintptr_t>(w_gate) & 7u) == 0u);
   auto kg = CudaContext::Global().registerCudaKernel(
     FC_QINT4_DP4A_SRC, fused     ? "dp4a_gemv_fused_h"
                        : raw     ? "dp4a_gemv_raw"
                        : gemv    ? "dp4a_gemv"
+                       : use_pipe ? "imma_gemm_pipe"
                        : use_imma ? "imma_gemm_reg"
                                   : (tiled ? "dp4a_gemm_reg" : "dp4a_gemm"));
   if (!kg)
@@ -1514,8 +1743,9 @@ bool dp4a_repack_and_gemm(const unsigned char *plain_w,
   kg->SetKernelArguments(10, &out_fp16, sizeof(out_fp16));
   kg->SetKernelArguments(11, &raw_i, sizeof(raw_i));
   if (use_imma) {
-    // Same 64x64 tile as dp4a_gemm_reg, but 256 threads as a 1-D block: the
-    // warp, not the thread, is the unit that owns an mma fragment.
+    // Same 64x64 output tile as dp4a_gemm_reg for both v1 and v2, but 256
+    // threads as a 1-D block: the warp, not the thread, is the unit that owns
+    // an mma fragment. Only the K depth differs (v2 stages 64 at a time).
     const int ib[3] = {256, 1, 1};
     const int ig[3] = {((int)N + 63) / 64, ((int)M + 63) / 64, 1};
     return StreamManager::Global().DispatchCommand(*kg, ig, ib);
@@ -2110,7 +2340,11 @@ extern "C" __global__ void i8_jit_unpack(const unsigned char *q4,
 extern "C" __global__ void i8_jit_unpack_v4(const unsigned char *q4,
                                             signed char *w8, int *rowsum, int N,
                                             int K, int Kh) {
-  __shared__ signed char t[64][68]; // [k_local][n_local], row stride 68 (4B)
+  // [k_local][n_local], row stride 68 so the 4-byte store below is aligned --
+  // 68 is a multiple of 4, but the ARRAY BASE also has to be, and a
+  // `signed char` array is only guaranteed byte alignment. Say so explicitly
+  // rather than relying on what ptxas happens to do.
+  __shared__ alignas(4) signed char t[64][68];
   __shared__ int rs[64];            // partial rowsum for this tile's 64 n
   const int nn0 = blockIdx.y * 64;
   const int kh0 = blockIdx.x * 32; // bytes of Kh covered by this tile
@@ -2281,9 +2515,22 @@ bool cuda_fc_qs4cx_cublas_i8_gemm_fp16(const unsigned short *Xh,
     if (cudaMemsetAsync(jit_rs, 0, sizeof(int) * (size_t)N,
                         StreamManager::Global().GetStream()) != cudaSuccess)
       return false;
-    // Vectorized transpose for 8|K && 4|N (every eligible FC); byte-granular
-    // fallback otherwise.
-    const bool vec_ok = ((K & 7u) == 0u) && ((N & 3u) == 0u);
+    // Vectorized transpose for 8|K && 4|N; byte-granular fallback otherwise.
+    //
+    // The THIRD condition is not optional and its absence was a hard failure,
+    // not a slow path: _v4 reads the payload as `unsigned int`, so besides
+    // 4|Kh (which 8|K gives) the payload BASE must be 4-byte aligned. A QS4CX
+    // tensor starts wherever the manifest put it in the weight arena, and
+    // nothing upstream rounds that up. gemma4 has such a tensor; the 35B does
+    // not, which is why this shipped. The symptom is the worst kind: an
+    // unaligned global read raises CUDA_ERROR_MISALIGNED_ADDRESS, which is
+    // STICKY -- every later call in the context fails, cublasCreate included,
+    // so the model dies far from here with "pack before run model" and a
+    // cuModuleLoadData that cannot possibly be misaligned. See the family in
+    // §5 of the hand-off: an error message that is the symptom of a dead
+    // context.
+    const bool vec_ok = ((K & 7u) == 0u) && ((N & 3u) == 0u) &&
+                        ((reinterpret_cast<uintptr_t>(plain_w) & 3u) == 0u);
     auto ku = CudaContext::Global().registerCudaKernel(
       I8_JIT_SRC, vec_ok ? "i8_jit_unpack_v4" : "i8_jit_unpack");
     if (!ku)
