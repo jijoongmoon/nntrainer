@@ -228,6 +228,75 @@ __global__ void moe_combine_h(const unsigned short *Y, unsigned short *out,
   }
   out[idx] = moe_f2h(acc);
 }
+// ------------------------------------------------------------- ROUTING ----
+// logits[t,e] = sum_h X[t,h] * Wg[h,e], fp16 activation widened to fp32,
+// fp32 weight, fp32 accumulate.
+//
+// This is the single largest item in a 35B prefill profile and it was on the
+// HOST: `input.clone(FP32)` (a 33 MB materialisation per layer per chunk)
+// followed by an OpenBLAS sgemm of [4096,2048]x[2048,256] = 2.1 GMAC. The
+// whole host routing block measured 13,637 ms of a 35 s prefill -- 39% of it,
+// and the leading explanation for the GPU sitting ~41% idle.
+//
+// Deliberately NOT fp16 tensor cores. Rounding the GATE weight to fp16 would
+// flip the top-k selection on near-ties, and the top-k choice is discrete: a
+// flipped expert is not a small numeric error, it is a different model. The
+// host widens fp16 -> fp32 and accumulates in fp32, so widening per element
+// here reproduces its arithmetic up to summation order.
+//
+// 64x64 tile, BK=16, 256 threads, 4x4 per thread. Shared rows are padded by 1
+// float so the 4-wide column reads do not all land in one bank.
+__global__ void moe_router_gemm(const unsigned short *X, const float *Wg,
+                                float *L, int T, int H, int E){
+  __shared__ float As[16][65];   // [k][m]
+  __shared__ float Bs[16][65];   // [k][n]
+  const int tid = threadIdx.x;                 // 256
+  const int tm = (tid >> 4) * 4, tn = (tid & 15) * 4;
+  const int m0 = blockIdx.y * 64, n0 = blockIdx.x * 64;
+  float acc[4][4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i)
+#pragma unroll
+    for (int j = 0; j < 4; ++j) acc[i][j] = 0.f;
+
+  for (int k0 = 0; k0 < H; k0 += 16) {
+    // 64x16 of A and 16x64 of B, 4 elements per thread each.
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+      const int idx = tid + r * 256;           // 0..1023
+      const int mm = idx >> 4, kk = idx & 15;  // A: 64 rows x 16 k
+      const int m = m0 + mm, k = k0 + kk;
+      As[kk][mm] = (m < T && k < H) ? moe_h2f(X[(long)m * H + k]) : 0.f;
+      const int kb = idx >> 6, nb = idx & 63;  // B: 16 k x 64 cols
+      const int k2 = k0 + kb, n = n0 + nb;
+      Bs[kb][nb] = (k2 < H && n < E) ? Wg[(long)k2 * E + n] : 0.f;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int kk = 0; kk < 16; ++kk) {
+      float a[4], b[4];
+#pragma unroll
+      for (int i = 0; i < 4; ++i) a[i] = As[kk][tm + i];
+#pragma unroll
+      for (int j = 0; j < 4; ++j) b[j] = Bs[kk][tn + j];
+#pragma unroll
+      for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) acc[i][j] = fmaf(a[i], b[j], acc[i][j]);
+    }
+    __syncthreads();
+  }
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const int m = m0 + tm + i;
+    if (m >= T) continue;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const int n = n0 + tn + j;
+      if (n < E) L[(long)m * E + n] = acc[i][j];
+    }
+  }
+}
 } // extern "C"
 )CU";
 
@@ -314,6 +383,26 @@ bool cuda_moe_gather_fp16(const unsigned short *src, unsigned short *dst,
   const long total = (long)m * width;
   const int B = 256;
   const int g[3] = {(int)((total + B - 1) / B), 1, 1}, b[3] = {B, 1, 1};
+  return StreamManager::Global().DispatchCommand(*k, g, b);
+}
+
+bool cuda_moe_router_gemm_fp16(const unsigned short *X, const float *Wg,
+                               float *L, unsigned int T, unsigned int H,
+                               unsigned int E) {
+  if (T == 0 || H == 0 || E == 0)
+    return true;
+  auto k = CudaContext::Global().registerCudaKernel(MOE_SRC, "moe_router_gemm");
+  if (!k)
+    return false;
+  int t = (int)T, h = (int)H, e = (int)E;
+  k->SetKernelArguments(0, &X, sizeof(X));
+  k->SetKernelArguments(1, &Wg, sizeof(Wg));
+  k->SetKernelArguments(2, &L, sizeof(L));
+  k->SetKernelArguments(3, &t, sizeof(t));
+  k->SetKernelArguments(4, &h, sizeof(h));
+  k->SetKernelArguments(5, &e, sizeof(e));
+  const int g[3] = {(int)((E + 63) / 64), (int)((T + 63) / 64), 1};
+  const int b[3] = {256, 1, 1};
   return StreamManager::Global().DispatchCommand(*k, g, b);
 }
 

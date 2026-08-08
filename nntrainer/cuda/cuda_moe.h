@@ -37,6 +37,20 @@ namespace nntrainer::cuda {
 bool cuda_moe_gather_fp16(const unsigned short *src, unsigned short *dst,
                           const int *rows, unsigned int m, unsigned int width);
 
+/**
+ * @brief Router logits on the device: L[T,E] = X[T,H](fp16) * Wg[H,E](fp32),
+ *        widened and accumulated in fp32.
+ *
+ * Replaces the host `input.clone(FP32)` + OpenBLAS sgemm that dominated the
+ * MoE routing block (13.6 s of a 35 s prefill for the whole block). Kept in
+ * fp32 rather than put on the fp16 Tensor Cores on purpose: the top-k pick is
+ * DISCRETE, so a weight rounded to fp16 does not give a slightly wrong answer,
+ * it gives a different expert.
+ */
+bool cuda_moe_router_gemm_fp16(const unsigned short *X, const float *Wg,
+                               float *L, unsigned int T, unsigned int H,
+                               unsigned int E);
+
 /** @brief out = silu(gate)*up elementwise, fp32 math, fp16 storage. */
 bool cuda_moe_swiglu_fp16(const unsigned short *gate, const unsigned short *up,
                           unsigned short *out, unsigned int n);

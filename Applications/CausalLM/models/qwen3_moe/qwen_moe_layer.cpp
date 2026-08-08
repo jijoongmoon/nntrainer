@@ -771,7 +771,13 @@ void MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     // reshape output: [B,1,S,H] -> [B*S,1,1,H]
     output.reshape({total_tokens, 1, 1, hidden_size});
     output.setZero();
-    expert_mask.setZero();
+    // expert_mask is WRITE-ONLY on this path: nothing in this layer, and
+    // nothing outside it (the tensor is layer-local, FORWARD_FUNC_LIFESPAN),
+    // ever reads it. Zeroing it cost an 8 MB memset and filling it cost 32,768
+    // virtual setValue() calls -- per layer, per chunk, 120 times over an
+    // 8,353-token prefill -- to produce a buffer that is then discarded. The
+    // non-incremental forwarding() still writes it; left alone because it is
+    // not on any measured path and other models share the shape.
 
     // routing
     std::vector<std::vector<std::pair<unsigned, float>>> expert_assignments(
@@ -782,12 +788,46 @@ void MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     // Routing is ALWAYS fp32: the gate weight and router_logits are FP32,
     // so an FP16 input makes HalfTensor::dot write FP16 bits into the FP32
     // logits buffer -- garbage top-k, no crash. Widen first on FP16 models.
-    if (input.getDataType() == ml::train::TensorDim::DataType::FP32) {
-      input.dot(gate_weights, router_logits);
-    } else {
-      nntrainer::Tensor input32 =
-        input.clone(ml::train::TensorDim::DataType::FP32);
-      input32.dot(gate_weights, router_logits);
+    //
+    // The router GEMM goes to the DEVICE when it can. On the host it is an
+    // [T,H]x[H,E] sgemm -- 2.1 GMAC at T=4096 -- plus a 33 MB fp16->fp32
+    // materialisation of the input, and it is the bulk of a routing block that
+    // measured 13,637 ms of a 35 s prefill. Same arithmetic: the kernel widens
+    // each fp16 element and accumulates in fp32, exactly as the clone+sgemm
+    // does, so only the summation order differs.
+    bool router_dev = false;
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+    // NNTR_MOE_ROUTER_DEV=0 opts out (the host path stays the A/B reference).
+    static const bool router_dev_on = []() {
+      const char *e = std::getenv("NNTR_MOE_ROUTER_DEV");
+      return !(e != nullptr && e[0] == '0');
+    }();
+    if (router_dev_on &&
+        input.getDataType() == ml::train::TensorDim::DataType::FP16 &&
+        gate_weights.getDataType() == ml::train::TensorDim::DataType::FP32) {
+      const unsigned short *xp =
+        reinterpret_cast<const unsigned short *>(input.getData<_FP16>());
+      const float *wp = gate_weights.getData<float>();
+      float *lp = router_logits.getData<float>();
+      if (nntrainer::cuda::dev_accessible(xp) &&
+          nntrainer::cuda::dev_accessible(wp) &&
+          nntrainer::cuda::dev_accessible(lp)) {
+        router_dev = nntrainer::cuda::cuda_moe_router_gemm_fp16(
+          xp, wp, lp, total_tokens, hidden_size, num_experts);
+        // The softmax/top-k below read these logits on the host.
+        if (router_dev)
+          nntrainer::cuda::StreamManager::Global().finish();
+      }
+    }
+#endif
+    if (!router_dev) {
+      if (input.getDataType() == ml::train::TensorDim::DataType::FP32) {
+        input.dot(gate_weights, router_logits);
+      } else {
+        nntrainer::Tensor input32 =
+          input.clone(ml::train::TensorDim::DataType::FP32);
+        input32.dot(gate_weights, router_logits);
+      }
     }
     router_logits.apply(nntrainer::ActiFunc::softmax<float>, router_logits);
     auto topk_result = router_logits.topK(topk);
@@ -798,12 +838,7 @@ void MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     topk_values.divide_i(topk_values.sum(3));
 
     const uint32_t *indices_data = topk_indices.getData<uint32_t>();
-    // Set expert mask
-    for (int i = 0; i < static_cast<int>(total_tokens); ++i) {
-      for (int k = 0; k < static_cast<int>(topk); ++k) {
-        expert_mask.setValue(indices_data[i * topk + k], 0, k, i, 1.0f);
-      }
-    }
+    // (the expert_mask fill that used to sit here was write-only -- see above)
 
     // Pre-compute expert token assignments for better performance
     for (int i = 0; i < static_cast<int>(total_tokens); ++i) {
