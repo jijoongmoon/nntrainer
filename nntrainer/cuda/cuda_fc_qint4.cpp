@@ -1863,10 +1863,27 @@ bool cuda_fc_qs4cx_dp4a_gemm_fp16(const unsigned short *Xh,
 // reusable scratch, instead of keeping a persistent per-weight int8 cache --
 // trades a small per-call unpack cost for the cache's VRAM. Opt-in, default
 // off.
+// DEFAULT ON. The persistent per-weight int8 cache it replaces loses on BOTH
+// axes for a MoE model -- measured at 1,341 tokens: JIT 28.7 GB peak /
+// 124.6 TPS against the cache's 37.6 GB / 110.0 TPS -- because 30,720 expert
+// weights would need ~30 GiB of [K,N] int8 to cache and each one is used for
+// only m_e rows before the next expert's turn.
+//
+// The per-call unpack looks expensive and is not: the int8 scratch is K*N =
+// 1 MB, which fits Orin's 4 MB L2, so the write and the GEMM's read of it stay
+// in cache and only the 512 KB int4 payload comes from DRAM. Profiled at 334 ms
+// (2.3%) against the IMMA GEMMs' 2,850 ms. And it is still clearly better than
+// skipping the Tensor Cores: same 8,353-token prefill, qwen_moe 22,548 ms with
+// this path vs 31,608 ms forced onto dp4a.
+//
+// It remains a workaround for using a library GEMM. cuBLAS int8 accepts only
+// int8 operands, so the weights must be materialised; a fused w4a16 kernel
+// (vLLM's Marlin) dequantises in-register inside the k-loop and never
+// materialises anything. That is the structural gap, not this flag.
 static inline bool i8_jit_on() {
   static const bool v = []() {
     const char *e = std::getenv("NNTR_CUDA_I8_JIT");
-    return e != nullptr && e[0] == '1';
+    return !(e != nullptr && e[0] == '0');
   }();
   return v;
 }
