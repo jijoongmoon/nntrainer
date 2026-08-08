@@ -28,6 +28,10 @@ bool cuda_swiglu_fp16(const unsigned short *gate, const unsigned short *up,
                       unsigned short *out, unsigned int n);
 
 // Fused sigmoid gates (device fp16): sigmoid(gate)*x and sigmoid(gate)+emb.
+/** @brief in-place x = sigmoid(x). Backs CudaComputeOps::apply_activation. */
+bool cuda_act_sigmoid_fp16(unsigned short *x, unsigned int n);
+bool cuda_act_sigmoid_fp32(float *x, unsigned int n);
+
 bool cuda_sigmoid_glu_fp16(const unsigned short *gate, const unsigned short *x,
                            unsigned short *out, unsigned int n);
 bool cuda_sigmoid_add_fp16(const unsigned short *gate,

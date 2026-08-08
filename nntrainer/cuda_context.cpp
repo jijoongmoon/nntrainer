@@ -26,6 +26,7 @@
 #include <scalar_multiply.h>
 #include <sigmoid_add_layer.h>
 #include <sigmoid_glu_layer.h>
+#include <activation_layer.h>
 #include <swiglu_layer.h>
 #include <tie_word_embedding.h>
 
@@ -266,6 +267,15 @@ void CudaContext::add_default_object() {
   // path (cuda_swiglu_fp16) under its residency gates, else the inherited
   // host body. Replaces the former app-side SwiGLU fork.
   registerFactory(nntrainer::createLayer<SwiGLULayer>, SwiGLULayer::type);
+  // activation: the backend-neutral ActivationLayer. Registered so a node can
+  // carry engine=cuda at all -- createLayer on a type the target engine does
+  // not know THROWS, it is not a silent host fallback, so without this every
+  // `activation` node had to be left unstamped and therefore ran on the host.
+  // The layer itself dispatches through the installed ops table, so sigmoid
+  // now reaches CudaComputeOps::apply_activation's device kernel and every
+  // other ActivationType still resolves to the inherited host body.
+  registerFactory(nntrainer::createLayer<ActivationLayer>,
+                  ActivationLayer::type);
   // logit_softcapping (promoted to core): dispatches via
   // CudaComputeOps::softcap — the fp16 device kernel on device-accessible
   // logits (carrying the terminal pipeline drain), else the inherited host

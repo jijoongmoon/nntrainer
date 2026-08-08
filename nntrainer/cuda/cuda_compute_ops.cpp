@@ -737,6 +737,33 @@ void CudaComputeOps::apply_activation(Tensor &out, int act_type) {
   // already filters it out; this keeps the op's contract self-contained.)
   if (static_cast<ActivationType>(act_type) == ActivationType::ACT_NONE)
     return;
+  // SIGMOID on the device. Everything else still falls through to the host --
+  // deliberately: this op is the whole ActivationType enum, and adding kernels
+  // for types no in-tree model reaches would be untested code. Sigmoid is here
+  // because it is the one the 35B runs, twice per layer, and the host path is
+  // ActiFunc::run_fn -> Tensor::apply, a std::function indirect PER ELEMENT.
+  // Measured at 39.0 ns/element over 210.4 M elements on a 20,463-token
+  // prefill = 8,199 ms, the third-largest item in the profile, for an
+  // elementwise op. In place: ActiFunc::supportInPlace() is true for sigmoid,
+  // which is the same branch CpuComputeOps takes.
+  using DT = ml::train::TensorDim::DataType;
+  if (static_cast<ActivationType>(act_type) == ActivationType::ACT_SIGMOID) {
+    const size_t n = out.size();
+#ifdef ENABLE_FP16
+    if (out.getDataType() == DT::FP16) {
+      auto *p = reinterpret_cast<unsigned short *>(out.getData<_FP16>());
+      if (n > 0 && nntrainer::cuda::dev_accessible(p) &&
+          nntrainer::cuda::cuda_act_sigmoid_fp16(p, (unsigned int)n))
+        return;
+    }
+#endif
+    if (out.getDataType() == DT::FP32) {
+      auto *p = out.getData<float>();
+      if (n > 0 && nntrainer::cuda::dev_accessible(p) &&
+          nntrainer::cuda::cuda_act_sigmoid_fp32(p, (unsigned int)n))
+        return;
+    }
+  }
   host_math_gate("apply_activation", {&out});
   CpuComputeOps::apply_activation(out, act_type);
 }

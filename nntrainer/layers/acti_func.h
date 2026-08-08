@@ -168,6 +168,14 @@ public:
   bool supportInPlace() const { return is_inplace; }
 
   /**
+   * @brief the activation this was built for, so a caller can hand it to the
+   *        ops table (ComputeOps::apply_activation) instead of run_fn -- the
+   *        only route to a backend kernel, since run_fn is a std::function
+   *        applied per element with no dispatch of its own.
+   */
+  ActivationType getType() const { return activation_type; }
+
+  /**
    * @brief       Calculate softmax for Tensor Type
    * @param[in] input input Tensor
    * @param[out] output output Tensor

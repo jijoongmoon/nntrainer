@@ -169,7 +169,8 @@ Tensor Qwen3_5MoeCausalLM::createFullAttention(const int layer_id, int n_heads,
   LayerHandle gate_sig(createLayer(
     "activation",
     {withKey("name", "layer" + std::to_string(layer_id) + "_attn_gate_sig"),
-     withKey("activation", "sigmoid")}));
+     withKey("activation", "sigmoid"),
+     withKey("engine", causallm_engine())}));
   Tensor gate_act = gate_sig(gate);
 
   LayerHandle gate_mul(createLayer(
@@ -257,7 +258,8 @@ Tensor Qwen3_5MoeCausalLM::createMlp(const int layer_id, int dim, int hidden_dim
   LayerHandle sh_gate_sig(createLayer(
     "activation",
     {withKey("name", "layer" + std::to_string(layer_id) + "_shared_gate_sig"),
-     withKey("activation", "sigmoid")}));
+     withKey("activation", "sigmoid"),
+     withKey("engine", causallm_engine())}));
   Tensor gsig = sh_gate_sig(gl);
 
   LayerHandle sh_mul(createLayer(

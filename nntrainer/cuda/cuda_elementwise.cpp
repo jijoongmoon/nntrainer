@@ -77,6 +77,26 @@ __global__ void sigmoid_glu_fp16(const unsigned short *gate,
   float g = 1.0f / (1.0f + expf(-ew_h2f(gate[i])));
   out[i] = ew_f2h(g * ew_h2f(x[i]));
 }
+// Plain in-place sigmoid, the whole-tensor activation. Same fp32 math as
+// sigmoid_glu's gate half and as the host ActiFunc, so the two agree.
+//
+// This exists because CudaComputeOps::apply_activation had NO device path at
+// all -- it host_math_gate'd straight into CpuComputeOps, and CpuComputeOps
+// runs ActiFunc::run_fn, i.e. Tensor::apply with a std::function indirect per
+// element. On a 20,463-token prefill the model's two sigmoid `activation`
+// nodes measured 8,199 ms at 39.0 ns/element. (Fixing exp_util's double
+// promotion first moved that only 42.7 -> 39.0 ns, which is what proved the
+// cost is the per-element dispatch and not the precision.)
+__global__ void act_sigmoid_fp16(unsigned short *x, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  x[i] = ew_f2h(1.0f / (1.0f + expf(-ew_h2f(x[i]))));
+}
+__global__ void act_sigmoid_fp32(float *x, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  x[i] = 1.0f / (1.0f + expf(-x[i]));
+}
 __global__ void sigmoid_add_fp16(const unsigned short *gate,
                                  const unsigned short *emb, unsigned short *out,
                                  int n) {
@@ -348,6 +368,36 @@ bool cuda_swiglu_fp16(const unsigned short *gate, const unsigned short *up,
   k->SetKernelArguments(1, &up, sizeof(up));
   k->SetKernelArguments(2, &out, sizeof(out));
   k->SetKernelArguments(3, &ni, sizeof(ni));
+  return dispatch1d(k, n);
+}
+
+bool cuda_act_sigmoid_fp16(unsigned short *x, unsigned int n) {
+  if (n == 0)
+    return true;
+  auto k =
+    CudaContext::Global().registerCudaKernel(ELTWISE_SRC, "act_sigmoid_fp16");
+  if (!k) {
+    ml_loge("[CUDA] act_sigmoid_fp16: registration failed");
+    return false;
+  }
+  int ni = (int)n;
+  k->SetKernelArguments(0, &x, sizeof(x));
+  k->SetKernelArguments(1, &ni, sizeof(ni));
+  return dispatch1d(k, n);
+}
+
+bool cuda_act_sigmoid_fp32(float *x, unsigned int n) {
+  if (n == 0)
+    return true;
+  auto k =
+    CudaContext::Global().registerCudaKernel(ELTWISE_SRC, "act_sigmoid_fp32");
+  if (!k) {
+    ml_loge("[CUDA] act_sigmoid_fp32: registration failed");
+    return false;
+  }
+  int ni = (int)n;
+  k->SetKernelArguments(0, &x, sizeof(x));
+  k->SetKernelArguments(1, &ni, sizeof(ni));
   return dispatch1d(k, n);
 }
 
