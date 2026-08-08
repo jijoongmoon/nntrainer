@@ -1599,6 +1599,35 @@ static bool fc_nocache_on() {
   return on;
 }
 
+// NNTR_CUDA_IMMA_TILE: run the register-blocked tile on the int8 Tensor Cores
+// instead of the int ALU.
+//   0 = dp4a only
+//   1 = imma_gemm_reg   (v1: byte staging, two barriers per k-step)
+//   2 = imma_gemm_pipe  (v2: vector staging, double-buffered, BK=64)
+//
+// DEFAULT 2, and the reason is measured on both models plus a bit-exactness
+// harness (7 shapes x raw/cached x fp32/fp16, all identical to dp4a_gemm_reg
+// -- int32 accumulation is associative, so a correct fragment mapping has no
+// tolerance to argue about):
+//
+//   kernel alone   MoE gate/up 128x512x2048   dp4a 0.228ms  v1 0.125  v2 0.026
+//                  attention   256x2048x4096  dp4a 2.540ms  v1 1.350  v2 0.223
+//   gemma4 e2e     prefill  390.4 -> 2,828.2 TPS   (identical output text)
+//   35B e2e        prefill  237.1 ->   263.1 TPS   (+11%: the expert GEMMs are
+//                                                   only 3.2 s of a 35 s
+//                                                   prefill -- host routing is
+//                                                   13.6 s of it)
+//
+// It is defaulted rather than left opt-in because a measured win behind a flag
+// is a trap for the next reader; =1 and =0 remain for A/B.
+static int imma_tile_level() {
+  static const int v = []() {
+    const char *e = std::getenv("NNTR_CUDA_IMMA_TILE");
+    return (e != nullptr) ? std::atoi(e) : 2;
+  }();
+  return v;
+}
+
 // repack (cached) + GEMM into a device float Y, using the already-staged
 // q8/ascale scratch. Caller holds g_dp4a_mtx and has run act-quant.
 bool dp4a_repack_and_gemm(const unsigned char *plain_w,
@@ -1622,15 +1651,7 @@ bool dp4a_repack_and_gemm(const unsigned char *plain_w,
   // shape is right -- what is missing is enough of them per launch, which is a
   // grouped kernel (all experts in one grid), not a smaller tile.
   const bool tiled = (M >= 8);
-  // NNTR_CUDA_IMMA_TILE: same tile, Tensor Cores instead of the int ALU.
-  //   1 = imma_gemm_reg  (v1: byte staging, two barriers per k-step)
-  //   2 = imma_gemm_pipe (v2: vector staging, double-buffered, BK=64)
-  // Opt-in until measured; both are bit-identical to dp4a by construction,
-  // since int32 accumulation is exact and associative.
-  static const int imma_tile = []() {
-    const char *e = std::getenv("NNTR_CUDA_IMMA_TILE");
-    return (e != nullptr) ? std::atoi(e) : 0;
-  }();
+  const int imma_tile = imma_tile_level();
   const bool use_imma = imma_tile > 0 && tiled && !gemv && !fused;
   // NNTR_CUDA_FC_NOCACHE=1: skip the DevWeightQ cache entirely for the decode
   // GEMV and read the QS4CX payload in place. That cache is a byte-for-byte
@@ -2430,6 +2451,19 @@ bool cuda_fc_qs4cx_cublas_i8_gemm_fp16(const unsigned short *Xh,
     return false;
   if (M == 0 || N == 0 || K == 0)
     return true;
+  // Stand aside for imma_gemm_pipe when it is eligible. Same int8 Tensor
+  // Cores, but it reads the packed int4 straight out of the weight and unpacks
+  // into shared memory while staging, so it never materialises the K*N int8
+  // scratch this path needs -- and it wins by 7.2x end to end on gemma4. The
+  // conditions MIRROR use_pipe in dp4a_repack_and_gemm and are deliberately
+  // the stricter reading: the alignment test is on plain_w even though a
+  // cached copy would make it moot, so an odd shape stays on cuBLAS rather
+  // than falling to v1. Returning false hands the call to the dp4a arm, which
+  // is where the tile lives (see the fall-through chain in
+  // cuda_compute_ops.cpp).
+  if (imma_tile_level() >= 2 && M >= 8u && (K % 64u) == 0u &&
+      (reinterpret_cast<uintptr_t>(plain_w) & 7u) == 0u)
+    return false;
   const bool q_vec4 = fused_normq_on() && cuda_vec4_rows_small(M) &&
                       cuda_vec4_rows_ok(K, Xh);
   auto kqh = CudaContext::Global().registerCudaKernel(
