@@ -312,9 +312,11 @@ void GatedDeltaNetLayer::runForward(nntrainer::RunLayerContext &context,
   bool pf_cmp = false;
   std::vector<float> pf_cmp_out, pf_cmp_state;
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+  // Same lever, same default-1 reasoning as the decode site below: the host
+  // prefill path is the one the golden gate fails on.
   static const int gdn_gpu_p = [] {
     const char *e = std::getenv("NNTR_CUDA_GDN");
-    return e ? std::atoi(e) : 0;
+    return e ? std::atoi(e) : 1;
   }();
   if (gdn_gpu_p > 0 &&
       input.getDataType() == ml::train::TensorDim::DataType::FP16) {
@@ -601,10 +603,22 @@ void GatedDeltaNetLayer::runDecode(nntrainer::RunLayerContext &context) {
 #if NNTR_GDN_HAVE_CUDA_KERNELS && defined(ENABLE_CUDA) && ENABLE_CUDA == 1 &&  \
   defined(ENABLE_FP16)
   // NNTR_CUDA_GDN: 1 = run the decode step on the GPU (one stream drain
-  // instead of ~7 host<->GPU transitions), 2 = run BOTH and print the diff.
+  // instead of ~7 host<->GPU transitions), 2 = run BOTH and print the diff,
+  // 0 = host only.
+  //
+  // DEFAULT 1. It used to default to 0, which made the SHIPPING path the host
+  // one -- and the host path is measurably WRONG: run_gdn_layer.sh puts the
+  // real layer 0.517 away from the P1 golden (the device path is 1.04e-07).
+  // With the old default a plain `NNTR_ENGINE=cuda` run produced fluent
+  // nonsense and a 16x slower decode (19-token prompt: prefill 8,081 ms /
+  // decode 0.41 TPS, against 2,796 ms / 6.79 TPS here), and every performance
+  // number ever recorded for this model was taken with the flag set by hand.
+  // A default that has to be corrected by hand is a trap for the next reader,
+  // so the good path is the default and =0 is the opt-out. The host path being
+  // wrong is a separate open bug; this only stops it from shipping.
   static const int gdn_gpu = [] {
     const char *e = std::getenv("NNTR_CUDA_GDN");
-    return e ? std::atoi(e) : 0;
+    return e ? std::atoi(e) : 1;
   }();
   if (gdn_gpu > 0 && B == 1 &&
       input.getDataType() == ml::train::TensorDim::DataType::FP16 &&
