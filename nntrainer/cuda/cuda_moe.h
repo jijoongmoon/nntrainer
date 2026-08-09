@@ -51,6 +51,30 @@ bool cuda_moe_router_gemm_fp16(const unsigned short *X, const float *Wg,
                                float *L, unsigned int T, unsigned int H,
                                unsigned int E);
 
+/**
+ * @brief Whole routing on the device: softmax over the router logits, top-k,
+ *        renormalise, and bucket the (token, k) assignments by expert.
+ *
+ * @param logits [T,E] fp32, as produced by cuda_moe_router_gemm_fp16
+ * @param rows   [T*topk] out, expert-major source token index
+ * @param wts    [T*topk] out, matching routing weight
+ * @param counts [E] out, assignments per expert
+ * @param offs   [E] out, exclusive scan of counts -- expert e owns
+ *               rows[offs[e] .. offs[e]+counts[e])
+ *
+ * Replaces the host softmax + Tensor::topK + 32,768 emplace_backs, which
+ * measured 3,036 ms of a 33 s 20K prefill AND is what forces a host read into
+ * the middle of every prefill forward.
+ *
+ * The bucketing uses an atomic cursor, so the order WITHIN one expert varies
+ * run to run. That is provably invisible: a token appears at most once per
+ * expert, so the scatter-add writes each destination row exactly once, and the
+ * expert GEMM treats rows independently. Different order, identical bits.
+ */
+bool cuda_moe_route_fp32(const float *logits, int *rows, float *wts,
+                         int *counts, int *offs, unsigned int T, unsigned int E,
+                         unsigned int K);
+
 /** @brief out = silu(gate)*up elementwise, fp32 math, fp16 storage. */
 bool cuda_moe_swiglu_fp16(const unsigned short *gate, const unsigned short *up,
                           unsigned short *out, unsigned int n);
@@ -64,6 +88,9 @@ bool cuda_moe_swiglu_fp16(const unsigned short *gate, const unsigned short *up,
 bool cuda_moe_scatter_add_fp16(const unsigned short *src, unsigned short *dst,
                                const int *rows, const float *wts,
                                unsigned int m, unsigned int width);
+
+/** @brief Mapped staging for counts[E] / offsets[E]. */
+bool cuda_moe_route_stage(unsigned int E, int **counts_out, int **offs_out);
 
 /** @brief Mapped staging for `m` row indices and routing weights. */
 bool cuda_moe_stage(unsigned int m, int **rows_out, float **wts_out);

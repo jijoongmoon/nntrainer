@@ -782,6 +782,11 @@ void MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     // routing
     std::vector<std::vector<std::pair<unsigned, float>>> expert_assignments(
       num_experts);
+    // Filled by the DEVICE routing path; null means the host path ran.
+    const int *dev_rows = nullptr;
+    const float *dev_wts = nullptr;
+    const int *dev_counts = nullptr;
+    const int *dev_offs = nullptr;
     {
     nntrainer::LayerProfScope _pr("  moe:routing(host)", total_tokens == 1);
     nntrainer::Tensor &gate_weights = context.getWeight(gate_idx);
@@ -829,26 +834,70 @@ void MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
         input32.dot(gate_weights, router_logits);
       }
     }
-    router_logits.apply(nntrainer::ActiFunc::softmax<float>, router_logits);
-    auto topk_result = router_logits.topK(topk);
-    auto topk_values = std::get<0>(topk_result);
-    auto topk_indices = std::get<1>(topk_result);
+    // Softmax + top-k + per-expert bucketing on the DEVICE when the router
+    // GEMM already ran there. What this replaces measured 3,036 ms of a 33 s
+    // 20K prefill: a host softmax over [T,256], Tensor::topK (a parallel_for
+    // that heap-allocates a size-256 index vector PER TOKEN), and 32,768
+    // emplace_backs into vector<vector<pair>>.
+    //
+    // It is also the last host READ inside a prefill forward, which is what a
+    // CUDA-graph capture cannot contain -- and the prefill graph is worth 1.45x
+    // on this model (measured on a single-chunk 1,341-token prompt: 248.5 ->
+    // 359.9 TPS). So this is a prerequisite, not just a 3-second item.
+    bool route_dev = false;
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+    // NNTR_MOE_ROUTE_DEV=0 keeps the host path as the A/B reference.
+    static const bool route_dev_on = []() {
+      const char *e = std::getenv("NNTR_MOE_ROUTE_DEV");
+      return !(e != nullptr && e[0] == '0');
+    }();
+    if (router_dev && route_dev_on) {
+      int *rp = nullptr;
+      float *wp = nullptr;
+      int *cp = nullptr, *op = nullptr;
+      if (nntrainer::cuda::cuda_moe_stage(total_tokens * topk, &rp, &wp) &&
+          nntrainer::cuda::cuda_moe_route_stage(num_experts, &cp, &op) &&
+          nntrainer::cuda::cuda_moe_route_fp32(router_logits.getData<float>(),
+                                               rp, wp, cp, op, total_tokens,
+                                               num_experts, topk)) {
+        // counts/offsets drive the per-expert loop below, so they must land.
+        nntrainer::cuda::StreamManager::Global().finish();
+        dev_rows = rp;
+        dev_wts = wp;
+        dev_counts = cp;
+        dev_offs = op;
+        route_dev = true;
+      }
+    }
+#endif
+    if (!route_dev) {
+      router_logits.apply(nntrainer::ActiFunc::softmax<float>, router_logits);
+      auto topk_result = router_logits.topK(topk);
+      auto topk_values = std::get<0>(topk_result);
+      auto topk_indices = std::get<1>(topk_result);
 
-    // norm_topk_prob
-    topk_values.divide_i(topk_values.sum(3));
+      // norm_topk_prob
+      topk_values.divide_i(topk_values.sum(3));
 
-    const uint32_t *indices_data = topk_indices.getData<uint32_t>();
-    // (the expert_mask fill that used to sit here was write-only -- see above)
+      const uint32_t *indices_data = topk_indices.getData<uint32_t>();
 
-    // Pre-compute expert token assignments for better performance
-    for (int i = 0; i < static_cast<int>(total_tokens); ++i) {
-      for (int k = 0; k < static_cast<int>(topk); ++k) {
-        unsigned expert_idx = indices_data[i * topk + k];
-        float weight = topk_values.getValue<float>(i, 0, 0, k);
-        expert_assignments[expert_idx].emplace_back(i, weight);
+      // Pre-compute expert token assignments for better performance
+      for (int i = 0; i < static_cast<int>(total_tokens); ++i) {
+        for (int k = 0; k < static_cast<int>(topk); ++k) {
+          unsigned expert_idx = indices_data[i * topk + k];
+          float weight = topk_values.getValue<float>(i, 0, 0, k);
+          expert_assignments[expert_idx].emplace_back(i, weight);
+        }
       }
     }
     } // end routing scope
+
+    // The per-expert loop below is host-driven, so it needs one count per
+    // expert. Only the SIZES come from the device; the pairs stay unfilled
+    // because the device path supplies rows/wts directly.
+    if (dev_counts != nullptr)
+      for (unsigned int e = 0; e < num_experts; ++e)
+        expert_assignments[e].resize((size_t)dev_counts[e]);
 
     // One expert, all of its tokens, three GEMMs. The dispatch table is taken
     // from the layer INPUT: that tensor carries the node's ContextData, while a
@@ -916,7 +965,14 @@ void MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
         output.getDataType() == ml::train::TensorDim::DataType::FP16) {
       int *rp = nullptr;
       float *wp = nullptr;
-      if (nntrainer::cuda::cuda_moe_stage(total_tokens * topk, &rp, &wp) &&
+      if (dev_rows != nullptr) {
+        // already bucketed on the device -- adopt it, no host fill at all
+        rows_all = dev_rows;
+        wts_all = dev_wts;
+        for (unsigned int e = 0; e < num_experts; ++e)
+          expert_off[e] = (size_t)dev_offs[e];
+        moe_dev = true;
+      } else if (nntrainer::cuda::cuda_moe_stage(total_tokens * topk, &rp, &wp) &&
           nntrainer::cuda::dev_accessible(input.getData<_FP16>()) &&
           nntrainer::cuda::dev_accessible(output.getData<_FP16>()) &&
           nntrainer::cuda::dev_accessible(rp)) {

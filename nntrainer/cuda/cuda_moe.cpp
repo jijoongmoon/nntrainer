@@ -297,6 +297,111 @@ __global__ void moe_router_gemm(const unsigned short *X, const float *Wg,
     }
   }
 }
+// --------------------------------------------------- ROUTING: topk + bucket
+// One block per token: softmax over the E router logits, take the top-k,
+// renormalise, and histogram the picks. Mirrors the host order exactly --
+// softmax, THEN topK, THEN divide by the sum of the k kept values -- because
+// dividing before the selection would not be the same number.
+//
+// E <= 1024 (256 here) so one block covers a row and the reductions are
+// block-local. The top-k is k passes of argmax-then-mask: with k=8 over 256
+// that is 8 tree reductions, far cheaper than a sort.
+__global__ void moe_route_topk(const float *logits, int *tk_idx, float *tk_wt,
+                               int *counts, int T, int E, int K){
+  extern __shared__ float sh[];             // E floats
+  __shared__ float red[32];
+  __shared__ int   redi[32];
+  const int t = blockIdx.x;
+  const int tid = threadIdx.x, nt = blockDim.x;
+  if (t >= T) return;
+  const float *row = logits + (long)t * E;
+  for (int e = tid; e < E; e += nt) sh[e] = row[e];
+  __syncthreads();
+
+  // softmax
+  float m = -1e30f;
+  for (int e = tid; e < E; e += nt) m = fmaxf(m, sh[e]);
+  for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_down_sync(0xffffffffu, m, o));
+  if ((tid & 31) == 0) red[tid >> 5] = m;
+  __syncthreads();
+  if (tid == 0) { float v = red[0];
+    for (int i = 1; i < (nt + 31) / 32; ++i) v = fmaxf(v, red[i]);
+    red[0] = v; }
+  __syncthreads();
+  m = red[0];
+  float s = 0.f;
+  for (int e = tid; e < E; e += nt) { float x = __expf(sh[e] - m); sh[e] = x; s += x; }
+  for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
+  if ((tid & 31) == 0) red[tid >> 5] = s;
+  __syncthreads();
+  if (tid == 0) { float v = 0.f;
+    for (int i = 0; i < (nt + 31) / 32; ++i) v += red[i];
+    red[0] = v; }
+  __syncthreads();
+  const float inv = 1.0f / red[0];
+  for (int e = tid; e < E; e += nt) sh[e] *= inv;
+  __syncthreads();
+
+  // top-k by repeated argmax; the winner is masked to -1 so it cannot repeat
+  float wsum = 0.f;
+  for (int j = 0; j < K; ++j) {
+    float bv = -1.f; int bi = -1;
+    for (int e = tid; e < E; e += nt)
+      if (sh[e] > bv) { bv = sh[e]; bi = e; }
+    for (int o = 16; o > 0; o >>= 1) {
+      float ov = __shfl_down_sync(0xffffffffu, bv, o);
+      int   oi = __shfl_down_sync(0xffffffffu, bi, o);
+      if (ov > bv) { bv = ov; bi = oi; }
+    }
+    if ((tid & 31) == 0) { red[tid >> 5] = bv; redi[tid >> 5] = bi; }
+    __syncthreads();
+    if (tid == 0) {
+      float v = red[0]; int i2 = redi[0];
+      for (int i = 1; i < (nt + 31) / 32; ++i)
+        if (red[i] > v) { v = red[i]; i2 = redi[i]; }
+      red[0] = v; redi[0] = i2;
+      tk_idx[(long)t * K + j] = i2;
+      tk_wt[(long)t * K + j] = v;
+      sh[i2] = -1.f;                    // mask so the next pass skips it
+    }
+    __syncthreads();
+    wsum += red[0];
+  }
+  // norm_topk_prob, then the per-expert histogram
+  if (tid == 0) {
+    const float n = (wsum > 0.f) ? (1.0f / wsum) : 1.0f;
+    for (int j = 0; j < K; ++j) {
+      tk_wt[(long)t * K + j] *= n;
+      atomicAdd(&counts[tk_idx[(long)t * K + j]], 1);
+    }
+  }
+}
+
+// exclusive scan of counts[E] -> offs[E], and seed the scatter cursors.
+// One block; E is 256, so a serial scan in thread 0 is a few hundred ns.
+__global__ void moe_route_scan(const int *counts, int *offs, int *cursor, int E){
+  if (threadIdx.x != 0) return;
+  int acc = 0;
+  for (int e = 0; e < E; ++e) { offs[e] = acc; cursor[e] = acc; acc += counts[e]; }
+}
+
+// Scatter every (token, k) assignment into the expert-major rows/wts arrays.
+//
+// The slot comes from an atomicAdd, so the ORDER inside one expert varies from
+// run to run -- and that is provably harmless here, which is why the cheap
+// form is the right one: a token appears at most once per expert, so the
+// downstream scatter-add writes each dst row exactly once per expert, and the
+// FC treats rows independently. Different order, identical bits.
+__global__ void moe_route_bucket(const int *tk_idx, const float *tk_wt,
+                                 int *cursor, int *rows, float *wts,
+                                 int T, int K){
+  const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= (long)T * K) return;
+  const int e = tk_idx[i];
+  const int slot = atomicAdd(&cursor[e], 1);
+  rows[slot] = (int)(i / K);
+  wts[slot] = tk_wt[i];
+}
 } // extern "C"
 )CU";
 
@@ -342,8 +447,17 @@ bool grow_mapped(void **p, size_t *cap, size_t need) {
 bool grow_dev(void **p, size_t *cap, size_t need) {
   if (need <= *cap)
     return true;
-  if (StreamManager::Global().isCapturing())
+  if (StreamManager::Global().isCapturing()) {
+    // A cudaMalloc inside a capture invalidates the stream, so the guard is
+    // correct -- but the REFUSAL then makes the caller fall back to a host
+    // path, which invalidates the capture just as surely. Either way the
+    // prefill graph is lost, and silently. Say so: the fix is to size this
+    // scratch before the first captured forward, not to relax the guard.
+    ml_logw("[CUDA] moe scratch grow refused during capture (need %zu, cap "
+            "%zu) -- the prefill graph will fall back",
+            need, *cap);
     return false;
+  }
   if (*p)
     cudaFree(*p);
   *p = nullptr;
@@ -364,6 +478,22 @@ bool cuda_moe_stage(unsigned int m, int **rows_out, float **wts_out) {
     return false;
   *rows_out = g_rows;
   *wts_out = g_wts;
+  return true;
+}
+
+// counts[E] and offs[E]. MAPPED, not device-only: the per-expert loop below
+// is host-driven, so the host has to read these back. That single 2 KB read is
+// what still stands between this and a capturable prefill -- removing it needs
+// the grouped kernel, which consumes the plan without a host loop.
+bool cuda_moe_route_stage(unsigned int E, int **counts_out, int **offs_out) {
+  static int *g_counts = nullptr, *g_offs = nullptr;
+  static size_t c_counts = 0, c_offs = 0;
+  std::lock_guard<std::mutex> lk(g_moe_mtx);
+  if (!grow_mapped((void **)&g_counts, &c_counts, (size_t)E * sizeof(int)) ||
+      !grow_mapped((void **)&g_offs, &c_offs, (size_t)E * sizeof(int)))
+    return false;
+  *counts_out = g_counts;
+  *offs_out = g_offs;
   return true;
 }
 
@@ -404,6 +534,63 @@ bool cuda_moe_router_gemm_fp16(const unsigned short *X, const float *Wg,
   const int g[3] = {(int)((E + 63) / 64), (int)((T + 63) / 64), 1};
   const int b[3] = {256, 1, 1};
   return StreamManager::Global().DispatchCommand(*k, g, b);
+}
+
+bool cuda_moe_route_fp32(const float *logits, int *rows, float *wts,
+                         int *counts, int *offs, unsigned int T, unsigned int E,
+                         unsigned int K) {
+  if (T == 0 || E == 0 || K == 0)
+    return true;
+  auto &ctx = CudaContext::Global();
+  auto k1 = ctx.registerCudaKernel(MOE_SRC, "moe_route_topk");
+  auto k2 = ctx.registerCudaKernel(MOE_SRC, "moe_route_scan");
+  auto k3 = ctx.registerCudaKernel(MOE_SRC, "moe_route_bucket");
+  if (!k1 || !k2 || !k3)
+    return false;
+
+  // scratch: [T*K] expert ids + [T*K] weights + [E] cursors, grown once
+  static int *d_idx = nullptr, *d_cur = nullptr;
+  static float *d_wt = nullptr;
+  static size_t c_idx = 0, c_wt = 0, c_cur = 0;
+  const size_t A = (size_t)T * K;
+  if (!grow_dev((void **)&d_idx, &c_idx, sizeof(int) * A) ||
+      !grow_dev((void **)&d_wt, &c_wt, sizeof(float) * A) ||
+      !grow_dev((void **)&d_cur, &c_cur, sizeof(int) * E))
+    return false;
+  auto &sm = StreamManager::Global();
+  if (cudaMemsetAsync(counts, 0, sizeof(int) * E, sm.GetStream()) != cudaSuccess)
+    return false;
+
+  int t = (int)T, e = (int)E, kk = (int)K;
+  k1->SetKernelArguments(0, &logits, sizeof(logits));
+  k1->SetKernelArguments(1, &d_idx, sizeof(d_idx));
+  k1->SetKernelArguments(2, &d_wt, sizeof(d_wt));
+  k1->SetKernelArguments(3, &counts, sizeof(counts));
+  k1->SetKernelArguments(4, &t, sizeof(t));
+  k1->SetKernelArguments(5, &e, sizeof(e));
+  k1->SetKernelArguments(6, &kk, sizeof(kk));
+  const int g1[3] = {(int)T, 1, 1}, b1[3] = {256, 1, 1};
+  if (!sm.DispatchCommand(*k1, g1, b1, (unsigned int)(sizeof(float) * E)))
+    return false;
+
+  k2->SetKernelArguments(0, &counts, sizeof(counts));
+  k2->SetKernelArguments(1, &offs, sizeof(offs));
+  k2->SetKernelArguments(2, &d_cur, sizeof(d_cur));
+  k2->SetKernelArguments(3, &e, sizeof(e));
+  const int g2[3] = {1, 1, 1}, b2[3] = {32, 1, 1};
+  if (!sm.DispatchCommand(*k2, g2, b2))
+    return false;
+
+  k3->SetKernelArguments(0, &d_idx, sizeof(d_idx));
+  k3->SetKernelArguments(1, &d_wt, sizeof(d_wt));
+  k3->SetKernelArguments(2, &d_cur, sizeof(d_cur));
+  k3->SetKernelArguments(3, &rows, sizeof(rows));
+  k3->SetKernelArguments(4, &wts, sizeof(wts));
+  k3->SetKernelArguments(5, &t, sizeof(t));
+  k3->SetKernelArguments(6, &kk, sizeof(kk));
+  const int B = 256;
+  const int g3[3] = {(int)((A + B - 1) / B), 1, 1}, b3[3] = {B, 1, 1};
+  return sm.DispatchCommand(*k3, g3, b3);
 }
 
 bool cuda_moe_swiglu_fp16(const unsigned short *gate, const unsigned short *up,
