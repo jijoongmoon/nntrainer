@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -1382,6 +1383,17 @@ bool attention_gemm_prefill_fp16(const unsigned short *q,
   const int win = (window <= 0 || window >= N_kv) ? 0 : window;
   const int B = 256;
   const size_t shmem = (size_t)B * sizeof(float);
+  // QK^T accumulate type: 32F by DEFAULT, and the 16F arm is a MEASURED
+  // TRAP on this cuBLAS/GA10B: numerics held (answer correct) but kernel
+  // selection collapsed on two of the five chunk shapes (Nkv=4096: 14.6 ->
+  // 177.9 ms; Nkv=20463: 96.5 -> 181.2 ms) for a -3.7% e2e regression. The
+  // '16F doubles the mma rate' arithmetic does NOT survive contact with
+  // cublasGemmEx here. NNTR_ATTN_QKT_16F=1 keeps the arm reproducible.
+  static const cublasComputeType_t g_qkt_compute = []() {
+    const char *e = std::getenv("NNTR_ATTN_QKT_16F");
+    return (e != nullptr && e[0] == '1') ? CUBLAS_COMPUTE_16F
+                                         : CUBLAS_COMPUTE_32F;
+  }();
   // NNTR_ATTN_DBG=1: per-stage GPU ms via events, printed for the FIRST call
   // at each distinct N_kv (so every prefill chunk shape gets one sample).
   static const bool g_adbg = []() {
@@ -1416,10 +1428,20 @@ bool attention_gemm_prefill_fp16(const unsigned short *q,
     unsigned short *Oh = o + (long)h * d;         // [N_q,d] ld=HD_Q
     // scores_cm[N_kv,N_q] = (K_h^T)[N_kv,d] @ Q_h[d,N_q] * scale -> row-major
     // scores[i*N_kv+j] = scale*dot(Q_i,K_j).
-    cublasStatus_t s1 =
-      cublasGemmEx(bh, CUBLAS_OP_T, CUBLAS_OP_N, N_kv, N_q, d, &scale, Kh,
-                   CUDA_R_16F, HD_KV, Qh, CUDA_R_16F, HD_Q, &zero, scores,
-                   CUDA_R_16F, ld_s, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+    cublasStatus_t s1;
+    if (g_qkt_compute == CUBLAS_COMPUTE_16F) {
+      // 16F compute wants half alpha/beta. scale = 1/16 is exact in fp16.
+      const __half sh = __float2half(scale), zh = __float2half(0.0f);
+      s1 = cublasGemmEx(bh, CUBLAS_OP_T, CUBLAS_OP_N, N_kv, N_q, d, &sh, Kh,
+                        CUDA_R_16F, HD_KV, Qh, CUDA_R_16F, HD_Q, &zh, scores,
+                        CUDA_R_16F, ld_s, CUBLAS_COMPUTE_16F,
+                        CUBLAS_GEMM_DEFAULT);
+    } else {
+      s1 = cublasGemmEx(bh, CUBLAS_OP_T, CUBLAS_OP_N, N_kv, N_q, d, &scale,
+                        Kh, CUDA_R_16F, HD_KV, Qh, CUDA_R_16F, HD_Q, &zero,
+                        scores, CUDA_R_16F, ld_s, CUBLAS_COMPUTE_32F,
+                        CUBLAS_GEMM_DEFAULT);
+    }
     if (s1 != CUBLAS_STATUS_SUCCESS)
       return false;
     if (adbg_this)
