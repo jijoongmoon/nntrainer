@@ -109,6 +109,18 @@ bool cuda_fc_qs4cx_moe_grouped_gemm(
   unsigned int N, unsigned int K, int out_fp16);
 
 /**
+ * @brief gate+up FUSED grouped GEMM: one A staging serves both projections'
+ *        W tiles (16 mma per k-step against one barrier). Outputs Yg/Yu are
+ *        written identically to two cuda_fc_qs4cx_moe_grouped_gemm calls.
+ */
+bool cuda_fc_qs4cx_moe_grouped_gemm2(
+  const signed char *q8, const int *tokid, const unsigned long long *wpg_tab,
+  const unsigned long long *wsg_tab, const unsigned long long *wpu_tab,
+  const unsigned long long *wsu_tab, const int *block_expert,
+  const float *ascale, const int *azp, void *Yg, void *Yu,
+  unsigned int n_mblocks, unsigned int N, unsigned int K, int out_fp16);
+
+/**
  * @brief fp16 activation in, FP32 out (the GDN projection variant): the same
  *        act-quant + w4a8 ladder as the fp16 entry, writing float Y directly.
  */

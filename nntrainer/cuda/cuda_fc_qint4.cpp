@@ -1406,6 +1406,443 @@ void imma_moe_grouped(const signed char *q8, const int *tokid,
   }
 }
 
+// clock64 phase-bracket twin of imma_moe_grouped (NNTR_IMMA_CK=1, debug only).
+// Identical math and identical output; thread 0 of each block samples the
+// per-k-step phase boundaries (the single barrier locksteps all 8 warps, so
+// one thread's timeline prices the block's rhythm) and atomicAdds cycle sums
+// into ck[4]: {mma+issue, store, barrier, full-step count}.
+__global__ __launch_bounds__(256, 2)
+void imma_moe_grouped_ck(const signed char *q8, const int *tokid,
+                         const unsigned long long *wp_tab,
+                         const unsigned long long *ws_tab,
+                         const int *block_expert, const float *ascale,
+                         const int *azp, float *Y, int N, int K, int out_fp16,
+                         unsigned long long *ck) {
+  const int e = block_expert[blockIdx.y];
+  if (e < 0)
+    return;
+  const unsigned char *plain =
+    (const unsigned char *)(unsigned long long)wp_tab[e];
+  const unsigned short *wscale =
+    (const unsigned short *)(unsigned long long)ws_tab[e];
+  __shared__ IPv16 Asv[2][IP_BM * IP_LD / 16];
+  __shared__ IPv16 Wsv[2][IP_BN * IP_LD / 16];
+  __shared__ int rsh[IP_BN];
+  __shared__ int toks[IP_BM];
+  const int tid = threadIdx.x;
+  const int lane = tid & 31, warp = tid >> 5;
+  const int wm = warp >> 1, wn = warp & 1;
+  const int g = lane >> 2, t = lane & 3;
+  const int blockM = blockIdx.y * IP_BM, blockN = blockIdx.x * IP_BN;
+  const int Kh = K >> 1;
+  const unsigned int cx = 0u;
+
+  if (tid < IP_BM)
+    toks[tid] = tokid ? tokid[blockM + tid] : (blockM + tid);
+  __syncthreads();
+
+  const int srow = tid >> 2, ssub = tid & 3;
+  const int atok = toks[srow];
+  const int wrow = blockN + srow;
+  const bool arow_ok = atok >= 0, wrow_ok = wrow < N;
+  const signed char *aptr = q8 + (long)atok * K + (ssub << 4);
+  const unsigned char *wptr = plain + (long)wrow * Kh + (ssub << 3);
+  const int sdst = srow * IP_LD + (ssub << 4);
+
+  int acc[4][4];
+#pragma unroll
+  for (int s = 0; s < 4; ++s)
+#pragma unroll
+    for (int r = 0; r < 4; ++r)
+      acc[s][r] = 0;
+  int rsacc = 0;
+
+  IPv16 ra;
+  IPv8 rw;
+  IPv16 wv;
+
+#define IPGK_LOAD(K0)                                                          \
+  do {                                                                         \
+    if (arow_ok) {                                                             \
+      ra = *(const IPv16 *)(aptr + (K0));                                      \
+    } else {                                                                   \
+      ra.a = ra.b = ra.c = ra.d = 0u;                                          \
+    }                                                                          \
+    if (wrow_ok) {                                                             \
+      rw = *(const IPv8 *)(wptr + ((K0) >> 1));                                \
+    } else {                                                                   \
+      rw.a = rw.b = 0u;                                                        \
+    }                                                                          \
+  } while (0)
+
+#define IPGK_STORE(BUF)                                                        \
+  do {                                                                         \
+    unsigned int lo = rw.a & 0x0F0F0F0Fu;                                      \
+    unsigned int hi = (rw.a >> 4) & 0x0F0F0F0Fu;                               \
+    wv.a = ip_nib2i8(__byte_perm(lo, hi, 0x5140), cx);                         \
+    wv.b = ip_nib2i8(__byte_perm(lo, hi, 0x7362), cx);                         \
+    lo = rw.b & 0x0F0F0F0Fu;                                                   \
+    hi = (rw.b >> 4) & 0x0F0F0F0Fu;                                            \
+    wv.c = ip_nib2i8(__byte_perm(lo, hi, 0x5140), cx);                         \
+    wv.d = ip_nib2i8(__byte_perm(lo, hi, 0x7362), cx);                         \
+    rsacc = __dp4a(0x01010101, (int)wv.a, rsacc);                              \
+    rsacc = __dp4a(0x01010101, (int)wv.b, rsacc);                              \
+    rsacc = __dp4a(0x01010101, (int)wv.c, rsacc);                              \
+    rsacc = __dp4a(0x01010101, (int)wv.d, rsacc);                              \
+    *(IPv16 *)((signed char *)Asv[BUF] + sdst) = ra;                           \
+    *(IPv16 *)((signed char *)Wsv[BUF] + sdst) = wv;                           \
+  } while (0)
+
+  IPGK_LOAD(0);
+  IPGK_STORE(0);
+  __syncthreads();
+
+  const int lrow_a = wm * 16 + (lane & 7) + ((lane & 8) ? 8 : 0);
+  const int lkb_a = (lane & 16) ? 16 : 0;
+  const int lrow_b = wn * 32 + (lane >> 3) * 8 + (lane & 7);
+  const unsigned pa_buf[2] = {
+    ip_sh((const signed char *)Asv[0] + lrow_a * IP_LD + lkb_a),
+    ip_sh((const signed char *)Asv[1] + lrow_a * IP_LD + lkb_a)};
+  const unsigned pb_buf[2] = {
+    ip_sh((const signed char *)Wsv[0] + lrow_b * IP_LD),
+    ip_sh((const signed char *)Wsv[1] + lrow_b * IP_LD)};
+
+#define IPGK_MMA(S, B0, B1)                                                    \
+  asm volatile(                                                                \
+    "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32.satfinite "               \
+    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"              \
+    : "=r"(acc[S][0]), "=r"(acc[S][1]), "=r"(acc[S][2]), "=r"(acc[S][3])       \
+    : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(B0), "r"(B1),                    \
+      "r"(acc[S][0]), "r"(acc[S][1]), "r"(acc[S][2]), "r"(acc[S][3]))
+#define IPGK_HALF(H)                                                           \
+  do {                                                                         \
+    int a0, a1, a2, a3, c_0, c_1, c_2, c_3, d0, d1, d2, d3;                    \
+    asm volatile(                                                              \
+      "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"        \
+      : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)                                 \
+      : "r"(pa + (H) * 32));                                                   \
+    asm volatile(                                                              \
+      "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"        \
+      : "=r"(c_0), "=r"(c_1), "=r"(c_2), "=r"(c_3)                             \
+      : "r"(pb + (H) * 32));                                                   \
+    asm volatile(                                                              \
+      "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"        \
+      : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3)                                 \
+      : "r"(pb + (H) * 32 + 16));                                              \
+    IPGK_MMA(0, c_0, d0);                                                      \
+    IPGK_MMA(1, c_1, d1);                                                      \
+    IPGK_MMA(2, c_2, d2);                                                      \
+    IPGK_MMA(3, c_3, d3);                                                      \
+  } while (0)
+
+  unsigned long long t_ld = 0ull, t_h0 = 0ull, t_h1 = 0ull, t_st = 0ull,
+                     t_bar = 0ull, ns = 0ull;
+  long long c0 = 0, cl = 0, ch = 0, c1 = 0, c2 = 0, c3 = 0;
+  int cur = 0;
+  for (int k0 = 0; k0 < K; k0 += IP_BK) {
+    const int knext = k0 + IP_BK;
+    if (tid == 0)
+      c0 = clock64();
+    if (knext < K)
+      IPGK_LOAD(knext);
+    if (tid == 0)
+      cl = clock64();
+
+    const unsigned pa = pa_buf[cur], pb = pb_buf[cur];
+    IPGK_HALF(0);
+    if (tid == 0)
+      ch = clock64();
+    IPGK_HALF(1);
+
+    if (knext < K) {
+      if (tid == 0)
+        c1 = clock64();
+      IPGK_STORE(cur ^ 1);
+      if (tid == 0)
+        c2 = clock64();
+      __syncthreads();
+      if (tid == 0) {
+        c3 = clock64();
+        t_ld += (unsigned long long)(cl - c0);
+        t_h0 += (unsigned long long)(ch - cl);
+        t_h1 += (unsigned long long)(c1 - ch);
+        t_st += (unsigned long long)(c2 - c1);
+        t_bar += (unsigned long long)(c3 - c2);
+        ++ns;
+      }
+      cur ^= 1;
+    }
+  }
+#undef IPGK_HALF
+#undef IPGK_MMA
+#undef IPGK_LOAD
+#undef IPGK_STORE
+
+  {
+    int v = rsacc;
+    v += __shfl_down_sync(0xffffffffu, v, 1);
+    v += __shfl_down_sync(0xffffffffu, v, 2);
+    if (ssub == 0)
+      rsh[srow] = v;
+    __syncthreads();
+  }
+  if (tid == 0 && ck) {
+    atomicAdd(&ck[0], t_ld);
+    atomicAdd(&ck[1], t_h0);
+    atomicAdd(&ck[2], t_h1);
+    atomicAdd(&ck[3], t_st);
+    atomicAdd(&ck[4], t_bar);
+    atomicAdd(&ck[5], ns);
+  }
+#pragma unroll
+  for (int s = 0; s < 4; ++s) {
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+      const int lrow = wm * 16 + g + ((r >> 1) ? 8 : 0);
+      const int cb = wn * 32 + s * 8 + 2 * t + (r & 1);
+      const int col = blockN + cb;
+      if (col < N) {
+        const int tok = toks[lrow];
+        float v = 0.0f;
+        if (tok >= 0)
+          v = (float)(acc[s][r] - azp[tok] * rsh[cb]) * ascale[tok] *
+              dp4a_h2f(wscale[col]);
+        if (out_fp16)
+          ((unsigned short *)Y)[(long)(blockM + lrow) * N + col] = dp4a_f2h(v);
+        else
+          Y[(long)(blockM + lrow) * N + col] = v;
+      }
+    }
+  }
+}
+
+// gate+up FUSED grouped GEMM (NNTR_MOE_G2=1): one A staging serves TWO W
+// tiles, so per k-step the block runs 16 mma against ONE A load/store/barrier
+// instead of 8 -- a direct attack on the measured per-k-step overhead
+// (~1,550 of ~1,700 cycles are not tensor-core time). Same math as two
+// imma_moe_grouped launches; outputs Yg/Yu are written identically.
+__global__ __launch_bounds__(256, 2)
+void imma_moe_grouped_g2(const signed char *q8, const int *tokid,
+                         const unsigned long long *wpg_tab,
+                         const unsigned long long *wsg_tab,
+                         const unsigned long long *wpu_tab,
+                         const unsigned long long *wsu_tab,
+                         const int *block_expert, const float *ascale,
+                         const int *azp, float *Yg, float *Yu, int N, int K,
+                         int out_fp16) {
+  const int e = block_expert[blockIdx.y];
+  if (e < 0)
+    return;
+  const unsigned char *plg =
+    (const unsigned char *)(unsigned long long)wpg_tab[e];
+  const unsigned short *wscg =
+    (const unsigned short *)(unsigned long long)wsg_tab[e];
+  const unsigned char *plu =
+    (const unsigned char *)(unsigned long long)wpu_tab[e];
+  const unsigned short *wscu =
+    (const unsigned short *)(unsigned long long)wsu_tab[e];
+  __shared__ IPv16 Asv[2][IP_BM * IP_LD / 16];
+  __shared__ IPv16 Wgv[2][IP_BN * IP_LD / 16];
+  __shared__ IPv16 Wuv[2][IP_BN * IP_LD / 16];
+  __shared__ int rshg[IP_BN];
+  __shared__ int rshu[IP_BN];
+  __shared__ int toks[IP_BM];
+  const int tid = threadIdx.x;
+  const int lane = tid & 31, warp = tid >> 5;
+  const int wm = warp >> 1, wn = warp & 1;
+  const int g = lane >> 2, t = lane & 3;
+  const int blockM = blockIdx.y * IP_BM, blockN = blockIdx.x * IP_BN;
+  const int Kh = K >> 1;
+  const unsigned int cx = 0u;
+
+  if (tid < IP_BM)
+    toks[tid] = tokid ? tokid[blockM + tid] : (blockM + tid);
+  __syncthreads();
+
+  const int srow = tid >> 2, ssub = tid & 3;
+  const int atok = toks[srow];
+  const int wrow = blockN + srow;
+  const bool arow_ok = atok >= 0, wrow_ok = wrow < N;
+  const signed char *aptr = q8 + (long)atok * K + (ssub << 4);
+  const unsigned char *wgptr = plg + (long)wrow * Kh + (ssub << 3);
+  const unsigned char *wuptr = plu + (long)wrow * Kh + (ssub << 3);
+  const int sdst = srow * IP_LD + (ssub << 4);
+
+  int accg[4][4], accu[4][4];
+#pragma unroll
+  for (int s = 0; s < 4; ++s)
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+      accg[s][r] = 0;
+      accu[s][r] = 0;
+    }
+  int rsg = 0, rsu = 0;
+
+  IPv16 ra;
+  IPv8 rwg, rwu;
+  IPv16 wv;
+
+#define IPG2_LOAD(K0)                                                          \
+  do {                                                                         \
+    if (arow_ok) {                                                             \
+      ra = *(const IPv16 *)(aptr + (K0));                                      \
+    } else {                                                                   \
+      ra.a = ra.b = ra.c = ra.d = 0u;                                          \
+    }                                                                          \
+    if (wrow_ok) {                                                             \
+      rwg = *(const IPv8 *)(wgptr + ((K0) >> 1));                              \
+      rwu = *(const IPv8 *)(wuptr + ((K0) >> 1));                              \
+    } else {                                                                   \
+      rwg.a = rwg.b = 0u;                                                      \
+      rwu.a = rwu.b = 0u;                                                      \
+    }                                                                          \
+  } while (0)
+
+#define IPG2_UNPACK(RW, RS, BUFV)                                              \
+  do {                                                                         \
+    unsigned int lo = (RW).a & 0x0F0F0F0Fu;                                    \
+    unsigned int hi = ((RW).a >> 4) & 0x0F0F0F0Fu;                             \
+    wv.a = ip_nib2i8(__byte_perm(lo, hi, 0x5140), cx);                         \
+    wv.b = ip_nib2i8(__byte_perm(lo, hi, 0x7362), cx);                         \
+    lo = (RW).b & 0x0F0F0F0Fu;                                                 \
+    hi = ((RW).b >> 4) & 0x0F0F0F0Fu;                                          \
+    wv.c = ip_nib2i8(__byte_perm(lo, hi, 0x5140), cx);                         \
+    wv.d = ip_nib2i8(__byte_perm(lo, hi, 0x7362), cx);                         \
+    RS = __dp4a(0x01010101, (int)wv.a, RS);                                    \
+    RS = __dp4a(0x01010101, (int)wv.b, RS);                                    \
+    RS = __dp4a(0x01010101, (int)wv.c, RS);                                    \
+    RS = __dp4a(0x01010101, (int)wv.d, RS);                                    \
+    *(IPv16 *)((signed char *)(BUFV) + sdst) = wv;                             \
+  } while (0)
+
+#define IPG2_STORE(BUF)                                                        \
+  do {                                                                         \
+    IPG2_UNPACK(rwg, rsg, Wgv[BUF]);                                           \
+    IPG2_UNPACK(rwu, rsu, Wuv[BUF]);                                           \
+    *(IPv16 *)((signed char *)Asv[BUF] + sdst) = ra;                           \
+  } while (0)
+
+  IPG2_LOAD(0);
+  IPG2_STORE(0);
+  __syncthreads();
+
+  const int lrow_a = wm * 16 + (lane & 7) + ((lane & 8) ? 8 : 0);
+  const int lkb_a = (lane & 16) ? 16 : 0;
+  const int lrow_b = wn * 32 + (lane >> 3) * 8 + (lane & 7);
+  const unsigned pa_buf[2] = {
+    ip_sh((const signed char *)Asv[0] + lrow_a * IP_LD + lkb_a),
+    ip_sh((const signed char *)Asv[1] + lrow_a * IP_LD + lkb_a)};
+  const unsigned pbg_buf[2] = {
+    ip_sh((const signed char *)Wgv[0] + lrow_b * IP_LD),
+    ip_sh((const signed char *)Wgv[1] + lrow_b * IP_LD)};
+  const unsigned pbu_buf[2] = {
+    ip_sh((const signed char *)Wuv[0] + lrow_b * IP_LD),
+    ip_sh((const signed char *)Wuv[1] + lrow_b * IP_LD)};
+
+#define IPG2_MMA(ACC, S, B0, B1)                                               \
+  asm volatile(                                                                \
+    "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32.satfinite "               \
+    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"              \
+    : "=r"(ACC[S][0]), "=r"(ACC[S][1]), "=r"(ACC[S][2]), "=r"(ACC[S][3])       \
+    : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(B0), "r"(B1),                    \
+      "r"(ACC[S][0]), "r"(ACC[S][1]), "r"(ACC[S][2]), "r"(ACC[S][3]))
+#define IPG2_HALF(H)                                                           \
+  do {                                                                         \
+    int a0, a1, a2, a3, c0, c1, c2, c3, d0, d1, d2, d3;                        \
+    asm volatile(                                                              \
+      "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"        \
+      : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)                                 \
+      : "r"(pa + (H) * 32));                                                   \
+    asm volatile(                                                              \
+      "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"        \
+      : "=r"(c0), "=r"(c1), "=r"(c2), "=r"(c3)                                 \
+      : "r"(pbg + (H) * 32));                                                  \
+    asm volatile(                                                              \
+      "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"        \
+      : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3)                                 \
+      : "r"(pbg + (H) * 32 + 16));                                             \
+    IPG2_MMA(accg, 0, c0, d0);                                                 \
+    IPG2_MMA(accg, 1, c1, d1);                                                 \
+    IPG2_MMA(accg, 2, c2, d2);                                                 \
+    IPG2_MMA(accg, 3, c3, d3);                                                 \
+    asm volatile(                                                              \
+      "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"        \
+      : "=r"(c0), "=r"(c1), "=r"(c2), "=r"(c3)                                 \
+      : "r"(pbu + (H) * 32));                                                  \
+    asm volatile(                                                              \
+      "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"        \
+      : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3)                                 \
+      : "r"(pbu + (H) * 32 + 16));                                             \
+    IPG2_MMA(accu, 0, c0, d0);                                                 \
+    IPG2_MMA(accu, 1, c1, d1);                                                 \
+    IPG2_MMA(accu, 2, c2, d2);                                                 \
+    IPG2_MMA(accu, 3, c3, d3);                                                 \
+  } while (0)
+
+  int cur = 0;
+  for (int k0 = 0; k0 < K; k0 += IP_BK) {
+    const int knext = k0 + IP_BK;
+    if (knext < K)
+      IPG2_LOAD(knext);
+
+    const unsigned pa = pa_buf[cur], pbg = pbg_buf[cur], pbu = pbu_buf[cur];
+    IPG2_HALF(0);
+    IPG2_HALF(1);
+
+    if (knext < K) {
+      IPG2_STORE(cur ^ 1);
+      __syncthreads();
+      cur ^= 1;
+    }
+  }
+#undef IPG2_HALF
+#undef IPG2_MMA
+#undef IPG2_STORE
+#undef IPG2_UNPACK
+#undef IPG2_LOAD
+
+  {
+    int vg = rsg, vu = rsu;
+    vg += __shfl_down_sync(0xffffffffu, vg, 1);
+    vg += __shfl_down_sync(0xffffffffu, vg, 2);
+    vu += __shfl_down_sync(0xffffffffu, vu, 1);
+    vu += __shfl_down_sync(0xffffffffu, vu, 2);
+    if (ssub == 0) {
+      rshg[srow] = vg;
+      rshu[srow] = vu;
+    }
+    __syncthreads();
+  }
+#pragma unroll
+  for (int s = 0; s < 4; ++s) {
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+      const int lrow = wm * 16 + g + ((r >> 1) ? 8 : 0);
+      const int cb = wn * 32 + s * 8 + 2 * t + (r & 1);
+      const int col = blockN + cb;
+      if (col < N) {
+        const int tok = toks[lrow];
+        float vg = 0.0f, vu = 0.0f;
+        if (tok >= 0) {
+          vg = (float)(accg[s][r] - azp[tok] * rshg[cb]) * ascale[tok] *
+               dp4a_h2f(wscg[col]);
+          vu = (float)(accu[s][r] - azp[tok] * rshu[cb]) * ascale[tok] *
+               dp4a_h2f(wscu[col]);
+        }
+        if (out_fp16) {
+          ((unsigned short *)Yg)[(long)(blockM + lrow) * N + col] =
+            dp4a_f2h(vg);
+          ((unsigned short *)Yu)[(long)(blockM + lrow) * N + col] =
+            dp4a_f2h(vu);
+        } else {
+          Yg[(long)(blockM + lrow) * N + col] = vg;
+          Yu[(long)(blockM + lrow) * N + col] = vu;
+        }
+      }
+    }
+  }
+}
+
 __global__ void dp4a_gemv_fused_h(const unsigned short *Xh,
                                   const signed char *plain,
                                   const int *wrowsum,
@@ -2180,6 +2617,56 @@ bool cuda_fc_qs4cx_moe_grouped_gemm(
       block_expert == nullptr || Y == nullptr || n_mblocks == 0 ||
       (N & 63u) != 0u || (K & 63u) != 0u)
     return false;
+  // NNTR_IMMA_CK=1: run the clock64 phase-bracket twin for the first few
+  // launches (identical output; prints per-k-step cycle split, then falls
+  // back to the production kernel for the rest of the run).
+  static const bool g_ck_dbg = []() {
+    const char *e = std::getenv("NNTR_IMMA_CK");
+    return e != nullptr && e[0] == '1';
+  }();
+  static int g_ck_n = 0;
+  if (g_ck_dbg && g_ck_n < 6) {
+    auto kc = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
+                                                       "imma_moe_grouped_ck");
+    static unsigned long long *d_ck = nullptr;
+    if (kc && (d_ck || cudaMalloc(&d_ck, 8 * sizeof(unsigned long long)) ==
+                         cudaSuccess)) {
+      cudaStream_t st = StreamManager::Global().GetStream();
+      cudaMemsetAsync(d_ck, 0, 8 * sizeof(unsigned long long), st);
+      const int n2 = (int)N, k2 = (int)K;
+      kc->SetKernelArguments(0, &q8, sizeof(q8));
+      kc->SetKernelArguments(1, &tokid, sizeof(tokid));
+      kc->SetKernelArguments(2, &wp_tab, sizeof(wp_tab));
+      kc->SetKernelArguments(3, &ws_tab, sizeof(ws_tab));
+      kc->SetKernelArguments(4, &block_expert, sizeof(block_expert));
+      kc->SetKernelArguments(5, &ascale, sizeof(ascale));
+      kc->SetKernelArguments(6, &azp, sizeof(azp));
+      kc->SetKernelArguments(7, &Y, sizeof(Y));
+      kc->SetKernelArguments(8, &n2, sizeof(n2));
+      kc->SetKernelArguments(9, &k2, sizeof(k2));
+      kc->SetKernelArguments(10, &out_fp16, sizeof(out_fp16));
+      kc->SetKernelArguments(11, &d_ck, sizeof(d_ck));
+      const int cb[3] = {256, 1, 1};
+      const int cg[3] = {(int)(N / 64u), (int)n_mblocks, 1};
+      if (StreamManager::Global().DispatchCommand(*kc, cg, cb)) {
+        unsigned long long h_ck[6] = {0, 0, 0, 0, 0, 0};
+        cudaStreamSynchronize(st);
+        cudaMemcpy(h_ck, d_ck, sizeof(h_ck), cudaMemcpyDeviceToHost);
+        const double s = h_ck[5] ? (double)h_ck[5] : 1.0;
+        const double ld = h_ck[0] / s, h0 = h_ck[1] / s, h1 = h_ck[2] / s;
+        const double w = h_ck[3] / s, b = h_ck[4] / s;
+        const double tot = ld + h0 + h1 + w + b;
+        fprintf(stderr,
+                "[imma_ck] N=%u K=%u mblocks=%u steps=%llu cyc/kstep: "
+                "ld_issue=%.0f h0=%.0f h1=%.0f store=%.0f bar=%.0f "
+                "total=%.0f\n",
+                N, K, n_mblocks, h_ck[5], ld, h0, h1, w, b, tot);
+        ++g_ck_n;
+        return true;
+      }
+    }
+    // twin unavailable: fall through to the production kernel
+  }
   auto kg = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
                                                      "imma_moe_grouped");
   if (!kg)
@@ -2196,6 +2683,41 @@ bool cuda_fc_qs4cx_moe_grouped_gemm(
   kg->SetKernelArguments(8, &n, sizeof(n));
   kg->SetKernelArguments(9, &k, sizeof(k));
   kg->SetKernelArguments(10, &out_fp16, sizeof(out_fp16));
+  const int ib[3] = {256, 1, 1};
+  const int ig[3] = {(int)(N / 64u), (int)n_mblocks, 1};
+  return StreamManager::Global().DispatchCommand(*kg, ig, ib);
+}
+
+bool cuda_fc_qs4cx_moe_grouped_gemm2(
+  const signed char *q8, const int *tokid, const unsigned long long *wpg_tab,
+  const unsigned long long *wsg_tab, const unsigned long long *wpu_tab,
+  const unsigned long long *wsu_tab, const int *block_expert,
+  const float *ascale, const int *azp, void *Yg, void *Yu,
+  unsigned int n_mblocks, unsigned int N, unsigned int K, int out_fp16) {
+  if (q8 == nullptr || wpg_tab == nullptr || wsg_tab == nullptr ||
+      wpu_tab == nullptr || wsu_tab == nullptr || block_expert == nullptr ||
+      Yg == nullptr || Yu == nullptr || n_mblocks == 0 || (N & 63u) != 0u ||
+      (K & 63u) != 0u)
+    return false;
+  auto kg = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
+                                                     "imma_moe_grouped_g2");
+  if (!kg)
+    return false;
+  const int n = (int)N, k = (int)K;
+  kg->SetKernelArguments(0, &q8, sizeof(q8));
+  kg->SetKernelArguments(1, &tokid, sizeof(tokid));
+  kg->SetKernelArguments(2, &wpg_tab, sizeof(wpg_tab));
+  kg->SetKernelArguments(3, &wsg_tab, sizeof(wsg_tab));
+  kg->SetKernelArguments(4, &wpu_tab, sizeof(wpu_tab));
+  kg->SetKernelArguments(5, &wsu_tab, sizeof(wsu_tab));
+  kg->SetKernelArguments(6, &block_expert, sizeof(block_expert));
+  kg->SetKernelArguments(7, &ascale, sizeof(ascale));
+  kg->SetKernelArguments(8, &azp, sizeof(azp));
+  kg->SetKernelArguments(9, &Yg, sizeof(Yg));
+  kg->SetKernelArguments(10, &Yu, sizeof(Yu));
+  kg->SetKernelArguments(11, &n, sizeof(n));
+  kg->SetKernelArguments(12, &k, sizeof(k));
+  kg->SetKernelArguments(13, &out_fp16, sizeof(out_fp16));
   const int ib[3] = {256, 1, 1};
   const int ig[3] = {(int)(N / 64u), (int)n_mblocks, 1};
   return StreamManager::Global().DispatchCommand(*kg, ig, ib);
