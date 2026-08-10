@@ -428,7 +428,7 @@ __global__ void gdn_ck_kkt(const float *conv, const float *gc,
 // e^{gs_c-gs_d} for c>d, via the proven fp16 recipes (A-normal + B-non-trans
 // from k rows). 256 threads, 4x2 warp grid of 16x32 tiles over [64x64].
 __global__ __launch_bounds__(256, 2)
-void gdn_ck_kkt_tc(const float *conv, const float *gc, const float *beta,
+void gdn_ck_kkt_tc(const unsigned short *conv, const float *gc, const float *beta,
                    float *A, int T, int CONV, int KEY, int NVH, int NKH,
                    int HKD){
   const int ck = blockIdx.x, vh = blockIdx.y;
@@ -442,11 +442,9 @@ void gdn_ck_kkt_tc(const float *conv, const float *gc, const float *beta,
   __shared__ float gs[64], bs[64];
   for (int i = tid; i < 64*128; i += 256) {
     const int c = i >> 7, e = i & 127;
-    float kv = (c < cn) ? conv[(long)(ck*64 + c)*CONV + KEY + kh*HKD + e]
-                        : 0.0f;
-    unsigned short hv;
-    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hv) : "f"(kv));
-    ksh[c*136 + e] = hv;
+    ksh[c*136 + e] = (c < cn)
+      ? conv[(long)(ck*64 + c)*CONV + KEY + kh*HKD + e]
+      : (unsigned short)0;
   }
   if (tid < 64) {
     const int t = ck*64 + tid;
@@ -507,7 +505,7 @@ void gdn_ck_kkt_tc(const float *conv, const float *gc, const float *beta,
 // both built fp16 in smem; T rounded to fp16 (a new fp16 surface -- the =2
 // gate arbitrates, and out's coef precedent passed with 16x margin).
 __global__ __launch_bounds__(256, 2)
-void gdn_ck_wu_tc(const float *conv, const float *A, const float *gc,
+void gdn_ck_wu_tc(const unsigned short *conv, const float *A, const float *gc,
                   const float *beta, float *w, float *u, int T, int CONV,
                   int KEY, int NVH, int NKH, int HKD, int HVD){
   const int ck = blockIdx.x, vh = blockIdx.y;
@@ -533,8 +531,13 @@ void gdn_ck_wu_tc(const float *conv, const float *A, const float *gc,
     if (c < cn) {
       const long t = (long)ck*64 + c;
       const float be = beta[t*NVH + vh];
-      k_ = be*expf(gc[t*NVH + vh])*conv[t*CONV + KEY + kh*HKD + dim];
-      v_ = be*conv[t*CONV + 2*KEY + vh*HVD + dim];
+      float kc, vc;
+      asm("cvt.f32.f16 %0, %1;" : "=f"(kc)
+          : "h"(conv[t*CONV + KEY + kh*HKD + dim]));
+      asm("cvt.f32.f16 %0, %1;" : "=f"(vc)
+          : "h"(conv[t*CONV + 2*KEY + vh*HVD + dim]));
+      k_ = be*expf(gc[t*NVH + vh])*kc;
+      v_ = be*vc;
     }
     unsigned short hk, hvv;
     asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hk) : "f"(k_));
@@ -840,7 +843,7 @@ __global__ void gdn_ck_out(const float *conv, const float *gc,
 //   B from [k][n] row-major: ldmatrix.trans.x4 -> 4 n8-subtile k8-halves
 //   B from [n][k] row-major: ldmatrix.x4 (non-trans), reg s = subtile s
 __global__ __launch_bounds__(256, 2)
-void gdn_ck_out_tc(const float *conv, const float *gc, const float *h,
+void gdn_ck_out_tc(const unsigned short *conv, const float *gc, const float *h,
                    const float *vnew, float *o, float scale, int T, int CONV,
                    int KEY, int NVH, int NKH, int HKD, int HVD){
   const int ck = blockIdx.x, vh = blockIdx.y;
@@ -865,15 +868,12 @@ void gdn_ck_out_tc(const float *conv, const float *gc, const float *h,
   // ---- stage q and k (fp32 -> fp16 round at load) ----
   for (int i = tid; i < 64*128; i += 256) {
     const int c = i >> 7, e = i & 127;
-    float qv = 0.f, kv = 0.f;
+    unsigned short hq = 0, hk = 0;
     if (c < cn) {
       const long tbase = (long)(ck*64 + c)*CONV + kh*HKD;
-      qv = conv[tbase + e];
-      kv = conv[tbase + KEY + e];
+      hq = conv[tbase + e];
+      hk = conv[tbase + KEY + e];
     }
-    unsigned short hq, hk;
-    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hq) : "f"(qv));
-    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hk) : "f"(kv));
     qs[c*LD + e] = hq;
     kx[c*LD + e] = hk;
   }
@@ -1051,7 +1051,7 @@ void gdn_ck_out_tc(const float *conv, const float *gc, const float *h,
 //   addr = (k0 + (lane&7) + ((lane&16)?8:0))*LD + m0 + ((lane&8)?8:0)
 // Bench-validated rel<=1e-3; 20.05 -> 4.13 ms at the T=4096 shape.
 __global__ __launch_bounds__(512, 1)
-void gdn_ck_state_tc(const float *conv, const float *w, const float *u,
+void gdn_ck_state_tc(const unsigned short *conv, const float *w, const float *u,
                      const float *gc, const float *gl, float *h, float *vnew,
                      float *state, int T, int CONV, int KEY, int NVH, int NKH,
                      int HKD, int HVD, int seed_state, int save_state){
@@ -1169,11 +1169,9 @@ void gdn_ck_state_tc(const float *conv, const float *w, const float *u,
     }
     for (int i = tid; i < 64*128; i += 512) {
       const int cc = i >> 7, jj = i & 127;
-      float kv = (cc < cn)
-        ? conv[((long)c*64 + cc)*CONV + KEY + kh*HKD + jj] : 0.0f;
-      unsigned short hv;
-      asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hv) : "f"(kv));
-      Sh[cc*SLD + jj] = hv;
+      Sh[cc*SLD + jj] = (cc < cn)
+        ? conv[((long)c*64 + cc)*CONV + KEY + kh*HKD + jj]
+        : (unsigned short)0;
     }
     __syncthreads();
 #pragma unroll
@@ -1224,6 +1222,52 @@ void gdn_ck_state_tc(const float *conv, const float *w, const float *u,
 
 // gated RMSNorm + silu(z) gate -> fp16, VERBATIM the scan's fused tail.
 // grid T*NVH, block 128 (thread = b).
+// fp16 twins for the chunked-TC arm: the four TC kernels stage conv as fp16
+// anyway, so producing the plane fp16 halves its write+read traffic and the
+// l2norm drops the qkdot (scan-only dead work). The scan arm keeps the fp32
+// plane -- it remains the semantic reference. Bodies are exact clones.
+__global__ void gdn_conv_prefill_h(const float *qkv, const float *wconv,
+                                   const float *ring, unsigned short *conv,
+                                   int T, int CONV, int KS, int has_ring){
+  const long idx = (long)blockIdx.x*blockDim.x + threadIdx.x;
+  if (idx >= (long)T*CONV) return;
+  const int t = (int)(idx / CONV), c = (int)(idx - (long)t*CONV);
+  float acc = 0.0f;
+  for (int j = 0; j < KS; ++j) {
+    const int ti = t - (KS-1) + j;
+    float xv;
+    if (ti >= 0)         xv = qkv[(long)ti*CONV + c];
+    else if (has_ring)   xv = ring[(long)c*(KS-1) + (KS-1+ti)];
+    else                 xv = 0.0f;
+    acc += wconv[c*KS + j] * xv;
+  }
+  const float sv = gdn_silu(acc);
+  unsigned short hh; asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hh) : "f"(sv));
+  conv[idx] = hh;
+}
+__global__ void gdn_l2norm_prefill_h(unsigned short *conv, int CONV, int KEY,
+                                     int NKH, int HKD, float eps){
+  const int kh = blockIdx.x % NKH, t = blockIdx.x / NKH;
+  const int d = threadIdx.x;
+  __shared__ float red[128];
+  unsigned short *qr = conv + (long)t*CONV + kh*HKD;
+  unsigned short *kr = conv + (long)t*CONV + KEY + kh*HKD;
+  float qv, kv;
+  asm("cvt.f32.f16 %0, %1;" : "=f"(qv) : "h"(qr[d]));
+  asm("cvt.f32.f16 %0, %1;" : "=f"(kv) : "h"(kr[d]));
+  red[d] = qv*qv; __syncthreads();
+  for (int sr = blockDim.x>>1; sr > 0; sr >>= 1){ if (d<sr) red[d]+=red[d+sr]; __syncthreads(); }
+  const float iq = 1.0f/sqrtf(red[0] + eps); __syncthreads();
+  red[d] = kv*kv; __syncthreads();
+  for (int sr = blockDim.x>>1; sr > 0; sr >>= 1){ if (d<sr) red[d]+=red[d+sr]; __syncthreads(); }
+  const float ik = 1.0f/sqrtf(red[0] + eps);
+  qv *= iq; kv *= ik;
+  unsigned short hq, hk;
+  asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hq) : "f"(qv));
+  asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hk) : "f"(kv));
+  qr[d] = hq; kr[d] = hk;
+}
+
 // fp16 round-trip stub (NNTR_GDN_CK_F16STUB=1, =2 harness only): rounds a
 // buffer through fp16 in place, emulating what a tensor-core rewrite would
 // feed as fp16 mma operands. Used on the conv plane (q/k/v), w/u (before the
@@ -1520,6 +1564,8 @@ namespace {
 float *g_ck_gc = nullptr, *g_ck_beta = nullptr, *g_ck_gl = nullptr;
 float *g_ck_A = nullptr, *g_ck_w = nullptr, *g_ck_u = nullptr;
 float *g_ck_vn = nullptr, *g_ck_h = nullptr, *g_ck_o = nullptr;
+unsigned short *g_ck_convh = nullptr;
+size_t c_ck_convh = 0;
 size_t c_ck_gc = 0, c_ck_beta = 0, c_ck_gl = 0, c_ck_A = 0, c_ck_w = 0,
        c_ck_u = 0, c_ck_vn = 0, c_ck_h = 0, c_ck_o = 0;
 } // namespace
@@ -1550,7 +1596,8 @@ bool cuda_gdn_prefill_chunked_fp16(
       !grow((void **)&g_ck_u, &c_ck_u, (size_t)T * NVH * HVD * 4) ||
       !grow((void **)&g_ck_vn, &c_ck_vn, (size_t)T * NVH * HVD * 4) ||
       !grow((void **)&g_ck_h, &c_ck_h, (size_t)NT * NVH * 16384 * 4) ||
-      !grow((void **)&g_ck_o, &c_ck_o, (size_t)T * VAL * 4)) {
+      !grow((void **)&g_ck_o, &c_ck_o, (size_t)T * VAL * 4) ||
+      !grow((void **)&g_ck_convh, &c_ck_convh, (size_t)T * CONV * 2)) {
     fprintf(stderr, "[cuda_gdn] chunked scratch alloc FAILED (T=%u): %s\n", T,
             cudaGetErrorString(cudaGetLastError()));
     return false;
@@ -1562,8 +1609,6 @@ bool cuda_gdn_prefill_chunked_fp16(
   if (!dp)
     return false;
   auto &ctx = CudaContext::Global();
-  auto kcv = ctx.registerCudaKernel(GDN_SRC, "gdn_conv_prefill");
-  auto kln = ctx.registerCudaKernel(GDN_SRC, "gdn_l2norm_prefill");
   // NNTR_GDN_CK_TC=1: the fp16 m16n8k16 tensor-core chunked kernels
   // (kkt/wu/state/out). Opt-in; gated by the =2 harness (out <= 0.0625,
   // state <= 0.021) + text identity.
@@ -1571,6 +1616,10 @@ bool cuda_gdn_prefill_chunked_fp16(
     const char *e = std::getenv("NNTR_GDN_CK_TC");
     return e == nullptr || e[0] != '0'; // default ON; =0 restores fp32 SIMT
   }();
+  auto kcv = ctx.registerCudaKernel(
+    GDN_SRC, g_ck_tc ? "gdn_conv_prefill_h" : "gdn_conv_prefill");
+  auto kln = ctx.registerCudaKernel(
+    GDN_SRC, g_ck_tc ? "gdn_l2norm_prefill_h" : "gdn_l2norm_prefill");
   auto kgc = ctx.registerCudaKernel(GDN_SRC, "gdn_ck_gcum");
   auto kkt = ctx.registerCudaKernel(GDN_SRC, g_ck_tc ? "gdn_ck_kkt_tc"
                                                      : "gdn_ck_kkt");
@@ -1603,6 +1652,8 @@ bool cuda_gdn_prefill_chunked_fp16(
     ml_loge("[CUDA] gdn: chunked kernel registration failed");
     return false;
   }
+  const void *ck_conv = g_ck_tc ? (const void *)g_ck_convh
+                                : (const void *)g_pf_conv;
   int iT = (int)T, iCONV = (int)CONV, iKS = (int)KS, iKEY = (int)KEY;
   int iNVH = (int)NVH, iNKH = (int)NKH, iHKD = (int)HKD, iHVD = (int)HVD;
   int has_ring = (seed_state && ring != nullptr) ? 1 : 0;
@@ -1630,7 +1681,9 @@ bool cuda_gdn_prefill_chunked_fp16(
     kcv->SetKernelArguments(0, &p_qkv, sizeof(p_qkv));
     kcv->SetKernelArguments(1, &dp->wconv, sizeof(dp->wconv));
     kcv->SetKernelArguments(2, &ring, sizeof(ring));
-    kcv->SetKernelArguments(3, &g_pf_conv, sizeof(g_pf_conv));
+    const void *cvout = g_ck_tc ? (const void *)g_ck_convh
+                              : (const void *)g_pf_conv;
+    kcv->SetKernelArguments(3, &cvout, sizeof(cvout));
     kcv->SetKernelArguments(4, &iT, sizeof(iT));
     kcv->SetKernelArguments(5, &iCONV, sizeof(iCONV));
     kcv->SetKernelArguments(6, &iKS, sizeof(iKS));
@@ -1641,14 +1694,23 @@ bool cuda_gdn_prefill_chunked_fp16(
       return false;
   }
   stamp(1);
-  { // l2norm(q,k) in place (qkdot is computed but unused by the chunked form)
-    kln->SetKernelArguments(0, &g_pf_conv, sizeof(g_pf_conv));
-    kln->SetKernelArguments(1, &g_pf_qkdot, sizeof(g_pf_qkdot));
-    kln->SetKernelArguments(2, &iCONV, sizeof(iCONV));
-    kln->SetKernelArguments(3, &iKEY, sizeof(iKEY));
-    kln->SetKernelArguments(4, &iNKH, sizeof(iNKH));
-    kln->SetKernelArguments(5, &iHKD, sizeof(iHKD));
-    kln->SetKernelArguments(6, &eps, sizeof(eps));
+  { // l2norm(q,k) in place (fp16 qkdot-free variant on the TC arm)
+    if (g_ck_tc) {
+      kln->SetKernelArguments(0, &g_ck_convh, sizeof(g_ck_convh));
+      kln->SetKernelArguments(1, &iCONV, sizeof(iCONV));
+      kln->SetKernelArguments(2, &iKEY, sizeof(iKEY));
+      kln->SetKernelArguments(3, &iNKH, sizeof(iNKH));
+      kln->SetKernelArguments(4, &iHKD, sizeof(iHKD));
+      kln->SetKernelArguments(5, &eps, sizeof(eps));
+    } else {
+      kln->SetKernelArguments(0, &g_pf_conv, sizeof(g_pf_conv));
+      kln->SetKernelArguments(1, &g_pf_qkdot, sizeof(g_pf_qkdot));
+      kln->SetKernelArguments(2, &iCONV, sizeof(iCONV));
+      kln->SetKernelArguments(3, &iKEY, sizeof(iKEY));
+      kln->SetKernelArguments(4, &iNKH, sizeof(iNKH));
+      kln->SetKernelArguments(5, &iHKD, sizeof(iHKD));
+      kln->SetKernelArguments(6, &eps, sizeof(eps));
+    }
     const int g[3] = {(int)(T * NKH), 1, 1}, b3[3] = {iHKD, 1, 1};
     if (!sm.DispatchCommand(*kln, g, b3))
       return false;
@@ -1675,7 +1737,7 @@ bool cuda_gdn_prefill_chunked_fp16(
   }
   stamp(3);
   { // A = beta (k k^T) e^{gdiff}, strictly lower
-    kkt->SetKernelArguments(0, &g_pf_conv, sizeof(g_pf_conv));
+    kkt->SetKernelArguments(0, &ck_conv, sizeof(ck_conv));
     kkt->SetKernelArguments(1, &g_ck_gc, sizeof(g_ck_gc));
     kkt->SetKernelArguments(2, &g_ck_beta, sizeof(g_ck_beta));
     kkt->SetKernelArguments(3, &g_ck_A, sizeof(g_ck_A));
@@ -1699,7 +1761,7 @@ bool cuda_gdn_prefill_chunked_fp16(
   }
   stamp(5);
   { // w, u
-    kwu->SetKernelArguments(0, &g_pf_conv, sizeof(g_pf_conv));
+    kwu->SetKernelArguments(0, &ck_conv, sizeof(ck_conv));
     kwu->SetKernelArguments(1, &g_ck_A, sizeof(g_ck_A));
     kwu->SetKernelArguments(2, &g_ck_gc, sizeof(g_ck_gc));
     kwu->SetKernelArguments(3, &g_ck_beta, sizeof(g_ck_beta));
@@ -1722,7 +1784,7 @@ bool cuda_gdn_prefill_chunked_fp16(
     return false;
   stamp(6);
   { // state propagation (the only sequential piece)
-    kst->SetKernelArguments(0, &g_pf_conv, sizeof(g_pf_conv));
+    kst->SetKernelArguments(0, &ck_conv, sizeof(ck_conv));
     kst->SetKernelArguments(1, &g_ck_w, sizeof(g_ck_w));
     kst->SetKernelArguments(2, &g_ck_u, sizeof(g_ck_u));
     kst->SetKernelArguments(3, &g_ck_gc, sizeof(g_ck_gc));
@@ -1749,7 +1811,7 @@ bool cuda_gdn_prefill_chunked_fp16(
     return false;
   stamp(7);
   { // outputs (fully parallel over chunks)
-    kou->SetKernelArguments(0, &g_pf_conv, sizeof(g_pf_conv));
+    kou->SetKernelArguments(0, &ck_conv, sizeof(ck_conv));
     kou->SetKernelArguments(1, &g_ck_gc, sizeof(g_ck_gc));
     kou->SetKernelArguments(2, &g_ck_h, sizeof(g_ck_h));
     kou->SetKernelArguments(3, &g_ck_vn, sizeof(g_ck_vn));
