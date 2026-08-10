@@ -137,6 +137,17 @@ bool cuda_moe_plan_stage(unsigned int A, unsigned int T, unsigned int topk,
                          unsigned int E, unsigned int Wmax, MoePlan *out);
 
 /**
+ * @brief Device-resident variant of cuda_moe_plan_stage for the fully
+ *        on-device (imma grouped) path: every plan buffer is written by
+ *        routing kernels and read by GEMM/combine kernels, so zero-copy
+ *        mapped memory only adds uncached-access tax (the mapped counts[]
+ *        histogram alone measured 5 ms/layer-chunk in atomicAdds). The host
+ *        must not dereference these pointers.
+ */
+bool cuda_moe_plan_stage_dev(unsigned int A, unsigned int T, unsigned int topk,
+                             unsigned int E, unsigned int Wmax, MoePlan *out);
+
+/**
  * @brief Allocate a per-LAYER mapped weight-pointer table of `n` entries each.
  *
  * Deliberately NOT part of cuda_moe_plan_stage's shared staging: that is reused

@@ -657,8 +657,11 @@ bool MoELayer::runGroupedMoEImma(nntrainer::RunLayerContext &context,
   plan.off_up = 0;
   plan.off_gate = E;
   plan.off_down = 2 * E;
-  if (!nntrainer::cuda::cuda_moe_plan_stage(Pcap, total_tokens, topk, E, Wcap,
-                                            &plan))
+  // Device-resident plan: every buffer here is kernel-written and
+  // kernel-read; the mapped variant's zero-copy tax measured 5 ms/layer-chunk
+  // on the counts atomics alone.
+  if (!nntrainer::cuda::cuda_moe_plan_stage_dev(Pcap, total_tokens, topk, E,
+                                                Wcap, &plan))
     return false;
   int *cp = nullptr, *op = nullptr;
   if (!nntrainer::cuda::cuda_moe_route_stage(E, &cp, &op))

@@ -343,7 +343,55 @@ __global__ void moe_route_topk(const float *logits, int *tk_idx, float *tk_wt,
   for (int e = tid; e < E; e += nt) sh[e] *= inv;
   __syncthreads();
 
-  // top-k by repeated argmax; the winner is masked to -1 so it cannot repeat
+  // top-k. Fast path (E == nt, K <= 16): each warp takes a warp-local top-K
+  // over its own 32 experts with shfl-only masked argmax passes (no block
+  // barriers), then thread 0 merges the 8 descending lists. Tie-break is
+  // IDENTICAL to the serial 8-pass argmax below: strict >, so the lower lane
+  // (= lower expert) wins inside a warp and the lower warp (= lower expert
+  // range) wins in the merge. Same selected experts, same order, same bits.
+  if (E == nt && nt <= 256 && K <= 16) {
+    __shared__ float wlv[8][16];
+    __shared__ int wli[8][16];
+    const int lane = tid & 31, w = tid >> 5;
+    float cv = sh[tid];
+    const int ci = tid;
+    for (int j = 0; j < K; ++j) {
+      float bv = cv; int bi = ci;
+      for (int o = 16; o > 0; o >>= 1) {
+        float ov = __shfl_down_sync(0xffffffffu, bv, o);
+        int   oi = __shfl_down_sync(0xffffffffu, bi, o);
+        if (ov > bv) { bv = ov; bi = oi; }
+      }
+      bv = __shfl_sync(0xffffffffu, bv, 0);
+      bi = __shfl_sync(0xffffffffu, bi, 0);
+      if (lane == 0) { wlv[w][j] = bv; wli[w][j] = bi; }
+      if (ci == bi) cv = -1.f; // winner self-masks for the next pass
+    }
+    __syncthreads();
+    if (tid == 0) {
+      const int nw = nt >> 5;
+      int hp[8];
+      for (int i = 0; i < 8; ++i) hp[i] = 0;
+      float wsum = 0.f;
+      for (int j = 0; j < K; ++j) {
+        float bv = -1.f; int bw = 0;
+        for (int i = 0; i < nw; ++i)
+          if (hp[i] < K && wlv[i][hp[i]] > bv) { bv = wlv[i][hp[i]]; bw = i; }
+        tk_idx[(long)t * K + j] = wli[bw][hp[bw]];
+        tk_wt[(long)t * K + j] = bv;
+        ++hp[bw];
+        wsum += bv;
+      }
+      const float n = (wsum > 0.f) ? (1.0f / wsum) : 1.0f;
+      for (int j = 0; j < K; ++j) {
+        tk_wt[(long)t * K + j] *= n;
+        atomicAdd(&counts[tk_idx[(long)t * K + j]], 1);
+      }
+    }
+    return;
+  }
+  // Generic path: top-k by repeated argmax; the winner is masked to -1 so it
+  // cannot repeat.
   float wsum = 0.f;
   for (int j = 0; j < K; ++j) {
     float bv = -1.f; int bi = -1;
@@ -656,6 +704,29 @@ bool cuda_moe_router_gemm_fp16(const unsigned short *X, const float *Wg,
   k->SetKernelArguments(5, &e, sizeof(e));
   const int g[3] = {(int)((E + 63) / 64), (int)((T + 63) / 64), 1};
   const int b[3] = {256, 1, 1};
+  // NNTR_MOE_R_DBG=1: router GEMM GPU ms via events (first few calls only).
+  static const bool g_rgdbg = []() {
+    const char *e = std::getenv("NNTR_MOE_R_DBG");
+    return e != nullptr && e[0] == '1';
+  }();
+  static int g_rgdbg_n = 0;
+  if (g_rgdbg && g_rgdbg_n < 3) {
+    cudaStream_t st = StreamManager::Global().GetStream();
+    cudaEvent_t ev0, ev1;
+    cudaEventCreate(&ev0);
+    cudaEventCreate(&ev1);
+    cudaEventRecord(ev0, st);
+    const bool ok = StreamManager::Global().DispatchCommand(*k, g, b);
+    cudaEventRecord(ev1, st);
+    cudaEventSynchronize(ev1);
+    float ms = 0.f;
+    cudaEventElapsedTime(&ms, ev0, ev1);
+    fprintf(stderr, "[moe_r_dbg] T=%u router_gemm=%.3fms\n", T, ms);
+    cudaEventDestroy(ev0);
+    cudaEventDestroy(ev1);
+    ++g_rgdbg_n;
+    return ok;
+  }
   return StreamManager::Global().DispatchCommand(*k, g, b);
 }
 
@@ -772,6 +843,33 @@ bool cuda_moe_plan_stage(unsigned int A, unsigned int T, unsigned int topk,
   out->wl_e = g_wl_e;
   out->wl_r0 = g_wl_r0;
   out->wl_n = g_wl_n;
+  return true; // wptr/wsc are the CALLER's, per layer
+}
+
+bool cuda_moe_plan_stage_dev(unsigned int A, unsigned int T, unsigned int topk,
+                             unsigned int E, unsigned int Wmax, MoePlan *out) {
+  // Separate statics from the mapped plan: the =1 arm's host loops write
+  // g_rows/g_slots directly and MUST keep zero-copy staging; this path's
+  // buffers are producer/consumer device-only.
+  static int *d_rows = nullptr, *d_slots = nullptr, *d_wl_e = nullptr;
+  static int *d_wl_r0 = nullptr, *d_wl_n = nullptr;
+  static float *d_wts = nullptr;
+  static size_t cr = 0, cs = 0, ce = 0, c0 = 0, cn = 0, cw = 0;
+  std::lock_guard<std::mutex> lk(g_moe_mtx);
+  if (!grow_dev((void **)&d_rows, &cr, (size_t)A * 4) ||
+      !grow_dev((void **)&d_wts, &cw, (size_t)A * 4) ||
+      !grow_dev((void **)&d_slots, &cs, (size_t)T * topk * 4) ||
+      !grow_dev((void **)&d_wl_e, &ce, (size_t)Wmax * 4) ||
+      !grow_dev((void **)&d_wl_r0, &c0, (size_t)Wmax * 4) ||
+      !grow_dev((void **)&d_wl_n, &cn, (size_t)Wmax * 4))
+    return false;
+  (void)E;
+  out->rows = d_rows;
+  out->wts = d_wts;
+  out->slots = d_slots;
+  out->wl_e = d_wl_e;
+  out->wl_r0 = d_wl_r0;
+  out->wl_n = d_wl_n;
   return true; // wptr/wsc are the CALLER's, per layer
 }
 
@@ -936,19 +1034,44 @@ bool cuda_moe_route_grouped_fp32(const float *logits, int *rows, float *wts,
                                  unsigned int Wcap, unsigned int Pcap) {
   if (T == 0 || E == 0 || K == 0 || BM == 0 || Wcap == 0 || Pcap == 0)
     return false;
-  // device-only intermediates (same lifetime pattern as cuda_moe_route_fp32)
+  // device-only intermediates (same lifetime pattern as cuda_moe_route_fp32).
+  // d_cnt: the caller hands us the MAPPED zero-copy counts it shares with the
+  // per-expert arm, but nothing on the host reads counts in the grouped path
+  // -- and 32,768 atomicAdds per layer-chunk on zero-copy memory are the
+  // measured cost of the 5 ms "topk" stage. Use a device-resident histogram
+  // instead; the passed-in mapped buffer is deliberately ignored.
   static int *d_idx = nullptr;
   static float *d_wt = nullptr;
   static int *d_cur = nullptr;
-  static size_t c_idx = 0, c_wt = 0, c_cur = 0;
+  static int *d_cnt = nullptr;
+  static size_t c_idx = 0, c_wt = 0, c_cur = 0, c_cnt = 0;
   std::lock_guard<std::mutex> lk(g_moe_mtx);
   if (!grow_dev((void **)&d_idx, &c_idx, (size_t)T * K * 4) ||
       !grow_dev((void **)&d_wt, &c_wt, (size_t)T * K * 4) ||
-      !grow_dev((void **)&d_cur, &c_cur, (size_t)E * 4))
+      !grow_dev((void **)&d_cur, &c_cur, (size_t)E * 4) ||
+      !grow_dev((void **)&d_cnt, &c_cnt, (size_t)E * 4))
     return false;
+  (void)counts;
+  counts = d_cnt;
   auto &sm = StreamManager::Global();
   auto &ctx = CudaContext::Global();
   cudaStream_t st = sm.GetStream();
+  // NNTR_MOE_R_DBG=1: per-kernel GPU ms via events (first few calls only).
+  static const bool g_rdbg = []() {
+    const char *e = std::getenv("NNTR_MOE_R_DBG");
+    return e != nullptr && e[0] == '1';
+  }();
+  static int g_rdbg_n = 0;
+  cudaEvent_t rev[5];
+  const bool rdbg_this = g_rdbg && g_rdbg_n < 3;
+  if (rdbg_this)
+    for (int i = 0; i < 5; ++i)
+      cudaEventCreate(&rev[i]);
+  auto rstamp = [&](int i) {
+    if (rdbg_this)
+      cudaEventRecord(rev[i], st);
+  };
+  rstamp(0);
   if (cudaMemsetAsync(counts, 0, (size_t)E * 4, st) != cudaSuccess)
     return false;
   // rows pre-filled with -1: per-expert padding tails must read as "no source
@@ -972,12 +1095,14 @@ bool cuda_moe_route_grouped_fp32(const float *logits, int *rows, float *wts,
     if (!sm.DispatchCommand(*k, g, b, (unsigned int)(E * sizeof(float))))
       return false;
   }
+  rstamp(1);
   { // e-ascending sort of each token's pairs (order only, values untouched)
     void *a[] = {(void *)&d_idx, (void *)&d_wt, &iT, &iK};
     const size_t s[] = {PS, PS, sizeof(int), sizeof(int)};
     if (!dispatch1d("moe_tk_esort", a, s, 4, (long)T, 256))
       return false;
   }
+  rstamp(2);
   { // padded offsets + block work list, single-threaded over E like the scan
     void *a[] = {(void *)&counts, (void *)&d_cur, (void *)&wl_e,
                  &iE,             &iBM,           &iW};
@@ -991,12 +1116,28 @@ bool cuda_moe_route_grouped_fp32(const float *logits, int *rows, float *wts,
     if (!sm.DispatchCommand(*k, g, b))
       return false;
   }
+  rstamp(3);
   { // bucket into padded slots + reverse map
     void *a[] = {(void *)&d_idx, (void *)&d_wt, (void *)&d_cur, (void *)&rows,
                  (void *)&wts,   (void *)&slots, &iT,           &iK};
     const size_t s[] = {PS, PS, PS, PS, PS, PS, sizeof(int), sizeof(int)};
     if (!dispatch1d("moe_route_bucket_rev", a, s, 8, (long)T * K, 256))
       return false;
+  }
+  rstamp(4);
+  if (rdbg_this) {
+    cudaEventSynchronize(rev[4]);
+    const char *nm[4] = {"topk+memset", "esort", "scan_pad", "bucket_rev"};
+    fprintf(stderr, "[moe_r_dbg] T=%u ", T);
+    for (int i = 0; i < 4; ++i) {
+      float ms = 0.f;
+      cudaEventElapsedTime(&ms, rev[i], rev[i + 1]);
+      fprintf(stderr, "%s=%.3fms ", nm[i], ms);
+    }
+    fprintf(stderr, "\n");
+    for (int i = 0; i < 5; ++i)
+      cudaEventDestroy(rev[i]);
+    ++g_rdbg_n;
   }
   return true;
 }
@@ -1074,17 +1215,32 @@ bool cuda_moe_grouped_ffn_imma(const unsigned short *input,
   const auto *wp64 = reinterpret_cast<const unsigned long long *>(p.wptr);
   const auto *ws64 = reinterpret_cast<const unsigned long long *>(p.wsc);
   // gate, then up (the table order is up/gate/down -- off_* pick, see the
-  // trap note in cuda_moe_expert_ffn_fp16)
-  if (!cuda_fc_qs4cx_moe_grouped_gemm(g_qa, p.rows, wp64 + p.off_gate,
-                                      ws64 + p.off_gate, p.wl_e, g_sa, g_za,
-                                      g_G, Wcap, I, H, 1))
-    return false;
-  stamp(2);
-  if (!cuda_fc_qs4cx_moe_grouped_gemm(g_qa, p.rows, wp64 + p.off_up,
-                                      ws64 + p.off_up, p.wl_e, g_sa, g_za, g_U,
-                                      Wcap, I, H, 1))
-    return false;
-  stamp(3);
+  // trap note in cuda_moe_expert_ffn_fp16). NNTR_MOE_G2=1 runs both as ONE
+  // fused kernel (one A staging per two W tiles); output identical.
+  static const bool g_g2 = []() {
+    const char *e = std::getenv("NNTR_MOE_G2");
+    return e != nullptr && e[0] == '1';
+  }();
+  if (g_g2) {
+    if (!cuda_fc_qs4cx_moe_grouped_gemm2(
+          g_qa, p.rows, wp64 + p.off_gate, ws64 + p.off_gate,
+          wp64 + p.off_up, ws64 + p.off_up, p.wl_e, g_sa, g_za, g_G, g_U,
+          Wcap, I, H, 1))
+      return false;
+    stamp(2);
+    stamp(3);
+  } else {
+    if (!cuda_fc_qs4cx_moe_grouped_gemm(g_qa, p.rows, wp64 + p.off_gate,
+                                        ws64 + p.off_gate, p.wl_e, g_sa, g_za,
+                                        g_G, Wcap, I, H, 1))
+      return false;
+    stamp(2);
+    if (!cuda_fc_qs4cx_moe_grouped_gemm(g_qa, p.rows, wp64 + p.off_up,
+                                        ws64 + p.off_up, p.wl_e, g_sa, g_za,
+                                        g_U, Wcap, I, H, 1))
+      return false;
+    stamp(3);
+  }
   { // silu(gate) * up, work-list-indexed: padding blocks self-discard
     auto k = ctx.registerCudaKernel(MOE_SRC, "moe_swiglu_wl");
     if (!k)
