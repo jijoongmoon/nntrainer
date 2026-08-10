@@ -464,9 +464,14 @@ sharedConstTensors CudaContext::runDecode(NeuralNetwork &nn, unsigned int from,
   static const char *_cgraph_env = std::getenv("NNTR_CUDA_GRAPH");
   static const bool cuda_graph_decode =
     _cgraph_env != nullptr && _cgraph_env[0] == '1';
-  // PREFILL graph (W3): capture the M>1 prefill forward like decode. Default ON
-  // for INTEGRATED GPUs (Orin) when the graph path is enabled; discrete GPUs
-  // (RTX) keep eager-async prefill. Override: NNTR_CUDA_PREFILL_GRAPH=1/0.
+  // PREFILL graph (W3): capture the M>1 prefill forward like decode. OPT-IN
+  // DIAGNOSTIC ONLY (NNTR_CUDA_PREFILL_GRAPH=1; the legacy NNTR_CUDA_GRAPH+
+  // integrated fallback below never fired on Orin). Retracted 2026-08-10: its
+  // measured wins were the warmup's timer restart, warm-vs-warm it loses to
+  // the deferred-drain path below, and on a data-dependent-routing model
+  // (qwen_moe) a capture bakes in STALE expert counts -- a capture that
+  // escapes markCaptureDoomed replays the wrong expert set silently. The
+  // integrated-default role belongs to NNTR_CUDA_PREFILL_DEFER (below).
   static const bool cuda_graph_prefill = []() {
     const char *e = std::getenv("NNTR_CUDA_PREFILL_GRAPH");
     if (e != nullptr)
@@ -696,8 +701,77 @@ sharedConstTensors CudaContext::runDecode(NeuralNetwork &nn, unsigned int from,
         stage, (int)cerr);
     }
   }
-  if (!cuda_graph_captured)
-    out = nn.incremental_forwarding(from, to, input, label, false);
+  // Deferred-drain eager forward (NNTR_CUDA_PREFILL_DEFER=1): collapse the
+  // per-op cudaStreamSynchronize gaps of an M>1 prefill WITHOUT graph capture.
+  // The prefill graph's measured win is not replay reuse (the exec is
+  // destroyed after one launch) -- it is that recording skips the per-op
+  // drains and pays ONE sync. This gets the same collapse with the kernels
+  // running eagerly async on the stream, and unlike capture it stays correct
+  // where the forward READS device results on the host mid-chunk (the MoE
+  // expert loop reading dev_counts after its explicit finish(),
+  // qwen_moe_layer.cpp): finish() is not suppressed, only maybeFinish(), and
+  // finishIfAsync() drains while deferred so host-fallback preambles keep
+  // their ordering. It also has no from==0 restriction: every chunk of a
+  // chunked prefill goes through here.
+  if (!cuda_graph_captured) {
+    // Default ON for integrated GPUs (every per-op maybeFinish there is a full
+    // cudaStreamSynchronize; discrete keeps eager-async prefill). Evaluated on
+    // the first runDecode call, when the CUDA context is necessarily up -- the
+    // never-ran PREFILL_GRAPH default (§ static-before-context) is the
+    // cautionary tale. Measured at the flip (2026-08-10, byte-identical output
+    // on both models): gemma4 warm 327 -> 291 ms; 35B 1.3K warm 574.7 -> 585.8
+    // TPS; 35B 20K 661.6 -> 668.3 TPS.
+    // =0 off; =1 whole-chunk region; =2 same region with a drain checkpoint at
+    // every node boundary (neuralnet.cpp) -- bounded staleness, race bisect.
+    static const bool prefill_defer = []() {
+      const char *e = std::getenv("NNTR_CUDA_PREFILL_DEFER");
+      if (e != nullptr)
+        return e[0] == '1' || e[0] == '2';
+      return nntrainer::cuda::ContextManager::Global().isIntegrated();
+    }();
+    // NNTR_CUDA_DEFER_WARM=1: run the process's FIRST M>1 forward at
+    // per-op-drain pace (the lazy-construction pass) and defer only later
+    // chunks. Default OFF -- with the audited drains in place the first chunk
+    // defers safely too (measured 2026-08-10: gemma4 cold 496 -> 450 ms, 35B
+    // 20K 671.8 TPS, byte-identical both) -- kept as a bisect knob for any
+    // future defer-exposed first-touch race.
+    static const bool defer_skip_first = []() {
+      const char *e = std::getenv("NNTR_CUDA_DEFER_WARM");
+      return e != nullptr && e[0] == '1';
+    }();
+    static bool s_m2_fwd_seen = false;
+    auto &smd = nntrainer::cuda::StreamManager::Global();
+    const bool defer = prefill_defer && (to - from) > 1 && !smd.isCapturing() &&
+                       (s_m2_fwd_seen || !defer_skip_first);
+    if ((to - from) > 1)
+      s_m2_fwd_seen = true;
+    using _dclk = std::chrono::high_resolution_clock;
+    const auto d0 = _dclk::now();
+    {
+      // RAII: incremental_forwarding can throw; a stuck defer_drain_ would
+      // silently suppress every later drain in the process.
+      struct DeferGuard {
+        nntrainer::cuda::StreamManager *sm;
+        explicit DeferGuard(nntrainer::cuda::StreamManager *s) : sm(s) {
+          if (sm)
+            sm->pushDeferDrain();
+        }
+        ~DeferGuard() {
+          if (sm) {
+            sm->popDeferDrain();
+            sm->finish(); // the region's single terminal drain
+          }
+        }
+      } dguard(defer ? &smd : nullptr);
+      out = nn.incremental_forwarding(from, to, input, label, false);
+    }
+    if (defer && cuda_graph_dbg)
+      std::fprintf(stderr, "[PREFILL_DEFER] M=%u fwd+drain=%ldus\n",
+                   (unsigned)(to - from),
+                   (long)std::chrono::duration_cast<std::chrono::microseconds>(
+                     _dclk::now() - d0)
+                     .count());
+  }
 
   return out;
 }

@@ -109,6 +109,28 @@ public:
   bool drainDeferred() const { return defer_drain_ > 0; }
 
   /**
+   * @brief Bounded-staleness drain point inside a deferred-drain region.
+   *
+   * A no-op outside a region (and under capture). The whole-forward defer
+   * region calls this at node boundaries when NNTR_CUDA_PREFILL_DEFER=2, both
+   * as a bisect scaffold for defer-exposed races and as a shallower-queue
+   * fallback if full-region defer proves too deep for this driver.
+   */
+  void deferCheckpoint() {
+    if (defer_drain_ > 0 && !capturing_)
+      finish();
+  }
+
+  /**
+   * @brief Tag the following dispatches with the graph node they belong to
+   *        (diagnostics: an async fault names its victim launch, and the tag
+   *        names the layer that issued it). Copied, so any lifetime is fine.
+   */
+  void setDispatchTag(const char *tag);
+  /** @brief Current dispatch tag ("" when unset). */
+  const char *dispatchTag() const { return dispatch_tag_; }
+
+  /**
    * @brief Ordering drain whose caller then runs a DEVICE kernel — the same
    *        sync as finish(), minus the [CAP-AUDIT] bookkeeping.
    *
@@ -206,6 +228,7 @@ private:
   bool capturing_{false};
   unsigned int defer_drain_{0};
   bool capture_doomed_{false};
+  char dispatch_tag_[96]{};
   unsigned long long dispatch_seq_{0};
 };
 

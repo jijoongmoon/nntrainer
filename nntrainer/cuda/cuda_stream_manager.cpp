@@ -85,6 +85,17 @@ bool StreamManager::DispatchCommand(Kernel &kernel, const int (&grid)[3],
     // kernel is only the first victim. Either way the graph cannot be trusted.
     markCaptureDoomed("a kernel launch failed inside the capture");
   }
+  if (r != CUDA_SUCCESS) {
+    // Name the launch: an async fault (illegal access) surfaces at a LATER
+    // launch than the kernel that caused it, and under deferred drains that
+    // distance grows -- without the name, the report site is anonymous. With
+    // CUDA_LAUNCH_BLOCKING=1 this line names the faulting kernel itself.
+    ml_loge("[CUDA] cuLaunchKernel FAILED for '%s' in node '%s' "
+            "grid(%d,%d,%d) block(%d,%d,%d) shmem=%u seq=%llu",
+            kernel.name().c_str(), dispatch_tag_, grid[0], grid[1], grid[2],
+            block[0], block[1], block[2], shared_bytes,
+            (unsigned long long)dispatch_seq_);
+  }
   return cuCheck(r, "cuLaunchKernel");
 }
 
@@ -189,7 +200,13 @@ void StreamManager::finishIfAsync() {
                    audit_n);
     return;
   }
-  if (cuda_async_mode())
+  // Inside a deferred-drain region the per-op maybeFinish() that normally
+  // orders a host read on integrated (sync mode) is suppressed, so a
+  // host-fallback preamble must supply its own drain here. Without this the
+  // fallback reads a buffer whose producing kernel is still queued -- the
+  // exact bug class the gemm_ex missing drain was (wrong and different every
+  // run, invisible to CAP-AUDIT/FC_DBG).
+  if (cuda_async_mode() || defer_drain_)
     finish();
 }
 
@@ -201,6 +218,12 @@ void StreamManager::drainPipeline() {
   if (capturing_)
     return;
   finish();
+}
+
+void StreamManager::setDispatchTag(const char *tag) {
+  if (tag == nullptr)
+    tag = "";
+  std::snprintf(dispatch_tag_, sizeof(dispatch_tag_), "%s", tag);
 }
 
 void StreamManager::markCaptureDoomed(const char *why) {

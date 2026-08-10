@@ -76,6 +76,10 @@
 #include <tflite_interpreter.h>
 #endif
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_stream_manager.h>
+#endif
+
 /**
  * @brief Internal enum values for nntrainer to summarize model accuracy & loss
  */
@@ -794,6 +798,27 @@ sharedConstTensors NeuralNetwork::incremental_forwarding(
     // declared first, hence destroyed last.
     const std::string _node_type = node->getType();
     LayerProfScope _node_prof(_node_type.c_str(), (to - from) == 1);
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+    // Diagnostics + bounded-staleness scaffold for the deferred-drain prefill
+    // (cuda_context.cpp). The tag names the issuing node in a failed-launch
+    // report; the checkpoint (NNTR_CUDA_PREFILL_DEFER=2) drains at every node
+    // boundary inside a defer region, bounding how far the host can run ahead
+    // of the stream -- both a race bisect tool and a shallower-queue fallback.
+    static const bool _defer_ckpt = []() {
+      const char *e = std::getenv("NNTR_CUDA_PREFILL_DEFER");
+      return e != nullptr && e[0] == '2';
+    }();
+    struct DeferCkpt {
+      bool on;
+      ~DeferCkpt() {
+        if (on)
+          nntrainer::cuda::StreamManager::Global().deferCheckpoint();
+      }
+    } _defer_ckpt_guard{_defer_ckpt};
+    nntrainer::cuda::StreamManager::Global().setDispatchTag(
+      node->getName().c_str());
+#endif
 
     auto f = std::get<0>(node->getExecutionOrder());
     if (exec_mode == ExecutionMode::TRAIN or
