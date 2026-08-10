@@ -42,6 +42,16 @@ bool cuda_sigmoid_add_fp16(const unsigned short *gate,
 bool cuda_add_fp16(const unsigned short *a, const unsigned short *b,
                    unsigned short *out, unsigned int n);
 
+/** @brief out[i] = a[i] * b[i] (same-shape eltwise multiply; bit-identical
+ *  to the host loop -- fp16 products are exact in fp32) */
+bool cuda_mul_fp16(const unsigned short *a, const unsigned short *b,
+                   unsigned short *out, unsigned int n);
+
+/** @brief out[r,w] = a[r,w] * g[r]: row-broadcast multiply over n = rows*W
+ *  contiguous fp16 elements (the shared-expert gate). */
+bool cuda_bcast_mul_fp16(const unsigned short *a, const unsigned short *g,
+                         unsigned short *out, unsigned int n, unsigned int W);
+
 /** @brief out[i] = in[i] * scalar */
 bool cuda_scalar_mul_fp16(const unsigned short *in, unsigned short *out,
                           unsigned int n, float scalar);

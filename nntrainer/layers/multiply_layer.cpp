@@ -21,6 +21,7 @@
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
 #include <cuda_context_manager.h>
+#include <cuda_elementwise.h>
 #endif
 
 namespace nntrainer {
@@ -34,6 +35,31 @@ void MultiplyLayer::finalize(InitLayerContext &context) {
 void MultiplyLayer::forwarding_operation(const Tensor &input0,
                                          const Tensor &input1, Tensor &hidden) {
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#ifdef ENABLE_FP16
+  // Device path: one stream-ordered eltwise kernel. Bit-identical to the
+  // host loop (an fp16 x fp16 product is exact in fp32; one rn round), and it
+  // removes both the full-stream drain below and the single-threaded host
+  // multiply over the whole chunk (10 nodes/chunk on the 35B's attention
+  // gate).
+  if (input0.getDataType() == ml::train::TensorDim::DataType::FP16 &&
+      input1.getDataType() == ml::train::TensorDim::DataType::FP16 &&
+      hidden.getDataType() == ml::train::TensorDim::DataType::FP16 &&
+      input0.size() == input1.size() && input0.size() == hidden.size() &&
+      input0.getContiguous() && input1.getContiguous() &&
+      hidden.getContiguous()) {
+    const auto *ap =
+      reinterpret_cast<const unsigned short *>(input0.getData<_FP16>());
+    const auto *bp =
+      reinterpret_cast<const unsigned short *>(input1.getData<_FP16>());
+    auto *op = reinterpret_cast<unsigned short *>(hidden.getData<_FP16>());
+    if (nntrainer::cuda::dev_accessible(ap) &&
+        nntrainer::cuda::dev_accessible(bp) &&
+        nntrainer::cuda::dev_accessible(op) &&
+        nntrainer::cuda::cuda_mul_fp16(ap, bp, op,
+                                       (unsigned int)input0.size()))
+      return;
+  }
+#endif
   // Tensor::multiply is a pure host element loop with no ComputeOps dispatch:
   // on a CUDA graph both operands are device-written (attention output, gate
   // sigmoid) and the only ordering is the producers' per-op drains. Inside a

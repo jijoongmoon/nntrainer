@@ -77,6 +77,25 @@ __global__ void sigmoid_glu_fp16(const unsigned short *gate,
   float g = 1.0f / (1.0f + expf(-ew_h2f(gate[i])));
   out[i] = ew_f2h(g * ew_h2f(x[i]));
 }
+// Row-broadcast multiply: out[r,w] = a[r,w] * g[r] (the shared-expert gate).
+// FP32 math with one fp16 rounding -- identical arithmetic to the
+// BroadcastMulLayer host loop it replaces.
+__global__ void bcast_mul_fp16(const unsigned short *a,
+                               const unsigned short *g, unsigned short *out,
+                               int n, int W) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  out[i] = ew_f2h(ew_h2f(a[i]) * ew_h2f(g[i / W]));
+}
+// Same-shape eltwise multiply (the attention output gate's `multiply` node).
+// An fp16 x fp16 product is exact in fp32, so one rn round here is
+// bit-identical to the host Tensor::multiply loop.
+__global__ void mul_fp16(const unsigned short *a, const unsigned short *b,
+                         unsigned short *out, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  out[i] = ew_f2h(ew_h2f(a[i]) * ew_h2f(b[i]));
+}
 // Plain in-place sigmoid, the whole-tensor activation. Same fp32 math as
 // sigmoid_glu's gate half and as the host ActiFunc, so the two agree.
 //
@@ -452,6 +471,42 @@ bool cuda_add_fp16(const unsigned short *a, const unsigned short *b,
   k->SetKernelArguments(1, &b, sizeof(b));
   k->SetKernelArguments(2, &out, sizeof(out));
   k->SetKernelArguments(3, &ni, sizeof(ni));
+  return dispatch1d(k, n);
+}
+
+bool cuda_mul_fp16(const unsigned short *a, const unsigned short *b,
+                   unsigned short *out, unsigned int n) {
+  if (n == 0)
+    return true;
+  auto k = CudaContext::Global().registerCudaKernel(ELTWISE_SRC, "mul_fp16");
+  if (!k) {
+    ml_loge("[CUDA] mul_fp16: registration failed");
+    return false;
+  }
+  int ni = (int)n;
+  k->SetKernelArguments(0, &a, sizeof(a));
+  k->SetKernelArguments(1, &b, sizeof(b));
+  k->SetKernelArguments(2, &out, sizeof(out));
+  k->SetKernelArguments(3, &ni, sizeof(ni));
+  return dispatch1d(k, n);
+}
+
+bool cuda_bcast_mul_fp16(const unsigned short *a, const unsigned short *g,
+                         unsigned short *out, unsigned int n, unsigned int W) {
+  if (n == 0)
+    return true;
+  auto k =
+    CudaContext::Global().registerCudaKernel(ELTWISE_SRC, "bcast_mul_fp16");
+  if (!k) {
+    ml_loge("[CUDA] bcast_mul_fp16: registration failed");
+    return false;
+  }
+  int ni = (int)n, wi = (int)W;
+  k->SetKernelArguments(0, &a, sizeof(a));
+  k->SetKernelArguments(1, &g, sizeof(g));
+  k->SetKernelArguments(2, &out, sizeof(out));
+  k->SetKernelArguments(3, &ni, sizeof(ni));
+  k->SetKernelArguments(4, &wi, sizeof(wi));
   return dispatch1d(k, n);
 }
 

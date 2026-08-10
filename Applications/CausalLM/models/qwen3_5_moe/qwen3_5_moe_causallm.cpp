@@ -171,6 +171,11 @@ Tensor Qwen3_5MoeCausalLM::createFullAttention(const int layer_id, int n_heads,
   Tensor a = mha({q_normed, k_normed, v, cache_k, cache_v});
 
   // Output gate: a *= sigmoid(gate)
+  // NB: replacing this activation+multiply pair with one sigmoid_glu node
+  // ABORTS WEIGHT LOADING ("unsupported legacy on-disk qscheme") -- the
+  // on-disk record stream is sensitive to the node enumeration even for
+  // weightless nodes. The device win lives in MultiplyLayer's forward
+  // instead (device eltwise mul, graph untouched).
   LayerHandle gate_sig(createLayer(
     "activation",
     {withKey("name", "layer" + std::to_string(layer_id) + "_attn_gate_sig"),
