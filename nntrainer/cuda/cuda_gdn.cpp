@@ -644,6 +644,218 @@ __global__ void gdn_ck_out(const float *conv, const float *gc,
   }
 }
 
+// Tensor-core rewrite of gdn_ck_out (NNTR_GDN_CK_TC=1): the same
+//   o = scale * ( e^{gc_c} (q_c @ h) + sum_{d<=c} (q_c.k_d) e^{gc_c-gc_d} vn_d )
+// with the three products as fp16 m16n8k16 mma (fp32 accumulate). Inputs are
+// rounded to fp16 at staging -- exactly the surfaces the measured acceptance
+// gate covers (out <= 0.0625 vs the scan; the fp16-stub envelope was
+// 0.03125). 256 threads (vs the SIMT kernel's 128), smem phase-union 44 KB.
+// Fragment recipe proven standalone in tile_bench/fp16_frag_bench.cu:
+//   A (row-major m16k16): x4 quadrants, row wm*16+(lane&15), k8 half lane>>4
+//   B from [k][n] row-major: ldmatrix.trans.x4 -> 4 n8-subtile k8-halves
+//   B from [n][k] row-major: ldmatrix.x4 (non-trans), reg s = subtile s
+__global__ __launch_bounds__(256, 2)
+void gdn_ck_out_tc(const float *conv, const float *gc, const float *h,
+                   const float *vnew, float *o, float scale, int T, int CONV,
+                   int KEY, int NVH, int NKH, int HKD, int HVD){
+  const int ck = blockIdx.x, vh = blockIdx.y;
+  const int kh = vh / (NVH / NKH);
+  const int cn = (T - ck*64 < 64) ? (T - ck*64) : 64;
+  const int tid = threadIdx.x;
+  const int lane = tid & 31, warp = tid >> 5;
+  const int wm = warp >> 1, wn = warp & 1; // 4x2 warp grid
+  const int g = lane >> 2, tq = lane & 3;
+  // phase-union shared memory. LD = 136 halves (128 + 8 pad = 16B-aligned
+  // rows, the bench-proven stride). Layout:
+  //   [0)      q   64x136 fp16 (17,408 B)  -- alive through T1
+  //   [17408)  kx  64x136 fp16 (17,408 B)  -- k in phase A; h-half in T1;
+  //                                            vn in T2
+  //   [34816)  coef 64x72 fp16  (9,216 B)  -- written end of phase A
+  __shared__ __align__(16) unsigned char sb[44032];
+  unsigned short *qs = (unsigned short *)sb;
+  unsigned short *kx = (unsigned short *)(sb + 17408);
+  unsigned short *cf = (unsigned short *)(sb + 34816);
+  const int LD = 136, LDC = 72;
+
+  // ---- stage q and k (fp32 -> fp16 round at load) ----
+  for (int i = tid; i < 64*128; i += 256) {
+    const int c = i >> 7, e = i & 127;
+    float qv = 0.f, kv = 0.f;
+    if (c < cn) {
+      const long tbase = (long)(ck*64 + c)*CONV + kh*HKD;
+      qv = conv[tbase + e];
+      kv = conv[tbase + KEY + e];
+    }
+    unsigned short hq, hk;
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hq) : "f"(qv));
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hk) : "f"(kv));
+    qs[c*LD + e] = hq;
+    kx[c*LD + e] = hk;
+  }
+  __syncthreads();
+
+  // ---- phase A: S_qk[64][64] = q @ k^T; coef = masked gate(S_qk) ----
+  // warp tile 16(m) x 32(n): 4 n8-subtiles, k walked 16 at a time.
+  {
+    float acc2[4][4];
+    #pragma unroll
+    for (int s = 0; s < 4; ++s)
+      #pragma unroll
+      for (int r = 0; r < 4; ++r) acc2[s][r] = 0.f;
+    const int a_row = wm*16 + (lane & 15);
+    const int a_kh8 = (lane >> 4) & 1;
+    const int b_row = wn*32 + (lane >> 3)*8 + (lane & 7); // k rows = n dim
+    #pragma unroll
+    for (int k0 = 0; k0 < 128; k0 += 16) {
+      int a0,a1,a2,a3, c0,c1,c2,c3;
+      asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+        : "=r"(a0),"=r"(a1),"=r"(a2),"=r"(a3)
+        : "r"((unsigned)__cvta_generic_to_shared(&qs[a_row*LD + k0 + a_kh8*8])));
+      // B = k^T from k stored [n(=d)][k(=e)] row-major: non-trans x4, two
+      // 16B k-halves live in regs (c0,c1)= subtiles k-lo? Proven int8-style
+      // mapping: reg s covers subtile s at THIS 16-elem k slice; a second
+      // load at +8 halves... For fp16 n8k16 B needs 2 regs per subtile:
+      // load k-lo (8 halves) and k-hi separately.
+      int bl0,bl1,bl2,bl3, bh0,bh1,bh2,bh3;
+      asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+        : "=r"(bl0),"=r"(bl1),"=r"(bl2),"=r"(bl3)
+        : "r"((unsigned)__cvta_generic_to_shared(&kx[b_row*LD + k0])));
+      asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+        : "=r"(bh0),"=r"(bh1),"=r"(bh2),"=r"(bh3)
+        : "r"((unsigned)__cvta_generic_to_shared(&kx[b_row*LD + k0 + 8])));
+#define GOMMA(ACC,S,BL,BH)                                                     \
+      asm volatile(                                                            \
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "                   \
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"              \
+        : "+f"(ACC[S][0]), "+f"(ACC[S][1]), "+f"(ACC[S][2]), "+f"(ACC[S][3])   \
+        : "r"(a0),"r"(a1),"r"(a2),"r"(a3), "r"(BL), "r"(BH))
+      GOMMA(acc2,0,bl0,bh0); GOMMA(acc2,1,bl1,bh1);
+      GOMMA(acc2,2,bl2,bh2); GOMMA(acc2,3,bl3,bh3);
+    }
+    // mask + gate -> coef (fp16). C layout: row wm*16+g(+8), col wn*32+s*8+2tq(+1)
+    #pragma unroll
+    for (int s = 0; s < 4; ++s) {
+      #pragma unroll
+      for (int r = 0; r < 4; ++r) {
+        const int c = wm*16 + g + ((r >> 1) ? 8 : 0);
+        const int d = wn*32 + s*8 + 2*tq + (r & 1);
+        float v = 0.f;
+        if (d <= c && c < cn)
+          v = acc2[s][r]*expf(gc[((long)ck*64 + c)*NVH + vh] -
+                              gc[((long)ck*64 + d)*NVH + vh]);
+        unsigned short hv;
+        asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hv) : "f"(v));
+        cf[c*LDC + d] = hv;
+      }
+    }
+  }
+  __syncthreads();
+
+  // ---- T1: acc = q @ h (h [e][b] row-major, staged in two k64 halves) ----
+  float acc[8][4];
+  #pragma unroll
+  for (int s = 0; s < 8; ++s)
+    #pragma unroll
+    for (int r = 0; r < 4; ++r) acc[s][r] = 0.f;
+  const float *hb = h + ((long)ck*NVH + vh)*16384;
+  const int a_row = wm*16 + (lane & 15);
+  const int a_kh8 = (lane >> 4) & 1;
+  for (int eh = 0; eh < 2; ++eh) {
+    // restage kx <- h rows [eh*64, eh*64+64) as fp16
+    for (int i = tid; i < 64*128; i += 256) {
+      const int e = i >> 7, bcol = i & 127;
+      unsigned short hh;
+      float hv = hb[(eh*64 + e)*128 + bcol];
+      asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hh) : "f"(hv));
+      kx[e*LD + bcol] = hh;
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int k0 = 0; k0 < 64; k0 += 16) {
+      int a0,a1,a2,a3;
+      asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+        : "=r"(a0),"=r"(a1),"=r"(a2),"=r"(a3)
+        : "r"((unsigned)__cvta_generic_to_shared(
+            &qs[a_row*LD + eh*64 + k0 + a_kh8*8])));
+      #pragma unroll
+      for (int s4 = 0; s4 < 2; ++s4) {
+        const int nb = wn*64 + s4*32;
+        int bl0,bl1,bl2,bl3, bh0,bh1,bh2,bh3;
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+          : "=r"(bl0),"=r"(bl1),"=r"(bl2),"=r"(bl3)
+          : "r"((unsigned)__cvta_generic_to_shared(
+              &kx[(k0 + (lane & 7))*LD + nb + (lane >> 3)*8])));
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+          : "=r"(bh0),"=r"(bh1),"=r"(bh2),"=r"(bh3)
+          : "r"((unsigned)__cvta_generic_to_shared(
+              &kx[(k0 + 8 + (lane & 7))*LD + nb + (lane >> 3)*8])));
+        GOMMA(acc,s4*4+0,bl0,bh0); GOMMA(acc,s4*4+1,bl1,bh1);
+        GOMMA(acc,s4*4+2,bl2,bh2); GOMMA(acc,s4*4+3,bl3,bh3);
+      }
+    }
+    __syncthreads(); // kx restaged next iteration
+  }
+  // scale the inter term by e^{gc_c} (row-dependent) before adding intra
+  {
+    const int c0 = wm*16 + g, c1 = c0 + 8;
+    const float e0 = (c0 < cn) ? expf(gc[((long)ck*64 + c0)*NVH + vh]) : 0.f;
+    const float e1 = (c1 < cn) ? expf(gc[((long)ck*64 + c1)*NVH + vh]) : 0.f;
+    #pragma unroll
+    for (int s = 0; s < 8; ++s) {
+      acc[s][0] *= e0; acc[s][1] *= e0;
+      acc[s][2] *= e1; acc[s][3] *= e1;
+    }
+  }
+
+  // ---- T2: acc += coef @ vn (A = coef [c][d], B = vn [d][b] row-major) ----
+  for (int i = tid; i < 64*128; i += 256) { // restage kx <- vn as fp16
+    const int d = i >> 7, bcol = i & 127;
+    float vv = (d < cn) ? vnew[(((long)ck*64 + d)*NVH + vh)*HVD + bcol] : 0.f;
+    unsigned short hv;
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hv) : "f"(vv));
+    kx[d*LD + bcol] = hv;
+  }
+  __syncthreads();
+  #pragma unroll
+  for (int k0 = 0; k0 < 64; k0 += 16) {
+    int a0,a1,a2,a3;
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+      : "=r"(a0),"=r"(a1),"=r"(a2),"=r"(a3)
+      : "r"((unsigned)__cvta_generic_to_shared(
+          &cf[a_row*LDC + k0 + a_kh8*8])));
+    #pragma unroll
+    for (int s4 = 0; s4 < 2; ++s4) {
+      const int nb = wn*64 + s4*32;
+      int bl0,bl1,bl2,bl3, bh0,bh1,bh2,bh3;
+      asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+        : "=r"(bl0),"=r"(bl1),"=r"(bl2),"=r"(bl3)
+        : "r"((unsigned)__cvta_generic_to_shared(
+            &kx[(k0 + (lane & 7))*LD + nb + (lane >> 3)*8])));
+      asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+        : "=r"(bh0),"=r"(bh1),"=r"(bh2),"=r"(bh3)
+        : "r"((unsigned)__cvta_generic_to_shared(
+            &kx[(k0 + 8 + (lane & 7))*LD + nb + (lane >> 3)*8])));
+      GOMMA(acc,s4*4+0,bl0,bh0); GOMMA(acc,s4*4+1,bl1,bh1);
+      GOMMA(acc,s4*4+2,bl2,bh2); GOMMA(acc,s4*4+3,bl3,bh3);
+    }
+  }
+#undef GOMMA
+
+  // ---- epilogue: o = scale * acc ----
+  #pragma unroll
+  for (int s = 0; s < 8; ++s) {
+    const int bcol = wn*64 + s*8 + 2*tq;
+    #pragma unroll
+    for (int r = 0; r < 4; ++r) {
+      const int c = wm*16 + g + ((r >> 1) ? 8 : 0);
+      if (c < cn) {
+        const long t = (long)ck*64 + c;
+        o[t*(long)(NVH*HVD) + vh*HVD + bcol + (r & 1)] = scale*acc[s][r];
+      }
+    }
+  }
+}
+
 // gated RMSNorm + silu(z) gate -> fp16, VERBATIM the scan's fused tail.
 // grid T*NVH, block 128 (thread = b).
 // fp16 round-trip stub (NNTR_GDN_CK_F16STUB=1, =2 harness only): rounds a
@@ -991,7 +1203,16 @@ bool cuda_gdn_prefill_chunked_fp16(
   auto ktr = ctx.registerCudaKernel(GDN_SRC, "gdn_ck_tril");
   auto kwu = ctx.registerCudaKernel(GDN_SRC, "gdn_ck_wu");
   auto kst = ctx.registerCudaKernel(GDN_SRC, "gdn_ck_state");
-  auto kou = ctx.registerCudaKernel(GDN_SRC, "gdn_ck_out");
+  // NNTR_GDN_CK_TC=1: the fp16 m16n8k16 tensor-core out kernel (256
+  // threads) instead of the fp32 SIMT one (128). Opt-in until it passes the
+  // measured acceptance gate (out <= 0.0625 / state <= 0.021 on the =2
+  // harness + text identity).
+  static const bool g_ck_tc = []() {
+    const char *e = std::getenv("NNTR_GDN_CK_TC");
+    return e != nullptr && e[0] == '1';
+  }();
+  auto kou =
+    ctx.registerCudaKernel(GDN_SRC, g_ck_tc ? "gdn_ck_out_tc" : "gdn_ck_out");
   auto kga = ctx.registerCudaKernel(GDN_SRC, "gdn_ck_gate");
   // fp16-input stub for the acceptance-gate measurement (task #11).
   static const bool g_f16stub = []() {
@@ -1173,7 +1394,7 @@ bool cuda_gdn_prefill_chunked_fp16(
     kou->SetKernelArguments(10, &iNKH, sizeof(iNKH));
     kou->SetKernelArguments(11, &iHKD, sizeof(iHKD));
     kou->SetKernelArguments(12, &iHVD, sizeof(iHVD));
-    const int g[3] = {(int)NT, iNVH, 1}, b3[3] = {128, 1, 1};
+    const int g[3] = {(int)NT, iNVH, 1}, b3[3] = {g_ck_tc ? 256 : 128, 1, 1};
     if (!sm.DispatchCommand(*kou, g, b3))
       return false;
   }
