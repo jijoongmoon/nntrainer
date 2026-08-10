@@ -140,12 +140,20 @@ private:
   std::vector<float> wconv_f, alog_f, dtb_f, wnorm_f;
   std::vector<float> wqkv_f, wz_f, wb_f, wa_f, wout_fv;
   bool wcache_loaded = false;
+  bool wcache_big_loaded = false;
   // gdnq decode mirror: a one-time fp16 device copy of the DEQUANTIZED qkv
   // (33.5 MB/layer, experiment-grade), so cuda_gdn_decode_fp16 runs
   // unchanged when in_proj_qkv is QS4CX. Without it decode would fall to the
   // numerically-wrong host GDN path and generate fluent garbage.
   unsigned short *qkv_dev_fp16 = nullptr;
   void ensureWeightCache(nntrainer::RunLayerContext &context);
+  /** @brief The five LARGE fp32 mirrors (qkv/z/b/a/out, ~134.7 MB/layer,
+   *  4.04 GB over 30 layers). On the default fp16-qkv device path NOTHING
+   *  reads them -- they are host-fallback (and gdnq decode-mirror) inputs
+   *  only, so they are built lazily by the lanes that consume them instead
+   *  of eagerly on the first forward (which cost ~1s of COLD prefill and
+   *  4 GB of resident RSS for buffers the shipped path never touches). */
+  void ensureBigWeightCache(nntrainer::RunLayerContext &context);
 
   /** prefill over seq_len tokens starting at INPUT ROW 0; when save_state,
    *  persists the final recurrent state S + the last (conv_kernel-1) conv

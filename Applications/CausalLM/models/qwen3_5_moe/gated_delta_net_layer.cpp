@@ -217,6 +217,13 @@ void GatedDeltaNetLayer::ensureWeightCache(
   readAsF32(context.getWeight(w_A_log), num_v_heads, alog_f);
   readAsF32(context.getWeight(w_dt_bias), num_v_heads, dtb_f);
   readAsF32(context.getWeight(w_norm), head_v_dim, wnorm_f);
+  wcache_loaded = true;
+}
+
+void GatedDeltaNetLayer::ensureBigWeightCache(
+  nntrainer::RunLayerContext &context) {
+  if (wcache_big_loaded)
+    return;
   {
     nntrainer::Tensor &Wq = context.getWeight(w_in_proj_qkv);
     if (Wq.getDataType() == ml::train::TensorDim::DataType::QS4CX) {
@@ -250,12 +257,13 @@ void GatedDeltaNetLayer::ensureWeightCache(
             wa_f);
   readAsF32(context.getWeight(w_out_proj), (size_t)value_dim * hidden_size,
             wout_fv);
-  wcache_loaded = true;
+  wcache_big_loaded = true;
 }
 
 void GatedDeltaNetLayer::outProj(nntrainer::RunLayerContext &context,
                                  const float *normed, int B, int S,
                                  nntrainer::Tensor &output) {
+  ensureBigWeightCache(context); // host lane: consumes wout_fv
   const int T = B * S, H = hidden_size, VAL = value_dim;
   nntrainer::Tensor normed_t(
     nntrainer::TensorDim(B, 1, S, VAL,
@@ -421,6 +429,7 @@ void GatedDeltaNetLayer::runForward(nntrainer::RunLayerContext &context,
     // Host projection fallback reads the device-written layer input.
     nntrainer::cuda::drain_if_async();
 #endif
+    ensureBigWeightCache(context); // host projection lane
     std::vector<float> xin_v;
     readAsF32(input, (size_t)T * H, xin_v);
     nntrainer::Tensor xin = wrapF32(xin_v.data(), T, H);
@@ -801,9 +810,9 @@ void GatedDeltaNetLayer::runDecode(nntrainer::RunLayerContext &context) {
     if (Wqkv.getDataType() == FP16D) {
       wqkv16 = reinterpret_cast<const unsigned short *>(Wqkv.getData<_FP16>());
     } else if (Wqkv.getDataType() ==
-                 ml::train::TensorDim::DataType::QS4CX &&
-               wcache_loaded) {
+               ml::train::TensorDim::DataType::QS4CX) {
       if (qkv_dev_fp16 == nullptr) {
+        ensureBigWeightCache(context); // gdnq mirror consumes wqkv_f
         const size_t n = (size_t)hidden_size * conv_dim;
         std::vector<unsigned short> h16(n);
         for (size_t i = 0; i < n; ++i) {
@@ -862,6 +871,7 @@ void GatedDeltaNetLayer::runDecode(nntrainer::RunLayerContext &context) {
 #endif
 
   // 1 token/batch: widen the input row once, sgemm over cached heap weights
+  ensureBigWeightCache(context); // host decode lane
   std::vector<float> xin_v;
   readAsF32(input, (size_t)B * H, xin_v);
   nntrainer::Tensor xin = wrapF32(xin_v.data(), B, H);
