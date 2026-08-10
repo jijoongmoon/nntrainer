@@ -856,6 +856,187 @@ void gdn_ck_out_tc(const float *conv, const float *gc, const float *h,
   }
 }
 
+// Tensor-core rewrite of the sequential state sweep (NNTR_GDN_CK_TC=1).
+// Same math: per chunk c -- h_c = S; vpre = w_c @ S; vn = u_c - vpre;
+// dv = vn*e^{gl_c - gc}; S = S*e^{gl_c} + k_c^T @ dv. S[128x128] lives in
+// mma-C-fragment fp32 registers of 16 warps (8x2 grid of 16x64 tiles, 32
+// floats/thread), so the k^T@dv update lands on S with NO relayout. w@S gets
+// S via a per-chunk fp16 smem dump (doubles as the h write); k^T uses the
+// A-TRANS quadrant recipe derived in tile_bench/fp16_state_bench.cu:
+//   addr = (k0 + (lane&7) + ((lane&16)?8:0))*LD + m0 + ((lane&8)?8:0)
+// Bench-validated rel<=1e-3; 20.05 -> 4.13 ms at the T=4096 shape.
+__global__ __launch_bounds__(512, 1)
+void gdn_ck_state_tc(const float *conv, const float *w, const float *u,
+                     const float *gc, const float *gl, float *h, float *vnew,
+                     float *state, int T, int CONV, int KEY, int NVH, int NKH,
+                     int HKD, int HVD, int seed_state, int save_state){
+  const int vh = blockIdx.x;
+  const int kh = vh / (NVH / NKH);
+  const int tid = threadIdx.x;
+  const int lane = tid & 31, warp = tid >> 5;
+  const int wm = warp >> 1, wn = warp & 1; // 8x2 grid of 16x64 tiles
+  const int g = lane >> 2, tq = lane & 3;
+  const int NCH = (T + 63) >> 6;
+  const int SLD = 136;
+  __shared__ __align__(16) unsigned short Sh[64 * 136]; // S j-half / k tile
+  __shared__ __align__(16) unsigned short Tb[64 * 136]; // w tile / dv tile
+
+  float S[8][4];
+#pragma unroll
+  for (int s = 0; s < 8; ++s)
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+      const int j = wm*16 + g + ((r >> 1) ? 8 : 0);
+      const int b = wn*64 + s*8 + 2*tq + (r & 1);
+      S[s][r] = seed_state ? state[((long)vh*HKD + j)*HVD + b] : 0.0f;
+    }
+
+  for (int c = 0; c < NCH; ++c) {
+    const int cn = (T - c*64 < 64) ? (T - c*64) : 64;
+    const float eglc = expf(gl[(long)c*NVH + vh]);
+    float vp[8][4];
+#pragma unroll
+    for (int s = 0; s < 8; ++s)
+#pragma unroll
+      for (int r = 0; r < 4; ++r) vp[s][r] = 0.0f;
+    for (int jh = 0; jh < 2; ++jh) {
+      __syncthreads();
+#pragma unroll
+      for (int s = 0; s < 8; ++s)
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+          const int j = wm*16 + g + ((r >> 1) ? 8 : 0);
+          const int b = wn*64 + s*8 + 2*tq + (r & 1);
+          if (j >= jh*64 && j < jh*64 + 64) {
+            unsigned short hv;
+            asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hv) : "f"(S[s][r]));
+            Sh[(j - jh*64)*SLD + b] = hv;
+            h[((long)c*NVH + vh)*16384 + j*128 + b] = S[s][r];
+          }
+        }
+      __syncthreads();
+      for (int i = tid; i < 64*64; i += 512) {
+        const int cc = i >> 6, jj = i & 63;
+        float wv = (cc < cn)
+          ? w[(((long)c*64 + cc)*NVH + vh)*HKD + jh*64 + jj] : 0.0f;
+        unsigned short hv;
+        asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hv) : "f"(wv));
+        Tb[cc*SLD + jj] = hv;
+      }
+      __syncthreads();
+      if (wm < 4) {
+        const int a_row = wm*16 + (lane & 15);
+        const int a_k8 = (lane >> 4) & 1;
+#pragma unroll
+        for (int k0 = 0; k0 < 64; k0 += 16) {
+          int a0,a1,a2,a3;
+          asm volatile(
+            "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+            : "=r"(a0),"=r"(a1),"=r"(a2),"=r"(a3)
+            : "r"((unsigned)__cvta_generic_to_shared(
+                &Tb[a_row*SLD + k0 + a_k8*8])));
+#pragma unroll
+          for (int s4 = 0; s4 < 2; ++s4) {
+            const int nb = wn*64 + s4*32;
+            int bl0,bl1,bl2,bl3, bh0,bh1,bh2,bh3;
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
+              "{%0,%1,%2,%3}, [%4];\n"
+              : "=r"(bl0),"=r"(bl1),"=r"(bl2),"=r"(bl3)
+              : "r"((unsigned)__cvta_generic_to_shared(
+                  &Sh[(k0 + (lane & 7))*SLD + nb + (lane >> 3)*8])));
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
+              "{%0,%1,%2,%3}, [%4];\n"
+              : "=r"(bh0),"=r"(bh1),"=r"(bh2),"=r"(bh3)
+              : "r"((unsigned)__cvta_generic_to_shared(
+                  &Sh[(k0 + 8 + (lane & 7))*SLD + nb + (lane >> 3)*8])));
+#define STMMA(ACC,S_,BL,BH)                                                    \
+            asm volatile(                                                      \
+              "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "             \
+              "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"        \
+              : "+f"(ACC[S_][0]),"+f"(ACC[S_][1]),"+f"(ACC[S_][2]),            \
+                "+f"(ACC[S_][3])                                               \
+              : "r"(a0),"r"(a1),"r"(a2),"r"(a3), "r"(BL), "r"(BH))
+            STMMA(vp,s4*4+0,bl0,bh0); STMMA(vp,s4*4+1,bl1,bh1);
+            STMMA(vp,s4*4+2,bl2,bh2); STMMA(vp,s4*4+3,bl3,bh3);
+          }
+        }
+      }
+    }
+    __syncthreads();
+    if (wm < 4) {
+#pragma unroll
+      for (int s = 0; s < 8; ++s)
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+          const int cc = wm*16 + g + ((r >> 1) ? 8 : 0);
+          const int b = wn*64 + s*8 + 2*tq + (r & 1);
+          float dvv = 0.0f;
+          if (cc < cn) {
+            const long t = (long)c*64 + cc;
+            const float vn = u[(t*NVH + vh)*HVD + b] - vp[s][r];
+            vnew[(t*NVH + vh)*HVD + b] = vn;
+            dvv = vn*expf(gl[(long)c*NVH + vh] - gc[t*NVH + vh]);
+          }
+          unsigned short hv;
+          asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hv) : "f"(dvv));
+          Tb[cc*SLD + b] = hv;
+        }
+    }
+    for (int i = tid; i < 64*128; i += 512) {
+      const int cc = i >> 7, jj = i & 127;
+      float kv = (cc < cn)
+        ? conv[((long)c*64 + cc)*CONV + KEY + kh*HKD + jj] : 0.0f;
+      unsigned short hv;
+      asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hv) : "f"(kv));
+      Sh[cc*SLD + jj] = hv;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int s = 0; s < 8; ++s)
+#pragma unroll
+      for (int r = 0; r < 4; ++r) S[s][r] *= eglc;
+#pragma unroll
+    for (int k0 = 0; k0 < 64; k0 += 16) {
+      int a0,a1,a2,a3;
+      asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+        : "=r"(a0),"=r"(a1),"=r"(a2),"=r"(a3)
+        : "r"((unsigned)__cvta_generic_to_shared(
+            &Sh[(k0 + (lane & 7) + ((lane & 16) ? 8 : 0))*SLD +
+                wm*16 + ((lane & 8) ? 8 : 0)])));
+#pragma unroll
+      for (int s4 = 0; s4 < 2; ++s4) {
+        const int nb = wn*64 + s4*32;
+        int bl0,bl1,bl2,bl3, bh0,bh1,bh2,bh3;
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
+          "{%0,%1,%2,%3}, [%4];\n"
+          : "=r"(bl0),"=r"(bl1),"=r"(bl2),"=r"(bl3)
+          : "r"((unsigned)__cvta_generic_to_shared(
+              &Tb[(k0 + (lane & 7))*SLD + nb + (lane >> 3)*8])));
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
+          "{%0,%1,%2,%3}, [%4];\n"
+          : "=r"(bh0),"=r"(bh1),"=r"(bh2),"=r"(bh3)
+          : "r"((unsigned)__cvta_generic_to_shared(
+              &Tb[(k0 + 8 + (lane & 7))*SLD + nb + (lane >> 3)*8])));
+        STMMA(S,s4*4+0,bl0,bh0); STMMA(S,s4*4+1,bl1,bh1);
+        STMMA(S,s4*4+2,bl2,bh2); STMMA(S,s4*4+3,bl3,bh3);
+      }
+    }
+#undef STMMA
+    __syncthreads();
+  }
+  if (save_state) {
+#pragma unroll
+    for (int s = 0; s < 8; ++s)
+#pragma unroll
+      for (int r = 0; r < 4; ++r) {
+        const int j = wm*16 + g + ((r >> 1) ? 8 : 0);
+        const int b = wn*64 + s*8 + 2*tq + (r & 1);
+        state[((long)vh*HKD + j)*HVD + b] = S[s][r];
+      }
+  }
+}
+
 // gated RMSNorm + silu(z) gate -> fp16, VERBATIM the scan's fused tail.
 // grid T*NVH, block 128 (thread = b).
 // fp16 round-trip stub (NNTR_GDN_CK_F16STUB=1, =2 harness only): rounds a
@@ -1202,7 +1383,6 @@ bool cuda_gdn_prefill_chunked_fp16(
   auto kkt = ctx.registerCudaKernel(GDN_SRC, "gdn_ck_kkt");
   auto ktr = ctx.registerCudaKernel(GDN_SRC, "gdn_ck_tril");
   auto kwu = ctx.registerCudaKernel(GDN_SRC, "gdn_ck_wu");
-  auto kst = ctx.registerCudaKernel(GDN_SRC, "gdn_ck_state");
   // NNTR_GDN_CK_TC=1: the fp16 m16n8k16 tensor-core out kernel (256
   // threads) instead of the fp32 SIMT one (128). Opt-in until it passes the
   // measured acceptance gate (out <= 0.0625 / state <= 0.021 on the =2
@@ -1211,6 +1391,8 @@ bool cuda_gdn_prefill_chunked_fp16(
     const char *e = std::getenv("NNTR_GDN_CK_TC");
     return e != nullptr && e[0] == '1';
   }();
+  auto kst = ctx.registerCudaKernel(GDN_SRC, g_ck_tc ? "gdn_ck_state_tc"
+                                                     : "gdn_ck_state");
   auto kou =
     ctx.registerCudaKernel(GDN_SRC, g_ck_tc ? "gdn_ck_out_tc" : "gdn_ck_out");
   auto kga = ctx.registerCudaKernel(GDN_SRC, "gdn_ck_gate");
