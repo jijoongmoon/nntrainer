@@ -495,14 +495,18 @@ void GatedDeltaNetLayer::runForward(nntrainer::RunLayerContext &context,
         nntrainer::cuda::dev_accessible(Wout.getData<_FP16>()) &&
         nntrainer::cuda::dev_accessible(output.getData<_FP16>()) &&
         nntrainer::cuda::dev_accessible(st)) {
-      // NNTR_CUDA_GDN_CHUNK: 0 = the sequential scan (default), 1 = the
-      // chunked WY form (cuda_gdn_prefill_chunked_fp16, falls back to the
-      // scan on decline), 2 = run BOTH and report max|d| out/state, keeping
-      // the sequential result (the scan is the semantic reference; the CPU
-      // golden harness is red for GDN).
+      // NNTR_CUDA_GDN_CHUNK: 1 = the chunked WY form -- THE DEFAULT since
+      // 2026-08-11: with the fp16 m16n8k16 tensor-core kernels
+      // (kkt 11.4x / wu 2.5x / state 4.1x / out 15.9x) it measures 19.84 vs
+      // the scan arm's 22.46 ms per layer-chunk and 1,095.6 vs 1,072.5 TPS
+      // at 20K e2e, gate-passed (out 0.03125 <= 0.0625, state 0.0067 <=
+      // 0.021, text identical). 0 = the sequential scan (fallback; still
+      // the semantic reference), 2 = run BOTH and report max|d| out/state,
+      // keeping the sequential result. (The CPU golden harness is red for
+      // GDN, so the scan remains the reference arm.)
       static const int gdn_chunk = [] {
         const char *e = std::getenv("NNTR_CUDA_GDN_CHUNK");
-        return e ? atoi(e) : 0;
+        return e ? atoi(e) : 1;
       }();
       const auto *wout16 =
         reinterpret_cast<const unsigned short *>(Wout.getData<_FP16>());

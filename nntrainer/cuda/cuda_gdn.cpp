@@ -424,6 +424,191 @@ __global__ void gdn_ck_kkt(const float *conv, const float *gc,
   }
 }
 
+// Tensor-core kkt (NNTR_GDN_CK_TC=1): same A[c][d] = beta_c (k_c.k_d)
+// e^{gs_c-gs_d} for c>d, via the proven fp16 recipes (A-normal + B-non-trans
+// from k rows). 256 threads, 4x2 warp grid of 16x32 tiles over [64x64].
+__global__ __launch_bounds__(256, 2)
+void gdn_ck_kkt_tc(const float *conv, const float *gc, const float *beta,
+                   float *A, int T, int CONV, int KEY, int NVH, int NKH,
+                   int HKD){
+  const int ck = blockIdx.x, vh = blockIdx.y;
+  const int kh = vh / (NVH / NKH);
+  const int cn = (T - ck*64 < 64) ? (T - ck*64) : 64;
+  const int tid = threadIdx.x;
+  const int lane = tid & 31, warp = tid >> 5;
+  const int wm = warp >> 1, wn = warp & 1;
+  const int g = lane >> 2, tq = lane & 3;
+  __shared__ __align__(16) unsigned short ksh[64 * 136];
+  __shared__ float gs[64], bs[64];
+  for (int i = tid; i < 64*128; i += 256) {
+    const int c = i >> 7, e = i & 127;
+    float kv = (c < cn) ? conv[(long)(ck*64 + c)*CONV + KEY + kh*HKD + e]
+                        : 0.0f;
+    unsigned short hv;
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hv) : "f"(kv));
+    ksh[c*136 + e] = hv;
+  }
+  if (tid < 64) {
+    const int t = ck*64 + tid;
+    gs[tid] = (tid < cn) ? gc[(long)t*NVH + vh] : 0.0f;
+    bs[tid] = (tid < cn) ? beta[(long)t*NVH + vh] : 0.0f;
+  }
+  __syncthreads();
+  float acc2[4][4];
+#pragma unroll
+  for (int s = 0; s < 4; ++s)
+#pragma unroll
+    for (int r = 0; r < 4; ++r) acc2[s][r] = 0.0f;
+  const int a_row = wm*16 + (lane & 15);
+  const int a_k8 = (lane >> 4) & 1;
+  const int b_row = wn*32 + (lane >> 3)*8 + (lane & 7);
+#pragma unroll
+  for (int k0 = 0; k0 < 128; k0 += 16) {
+    int a0,a1,a2,a3, bl0,bl1,bl2,bl3, bh0,bh1,bh2,bh3;
+    asm volatile(
+      "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+      : "=r"(a0),"=r"(a1),"=r"(a2),"=r"(a3)
+      : "r"((unsigned)__cvta_generic_to_shared(
+          &ksh[a_row*136 + k0 + a_k8*8])));
+    asm volatile(
+      "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+      : "=r"(bl0),"=r"(bl1),"=r"(bl2),"=r"(bl3)
+      : "r"((unsigned)__cvta_generic_to_shared(&ksh[b_row*136 + k0])));
+    asm volatile(
+      "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+      : "=r"(bh0),"=r"(bh1),"=r"(bh2),"=r"(bh3)
+      : "r"((unsigned)__cvta_generic_to_shared(&ksh[b_row*136 + k0 + 8])));
+#define KKMMA(S_,BL,BH)                                                        \
+    asm volatile(                                                              \
+      "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "                     \
+      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"                \
+      : "+f"(acc2[S_][0]),"+f"(acc2[S_][1]),"+f"(acc2[S_][2]),                 \
+        "+f"(acc2[S_][3])                                                      \
+      : "r"(a0),"r"(a1),"r"(a2),"r"(a3), "r"(BL), "r"(BH))
+    KKMMA(0,bl0,bh0); KKMMA(1,bl1,bh1); KKMMA(2,bl2,bh2); KKMMA(3,bl3,bh3);
+#undef KKMMA
+  }
+  float *Ab = A + ((long)ck*NVH + vh)*4096;
+#pragma unroll
+  for (int s = 0; s < 4; ++s)
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+      const int c = wm*16 + g + ((r >> 1) ? 8 : 0);
+      const int d = wn*32 + s*8 + 2*tq + (r & 1);
+      float v = 0.0f;
+      if (c > d && c < cn)
+        v = bs[c]*acc2[s][r]*expf(gs[c] - gs[d]);
+      Ab[c*64 + d] = v;
+    }
+}
+
+// Tensor-core wu (NNTR_GDN_CK_TC=1): w = T@xk, u = T@xv with SHARED T
+// A-fragments (one load, two mma chains). xk = beta e^{gc} k, xv = beta v,
+// both built fp16 in smem; T rounded to fp16 (a new fp16 surface -- the =2
+// gate arbitrates, and out's coef precedent passed with 16x margin).
+__global__ __launch_bounds__(256, 2)
+void gdn_ck_wu_tc(const float *conv, const float *A, const float *gc,
+                  const float *beta, float *w, float *u, int T, int CONV,
+                  int KEY, int NVH, int NKH, int HKD, int HVD){
+  const int ck = blockIdx.x, vh = blockIdx.y;
+  const int kh = vh / (NVH / NKH);
+  const int cn = (T - ck*64 < 64) ? (T - ck*64) : 64;
+  const int tid = threadIdx.x;
+  const int lane = tid & 31, warp = tid >> 5;
+  const int wm = warp >> 1, wn = warp & 1;
+  const int g = lane >> 2, tq = lane & 3;
+  __shared__ __align__(16) unsigned short Th[64 * 72];
+  __shared__ __align__(16) unsigned short xk[64 * 136];
+  __shared__ __align__(16) unsigned short xv[64 * 136];
+  const float *Ab = A + ((long)ck*NVH + vh)*4096;
+  for (int i = tid; i < 4096; i += 256) {
+    unsigned short hv;
+    float tv = Ab[i];
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hv) : "f"(tv));
+    Th[(i >> 6)*72 + (i & 63)] = hv;
+  }
+  for (int i = tid; i < 64*128; i += 256) {
+    const int c = i >> 7, dim = i & 127;
+    float k_ = 0.0f, v_ = 0.0f;
+    if (c < cn) {
+      const long t = (long)ck*64 + c;
+      const float be = beta[t*NVH + vh];
+      k_ = be*expf(gc[t*NVH + vh])*conv[t*CONV + KEY + kh*HKD + dim];
+      v_ = be*conv[t*CONV + 2*KEY + vh*HVD + dim];
+    }
+    unsigned short hk, hvv;
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hk) : "f"(k_));
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hvv) : "f"(v_));
+    xk[c*136 + dim] = hk;
+    xv[c*136 + dim] = hvv;
+  }
+  __syncthreads();
+  float aw[8][4], au[8][4];
+#pragma unroll
+  for (int s = 0; s < 8; ++s)
+#pragma unroll
+    for (int r = 0; r < 4; ++r) { aw[s][r] = 0.0f; au[s][r] = 0.0f; }
+  const int a_row = wm*16 + (lane & 15);
+  const int a_k8 = (lane >> 4) & 1;
+#pragma unroll
+  for (int k0 = 0; k0 < 64; k0 += 16) {
+    int a0,a1,a2,a3;
+    asm volatile(
+      "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+      : "=r"(a0),"=r"(a1),"=r"(a2),"=r"(a3)
+      : "r"((unsigned)__cvta_generic_to_shared(
+          &Th[a_row*72 + k0 + a_k8*8])));
+#define WUMMA(ACC,S_,BL,BH)                                                    \
+    asm volatile(                                                              \
+      "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "                     \
+      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"                \
+      : "+f"(ACC[S_][0]),"+f"(ACC[S_][1]),"+f"(ACC[S_][2]),"+f"(ACC[S_][3])    \
+      : "r"(a0),"r"(a1),"r"(a2),"r"(a3), "r"(BL), "r"(BH))
+#pragma unroll
+    for (int s4 = 0; s4 < 2; ++s4) {
+      const int nb = wn*64 + s4*32;
+      int bl0,bl1,bl2,bl3, bh0,bh1,bh2,bh3;
+      asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
+        "{%0,%1,%2,%3}, [%4];\n"
+        : "=r"(bl0),"=r"(bl1),"=r"(bl2),"=r"(bl3)
+        : "r"((unsigned)__cvta_generic_to_shared(
+            &xk[(k0 + (lane & 7))*136 + nb + (lane >> 3)*8])));
+      asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
+        "{%0,%1,%2,%3}, [%4];\n"
+        : "=r"(bh0),"=r"(bh1),"=r"(bh2),"=r"(bh3)
+        : "r"((unsigned)__cvta_generic_to_shared(
+            &xk[(k0 + 8 + (lane & 7))*136 + nb + (lane >> 3)*8])));
+      WUMMA(aw,s4*4+0,bl0,bh0); WUMMA(aw,s4*4+1,bl1,bh1);
+      WUMMA(aw,s4*4+2,bl2,bh2); WUMMA(aw,s4*4+3,bl3,bh3);
+      asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
+        "{%0,%1,%2,%3}, [%4];\n"
+        : "=r"(bl0),"=r"(bl1),"=r"(bl2),"=r"(bl3)
+        : "r"((unsigned)__cvta_generic_to_shared(
+            &xv[(k0 + (lane & 7))*136 + nb + (lane >> 3)*8])));
+      asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
+        "{%0,%1,%2,%3}, [%4];\n"
+        : "=r"(bh0),"=r"(bh1),"=r"(bh2),"=r"(bh3)
+        : "r"((unsigned)__cvta_generic_to_shared(
+            &xv[(k0 + 8 + (lane & 7))*136 + nb + (lane >> 3)*8])));
+      WUMMA(au,s4*4+0,bl0,bh0); WUMMA(au,s4*4+1,bl1,bh1);
+      WUMMA(au,s4*4+2,bl2,bh2); WUMMA(au,s4*4+3,bl3,bh3);
+    }
+#undef WUMMA
+  }
+#pragma unroll
+  for (int s = 0; s < 8; ++s)
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+      const int c = wm*16 + g + ((r >> 1) ? 8 : 0);
+      const int dim = wn*64 + s*8 + 2*tq + (r & 1);
+      if (c < cn) {
+        const long t = (long)ck*64 + c;
+        w[(t*NVH + vh)*HKD + dim] = aw[s][r];
+        u[(t*NVH + vh)*HVD + dim] = au[s][r];
+      }
+    }
+}
+
 // Tv = (I + A)^-1 by forward substitution, in place over A.
 // grid (NT, NVH), block 64 (thread = column). fp32 throughout.
 __global__ void gdn_ck_tril(float *A, int NVH){
@@ -1379,18 +1564,19 @@ bool cuda_gdn_prefill_chunked_fp16(
   auto &ctx = CudaContext::Global();
   auto kcv = ctx.registerCudaKernel(GDN_SRC, "gdn_conv_prefill");
   auto kln = ctx.registerCudaKernel(GDN_SRC, "gdn_l2norm_prefill");
-  auto kgc = ctx.registerCudaKernel(GDN_SRC, "gdn_ck_gcum");
-  auto kkt = ctx.registerCudaKernel(GDN_SRC, "gdn_ck_kkt");
-  auto ktr = ctx.registerCudaKernel(GDN_SRC, "gdn_ck_tril");
-  auto kwu = ctx.registerCudaKernel(GDN_SRC, "gdn_ck_wu");
-  // NNTR_GDN_CK_TC=1: the fp16 m16n8k16 tensor-core out kernel (256
-  // threads) instead of the fp32 SIMT one (128). Opt-in until it passes the
-  // measured acceptance gate (out <= 0.0625 / state <= 0.021 on the =2
-  // harness + text identity).
+  // NNTR_GDN_CK_TC=1: the fp16 m16n8k16 tensor-core chunked kernels
+  // (kkt/wu/state/out). Opt-in; gated by the =2 harness (out <= 0.0625,
+  // state <= 0.021) + text identity.
   static const bool g_ck_tc = []() {
     const char *e = std::getenv("NNTR_GDN_CK_TC");
-    return e != nullptr && e[0] == '1';
+    return e == nullptr || e[0] != '0'; // default ON; =0 restores fp32 SIMT
   }();
+  auto kgc = ctx.registerCudaKernel(GDN_SRC, "gdn_ck_gcum");
+  auto kkt = ctx.registerCudaKernel(GDN_SRC, g_ck_tc ? "gdn_ck_kkt_tc"
+                                                     : "gdn_ck_kkt");
+  auto ktr = ctx.registerCudaKernel(GDN_SRC, "gdn_ck_tril");
+  auto kwu = ctx.registerCudaKernel(GDN_SRC, g_ck_tc ? "gdn_ck_wu_tc"
+                                                     : "gdn_ck_wu");
   auto kst = ctx.registerCudaKernel(GDN_SRC, g_ck_tc ? "gdn_ck_state_tc"
                                                      : "gdn_ck_state");
   auto kou =
@@ -1526,7 +1712,7 @@ bool cuda_gdn_prefill_chunked_fp16(
     kwu->SetKernelArguments(10, &iNKH, sizeof(iNKH));
     kwu->SetKernelArguments(11, &iHKD, sizeof(iHKD));
     kwu->SetKernelArguments(12, &iHVD, sizeof(iHVD));
-    const int g[3] = {(int)NT, iNVH, 1}, b3[3] = {128, 1, 1};
+    const int g[3] = {(int)NT, iNVH, 1}, b3[3] = {g_ck_tc ? 256 : 128, 1, 1};
     if (!sm.DispatchCommand(*kwu, g, b3))
       return false;
   }
