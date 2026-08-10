@@ -1221,7 +1221,26 @@ bool cuda_moe_grouped_ffn_imma(const unsigned short *input,
     const char *e = std::getenv("NNTR_MOE_G2");
     return e != nullptr && e[0] == '1';
   }();
-  if (g_g2) {
+  // Wide-N 64x128 tile (32x32 warp tiles, half the B-ldmatrix per mma) for
+  // the K=2048 gate/up shapes: measured -5% each, byte-identical (integer
+  // accumulation is order-exact). Default ON; NNTR_MOE_WT=0 keeps the 64x64
+  // tile for A/B. down is NOT wide (see the stamp(5) note).
+  static const bool g_wt = []() {
+    const char *e = std::getenv("NNTR_MOE_WT");
+    return e == nullptr || e[0] != '0';
+  }();
+  if (g_wt) {
+    if (!cuda_fc_qs4cx_moe_grouped_gemm_w(g_qa, p.rows, wp64 + p.off_gate,
+                                          ws64 + p.off_gate, p.wl_e, g_sa,
+                                          g_za, g_G, Wcap, I, H, 1))
+      return false;
+    stamp(2);
+    if (!cuda_fc_qs4cx_moe_grouped_gemm_w(g_qa, p.rows, wp64 + p.off_up,
+                                          ws64 + p.off_up, p.wl_e, g_sa, g_za,
+                                          g_U, Wcap, I, H, 1))
+      return false;
+    stamp(3);
+  } else if (g_g2) {
     if (!cuda_fc_qs4cx_moe_grouped_gemm2(
           g_qa, p.rows, wp64 + p.off_gate, ws64 + p.off_gate,
           wp64 + p.off_up, ws64 + p.off_up, p.wl_e, g_sa, g_za, g_G, g_U,
@@ -1270,6 +1289,9 @@ bool cuda_moe_grouped_ffn_imma(const unsigned short *input,
       return false;
   }
   stamp(5);
+  // down stays on the 64x64 tile: with K=512 (8 k-steps) the wide tile's
+  // doubled W staging outweighs its fragment savings -- measured 8.7 -> 9.5
+  // ms. The wide tile pays only on the K=2048 gate/up shapes (-5% each).
   if (!cuda_fc_qs4cx_moe_grouped_gemm(g_qb, /*tokid=*/nullptr,
                                       wp64 + p.off_down, ws64 + p.off_down,
                                       p.wl_e, g_sb, g_zb, g_Y, Wcap, H, I, 1))

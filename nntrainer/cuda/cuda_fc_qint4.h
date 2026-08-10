@@ -121,6 +121,17 @@ bool cuda_fc_qs4cx_moe_grouped_gemm2(
   unsigned int n_mblocks, unsigned int N, unsigned int K, int out_fp16);
 
 /**
+ * @brief Wide-N (64x128 block, 32x32 warp tiles) grouped GEMM: halves the
+ *        B-fragment ldmatrix per mma. Same output as
+ *        cuda_fc_qs4cx_moe_grouped_gemm; requires N % 128 == 0.
+ */
+bool cuda_fc_qs4cx_moe_grouped_gemm_w(
+  const signed char *q8, const int *tokid, const unsigned long long *wp_tab,
+  const unsigned long long *ws_tab, const int *block_expert,
+  const float *ascale, const int *azp, void *Y, unsigned int n_mblocks,
+  unsigned int N, unsigned int K, int out_fp16);
+
+/**
  * @brief fp16 activation in, FP32 out (the GDN projection variant): the same
  *        act-quant + w4a8 ladder as the fp16 entry, writing float Y directly.
  */

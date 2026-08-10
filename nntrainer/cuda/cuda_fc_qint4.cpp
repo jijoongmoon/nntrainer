@@ -1843,6 +1843,227 @@ void imma_moe_grouped_g2(const signed char *q8, const int *tokid,
   }
 }
 
+// WIDE-N grouped GEMM (NNTR_MOE_WT=1): 64x128 block tile, 8 warps in a 2x4
+// grid of 32x32 warp tiles. Per half-k-step a warp loads 2 A + 2 B fragments
+// and runs 8 mma -- B-ldmatrix per mma HALVES vs the 64x64 tile (2 ld / 8 mma
+// vs 2 / 4). That is the surviving suspect from the gate+up-fusion negative
+// result: halving A-staging+barriers per mma moved nothing, so the binder is
+// the B-fragment ldmatrix/LSU path, which this variant is built to relieve.
+// Same math and output as imma_moe_grouped; N must be a multiple of 128.
+__global__ __launch_bounds__(256, 2)
+void imma_moe_grouped_w(const signed char *q8, const int *tokid,
+                        const unsigned long long *wp_tab,
+                        const unsigned long long *ws_tab,
+                        const int *block_expert, const float *ascale,
+                        const int *azp, float *Y, int N, int K, int out_fp16) {
+  const int e = block_expert[blockIdx.y];
+  if (e < 0)
+    return;
+  const unsigned char *plain =
+    (const unsigned char *)(unsigned long long)wp_tab[e];
+  const unsigned short *wscale =
+    (const unsigned short *)(unsigned long long)ws_tab[e];
+  __shared__ IPv16 Asv[2][IP_BM * IP_LD / 16];
+  __shared__ IPv16 Wsv[2][2 * IP_BN * IP_LD / 16]; // 128 rows
+  __shared__ int rsh[2 * IP_BN];
+  __shared__ int toks[IP_BM];
+  const int tid = threadIdx.x;
+  const int lane = tid & 31, warp = tid >> 5;
+  const int wm = warp >> 2, wn = warp & 3; // 2 x 4 grid of 32x32 tiles
+  const int g = lane >> 2, t = lane & 3;
+  const int blockM = blockIdx.y * IP_BM, blockN = blockIdx.x * (2 * IP_BN);
+  const int Kh = K >> 1;
+  const unsigned int cx = 0u;
+
+  if (tid < IP_BM)
+    toks[tid] = tokid ? tokid[blockM + tid] : (blockM + tid);
+  __syncthreads();
+
+  const int srow = tid >> 2, ssub = tid & 3;
+  const int atok = toks[srow];
+  const int wrow0 = blockN + srow, wrow1 = blockN + IP_BN + srow;
+  const bool arow_ok = atok >= 0;
+  const bool w0_ok = wrow0 < N, w1_ok = wrow1 < N;
+  const signed char *aptr = q8 + (long)atok * K + (ssub << 4);
+  const unsigned char *w0ptr = plain + (long)wrow0 * Kh + (ssub << 3);
+  const unsigned char *w1ptr = plain + (long)wrow1 * Kh + (ssub << 3);
+  const int sdst = srow * IP_LD + (ssub << 4);
+  const int sdst1 = (IP_BN + srow) * IP_LD + (ssub << 4);
+
+  int acc[2][4][4];
+#pragma unroll
+  for (int m = 0; m < 2; ++m)
+#pragma unroll
+    for (int s = 0; s < 4; ++s)
+#pragma unroll
+      for (int r = 0; r < 4; ++r)
+        acc[m][s][r] = 0;
+  int rs0 = 0, rs1 = 0;
+
+  IPv16 ra;
+  IPv8 rw0, rw1;
+  IPv16 wv;
+
+#define IPW_LOAD(K0)                                                           \
+  do {                                                                         \
+    if (arow_ok) {                                                             \
+      ra = *(const IPv16 *)(aptr + (K0));                                      \
+    } else {                                                                   \
+      ra.a = ra.b = ra.c = ra.d = 0u;                                          \
+    }                                                                          \
+    if (w0_ok) {                                                               \
+      rw0 = *(const IPv8 *)(w0ptr + ((K0) >> 1));                              \
+    } else {                                                                   \
+      rw0.a = rw0.b = 0u;                                                      \
+    }                                                                          \
+    if (w1_ok) {                                                               \
+      rw1 = *(const IPv8 *)(w1ptr + ((K0) >> 1));                              \
+    } else {                                                                   \
+      rw1.a = rw1.b = 0u;                                                      \
+    }                                                                          \
+  } while (0)
+
+#define IPW_UNPACK(RW, RS, DST)                                                \
+  do {                                                                         \
+    unsigned int lo = (RW).a & 0x0F0F0F0Fu;                                    \
+    unsigned int hi = ((RW).a >> 4) & 0x0F0F0F0Fu;                             \
+    wv.a = ip_nib2i8(__byte_perm(lo, hi, 0x5140), cx);                         \
+    wv.b = ip_nib2i8(__byte_perm(lo, hi, 0x7362), cx);                         \
+    lo = (RW).b & 0x0F0F0F0Fu;                                                 \
+    hi = ((RW).b >> 4) & 0x0F0F0F0Fu;                                          \
+    wv.c = ip_nib2i8(__byte_perm(lo, hi, 0x5140), cx);                         \
+    wv.d = ip_nib2i8(__byte_perm(lo, hi, 0x7362), cx);                         \
+    RS = __dp4a(0x01010101, (int)wv.a, RS);                                    \
+    RS = __dp4a(0x01010101, (int)wv.b, RS);                                    \
+    RS = __dp4a(0x01010101, (int)wv.c, RS);                                    \
+    RS = __dp4a(0x01010101, (int)wv.d, RS);                                    \
+    *(IPv16 *)((signed char *)(DST)) = wv;                                     \
+  } while (0)
+
+#define IPW_STORE(BUF)                                                         \
+  do {                                                                         \
+    IPW_UNPACK(rw0, rs0, (signed char *)Wsv[BUF] + sdst);                      \
+    IPW_UNPACK(rw1, rs1, (signed char *)Wsv[BUF] + sdst1);                     \
+    *(IPv16 *)((signed char *)Asv[BUF] + sdst) = ra;                           \
+  } while (0)
+
+  IPW_LOAD(0);
+  IPW_STORE(0);
+  __syncthreads();
+
+  // A: two m16 tiles per warp (rows wm*32 .. +31); B: one 32-col strip.
+  const int lrow_a0 = wm * 32 + (lane & 7) + ((lane & 8) ? 8 : 0);
+  const int lkb_a = (lane & 16) ? 16 : 0;
+  const int lrow_b = wn * 32 + (lane >> 3) * 8 + (lane & 7);
+  const unsigned pa0_buf[2] = {
+    ip_sh((const signed char *)Asv[0] + lrow_a0 * IP_LD + lkb_a),
+    ip_sh((const signed char *)Asv[1] + lrow_a0 * IP_LD + lkb_a)};
+  const unsigned pa1_buf[2] = {
+    ip_sh((const signed char *)Asv[0] + (lrow_a0 + 16) * IP_LD + lkb_a),
+    ip_sh((const signed char *)Asv[1] + (lrow_a0 + 16) * IP_LD + lkb_a)};
+  const unsigned pb_buf[2] = {
+    ip_sh((const signed char *)Wsv[0] + lrow_b * IP_LD),
+    ip_sh((const signed char *)Wsv[1] + lrow_b * IP_LD)};
+
+#define IPW_MMA(M, S, B0, B1)                                                  \
+  asm volatile(                                                                \
+    "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32.satfinite "               \
+    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"              \
+    : "=r"(acc[M][S][0]), "=r"(acc[M][S][1]), "=r"(acc[M][S][2]),              \
+      "=r"(acc[M][S][3])                                                       \
+    : "r"(a##M##0), "r"(a##M##1), "r"(a##M##2), "r"(a##M##3), "r"(B0),         \
+      "r"(B1), "r"(acc[M][S][0]), "r"(acc[M][S][1]), "r"(acc[M][S][2]),        \
+      "r"(acc[M][S][3]))
+#define IPW_HALF(H)                                                            \
+  do {                                                                         \
+    int a00, a01, a02, a03, a10, a11, a12, a13;                                \
+    int c0, c1, c2, c3, d0, d1, d2, d3;                                        \
+    asm volatile(                                                              \
+      "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"        \
+      : "=r"(a00), "=r"(a01), "=r"(a02), "=r"(a03)                             \
+      : "r"(pa0 + (H) * 32));                                                  \
+    asm volatile(                                                              \
+      "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"        \
+      : "=r"(a10), "=r"(a11), "=r"(a12), "=r"(a13)                             \
+      : "r"(pa1 + (H) * 32));                                                  \
+    asm volatile(                                                              \
+      "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"        \
+      : "=r"(c0), "=r"(c1), "=r"(c2), "=r"(c3)                                 \
+      : "r"(pb + (H) * 32));                                                   \
+    asm volatile(                                                              \
+      "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"        \
+      : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3)                                 \
+      : "r"(pb + (H) * 32 + 16));                                              \
+    IPW_MMA(0, 0, c0, d0);                                                     \
+    IPW_MMA(0, 1, c1, d1);                                                     \
+    IPW_MMA(0, 2, c2, d2);                                                     \
+    IPW_MMA(0, 3, c3, d3);                                                     \
+    IPW_MMA(1, 0, c0, d0);                                                     \
+    IPW_MMA(1, 1, c1, d1);                                                     \
+    IPW_MMA(1, 2, c2, d2);                                                     \
+    IPW_MMA(1, 3, c3, d3);                                                     \
+  } while (0)
+
+  int cur = 0;
+  for (int k0 = 0; k0 < K; k0 += IP_BK) {
+    const int knext = k0 + IP_BK;
+    if (knext < K)
+      IPW_LOAD(knext);
+
+    const unsigned pa0 = pa0_buf[cur], pa1 = pa1_buf[cur], pb = pb_buf[cur];
+    IPW_HALF(0);
+    IPW_HALF(1);
+
+    if (knext < K) {
+      IPW_STORE(cur ^ 1);
+      __syncthreads();
+      cur ^= 1;
+    }
+  }
+#undef IPW_HALF
+#undef IPW_MMA
+#undef IPW_STORE
+#undef IPW_UNPACK
+#undef IPW_LOAD
+
+  {
+    int v0 = rs0, v1 = rs1;
+    v0 += __shfl_down_sync(0xffffffffu, v0, 1);
+    v0 += __shfl_down_sync(0xffffffffu, v0, 2);
+    v1 += __shfl_down_sync(0xffffffffu, v1, 1);
+    v1 += __shfl_down_sync(0xffffffffu, v1, 2);
+    if (ssub == 0) {
+      rsh[srow] = v0;
+      rsh[IP_BN + srow] = v1;
+    }
+    __syncthreads();
+  }
+#pragma unroll
+  for (int m = 0; m < 2; ++m) {
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+#pragma unroll
+      for (int r = 0; r < 4; ++r) {
+        const int lrow = wm * 32 + m * 16 + g + ((r >> 1) ? 8 : 0);
+        const int cb = wn * 32 + s * 8 + 2 * t + (r & 1);
+        const int col = blockN + cb;
+        if (col < N) {
+          const int tok = toks[lrow];
+          float v = 0.0f;
+          if (tok >= 0)
+            v = (float)(acc[m][s][r] - azp[tok] * rsh[cb]) * ascale[tok] *
+                dp4a_h2f(wscale[col]);
+          if (out_fp16)
+            ((unsigned short *)Y)[(long)(blockM + lrow) * N + col] =
+              dp4a_f2h(v);
+          else
+            Y[(long)(blockM + lrow) * N + col] = v;
+        }
+      }
+    }
+  }
+}
+
 __global__ void dp4a_gemv_fused_h(const unsigned short *Xh,
                                   const signed char *plain,
                                   const int *wrowsum,
@@ -2720,6 +2941,36 @@ bool cuda_fc_qs4cx_moe_grouped_gemm2(
   kg->SetKernelArguments(13, &out_fp16, sizeof(out_fp16));
   const int ib[3] = {256, 1, 1};
   const int ig[3] = {(int)(N / 64u), (int)n_mblocks, 1};
+  return StreamManager::Global().DispatchCommand(*kg, ig, ib);
+}
+
+bool cuda_fc_qs4cx_moe_grouped_gemm_w(
+  const signed char *q8, const int *tokid, const unsigned long long *wp_tab,
+  const unsigned long long *ws_tab, const int *block_expert,
+  const float *ascale, const int *azp, void *Y, unsigned int n_mblocks,
+  unsigned int N, unsigned int K, int out_fp16) {
+  if (q8 == nullptr || wp_tab == nullptr || ws_tab == nullptr ||
+      block_expert == nullptr || Y == nullptr || n_mblocks == 0 ||
+      (N & 127u) != 0u || (K & 63u) != 0u)
+    return false;
+  auto kg = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
+                                                     "imma_moe_grouped_w");
+  if (!kg)
+    return false;
+  const int n = (int)N, k = (int)K;
+  kg->SetKernelArguments(0, &q8, sizeof(q8));
+  kg->SetKernelArguments(1, &tokid, sizeof(tokid));
+  kg->SetKernelArguments(2, &wp_tab, sizeof(wp_tab));
+  kg->SetKernelArguments(3, &ws_tab, sizeof(ws_tab));
+  kg->SetKernelArguments(4, &block_expert, sizeof(block_expert));
+  kg->SetKernelArguments(5, &ascale, sizeof(ascale));
+  kg->SetKernelArguments(6, &azp, sizeof(azp));
+  kg->SetKernelArguments(7, &Y, sizeof(Y));
+  kg->SetKernelArguments(8, &n, sizeof(n));
+  kg->SetKernelArguments(9, &k, sizeof(k));
+  kg->SetKernelArguments(10, &out_fp16, sizeof(out_fp16));
+  const int ib[3] = {256, 1, 1};
+  const int ig[3] = {(int)(N / 128u), (int)n_mblocks, 1};
   return StreamManager::Global().DispatchCommand(*kg, ig, ib);
 }
 
