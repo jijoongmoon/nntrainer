@@ -797,6 +797,22 @@ bool cuda_gdn_prefill_fp16(const float *p_qkv, const float *p_z,
   }
   auto &sm = StreamManager::Global();
   cudaStream_t stream = sm.GetStream();
+  // NNTR_GDN_P_DBG=1: per-stage GPU ms via events (first few calls only).
+  static const bool g_pdbg = []() {
+    const char *e = std::getenv("NNTR_GDN_P_DBG");
+    return e != nullptr && e[0] == '1';
+  }();
+  static int g_pdbg_n = 0;
+  cudaEvent_t pev[5];
+  const bool pdbg_this = g_pdbg && g_pdbg_n < 3;
+  if (pdbg_this)
+    for (int i = 0; i < 5; ++i)
+      cudaEventCreate(&pev[i]);
+  auto pstamp = [&](int i) {
+    if (pdbg_this)
+      cudaEventRecord(pev[i], stream);
+  };
+  pstamp(0);
   const DevParams *dp =
     ensure_params(h_wconv, h_alog, h_dtb, h_wnorm, CONV, KS, NVH, HVD, stream);
   if (!dp) {
@@ -836,6 +852,7 @@ bool cuda_gdn_prefill_fp16(const float *p_qkv, const float *p_z,
       return false;
     }
   }
+  pstamp(1);
   { // in-place l2norm(q,k) + the per-(token,k-head) q.k
     kln->SetKernelArguments(0, &g_pf_conv, sizeof(g_pf_conv));
     kln->SetKernelArguments(1, &g_pf_qkdot, sizeof(g_pf_qkdot));
@@ -851,6 +868,7 @@ bool cuda_gdn_prefill_fp16(const float *p_qkv, const float *p_z,
       return false;
     }
   }
+  pstamp(2);
   { // the sequential scan + fused gated RMSNorm
     ksc->SetKernelArguments(0, &g_pf_conv, sizeof(g_pf_conv));
     ksc->SetKernelArguments(1, &p_z, sizeof(p_z));
@@ -881,11 +899,27 @@ bool cuda_gdn_prefill_fp16(const float *p_qkv, const float *p_z,
       return false;
     }
   }
+  pstamp(3);
   // out_proj: [T,VAL] fp16 x [VAL,H] fp16 -> [T,H] fp16, fp32 accumulate.
   // cuBLAS drains, so the host may read `out` immediately after this returns.
   if (!cuda_fc_dense_gemm_fp16(g_pf_normed, wout, out, T, H, VAL)) {
     fprintf(stderr, "[cuda_gdn] prefill out_proj FAILED\n");
     return false;
+  }
+  pstamp(4);
+  if (pdbg_this) {
+    cudaEventSynchronize(pev[4]);
+    const char *nm[4] = {"conv", "l2norm", "scan", "out_proj"};
+    fprintf(stderr, "[gdn_p_dbg] T=%u ", T);
+    for (int i = 0; i < 4; ++i) {
+      float ms = 0.f;
+      cudaEventElapsedTime(&ms, pev[i], pev[i + 1]);
+      fprintf(stderr, "%s=%.2fms ", nm[i], ms);
+    }
+    fprintf(stderr, "\n");
+    for (int i = 0; i < 5; ++i)
+      cudaEventDestroy(pev[i]);
+    ++g_pdbg_n;
   }
   return true;
 }
