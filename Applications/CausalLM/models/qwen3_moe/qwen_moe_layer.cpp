@@ -598,6 +598,95 @@ bool MoELayer::runGroupedMoE(
 #endif
 }
 
+bool MoELayer::runGroupedMoEImma(nntrainer::RunLayerContext &context,
+                                 const nntrainer::Tensor &input,
+                                 nntrainer::Tensor &output,
+                                 const nntrainer::Tensor &router_logits,
+                                 unsigned int total_tokens,
+                                 unsigned int hidden_size) {
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+  const unsigned int E = num_experts;
+  const unsigned int I =
+    context.getWeight(expert_gate_proj_indices[0]).getDim().width();
+  // The imma tile has no k tail and needs N % 64 == 0; H and I each serve as
+  // both N and K across the three projections.
+  if ((hidden_size & 63u) != 0u || (I & 63u) != 0u)
+    return false;
+  if (!moe_tbl_built) {
+    if (!nntrainer::cuda::cuda_moe_new_ptr_table(3 * E, &moe_wptr, &moe_wsc))
+      return false;
+    auto fill = [&](unsigned int base,
+                    const std::vector<unsigned int> &idx) -> bool {
+      for (unsigned int e = 0; e < E; ++e) {
+        auto &w = context.getWeight(idx[e]);
+        const unsigned short *sc = nullptr;
+        if (!nntrainer::cuda::cuda_fc_qs4cx_scales_to_uvm_fp16(
+              w.getScale<float>(), w.getDim().width(), &sc))
+          return false;
+        const uint8_t *pl = w.getData<uint8_t>();
+        // The pipe tile reads the payload as 8-byte vectors; one misaligned
+        // expert disqualifies the whole layer (checked once, here).
+        if ((reinterpret_cast<uintptr_t>(pl) & 7u) != 0u)
+          moe_tbl_ok = false;
+        moe_wptr[base + e] = pl;
+        moe_wsc[base + e] = sc;
+      }
+      return true;
+    };
+    // PROJECTION-MAJOR, and the layer requests up/gate/down in that order.
+    // Swapping gate and up yields silu(up)*gate: fluent garbage, no error.
+    if (!fill(0, expert_up_proj_indices) ||
+        !fill(E, expert_gate_proj_indices) ||
+        !fill(2 * E, expert_down_proj_indices))
+      return false;
+    moe_tbl_built = true;
+  }
+  if (!moe_tbl_ok)
+    return false;
+
+  // Worst-case padded geometry from SHAPES ALONE -- the host reads nothing
+  // the routing kernels produce, which is the whole point of this path.
+  constexpr unsigned int BM = 64;
+  const unsigned int A = total_tokens * topk;
+  const unsigned int Wcap = (A + BM - 1) / BM + E;
+  const unsigned int Pcap = Wcap * BM;
+
+  nntrainer::cuda::MoePlan plan{};
+  plan.wptr = moe_wptr;
+  plan.wsc = moe_wsc;
+  plan.off_up = 0;
+  plan.off_gate = E;
+  plan.off_down = 2 * E;
+  if (!nntrainer::cuda::cuda_moe_plan_stage(Pcap, total_tokens, topk, E, Wcap,
+                                            &plan))
+    return false;
+  int *cp = nullptr, *op = nullptr;
+  if (!nntrainer::cuda::cuda_moe_route_stage(E, &cp, &op))
+    return false;
+  if (!nntrainer::cuda::cuda_moe_route_grouped_fp32(
+        router_logits.getData<float>(), plan.rows, plan.wts, cp, plan.wl_e,
+        plan.slots, total_tokens, E, topk, BM, Wcap, Pcap))
+    return false;
+  if (!nntrainer::cuda::cuda_moe_grouped_ffn_imma(
+        reinterpret_cast<const unsigned short *>(input.getData<_FP16>()),
+        reinterpret_cast<unsigned short *>(output.getData<_FP16>()), plan,
+        total_tokens, topk, hidden_size, I, Pcap, Wcap))
+    return false;
+  // Standard per-op discipline: a no-op inside the deferred-drain region, a
+  // real drain in plain sync mode (nothing downstream may read early).
+  nntrainer::cuda::StreamManager::Global().maybeFinish();
+  return true;
+#else
+  (void)context;
+  (void)input;
+  (void)output;
+  (void)router_logits;
+  (void)total_tokens;
+  (void)hidden_size;
+  return false;
+#endif
+}
+
 void MoELayer::compute_expert_forward_batched(
   nntrainer::ComputeOps *ops, nntrainer::RunLayerContext &context,
   const nntrainer::Tensor &input, nntrainer::Tensor &output,
@@ -841,9 +930,11 @@ void MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
           nntrainer::cuda::dev_accessible(lp)) {
         router_dev = nntrainer::cuda::cuda_moe_router_gemm_fp16(
           xp, wp, lp, total_tokens, hidden_size, num_experts);
-        // The softmax/top-k below read these logits on the host.
-        if (router_dev)
-          nntrainer::cuda::StreamManager::Global().finish();
+        // NO drain here: both device consumers of these logits (the grouped
+        // route and route_fp32's top-k kernel) are stream-ordered. Only the
+        // HOST softmax fallback reads them on the CPU, and it drains for
+        // itself below -- one drain per layer per chunk saved on every
+        // device path.
       }
     }
 #endif
@@ -874,12 +965,38 @@ void MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     // 359.9 TPS). So this is a prerequisite, not just a 3-second item.
     bool route_dev = false;
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+    // NNTR_CUDA_MOE_GROUPED=2: the imma-tile grouped path -- routing, padded
+    // work list, three grouped Tensor-Core GEMMs, SwiGLU and the sequential
+    // combine, with ZERO host reads (no counts, no offsets, no finish()).
+    // On success it sets route_dev so the host routing below is skipped;
+    // expert_assignments stay empty, so the per-expert loop no-ops and the
+    // function falls through to the reshape with `output` already written.
+    // Prefill only (total_tokens > 1): at decode m_e = 1 and the 64-row tile
+    // is 98% padding (measured on the dp4a grouped ancestor).
+    //
+    // DEFAULT 2 (2026-08-10), measured at the flip with byte-identical output
+    // at 1.3K and 20K: 20K prefill 669.7 -> 845.9 TPS, qwen_moe 14,047 ->
+    // 7,722 ms, moe:3x fc 63,916 calls -> 0. =0 disables, =1 is the old dp4a
+    // grouped arm (A/B only), decode is untouched either way.
+    static const int grouped2_env = []() {
+      const char *e = std::getenv("NNTR_CUDA_MOE_GROUPED");
+      return e ? std::atoi(e) : 2;
+    }();
+    if (router_dev && grouped2_env == 2 && total_tokens > 1 &&
+        input.getDataType() == ml::train::TensorDim::DataType::FP16 &&
+        output.getDataType() == ml::train::TensorDim::DataType::FP16 &&
+        nntrainer::cuda::dev_accessible(input.getData<_FP16>()) &&
+        nntrainer::cuda::dev_accessible(output.getData<_FP16>()) &&
+        runGroupedMoEImma(context, input, output, router_logits, total_tokens,
+                          hidden_size)) {
+      route_dev = true;
+    }
     // NNTR_MOE_ROUTE_DEV=0 keeps the host path as the A/B reference.
     static const bool route_dev_on = []() {
       const char *e = std::getenv("NNTR_MOE_ROUTE_DEV");
       return !(e != nullptr && e[0] == '0');
     }();
-    if (router_dev && route_dev_on) {
+    if (!route_dev && router_dev && route_dev_on) {
       int *rp = nullptr;
       float *wp = nullptr;
       int *cp = nullptr, *op = nullptr;
@@ -899,6 +1016,12 @@ void MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     }
 #endif
     if (!route_dev) {
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+      // The device router GEMM may still be in flight; this host softmax
+      // reads its logits (the drain that used to sit right after the GEMM).
+      if (router_dev)
+        nntrainer::cuda::StreamManager::Global().finish();
+#endif
       router_logits.apply(nntrainer::ActiFunc::softmax<float>, router_logits);
       auto topk_result = router_logits.topK(topk);
       auto topk_values = std::get<0>(topk_result);
@@ -962,7 +1085,7 @@ void MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     // them, the way vLLM's fused MoE does. NNTR_CUDA_MOE_GROUPED=1 to measure.
     static const int grouped_env = []() {
       const char *e = std::getenv("NNTR_CUDA_MOE_GROUPED");
-      return e ? (e[0] == '0' ? 0 : 1) : -1;
+      return e ? std::atoi(e) : -1; // =2 is the imma grouped path, above
     }();
     const bool grouped_on = (grouped_env == 1);
     static const bool moe_dbg_gate = std::getenv("NNTR_MOE_DBG") != nullptr;

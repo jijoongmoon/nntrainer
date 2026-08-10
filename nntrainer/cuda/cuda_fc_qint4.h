@@ -93,6 +93,21 @@ bool cuda_fc_qs4cx_dp4a_gemm_fp16(const unsigned short *Xh,
                                   unsigned short *Yh, unsigned int M,
                                   unsigned int N, unsigned int K);
 
+/**
+ * @brief Grouped-MoE int4 GEMM on the Tensor Cores (imma_moe_grouped): one
+ *        launch covers every expert via a padded per-expert block work list;
+ *        block_expert[b] steers block b to its expert's weight through the
+ *        wp_tab/ws_tab pointer tables (-1 discards). tokid maps gathered rows
+ *        to source token rows of q8 (nullptr = direct/gathered input, the
+ *        down projection). Bit-identical to per-expert imma_gemm_pipe calls.
+ *        N and K must be multiples of 64; buffers are caller-owned.
+ */
+bool cuda_fc_qs4cx_moe_grouped_gemm(
+  const signed char *q8, const int *tokid, const unsigned long long *wp_tab,
+  const unsigned long long *ws_tab, const int *block_expert,
+  const float *ascale, const int *azp, void *Y, unsigned int n_mblocks,
+  unsigned int N, unsigned int K, int out_fp16);
+
 /** @brief NNTR_CUDA_FUSED_NORMQ (default on, =0 opts out): whether the decode
  *  RMSNorm may fold in the int8 activation quant of the FC group it feeds. */
 bool cuda_fc_qs4cx_fused_normq_enabled();

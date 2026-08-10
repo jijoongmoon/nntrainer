@@ -166,6 +166,38 @@ bool cuda_moe_expert_ffn_fp16(const unsigned short *input,
                               unsigned int topk, unsigned int H,
                               unsigned int I);
 
+/**
+ * @brief Padded grouped routing (vLLM moe_align_block_size shape), entirely
+ *        on the device: softmax/top-k/normalize (bit-identical to
+ *        cuda_moe_route_fp32), e-ascending sort of each token's pairs, padded
+ *        per-expert bucketing into rows/wts (rows pre-filled -1 for padding
+ *        tails), the reverse map slots[t*K+j], and the block work list
+ *        wl_e[Wcap] with -1 self-discard. The host reads NONE of it.
+ *
+ * @param BM    block row height (the imma tile's 64)
+ * @param Wcap  ceil(T*K/BM) + E  (data-independent worst case)
+ * @param Pcap  Wcap * BM         (padded gathered row capacity)
+ */
+bool cuda_moe_route_grouped_fp32(const float *logits, int *rows, float *wts,
+                                 int *counts, int *wl_e, int *slots,
+                                 unsigned int T, unsigned int E,
+                                 unsigned int K, unsigned int BM,
+                                 unsigned int Wcap, unsigned int Pcap);
+
+/**
+ * @brief Grouped expert FFN on the int4 Tensor-Core tile (imma_moe_grouped):
+ *        one launch per projection covers every expert via the padded work
+ *        list. No gather: the layer input quantizes ONCE ([T,H]) and gate/up
+ *        read rows through p.rows. The combine is the SEQUENTIAL-rounding
+ *        variant, bit-identical to the per-expert scatter-add path.
+ *        Requires H % 64 == 0 and I % 64 == 0.
+ */
+bool cuda_moe_grouped_ffn_imma(const unsigned short *input,
+                               unsigned short *output, const MoePlan &p,
+                               unsigned int T, unsigned int topk,
+                               unsigned int H, unsigned int I,
+                               unsigned int Pcap, unsigned int Wcap);
+
 } // namespace nntrainer::cuda
 
 #endif /* __CUDA_MOE_H__ */

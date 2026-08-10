@@ -149,6 +149,9 @@ private:
   const unsigned char **moe_wptr = nullptr;
   const unsigned short **moe_wsc = nullptr;
   bool moe_tbl_built = false;
+  // false when any expert payload fails the imma tile's 8-byte alignment
+  // check at table-build time; the grouped-imma path then declines for good.
+  bool moe_tbl_ok = true;
 
   unsigned int gathered_in_idx;
   unsigned int gate_out_idx;
@@ -217,6 +220,19 @@ private:
     nntrainer::Tensor &output,
     const std::vector<std::vector<std::pair<unsigned, float>>> &assign,
     unsigned int total_tokens, unsigned int hidden_size);
+
+  /**
+   * @brief The imma-tile grouped path (NNTR_CUDA_MOE_GROUPED=2): device
+   *        routing straight into a padded per-expert work list, three grouped
+   *        Tensor-Core GEMMs and the sequential combine -- zero host reads,
+   *        bit-identical to the per-expert path. Returns false (having
+   *        written nothing) so the caller falls through.
+   */
+  bool runGroupedMoEImma(nntrainer::RunLayerContext &context,
+                         const nntrainer::Tensor &input,
+                         nntrainer::Tensor &output,
+                         const nntrainer::Tensor &router_logits,
+                         unsigned int total_tokens, unsigned int hidden_size);
 
   void compute_expert_forward_batched(
     nntrainer::ComputeOps *ops, nntrainer::RunLayerContext &context,

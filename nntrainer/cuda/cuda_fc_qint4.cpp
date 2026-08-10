@@ -1174,6 +1174,189 @@ void imma_gemm_pipe(const signed char *q8, const unsigned char *plain,
   }
 }
 
+// ---------------------------------------------------- grouped MoE IMMA ----
+// imma_gemm_pipe with the M axis driven by a PADDED per-expert work list
+// (vLLM's moe_align_block_size shape): every expert's assigned rows are
+// bucketed into a contiguous "gathered" row space padded per expert to a
+// multiple of IP_BM, so block `by` always owns gathered rows
+// [by*64, by*64+64) and needs only ONE int of steering data:
+// block_expert[by], the expert whose weight this block multiplies, with -1
+// meaning "padding block, discard". The HOST never reads per-expert counts;
+// the grid is sized to the data-independent worst case (T*topk/64 + E).
+//
+// Differences from imma_gemm_pipe, and nothing else differs:
+//  - B base + per-channel fp16 scale come from per-expert POINTER TABLES
+//    (the 35B's 30,720 expert weights are separate tensors, not one [E,N,K]).
+//  - A rows load through toks[] (gathered row -> source token row of q8);
+//    tokid == nullptr is the DIRECT mode for the down projection, whose
+//    input (the SwiGLU output) already lives in gathered space. toks < 0 is
+//    an intra-block padding row: its A stages as zeros and its output row is
+//    written as EXACT 0 (keeps the gathered buffers deterministic; SwiGLU of
+//    0 is 0, so padded rows stay clean through the whole chain).
+//  - raw path only (cx = 0, in-kernel rowsum): expert weights carry no
+//    DevWeightQ cache by default (NNTR_CUDA_FC_NOCACHE) and never should --
+//    a second copy of 15 GiB of experts is the documented anti-pattern.
+//  - ascale/azp index by SOURCE TOKEN (per-row quant params of the shared
+//    layer activation), not by gathered row.
+// Bit-exactness contract: identical K-order int32 accumulation and identical
+// epilogue scalars as the per-expert imma_gemm_pipe call on the same rows,
+// so the result bytes must MATCH the per-expert path exactly (int32
+// accumulation is associative; any diff is a mapping bug, never rounding).
+__global__ __launch_bounds__(256, 2)
+void imma_moe_grouped(const signed char *q8, const int *tokid,
+                      const unsigned long long *wp_tab,
+                      const unsigned long long *ws_tab,
+                      const int *block_expert, const float *ascale,
+                      const int *azp, float *Y, int N, int K, int out_fp16) {
+  const int e = block_expert[blockIdx.y];
+  if (e < 0)
+    return;
+  const unsigned char *plain =
+    (const unsigned char *)(unsigned long long)wp_tab[e];
+  const unsigned short *wscale =
+    (const unsigned short *)(unsigned long long)ws_tab[e];
+  __shared__ IPv16 Asv[2][IP_BM * IP_LD / 16];
+  __shared__ IPv16 Wsv[2][IP_BN * IP_LD / 16];
+  __shared__ int rsh[IP_BN];
+  __shared__ int toks[IP_BM];
+  const int tid = threadIdx.x;
+  const int lane = tid & 31, warp = tid >> 5;
+  const int wm = warp >> 1, wn = warp & 1; // 4 x 2 warp grid over 64x64
+  const int g = lane >> 2, t = lane & 3;
+  const int blockM = blockIdx.y * IP_BM, blockN = blockIdx.x * IP_BN;
+  const int Kh = K >> 1;
+  const unsigned int cx = 0u; // raw payload: offset-binary nibbles
+
+  if (tid < IP_BM)
+    toks[tid] = tokid ? tokid[blockM + tid] : (blockM + tid);
+  __syncthreads();
+
+  const int srow = tid >> 2, ssub = tid & 3;
+  const int atok = toks[srow];
+  const int wrow = blockN + srow;
+  const bool arow_ok = atok >= 0, wrow_ok = wrow < N;
+  const signed char *aptr = q8 + (long)atok * K + (ssub << 4);
+  const unsigned char *wptr = plain + (long)wrow * Kh + (ssub << 3);
+  const int sdst = srow * IP_LD + (ssub << 4);
+
+  int acc[4][4];
+#pragma unroll
+  for (int s = 0; s < 4; ++s)
+#pragma unroll
+    for (int r = 0; r < 4; ++r)
+      acc[s][r] = 0;
+  int rsacc = 0;
+
+  IPv16 ra;
+  IPv8 rw;
+  IPv16 wv;
+
+#define IPG_LOAD(K0)                                                           \
+  do {                                                                         \
+    if (arow_ok) {                                                             \
+      ra = *(const IPv16 *)(aptr + (K0));                                      \
+    } else {                                                                   \
+      ra.a = ra.b = ra.c = ra.d = 0u;                                          \
+    }                                                                          \
+    if (wrow_ok) {                                                             \
+      rw = *(const IPv8 *)(wptr + ((K0) >> 1));                                \
+    } else {                                                                   \
+      rw.a = rw.b = 0u;                                                        \
+    }                                                                          \
+  } while (0)
+
+#define IPG_STORE(BUF)                                                         \
+  do {                                                                         \
+    unsigned int lo = rw.a & 0x0F0F0F0Fu;                                      \
+    unsigned int hi = (rw.a >> 4) & 0x0F0F0F0Fu;                               \
+    wv.a = ip_nib2i8(__byte_perm(lo, hi, 0x5140), cx);                         \
+    wv.b = ip_nib2i8(__byte_perm(lo, hi, 0x7362), cx);                         \
+    lo = rw.b & 0x0F0F0F0Fu;                                                   \
+    hi = (rw.b >> 4) & 0x0F0F0F0Fu;                                            \
+    wv.c = ip_nib2i8(__byte_perm(lo, hi, 0x5140), cx);                         \
+    wv.d = ip_nib2i8(__byte_perm(lo, hi, 0x7362), cx);                         \
+    rsacc = __dp4a(0x01010101, (int)wv.a, rsacc);                              \
+    rsacc = __dp4a(0x01010101, (int)wv.b, rsacc);                              \
+    rsacc = __dp4a(0x01010101, (int)wv.c, rsacc);                              \
+    rsacc = __dp4a(0x01010101, (int)wv.d, rsacc);                              \
+    *(IPv16 *)((signed char *)Asv[BUF] + sdst) = ra;                           \
+    *(IPv16 *)((signed char *)Wsv[BUF] + sdst) = wv;                           \
+  } while (0)
+
+  IPG_LOAD(0);
+  IPG_STORE(0);
+  __syncthreads();
+
+  int cur = 0;
+  for (int k0 = 0; k0 < K; k0 += IP_BK) {
+    const int knext = k0 + IP_BK;
+    if (knext < K)
+      IPG_LOAD(knext);
+
+    const signed char *Ab =
+      (const signed char *)Asv[cur] + (wm * 16 + g) * IP_LD;
+    const signed char *Bb =
+      (const signed char *)Wsv[cur] + (wn * 32 + g) * IP_LD;
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const int ko = h * 32 + 4 * t;
+      int a0 = *(const int *)(Ab + ko);
+      int a1 = *(const int *)(Ab + 8 * IP_LD + ko);
+      int a2 = *(const int *)(Ab + ko + 16);
+      int a3 = *(const int *)(Ab + 8 * IP_LD + ko + 16);
+#pragma unroll
+      for (int s = 0; s < 4; ++s) {
+        const signed char *Bs = Bb + s * 8 * IP_LD;
+        int b0 = *(const int *)(Bs + ko);
+        int b1 = *(const int *)(Bs + ko + 16);
+        asm volatile(
+          "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32.satfinite "
+          "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
+          : "=r"(acc[s][0]), "=r"(acc[s][1]), "=r"(acc[s][2]), "=r"(acc[s][3])
+          : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1),
+            "r"(acc[s][0]), "r"(acc[s][1]), "r"(acc[s][2]), "r"(acc[s][3]));
+      }
+    }
+
+    if (knext < K) {
+      IPG_STORE(cur ^ 1);
+      __syncthreads();
+      cur ^= 1;
+    }
+  }
+#undef IPG_LOAD
+#undef IPG_STORE
+
+  {
+    int v = rsacc;
+    v += __shfl_down_sync(0xffffffffu, v, 1);
+    v += __shfl_down_sync(0xffffffffu, v, 2);
+    if (ssub == 0)
+      rsh[srow] = v;
+    __syncthreads();
+  }
+#pragma unroll
+  for (int s = 0; s < 4; ++s) {
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+      const int lrow = wm * 16 + g + ((r >> 1) ? 8 : 0);
+      const int cb = wn * 32 + s * 8 + 2 * t + (r & 1);
+      const int col = blockN + cb;
+      if (col < N) {
+        const int tok = toks[lrow];
+        float v = 0.0f;
+        if (tok >= 0)
+          v = (float)(acc[s][r] - azp[tok] * rsh[cb]) * ascale[tok] *
+              dp4a_h2f(wscale[col]);
+        if (out_fp16)
+          ((unsigned short *)Y)[(long)(blockM + lrow) * N + col] = dp4a_f2h(v);
+        else
+          Y[(long)(blockM + lrow) * N + col] = v;
+      }
+    }
+  }
+}
+
 __global__ void dp4a_gemv_fused_h(const unsigned short *Xh,
                                   const signed char *plain,
                                   const int *wrowsum,
@@ -1786,6 +1969,7 @@ static bool dp4a_stage_scratch(unsigned int M, unsigned int K) {
                     sizeof(int) * (size_t)M);
 }
 
+
 // --- cuBLAS int8 IMMA (Tensor Core) prefill weight cache ------------------
 /**
  * @brief int8-unpacked weight [K,N] + per-channel rowsum for the cuBLAS int8
@@ -1932,6 +2116,41 @@ static DevWeightI8 *ensure_i8_cache_locked(const unsigned char *plain_w,
 }
 
 } // namespace
+
+// One grouped-MoE GEMM launch: every expert's rows in one grid (see the
+// kernel comment). All buffers are caller-owned (cuda_moe.cpp) -- this
+// function touches none of the dp4a scratch, so it takes no lock. N and K
+// must be multiples of 64 (both 35B projections qualify: 512/2048); the
+// per-expert payload alignment is the CALLER's table-build-time check.
+bool cuda_fc_qs4cx_moe_grouped_gemm(
+  const signed char *q8, const int *tokid, const unsigned long long *wp_tab,
+  const unsigned long long *ws_tab, const int *block_expert,
+  const float *ascale, const int *azp, void *Y, unsigned int n_mblocks,
+  unsigned int N, unsigned int K, int out_fp16) {
+  if (q8 == nullptr || wp_tab == nullptr || ws_tab == nullptr ||
+      block_expert == nullptr || Y == nullptr || n_mblocks == 0 ||
+      (N & 63u) != 0u || (K & 63u) != 0u)
+    return false;
+  auto kg = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
+                                                     "imma_moe_grouped");
+  if (!kg)
+    return false;
+  const int n = (int)N, k = (int)K;
+  kg->SetKernelArguments(0, &q8, sizeof(q8));
+  kg->SetKernelArguments(1, &tokid, sizeof(tokid));
+  kg->SetKernelArguments(2, &wp_tab, sizeof(wp_tab));
+  kg->SetKernelArguments(3, &ws_tab, sizeof(ws_tab));
+  kg->SetKernelArguments(4, &block_expert, sizeof(block_expert));
+  kg->SetKernelArguments(5, &ascale, sizeof(ascale));
+  kg->SetKernelArguments(6, &azp, sizeof(azp));
+  kg->SetKernelArguments(7, &Y, sizeof(Y));
+  kg->SetKernelArguments(8, &n, sizeof(n));
+  kg->SetKernelArguments(9, &k, sizeof(k));
+  kg->SetKernelArguments(10, &out_fp16, sizeof(out_fp16));
+  const int ib[3] = {256, 1, 1};
+  const int ig[3] = {(int)(N / 64u), (int)n_mblocks, 1};
+  return StreamManager::Global().DispatchCommand(*kg, ig, ib);
+}
 
 bool cuda_fc_qs4cx_gemm_fp32(const float *X, const unsigned char *plain_w,
                              const unsigned short *scales_fp16, float *Y,

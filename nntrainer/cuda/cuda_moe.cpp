@@ -7,6 +7,7 @@
 
 #include <cuda_context.h>
 #include <cuda_context_manager.h>
+#include <cuda_fc_qint4.h> // cuda_fc_qs4cx_moe_grouped_gemm (imma tile)
 #include <cuda_runtime.h>
 #include <cuda_stream_manager.h>
 #include <cstdio>
@@ -401,6 +402,80 @@ __global__ void moe_route_bucket(const int *tk_idx, const float *tk_wt,
   const int slot = atomicAdd(&cursor[e], 1);
   rows[slot] = (int)(i / K);
   wts[slot] = tk_wt[i];
+}
+
+// ---- grouped (padded work-list) routing tail --------------------------------
+// Sort each token's K (expert, weight) pairs by ASCENDING EXPERT ID, after the
+// normalization already happened in topk order. Values are untouched, only
+// their storage order changes -- which makes the j index of slots[t*K+j] an
+// e-ascending walk, so the sequential combine reproduces the per-expert host
+// loop's e-ascending fp16 accumulation order EXACTLY (bit-exactness contract).
+__global__ void moe_tk_esort(int *tk_idx, float *tk_wt, int T, int K){
+  const int t = blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= T) return;
+  int   *ei = tk_idx + (long)t * K;
+  float *ew = tk_wt + (long)t * K;
+  for (int a = 1; a < K; ++a) {
+    int e = ei[a]; float w = ew[a]; int b = a - 1;
+    for (; b >= 0 && ei[b] > e; --b) { ei[b+1] = ei[b]; ew[b+1] = ew[b]; }
+    ei[b+1] = e; ew[b+1] = w;
+  }
+}
+
+// Padded scan (vLLM moe_align_block_size shape): every expert's bucket starts
+// at a multiple of BM in the gathered row space, and the block work list maps
+// grid block b -> its expert (or -1 = padding block, self-discard). The HOST
+// never reads any of this: Wcap is the data-independent worst case
+// ceil(T*K/BM) + E, computed from shapes alone.
+__global__ void moe_route_scan_pad(const int *counts, int *cursor, int *wl_e,
+                                   int E, int BM, int Wcap){
+  if (threadIdx.x != 0) return;
+  int accp = 0, w = 0;
+  for (int e = 0; e < E; ++e) {
+    cursor[e] = accp;
+    const int nb = (counts[e] + BM - 1) / BM;
+    for (int i = 0; i < nb && w < Wcap; ++i) wl_e[w++] = e;
+    accp += nb * BM;
+  }
+  for (; w < Wcap; ++w) wl_e[w] = -1;
+}
+
+// bucket + reverse map: slots[t*K+j] = the gathered row of token t's j-th
+// assignment. With moe_tk_esort applied first, j order IS e-ascending order.
+// rows[] must be pre-filled with -1 so per-expert padding tails read as
+// "no source token" in the grouped GEMM's A staging.
+__global__ void moe_route_bucket_rev(const int *tk_idx, const float *tk_wt,
+                                     int *cursor, int *rows, float *wts,
+                                     int *slots, int T, int K){
+  const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= (long)T * K) return;
+  const int e = tk_idx[i];
+  const int slot = atomicAdd(&cursor[e], 1);
+  rows[slot] = (int)(i / K);
+  wts[slot] = tk_wt[i];
+  slots[i] = slot;
+}
+
+// Sequential-rounding combine: bit-identical to the per-expert path's
+// moe_scatter_add_h sequence (one fp16 round after EVERY expert, dst starting
+// from zero), walked in slots' j order == e-ascending. moe_combine_h (fp32
+// accumulate, one final round) is the better-precision variant but does NOT
+// reproduce the per-expert bytes; this one exists so the grouped path can be
+// gated as bit-identical before anything else is argued about.
+__global__ void moe_combine_seq_h(const unsigned short *Y, unsigned short *out,
+                                  const int *slots, const float *wts,
+                                  int T, int topk, int width){
+  const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= (long)T * width) return;
+  const int t = (int)(idx / width);
+  const int w = (int)(idx - (long)t * width);
+  unsigned short acc = (unsigned short)0; // fp16 +0
+  for (int k = 0; k < topk; ++k) {
+    const int a = slots[(long)t * topk + k];
+    if (a >= 0)
+      acc = moe_f2h(moe_h2f(acc) + moe_h2f(Y[(long)a * width + w]) * wts[a]);
+  }
+  out[(long)t * width + w] = acc;
 }
 } // extern "C"
 )CU";
@@ -797,6 +872,184 @@ bool cuda_moe_expert_ffn_fp16(const unsigned short *input,
     const size_t s[] = {PS,          PS,          PS,         PS,
                         sizeof(int), sizeof(int), sizeof(int)};
     if (!dispatch1d("moe_combine_h", a, s, 7, (long)T * H, 256))
+      return false;
+  }
+  return true;
+}
+
+// ---- padded grouped routing (vLLM moe_align_block_size shape) --------------
+// Everything the per-expert loop needed the host to know (counts, offsets)
+// stays on the device: the grid is sized from shapes alone (Wcap, Pcap) and
+// padding blocks self-discard on wl_e == -1. No finish() anywhere.
+bool cuda_moe_route_grouped_fp32(const float *logits, int *rows, float *wts,
+                                 int *counts, int *wl_e, int *slots,
+                                 unsigned int T, unsigned int E,
+                                 unsigned int K, unsigned int BM,
+                                 unsigned int Wcap, unsigned int Pcap) {
+  if (T == 0 || E == 0 || K == 0 || BM == 0 || Wcap == 0 || Pcap == 0)
+    return false;
+  // device-only intermediates (same lifetime pattern as cuda_moe_route_fp32)
+  static int *d_idx = nullptr;
+  static float *d_wt = nullptr;
+  static int *d_cur = nullptr;
+  static size_t c_idx = 0, c_wt = 0, c_cur = 0;
+  std::lock_guard<std::mutex> lk(g_moe_mtx);
+  if (!grow_dev((void **)&d_idx, &c_idx, (size_t)T * K * 4) ||
+      !grow_dev((void **)&d_wt, &c_wt, (size_t)T * K * 4) ||
+      !grow_dev((void **)&d_cur, &c_cur, (size_t)E * 4))
+    return false;
+  auto &sm = StreamManager::Global();
+  auto &ctx = CudaContext::Global();
+  cudaStream_t st = sm.GetStream();
+  if (cudaMemsetAsync(counts, 0, (size_t)E * 4, st) != cudaSuccess)
+    return false;
+  // rows pre-filled with -1: per-expert padding tails must read as "no source
+  // token" in the grouped GEMM's A staging.
+  if (cudaMemsetAsync(rows, 0xFF, (size_t)Pcap * 4, st) != cudaSuccess)
+    return false;
+  const size_t PS = sizeof(void *);
+  int iT = (int)T, iE = (int)E, iK = (int)K, iBM = (int)BM, iW = (int)Wcap;
+  { // softmax + top-k + normalize (bit-identical to the per-expert path)
+    auto k = ctx.registerCudaKernel(MOE_SRC, "moe_route_topk");
+    if (!k)
+      return false;
+    k->SetKernelArguments(0, &logits, PS);
+    k->SetKernelArguments(1, &d_idx, PS);
+    k->SetKernelArguments(2, &d_wt, PS);
+    k->SetKernelArguments(3, &counts, PS);
+    k->SetKernelArguments(4, &iT, sizeof(int));
+    k->SetKernelArguments(5, &iE, sizeof(int));
+    k->SetKernelArguments(6, &iK, sizeof(int));
+    const int g[3] = {iT, 1, 1}, b[3] = {256, 1, 1};
+    if (!sm.DispatchCommand(*k, g, b, (unsigned int)(E * sizeof(float))))
+      return false;
+  }
+  { // e-ascending sort of each token's pairs (order only, values untouched)
+    void *a[] = {(void *)&d_idx, (void *)&d_wt, &iT, &iK};
+    const size_t s[] = {PS, PS, sizeof(int), sizeof(int)};
+    if (!dispatch1d("moe_tk_esort", a, s, 4, (long)T, 256))
+      return false;
+  }
+  { // padded offsets + block work list, single-threaded over E like the scan
+    void *a[] = {(void *)&counts, (void *)&d_cur, (void *)&wl_e,
+                 &iE,             &iBM,           &iW};
+    const size_t s[] = {PS, PS, PS, sizeof(int), sizeof(int), sizeof(int)};
+    auto k = ctx.registerCudaKernel(MOE_SRC, "moe_route_scan_pad");
+    if (!k)
+      return false;
+    for (int i = 0; i < 6; ++i)
+      k->SetKernelArguments(i, a[i], s[i]);
+    const int g[3] = {1, 1, 1}, b[3] = {32, 1, 1};
+    if (!sm.DispatchCommand(*k, g, b))
+      return false;
+  }
+  { // bucket into padded slots + reverse map
+    void *a[] = {(void *)&d_idx, (void *)&d_wt, (void *)&d_cur, (void *)&rows,
+                 (void *)&wts,   (void *)&slots, &iT,           &iK};
+    const size_t s[] = {PS, PS, PS, PS, PS, PS, sizeof(int), sizeof(int)};
+    if (!dispatch1d("moe_route_bucket_rev", a, s, 8, (long)T * K, 256))
+      return false;
+  }
+  return true;
+}
+
+// ---- grouped expert FFN on the int4 Tensor-Core tile -----------------------
+// The imma_gemm_pipe variant (cuda_fc_qint4.cpp: imma_moe_grouped) with the M
+// axis on the padded work list. Differences from cuda_moe_expert_ffn_fp16:
+// no gather and no per-assignment quant -- the layer input is quantized ONCE
+// ([T,H] rows; per-row params are identical to quantizing gathered copies, so
+// this is bit-exact) and the gate/up GEMMs read rows through p.rows; only the
+// SwiGLU output lives (and quantizes) in gathered space.
+bool cuda_moe_grouped_ffn_imma(const unsigned short *input,
+                               unsigned short *output, const MoePlan &p,
+                               unsigned int T, unsigned int topk,
+                               unsigned int H, unsigned int I,
+                               unsigned int Pcap, unsigned int Wcap) {
+  if (T == 0 || Pcap == 0 || Wcap == 0)
+    return true;
+  if ((H & 63u) != 0u || (I & 63u) != 0u)
+    return false; // the tile has no k tail and needs N%64==0 too (H,I serve
+                  // as both N and K across the three projections)
+  std::lock_guard<std::mutex> lk(g_moe_mtx);
+  if (!grow_dev((void **)&g_G, &c_G, (size_t)Pcap * I * 2) ||
+      !grow_dev((void **)&g_U, &c_U, (size_t)Pcap * I * 2) ||
+      !grow_dev((void **)&g_S, &c_S, (size_t)Pcap * I * 2) ||
+      !grow_dev((void **)&g_Y, &c_Y, (size_t)Pcap * H * 2) ||
+      !grow_dev((void **)&g_qa, &c_qa, (size_t)T * H) ||
+      !grow_dev((void **)&g_qb, &c_qb, (size_t)Pcap * I) ||
+      !grow_dev((void **)&g_sa, &c_sa, (size_t)T * 4) ||
+      !grow_dev((void **)&g_sb, &c_sb, (size_t)Pcap * 4) ||
+      !grow_dev((void **)&g_za, &c_za, (size_t)T * 4) ||
+      !grow_dev((void **)&g_zb, &c_zb, (size_t)Pcap * 4)) {
+    std::fprintf(stderr, "[cuda_moe] grouped-imma scratch alloc FAILED "
+                         "(T=%u Pcap=%u): %s\n",
+                 T, Pcap, cudaGetErrorString(cudaGetLastError()));
+    return false;
+  }
+  auto &sm = StreamManager::Global();
+  auto &ctx = CudaContext::Global();
+  const size_t PS = sizeof(void *);
+  int iT = (int)T, iH = (int)H, iI = (int)I, iP = (int)Pcap, ik = (int)topk;
+
+  { // quantize the LAYER input once (shared by gate and up, all experts)
+    auto k = ctx.registerCudaKernel(MOE_SRC, "moe_actq_h");
+    if (!k)
+      return false;
+    k->SetKernelArguments(0, &input, PS);
+    k->SetKernelArguments(1, &g_qa, PS);
+    k->SetKernelArguments(2, &g_sa, PS);
+    k->SetKernelArguments(3, &g_za, PS);
+    k->SetKernelArguments(4, &iT, sizeof(int));
+    k->SetKernelArguments(5, &iH, sizeof(int));
+    const int g[3] = {iT, 1, 1}, b[3] = {256, 1, 1};
+    if (!sm.DispatchCommand(*k, g, b))
+      return false;
+  }
+  const auto *wp64 = reinterpret_cast<const unsigned long long *>(p.wptr);
+  const auto *ws64 = reinterpret_cast<const unsigned long long *>(p.wsc);
+  // gate, then up (the table order is up/gate/down -- off_* pick, see the
+  // trap note in cuda_moe_expert_ffn_fp16)
+  if (!cuda_fc_qs4cx_moe_grouped_gemm(g_qa, p.rows, wp64 + p.off_gate,
+                                      ws64 + p.off_gate, p.wl_e, g_sa, g_za,
+                                      g_G, Wcap, I, H, 1))
+    return false;
+  if (!cuda_fc_qs4cx_moe_grouped_gemm(g_qa, p.rows, wp64 + p.off_up,
+                                      ws64 + p.off_up, p.wl_e, g_sa, g_za, g_U,
+                                      Wcap, I, H, 1))
+    return false;
+  { // silu(gate) * up over the whole padded gathered space (pad rows are 0)
+    const long n = (long)Pcap * I;
+    int nn = (int)n;
+    void *a[] = {(void *)&g_G, (void *)&g_U, (void *)&g_S, &nn};
+    const size_t s[] = {PS, PS, PS, sizeof(int)};
+    if (!dispatch1d("moe_swiglu_h", a, s, 4, n, 256))
+      return false;
+  }
+  { // re-quantize the SwiGLU output (gathered space, direct rows)
+    auto k = ctx.registerCudaKernel(MOE_SRC, "moe_actq_h");
+    if (!k)
+      return false;
+    k->SetKernelArguments(0, &g_S, PS);
+    k->SetKernelArguments(1, &g_qb, PS);
+    k->SetKernelArguments(2, &g_sb, PS);
+    k->SetKernelArguments(3, &g_zb, PS);
+    k->SetKernelArguments(4, &iP, sizeof(int));
+    k->SetKernelArguments(5, &iI, sizeof(int));
+    const int g[3] = {iP, 1, 1}, b[3] = {256, 1, 1};
+    if (!sm.DispatchCommand(*k, g, b))
+      return false;
+  }
+  if (!cuda_fc_qs4cx_moe_grouped_gemm(g_qb, /*tokid=*/nullptr,
+                                      wp64 + p.off_down, ws64 + p.off_down,
+                                      p.wl_e, g_sb, g_zb, g_Y, Wcap, H, I, 1))
+    return false;
+  { // sequential-rounding combine: bit-identical to the per-expert scatter
+    void *a[] = {(void *)&g_Y, (void *)&output, (void *)&p.slots,
+                 (void *)&p.wts, &iT,           &ik,
+                 &iH};
+    const size_t s[] = {PS,          PS,          PS,         PS,
+                        sizeof(int), sizeof(int), sizeof(int)};
+    if (!dispatch1d("moe_combine_seq_h", a, s, 7, (long)T * H, 256))
       return false;
   }
   return true;
