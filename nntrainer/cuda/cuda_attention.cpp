@@ -1060,10 +1060,11 @@ __device__ __forceinline__ unsigned short sm_f2h(float f) {
   return h;
 }
 __global__ void attn_softmax_fp16(unsigned short *scores, int N_q, int N_kv,
-                                  int cache_from, int window, float softcap) {
+                                  int ld_s, int cache_from, int window,
+                                  float softcap) {
   int i = blockIdx.x;
   if (i >= N_q) return;
-  unsigned short *row = scores + (long)i * N_kv;
+  unsigned short *row = scores + (long)i * ld_s;
   int i_abs = cache_from + i;
   int j_hi = i_abs < N_kv - 1 ? i_abs : N_kv - 1;
   int j_lo = (window > 0) ? i_abs - window + 1 : 0;
@@ -1342,8 +1343,14 @@ bool attention_gemm_prefill_fp16(const unsigned short *q,
                                                      "attn_softmax_fp16");
   if (!sm)
     return false;
-  // scratch scores [N_q, N_kv] fp16 reused across heads (heads run serially).
-  const size_t need = (size_t)N_q * N_kv;
+  // scratch scores [N_q, ld_s] fp16 reused across heads (heads run serially).
+  // ld_s pads the leading dimension to a multiple of 16 elements (32 B): an
+  // odd N_kv (the last chunk's 20,463) misaligns every score column, which
+  // measured 28-39% slower on both GEMMs. Padding columns are written by
+  // nothing and read by nothing (QK^T writes N_kv rows; PV's K loop stops at
+  // N_kv; the softmax row pointer strides by ld_s) -- output is byte-exact.
+  const int ld_s = (N_kv + 15) & ~15;
+  const size_t need = (size_t)N_q * ld_s;
   if (need > g_scores_cap) {
     // This runs on the PREFILL path, which IS graph-captured on an integrated
     // GPU. A cudaFree/cudaMalloc there does not merely fail -- it INVALIDATES
@@ -1375,6 +1382,32 @@ bool attention_gemm_prefill_fp16(const unsigned short *q,
   const int win = (window <= 0 || window >= N_kv) ? 0 : window;
   const int B = 256;
   const size_t shmem = (size_t)B * sizeof(float);
+  // NNTR_ATTN_DBG=1: per-stage GPU ms via events, printed for the FIRST call
+  // at each distinct N_kv (so every prefill chunk shape gets one sample).
+  static const bool g_adbg = []() {
+    const char *e = std::getenv("NNTR_ATTN_DBG");
+    return e != nullptr && e[0] == '1';
+  }();
+  static int g_adbg_seen[8];
+  static int g_adbg_n = 0;
+  bool adbg_this = false;
+  if (g_adbg && HQ <= 16) {
+    bool seen = false;
+    for (int i = 0; i < g_adbg_n; ++i)
+      if (g_adbg_seen[i] == N_kv)
+        seen = true;
+    if (!seen && g_adbg_n < 8) {
+      g_adbg_seen[g_adbg_n++] = N_kv;
+      adbg_this = true;
+    }
+  }
+  cudaEvent_t aev[1 + 3 * 16];
+  cudaStream_t astream = StreamManager::Global().GetStream();
+  if (adbg_this) {
+    for (int i = 0; i < 1 + 3 * HQ; ++i)
+      cudaEventCreate(&aev[i]);
+    cudaEventRecord(aev[0], astream);
+  }
   for (int h = 0; h < HQ; ++h) {
     const int hkv = h / gqa;
     const unsigned short *Qh = q + (long)h * d;   // [N_q,d] ld=HD_Q
@@ -1386,26 +1419,51 @@ bool attention_gemm_prefill_fp16(const unsigned short *q,
     cublasStatus_t s1 =
       cublasGemmEx(bh, CUBLAS_OP_T, CUBLAS_OP_N, N_kv, N_q, d, &scale, Kh,
                    CUDA_R_16F, HD_KV, Qh, CUDA_R_16F, HD_Q, &zero, scores,
-                   CUDA_R_16F, N_kv, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+                   CUDA_R_16F, ld_s, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
     if (s1 != CUBLAS_STATUS_SUCCESS)
       return false;
+    if (adbg_this)
+      cudaEventRecord(aev[1 + 3 * h], astream);
     sm->SetKernelArguments(0, &scores, sizeof(scores));
     sm->SetKernelArguments(1, &N_q, sizeof(N_q));
     sm->SetKernelArguments(2, &N_kv, sizeof(N_kv));
-    sm->SetKernelArguments(3, &cache_from, sizeof(cache_from));
-    sm->SetKernelArguments(4, &win, sizeof(win));
-    sm->SetKernelArguments(5, &softcap, sizeof(softcap));
+    sm->SetKernelArguments(3, &ld_s, sizeof(ld_s));
+    sm->SetKernelArguments(4, &cache_from, sizeof(cache_from));
+    sm->SetKernelArguments(5, &win, sizeof(win));
+    sm->SetKernelArguments(6, &softcap, sizeof(softcap));
     const int sg[3] = {N_q, 1, 1};
     const int sb[3] = {B, 1, 1};
     if (!StreamManager::Global().DispatchCommand(*sm, sg, sb, shmem))
       return false;
+    if (adbg_this)
+      cudaEventRecord(aev[2 + 3 * h], astream);
     // O_cm[d,N_q] = V_h[d,N_kv] @ scores_cm[N_kv,N_q] -> row-major O[i,e].
     cublasStatus_t s2 =
       cublasGemmEx(bh, CUBLAS_OP_N, CUBLAS_OP_N, d, N_q, N_kv, &one, Vh,
-                   CUDA_R_16F, HD_KV, scores, CUDA_R_16F, N_kv, &zero, Oh,
+                   CUDA_R_16F, HD_KV, scores, CUDA_R_16F, ld_s, &zero, Oh,
                    CUDA_R_16F, HD_Q, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
     if (s2 != CUBLAS_STATUS_SUCCESS)
       return false;
+    if (adbg_this)
+      cudaEventRecord(aev[3 + 3 * h], astream);
+  }
+  if (adbg_this) {
+    cudaEventSynchronize(aev[3 * HQ]);
+    float t_qkt = 0.f, t_sm = 0.f, t_pv = 0.f, ms = 0.f;
+    for (int h = 0; h < HQ; ++h) {
+      cudaEventElapsedTime(&ms, aev[3 * h], aev[1 + 3 * h]);
+      t_qkt += ms;
+      cudaEventElapsedTime(&ms, aev[1 + 3 * h], aev[2 + 3 * h]);
+      t_sm += ms;
+      cudaEventElapsedTime(&ms, aev[2 + 3 * h], aev[3 + 3 * h]);
+      t_pv += ms;
+    }
+    fprintf(stderr,
+            "[attn_dbg] Nq=%d Nkv=%d from=%d qkt=%.2fms softmax=%.2fms "
+            "pv=%.2fms total=%.2fms\n",
+            N_q, N_kv, cache_from, t_qkt, t_sm, t_pv, t_qkt + t_sm + t_pv);
+    for (int i = 0; i < 1 + 3 * HQ; ++i)
+      cudaEventDestroy(aev[i]);
   }
   return true;
 }
