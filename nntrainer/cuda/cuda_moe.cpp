@@ -456,6 +456,54 @@ __global__ void moe_route_bucket_rev(const int *tk_idx, const float *tk_wt,
   slots[i] = slot;
 }
 
+// Work-list-indexed SwiGLU + act-quant for the grouped path: blockIdx.y walks
+// the SAME padded block work list as the GEMMs, so padding blocks self-discard
+// on wl_e == -1 instead of processing Pcap-worth of dead rows (2.6x of the
+// real rows at a 1.3K chunk). One block = one 64-row tile of the gathered
+// space; grid.x covers the feature dim.
+__global__ void moe_swiglu_wl(const unsigned short *gate,
+                              const unsigned short *up, unsigned short *out,
+                              const int *wl_e, int I){
+  if (wl_e[blockIdx.y] < 0) return;
+  const long base = (long)blockIdx.y*64*I;
+  const long n = 64L*I;
+  for (long i = (long)blockIdx.x*blockDim.x + threadIdx.x; i < n;
+       i += (long)gridDim.x*blockDim.x) {
+    const float g = moe_h2f(gate[base + i]);
+    out[base + i] = moe_f2h((g / (1.0f + expf(-g))) * moe_h2f(up[base + i]));
+  }
+}
+__global__ void moe_actq_wl(const unsigned short *Xh, signed char *q8,
+                            float *ascale, int *azp, const int *wl_e, int K){
+  if (wl_e[blockIdx.y] < 0) return;
+  const int m = blockIdx.y*64 + blockIdx.x; // gathered row
+  __shared__ float smn[256];
+  __shared__ float smx[256];
+  const unsigned short *xr = Xh + (long)m*K;
+  float lmn = 0.f, lmx = 0.f;
+  for (int k = threadIdx.x; k < K; k += blockDim.x) {
+    float v = moe_h2f(xr[k]);
+    lmn = fminf(lmn, v); lmx = fmaxf(lmx, v);
+  }
+  smn[threadIdx.x] = lmn; smx[threadIdx.x] = lmx;
+  __syncthreads();
+  for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+    if (threadIdx.x < s) {
+      smn[threadIdx.x] = fminf(smn[threadIdx.x], smn[threadIdx.x+s]);
+      smx[threadIdx.x] = fmaxf(smx[threadIdx.x], smx[threadIdx.x+s]);
+    }
+    __syncthreads();
+  }
+  float scale_q, recip; int zp;
+  moe_asym(smn[0], smx[0], scale_q, recip, zp);
+  if (threadIdx.x == 0) { ascale[m] = recip; azp[m] = zp; }
+  for (int k = threadIdx.x; k < K; k += blockDim.x) {
+    int q = (int)rintf(moe_h2f(xr[k]) * scale_q) + zp;
+    q = max(-128, min(127, q));
+    q8[(long)m*K + k] = (signed char)q;
+  }
+}
+
 // Sequential-rounding combine: bit-identical to the per-expert path's
 // moe_scatter_add_h sequence (one fp16 round after EVERY expert, dst starting
 // from zero), walked in slots' j order == e-ascending. moe_combine_h (fp32
@@ -991,6 +1039,23 @@ bool cuda_moe_grouped_ffn_imma(const unsigned short *input,
   const size_t PS = sizeof(void *);
   int iT = (int)T, iH = (int)H, iI = (int)I, iP = (int)Pcap, ik = (int)topk;
 
+  // NNTR_MOE_G_DBG=1: per-launch GPU ms via events (first few calls only).
+  static const bool g_dbg = []() {
+    const char *e = std::getenv("NNTR_MOE_G_DBG");
+    return e != nullptr && e[0] == '1';
+  }();
+  static int g_dbg_n = 0;
+  cudaEvent_t ev[8];
+  const bool dbg_this = g_dbg && g_dbg_n < 3;
+  if (dbg_this)
+    for (int i = 0; i < 8; ++i)
+      cudaEventCreate(&ev[i]);
+  auto stamp = [&](int i) {
+    if (dbg_this)
+      cudaEventRecord(ev[i], sm.GetStream());
+  };
+  stamp(0);
+
   { // quantize the LAYER input once (shared by gate and up, all experts)
     auto k = ctx.registerCudaKernel(MOE_SRC, "moe_actq_h");
     if (!k)
@@ -1005,6 +1070,7 @@ bool cuda_moe_grouped_ffn_imma(const unsigned short *input,
     if (!sm.DispatchCommand(*k, g, b))
       return false;
   }
+  stamp(1);
   const auto *wp64 = reinterpret_cast<const unsigned long long *>(p.wptr);
   const auto *ws64 = reinterpret_cast<const unsigned long long *>(p.wsc);
   // gate, then up (the table order is up/gate/down -- off_* pick, see the
@@ -1013,36 +1079,46 @@ bool cuda_moe_grouped_ffn_imma(const unsigned short *input,
                                       ws64 + p.off_gate, p.wl_e, g_sa, g_za,
                                       g_G, Wcap, I, H, 1))
     return false;
+  stamp(2);
   if (!cuda_fc_qs4cx_moe_grouped_gemm(g_qa, p.rows, wp64 + p.off_up,
                                       ws64 + p.off_up, p.wl_e, g_sa, g_za, g_U,
                                       Wcap, I, H, 1))
     return false;
-  { // silu(gate) * up over the whole padded gathered space (pad rows are 0)
-    const long n = (long)Pcap * I;
-    int nn = (int)n;
-    void *a[] = {(void *)&g_G, (void *)&g_U, (void *)&g_S, &nn};
-    const size_t s[] = {PS, PS, PS, sizeof(int)};
-    if (!dispatch1d("moe_swiglu_h", a, s, 4, n, 256))
+  stamp(3);
+  { // silu(gate) * up, work-list-indexed: padding blocks self-discard
+    auto k = ctx.registerCudaKernel(MOE_SRC, "moe_swiglu_wl");
+    if (!k)
+      return false;
+    k->SetKernelArguments(0, &g_G, PS);
+    k->SetKernelArguments(1, &g_U, PS);
+    k->SetKernelArguments(2, &g_S, PS);
+    k->SetKernelArguments(3, &p.wl_e, PS);
+    k->SetKernelArguments(4, &iI, sizeof(int));
+    const int g[3] = {32, (int)Wcap, 1}, b[3] = {256, 1, 1};
+    if (!sm.DispatchCommand(*k, g, b))
       return false;
   }
-  { // re-quantize the SwiGLU output (gathered space, direct rows)
-    auto k = ctx.registerCudaKernel(MOE_SRC, "moe_actq_h");
+  stamp(4);
+  { // re-quantize the SwiGLU output, work-list-indexed
+    auto k = ctx.registerCudaKernel(MOE_SRC, "moe_actq_wl");
     if (!k)
       return false;
     k->SetKernelArguments(0, &g_S, PS);
     k->SetKernelArguments(1, &g_qb, PS);
     k->SetKernelArguments(2, &g_sb, PS);
     k->SetKernelArguments(3, &g_zb, PS);
-    k->SetKernelArguments(4, &iP, sizeof(int));
+    k->SetKernelArguments(4, &p.wl_e, PS);
     k->SetKernelArguments(5, &iI, sizeof(int));
-    const int g[3] = {iP, 1, 1}, b[3] = {256, 1, 1};
+    const int g[3] = {64, (int)Wcap, 1}, b[3] = {256, 1, 1};
     if (!sm.DispatchCommand(*k, g, b))
       return false;
   }
+  stamp(5);
   if (!cuda_fc_qs4cx_moe_grouped_gemm(g_qb, /*tokid=*/nullptr,
                                       wp64 + p.off_down, ws64 + p.off_down,
                                       p.wl_e, g_sb, g_zb, g_Y, Wcap, H, I, 1))
     return false;
+  stamp(6);
   { // sequential-rounding combine: bit-identical to the per-expert scatter
     void *a[] = {(void *)&g_Y, (void *)&output, (void *)&p.slots,
                  (void *)&p.wts, &iT,           &ik,
@@ -1051,6 +1127,22 @@ bool cuda_moe_grouped_ffn_imma(const unsigned short *input,
                         sizeof(int), sizeof(int), sizeof(int)};
     if (!dispatch1d("moe_combine_seq_h", a, s, 7, (long)T * H, 256))
       return false;
+  }
+  stamp(7);
+  if (dbg_this) {
+    cudaEventSynchronize(ev[7]);
+    float ms[7];
+    const char *nm[7] = {"actq1", "gate", "up", "swiglu", "actq2", "down",
+                         "combine"};
+    fprintf(stderr, "[moe_g_dbg] T=%u ", T);
+    for (int i = 0; i < 7; ++i) {
+      cudaEventElapsedTime(&ms[i], ev[i], ev[i + 1]);
+      fprintf(stderr, "%s=%.2fms ", nm[i], ms[i]);
+    }
+    fprintf(stderr, "\n");
+    for (int i = 0; i < 8; ++i)
+      cudaEventDestroy(ev[i]);
+    ++g_dbg_n;
   }
   return true;
 }

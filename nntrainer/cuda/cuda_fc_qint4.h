@@ -108,6 +108,16 @@ bool cuda_fc_qs4cx_moe_grouped_gemm(
   const float *ascale, const int *azp, void *Y, unsigned int n_mblocks,
   unsigned int N, unsigned int K, int out_fp16);
 
+/**
+ * @brief fp16 activation in, FP32 out (the GDN projection variant): the same
+ *        act-quant + w4a8 ladder as the fp16 entry, writing float Y directly.
+ */
+bool cuda_fc_qs4cx_dp4a_gemm_fp16in_f32out(const unsigned short *Xh,
+                                           const unsigned char *plain_w,
+                                           const unsigned short *scales_fp16,
+                                           float *Yf, unsigned int M,
+                                           unsigned int N, unsigned int K);
+
 /** @brief NNTR_CUDA_FUSED_NORMQ (default on, =0 opts out): whether the decode
  *  RMSNorm may fold in the int8 activation quant of the FC group it feeds. */
 bool cuda_fc_qs4cx_fused_normq_enabled();

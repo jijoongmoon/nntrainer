@@ -2486,6 +2486,52 @@ bool cuda_fc_qs4cx_dp4a_gemm_fp16(const unsigned short *Xh,
   return true;
 }
 
+// fp16 activation in, FP32 out: the GDN projection variant. The gated
+// delta net consumes its projections in fp32 (conv/scan are fp32 end to
+// end), so when in_proj_qkv is QS4CX this entry runs the same act-quant +
+// w4a8 ladder as the fp16 entry but writes the float Y directly
+// (out_fp16=0) -- no extra convert kernel, no fp16 round-trip on a tensor
+// the fp32 reference path never rounded.
+bool cuda_fc_qs4cx_dp4a_gemm_fp16in_f32out(const unsigned short *Xh,
+                                           const unsigned char *plain_w,
+                                           const unsigned short *scales_fp16,
+                                           float *Yf, unsigned int M,
+                                           unsigned int N, unsigned int K) {
+  if (M == 0 || N == 0 || K == 0)
+    return true;
+  const bool q_vec4 = fused_normq_on() && cuda_vec4_rows_small(M) &&
+                      cuda_vec4_rows_ok(K, Xh);
+  auto kqh = CudaContext::Global().registerCudaKernel(
+    FC_QINT4_DP4A_SRC, q_vec4 ? "act_quant_i8_h_v4" : "act_quant_i8_h");
+  if (!kqh) {
+    ml_loge("[CUDA] fc_qint4 dp4a f32out: kernel registration failed");
+    return false;
+  }
+  std::lock_guard<std::mutex> lk(g_dp4a_mtx);
+  if (!dp4a_stage_scratch(M, K))
+    return false;
+  int m = (int)M, k = (int)K;
+  if (!quant_staged_for(Xh, k)) {
+    kqh->SetKernelArguments(0, &Xh, sizeof(Xh));
+    kqh->SetKernelArguments(1, &g_dp4a_q8, sizeof(g_dp4a_q8));
+    kqh->SetKernelArguments(2, &g_dp4a_ascale, sizeof(g_dp4a_ascale));
+    kqh->SetKernelArguments(3, &g_dp4a_azp, sizeof(g_dp4a_azp));
+    kqh->SetKernelArguments(4, &m, sizeof(m));
+    kqh->SetKernelArguments(5, &k, sizeof(k));
+    const int qb[3] = {q_vec4 ? 512 : 256, 1, 1};
+    const int qg[3] = {(int)M, 1, 1};
+    if (!StreamManager::Global().DispatchCommand(*kqh, qg, qb))
+      return false;
+  }
+  if (!dp4a_repack_and_gemm(plain_w, scales_fp16, Yf, M, N, K,
+                            /** out_fp16= */ 0))
+    return false;
+  if (fused_normq_on())
+    mark_quant_staged(Xh, k);
+  StreamManager::Global().maybeFinish();
+  return true;
+}
+
 // [i8-jit] Optional transient JIT int8 weight unpack (NNTR_CUDA_I8_JIT): unpack
 // the resident dp4a packed-int4 weight to int8 on the GPU per-prefill into a
 // reusable scratch, instead of keeping a persistent per-weight int8 cache --

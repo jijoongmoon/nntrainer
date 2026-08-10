@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cuda_context_manager.h>
 #include <cuda_fc_dense.h>
+#include <cuda_fc_qint4.h> // QS4CX in_proj_qkv (the gdnq bin variant)
 #include <cuda_gdn.h>
 #include <cuda_stream_manager.h>
 #endif
@@ -327,7 +328,13 @@ void GatedDeltaNetLayer::runForward(nntrainer::RunLayerContext &context,
     nntrainer::Tensor &Wb = context.getWeight(w_in_proj_b);
     nntrainer::Tensor &Wa = context.getWeight(w_in_proj_a);
     const void *xp = input.getData<_FP16>();
-    if (Wqkv.getDataType() == FP16D && Wz.getDataType() == FP16D &&
+    // in_proj_qkv may be QS4CX (4-bit, the gdnq bin variant): it then rides
+    // the same act-quant + w4a8 ladder as the expert FCs, writing fp32
+    // directly (the conv/scan consume fp32). z/b/a stay fp16 dense.
+    const auto QS4D = ml::train::TensorDim::DataType::QS4CX;
+    const bool qkv_q4 = (Wqkv.getDataType() == QS4D);
+    if ((Wqkv.getDataType() == FP16D || qkv_q4) &&
+        Wz.getDataType() == FP16D &&
         Wb.getDataType() == FP16D && Wa.getDataType() == FP16D &&
         nntrainer::cuda::dev_accessible(xp) &&
         nntrainer::cuda::dev_accessible(pq_w) &&
@@ -336,11 +343,24 @@ void GatedDeltaNetLayer::runForward(nntrainer::RunLayerContext &context,
         nntrainer::cuda::dev_accessible(pa_w)) {
       using nntrainer::cuda::cuda_fc_dense_gemm_fp16_f32out;
       const unsigned uT = (unsigned)T, uH = (unsigned)H;
+      int qkv_ok = 0;
+      if (qkv_q4) {
+        const unsigned short *qsc = nullptr;
+        qkv_ok =
+          (int)(nntrainer::cuda::cuda_fc_qs4cx_scales_to_uvm_fp16(
+                  Wqkv.getScale<float>(), (unsigned)CONV, &qsc) &&
+                nntrainer::cuda::cuda_fc_qs4cx_dp4a_gemm_fp16in_f32out(
+                  reinterpret_cast<const unsigned short *>(xp),
+                  Wqkv.getData<uint8_t>(), qsc, pq_w, uT, (unsigned)CONV, uH));
+      } else {
+        qkv_ok = (int)cuda_fc_dense_gemm_fp16_f32out(xp, Wqkv.getData<_FP16>(),
+                                                     pq_w, uT, (unsigned)CONV,
+                                                     uH);
+      }
       // & not && on purpose: a partial failure must not leave some outputs
       // written and others stale, and the host fallback rewrites all four.
       proj_gpu =
-        (int)cuda_fc_dense_gemm_fp16_f32out(xp, Wqkv.getData<_FP16>(), pq_w, uT,
-                                            (unsigned)CONV, uH) &
+        qkv_ok &
         (int)cuda_fc_dense_gemm_fp16_f32out(xp, Wz.getData<_FP16>(), pz_w, uT,
                                             (unsigned)VAL, uH) &
         (int)cuda_fc_dense_gemm_fp16_f32out(xp, Wb.getData<_FP16>(), pb_w, uT,
