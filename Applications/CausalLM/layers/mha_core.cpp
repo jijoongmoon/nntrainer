@@ -477,6 +477,11 @@ static inline unsigned int mha_effective_chunk() {
     return 0;
 #if defined(__aarch64__) || defined(__arm__) || defined(_M_ARM64) ||           \
   defined(_M_ARM)
+  // Lockstep with causallm::effectivePrefillChunk(): CUDA on aarch64 chunks
+  // by default (the Adreno restride reason does not apply to it).
+  const char *eng = std::getenv("NNTR_ENGINE");
+  if (eng && (eng[0] == 'c' || eng[0] == 'C'))
+    return 4096u;
   return 0u;
 #else
   return 4096u;

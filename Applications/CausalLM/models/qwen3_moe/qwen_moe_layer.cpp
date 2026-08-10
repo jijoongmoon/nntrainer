@@ -1100,7 +1100,21 @@ void MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       const char *e = std::getenv("NNTR_CUDA_MOE_GROUPED");
       return e ? std::atoi(e) : -1; // =2 is the imma grouped path, above
     }();
-    const bool grouped_on = (grouped_env == 1);
+    // TRAP DEFUSED: the =1 (dp4a grouped) arm reads host expert_assignments,
+    // which device routing (the default) leaves EMPTY -- it computed fluent
+    // garbage with no error. Until someone wires it to dev_rows/dev_wts it
+    // warns once and falls through to the correct per-expert path.
+    const bool grouped_on = false;
+    if (grouped_env == 1) {
+      static const bool warned = []() {
+        fprintf(stderr,
+                "[qwen_moe] NNTR_CUDA_MOE_GROUPED=1 is DISABLED (it reads "
+                "host expert_assignments, empty under device routing) -- "
+                "falling back to the per-expert path; use =2 (default).\n");
+        return true;
+      }();
+      (void)warned;
+    }
     static const bool moe_dbg_gate = std::getenv("NNTR_MOE_DBG") != nullptr;
     if (grouped_on && !moe_dbg_gate &&
         input.getDataType() == ml::train::TensorDim::DataType::FP16 &&

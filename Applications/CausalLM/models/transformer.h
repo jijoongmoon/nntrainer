@@ -564,6 +564,16 @@ inline unsigned int effectivePrefillChunk() {
     return static_cast<unsigned int>(std::atoi(pc)); // explicit override wins
 #if defined(__aarch64__) || defined(__arm__) || defined(_M_ARM64) ||           \
   defined(_M_ARM)
+  // The V-mirror restride penalty above is an Adreno/OpenCL mechanism; the
+  // CUDA engine has no analogue, chunking measured strictly better at long
+  // prompts there, and with chunking OFF a prompt longer than init_seq_len
+  // is SILENTLY TRUNCATED (the shipped run script measured a "20K" prefill
+  // that was actually 4,096 tokens). CUDA on aarch64 therefore chunks by
+  // default; OpenCL/Adreno keeps 0. MUST stay in lockstep with
+  // mha_effective_chunk() in mha_core.cpp.
+  const char *eng = std::getenv("NNTR_ENGINE");
+  if (eng && (eng[0] == 'c' || eng[0] == 'C'))
+    return 4096u;
   return 0u; // Adreno V-mirror restride, see above
 #else
   return 4096u;
