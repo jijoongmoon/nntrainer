@@ -84,7 +84,7 @@ GatedDeltaNetLayer::GatedDeltaNetLayer() :
   value_dim(0), conv_dim(0), conv_kernel(0), hidden_size(0), eps(1e-6f),
   gdn_props(props::LinearNumValueHeads(), props::LinearNumKeyHeads(),
             props::LinearKeyHeadDim(), props::LinearValueHeadDim(),
-            props::LinearConvKernelDim()),
+            props::LinearConvKernelDim(), props::GdnQkvPacked()),
   w_in_proj_qkv(0), w_in_proj_z(0), w_in_proj_b(0), w_in_proj_a(0), w_conv1d(0),
   w_A_log(0), w_dt_bias(0), w_norm(0), w_out_proj(0) {}
 
@@ -146,7 +146,30 @@ void GatedDeltaNetLayer::finalize(nntrainer::InitLayerContext &context) {
                                  true);
   };
   // projection weights stored [in, out] (HF [out,in] is transposed at load)
-  w_in_proj_qkv = reqW(WD(hidden_size, conv_dim), "in_proj_qkv");
+  //
+  // in_proj_qkv may be requested QINT4 (gdn_qkv_packed, the gdnq bin): the
+  // layer_context coercion materialises it as QS4CX in memory exactly like
+  // the expert FCs, and the legacy-container loader transcodes the on-disk
+  // record. Everything else stays at the layer dtype -- neither
+  // model_tensor_type nor props::WeightDtype can move ONE weight.
+  const bool qkv_packed =
+    !std::get<props::GdnQkvPacked>(gdn_props).empty() &&
+    std::get<props::GdnQkvPacked>(gdn_props).get();
+  if (qkv_packed) {
+    // QS4CX directly -- the QINT4->QS4CX coercion lives in
+    // getWeightDataType(), which an explicit dim bypasses; requesting QINT4
+    // here creates an actual QINT4 tensor that no compute path consumes
+    // (field: "GDN: unsupported tensor dtype"). The loader still transcodes
+    // the on-disk legacy record because legacy_int4_model sizes QS4CX weights
+    // by the QINT4 container.
+    const auto q4 = nntrainer::TensorDim::TensorType(
+      context.getFormat(), nntrainer::TensorDim::DataType::QS4CX);
+    w_in_proj_qkv = reqW(
+      nntrainer::TensorDim(1, 1, hidden_size, conv_dim, q4, 0b0011),
+      "in_proj_qkv");
+  } else {
+    w_in_proj_qkv = reqW(WD(hidden_size, conv_dim), "in_proj_qkv");
+  }
   w_in_proj_z = reqW(WD(hidden_size, value_dim), "in_proj_z");
   w_in_proj_b = reqW(WD(hidden_size, num_v_heads), "in_proj_b");
   w_in_proj_a = reqW(WD(hidden_size, num_v_heads), "in_proj_a");
@@ -194,8 +217,31 @@ void GatedDeltaNetLayer::ensureWeightCache(
   readAsF32(context.getWeight(w_A_log), num_v_heads, alog_f);
   readAsF32(context.getWeight(w_dt_bias), num_v_heads, dtb_f);
   readAsF32(context.getWeight(w_norm), head_v_dim, wnorm_f);
-  readAsF32(context.getWeight(w_in_proj_qkv), (size_t)hidden_size * conv_dim,
-            wqkv_f);
+  {
+    nntrainer::Tensor &Wq = context.getWeight(w_in_proj_qkv);
+    if (Wq.getDataType() == ml::train::TensorDim::DataType::QS4CX) {
+      // Dequantize the gdnq payload into the same [in=K][out=N] fp32 layout
+      // readAsF32 produces. Payload is [N][ceil(K/2)] offset-binary nibbles
+      // (low nibble = even k) + N fp32 scales -- i.e. [out][in], so this
+      // TRANSPOSES while dequantizing. Scales round through fp16 exactly as
+      // the device dequant does (scales_to_uvm_fp16), keeping the host
+      // mirror consistent with the w4a8 path's arithmetic.
+      const uint8_t *pl = Wq.getData<uint8_t>();
+      const float *sc = Wq.getScale<float>();
+      const size_t K = hidden_size, N = conv_dim, Kh = (K + 1) / 2;
+      wqkv_f.resize(K * N);
+      for (size_t n = 0; n < N; ++n) {
+        const float s = (float)(_FP16)sc[n];
+        for (size_t k = 0; k < K; ++k) {
+          const uint8_t b = pl[n * Kh + (k >> 1)];
+          const int nib = (k & 1) ? (b >> 4) : (b & 0xF);
+          wqkv_f[k * N + n] = (float)(nib - 8) * s;
+        }
+      }
+    } else {
+      readAsF32(Wq, (size_t)hidden_size * conv_dim, wqkv_f);
+    }
+  }
   readAsF32(context.getWeight(w_in_proj_z), (size_t)hidden_size * value_dim,
             wz_f);
   readAsF32(context.getWeight(w_in_proj_b), (size_t)hidden_size * num_v_heads,
@@ -746,7 +792,38 @@ void GatedDeltaNetLayer::runDecode(nntrainer::RunLayerContext &context) {
       reinterpret_cast<const unsigned short *>(input.getData<_FP16>());
     unsigned short *op =
       reinterpret_cast<unsigned short *>(output.getData<_FP16>());
-    if (Wqkv.getDataType() == FP16D && Wz.getDataType() == FP16D &&
+    // gdnq bin: qkv is QS4CX; decode runs against a one-time fp16 device
+    // mirror of the dequantized weight (same values the prefill w4a8 path
+    // dequantizes), so the decode kernel stays unchanged. Built lazily on
+    // the first decode step -- ensureWeightCache has already produced the
+    // dequantized fp32 wqkv_f by then.
+    const unsigned short *wqkv16 = nullptr;
+    if (Wqkv.getDataType() == FP16D) {
+      wqkv16 = reinterpret_cast<const unsigned short *>(Wqkv.getData<_FP16>());
+    } else if (Wqkv.getDataType() ==
+                 ml::train::TensorDim::DataType::QS4CX &&
+               wcache_loaded) {
+      if (qkv_dev_fp16 == nullptr) {
+        const size_t n = (size_t)hidden_size * conv_dim;
+        std::vector<unsigned short> h16(n);
+        for (size_t i = 0; i < n; ++i) {
+          const _FP16 v = (_FP16)wqkv_f[i];
+          std::memcpy(&h16[i], &v, sizeof(unsigned short));
+        }
+        void *d = nullptr;
+        if (cudaMalloc(&d, n * sizeof(unsigned short)) == cudaSuccess &&
+            cudaMemcpy(d, h16.data(), n * sizeof(unsigned short),
+                       cudaMemcpyHostToDevice) == cudaSuccess) {
+          qkv_dev_fp16 = static_cast<unsigned short *>(d);
+        } else {
+          cudaGetLastError();
+          if (d)
+            cudaFree(d);
+        }
+      }
+      wqkv16 = qkv_dev_fp16;
+    }
+    if (wqkv16 != nullptr && Wz.getDataType() == FP16D &&
         Wb.getDataType() == FP16D && Wa.getDataType() == FP16D &&
         Wout.getDataType() == FP16D && nntrainer::cuda::dev_accessible(xp) &&
         nntrainer::cuda::dev_accessible(op) &&
@@ -758,7 +835,7 @@ void GatedDeltaNetLayer::runDecode(nntrainer::RunLayerContext &context) {
         r_bak.assign(cs, cs + (size_t)CONV * (KS - 1));
       }
       const bool ok = nntrainer::cuda::cuda_gdn_decode_fp16(
-        xp, reinterpret_cast<const unsigned short *>(Wqkv.getData<_FP16>()),
+        xp, wqkv16,
         reinterpret_cast<const unsigned short *>(Wz.getData<_FP16>()),
         reinterpret_cast<const unsigned short *>(Wb.getData<_FP16>()),
         reinterpret_cast<const unsigned short *>(Wa.getData<_FP16>()),

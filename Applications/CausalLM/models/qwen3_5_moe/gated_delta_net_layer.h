@@ -65,6 +65,15 @@ public:
   static constexpr const char *key = "linear_conv_kernel_dim";
   using prop_tag = nntrainer::uint_prop_tag;
 };
+/** request in_proj_qkv as QS4CX (the gdnq bin variant). Per-WEIGHT, because
+ *  neither model_tensor_type nor props::WeightDtype can move ONE weight:
+ *  both stamp the whole layer, and z/b/a/conv/norm/out_proj must stay
+ *  FP16/FP32. */
+class GdnQkvPacked : public nntrainer::Property<bool> {
+public:
+  static constexpr const char *key = "gdn_qkv_packed";
+  using prop_tag = nntrainer::bool_prop_tag;
+};
 
 } // namespace props
 
@@ -102,7 +111,7 @@ private:
 
   std::tuple<props::LinearNumValueHeads, props::LinearNumKeyHeads,
              props::LinearKeyHeadDim, props::LinearValueHeadDim,
-             props::LinearConvKernelDim>
+             props::LinearConvKernelDim, props::GdnQkvPacked>
     gdn_props;
 
   // weight indices (finalize order)
@@ -131,6 +140,11 @@ private:
   std::vector<float> wconv_f, alog_f, dtb_f, wnorm_f;
   std::vector<float> wqkv_f, wz_f, wb_f, wa_f, wout_fv;
   bool wcache_loaded = false;
+  // gdnq decode mirror: a one-time fp16 device copy of the DEQUANTIZED qkv
+  // (33.5 MB/layer, experiment-grade), so cuda_gdn_decode_fp16 runs
+  // unchanged when in_proj_qkv is QS4CX. Without it decode would fall to the
+  // numerically-wrong host GDN path and generate fluent garbage.
+  unsigned short *qkv_dev_fp16 = nullptr;
   void ensureWeightCache(nntrainer::RunLayerContext &context);
 
   /** prefill over seq_len tokens starting at INPUT ROW 0; when save_state,

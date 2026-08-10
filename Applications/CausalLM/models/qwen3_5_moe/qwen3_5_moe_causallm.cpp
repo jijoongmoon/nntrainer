@@ -31,6 +31,10 @@ void Qwen3_5MoeCausalLM::setupParameters(json &cfg, json &generation_cfg,
     LINEAR_KEY_HEAD_DIM = cfg["linear_key_head_dim"];
     LINEAR_VALUE_HEAD_DIM = cfg["linear_value_head_dim"];
     LINEAR_CONV_KERNEL_DIM = cfg["linear_conv_kernel_dim"];
+    // gdnq bin variant: in_proj_qkv stored QS4CX. Optional key; absent on
+    // the standard bin.
+    GDN_QKV_PACKED = cfg.contains("gdn_qkv_dtype") &&
+                     cfg["gdn_qkv_dtype"] == "QINT4";
   } catch (const std::exception &e) {
     throw std::runtime_error(
       std::string("Qwen3_5Moe: missing MoE/GDN config field: ") + e.what());
@@ -78,7 +82,8 @@ Tensor Qwen3_5MoeCausalLM::createGatedDeltaNet(const int layer_id,
      withKey("linear_num_key_heads", LINEAR_NUM_KEY_HEADS),
      withKey("linear_key_head_dim", LINEAR_KEY_HEAD_DIM),
      withKey("linear_value_head_dim", LINEAR_VALUE_HEAD_DIM),
-     withKey("linear_conv_kernel_dim", LINEAR_CONV_KERNEL_DIM)}));
+     withKey("linear_conv_kernel_dim", LINEAR_CONV_KERNEL_DIM),
+     withKey("gdn_qkv_packed", GDN_QKV_PACKED ? "true" : "false")}));
   return gdn(input);
 }
 

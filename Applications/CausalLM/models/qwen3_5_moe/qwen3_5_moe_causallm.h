@@ -75,6 +75,7 @@ private:
   unsigned int LINEAR_KEY_HEAD_DIM;
   unsigned int LINEAR_VALUE_HEAD_DIM;
   unsigned int LINEAR_CONV_KERNEL_DIM;
+  bool GDN_QKV_PACKED = false; // gdnq bin: in_proj_qkv stored QS4CX
   float PARTIAL_ROTARY_FACTOR; /**< full-attn partial RoPE (e.g. 0.25) */
 
   /** GatedDeltaNet mixer sub-graph (linear_attention layers) */
