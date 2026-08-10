@@ -1023,6 +1023,13 @@ __device__ __forceinline__ unsigned int ip_nib2i8(unsigned int x,
   x ^= cx;
   return (((x | 0x80808080u) - 0x08080808u) ^ 0x80808080u);
 }
+// generic -> shared-window u32 address for ldmatrix (no headers under NVRTC)
+__device__ __forceinline__ unsigned ip_sh(const void *p) {
+  unsigned r;
+  asm("{ .reg .u64 t; cvta.to.shared.u64 t, %1; cvt.u32.u64 %0, t; }"
+      : "=r"(r) : "l"(p));
+  return r;
+}
 __global__ __launch_bounds__(256, 2)
 void imma_gemm_pipe(const signed char *q8, const unsigned char *plain,
                     const float *ascale, const int *azp, const int *wrowsum,
@@ -1100,6 +1107,26 @@ void imma_gemm_pipe(const signed char *q8, const unsigned char *plain,
   IP_STORE(0);
   __syncthreads();
 
+  // ldmatrix lane addressing (the fragment-load compression that lifts the
+  // ~25% mma-issue ceiling of 12 lds.32 per 4 mma):
+  //  - A x4: lanes 0-7 -> rows wm*16+0..7 @k0, 8-15 -> +8 @k0, 16-23 ->
+  //    +0..7 @k16, 24-31 -> +8 @k16; result d0..d3 IS {a0,a1,a2,a3}.
+  //  - B x4: lane group s = lane>>3, row wn*32 + s*8 + (lane&7); the result
+  //    hands SUB-TILE s's fragment back in register s -- one x4 covers b0 of
+  //    all four s, a second (+16B) covers b1.
+  //  m8n8.b16 distribution (lane l: row l>>2, b16 cols 2*(l&3)) equals the
+  //  s8 mma fragment mapping exactly; values and mma order are unchanged, so
+  //  the result stays BIT-IDENTICAL (the binary validation contract).
+  const int lrow_a = wm * 16 + (lane & 7) + ((lane & 8) ? 8 : 0);
+  const int lkb_a = (lane & 16) ? 16 : 0;
+  const int lrow_b = wn * 32 + (lane >> 3) * 8 + (lane & 7);
+  const unsigned pa_buf[2] = {
+    ip_sh((const signed char *)Asv[0] + lrow_a * IP_LD + lkb_a),
+    ip_sh((const signed char *)Asv[1] + lrow_a * IP_LD + lkb_a)};
+  const unsigned pb_buf[2] = {
+    ip_sh((const signed char *)Wsv[0] + lrow_b * IP_LD),
+    ip_sh((const signed char *)Wsv[1] + lrow_b * IP_LD)};
+
   int cur = 0;
   for (int k0 = 0; k0 < K; k0 += IP_BK) {
     const int knext = k0 + IP_BK;
@@ -1108,28 +1135,34 @@ void imma_gemm_pipe(const signed char *q8, const unsigned char *plain,
     if (knext < K)
       IP_LOAD(knext);
 
-    const signed char *Ab =
-      (const signed char *)Asv[cur] + (wm * 16 + g) * IP_LD;
-    const signed char *Bb = (const signed char *)Wsv[cur] + (wn * 32 + g) * IP_LD;
+    const unsigned pa = pa_buf[cur], pb = pb_buf[cur];
 #pragma unroll
     for (int h = 0; h < 2; ++h) {
-      const int ko = h * 32 + 4 * t;
-      int a0 = *(const int *)(Ab + ko);
-      int a1 = *(const int *)(Ab + 8 * IP_LD + ko);
-      int a2 = *(const int *)(Ab + ko + 16);
-      int a3 = *(const int *)(Ab + 8 * IP_LD + ko + 16);
-#pragma unroll
-      for (int s = 0; s < 4; ++s) {
-        const signed char *Bs = Bb + s * 8 * IP_LD;
-        int b0 = *(const int *)(Bs + ko);
-        int b1 = *(const int *)(Bs + ko + 16);
-        asm volatile(
-          "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32.satfinite "
-          "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
-          : "=r"(acc[s][0]), "=r"(acc[s][1]), "=r"(acc[s][2]), "=r"(acc[s][3])
-          : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1),
-            "r"(acc[s][0]), "r"(acc[s][1]), "r"(acc[s][2]), "r"(acc[s][3]));
-      }
+      int a0, a1, a2, a3, c0, c1, c2, c3, d0, d1, d2, d3;
+      asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+        : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)
+        : "r"(pa + h * 32));
+      asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+        : "=r"(c0), "=r"(c1), "=r"(c2), "=r"(c3)
+        : "r"(pb + h * 32));
+      asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+        : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3)
+        : "r"(pb + h * 32 + 16));
+#define IP_MMA(S, B0, B1)                                                      \
+  asm volatile(                                                                \
+    "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32.satfinite "               \
+    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"              \
+    : "=r"(acc[S][0]), "=r"(acc[S][1]), "=r"(acc[S][2]), "=r"(acc[S][3])       \
+    : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(B0), "r"(B1),                    \
+      "r"(acc[S][0]), "r"(acc[S][1]), "r"(acc[S][2]), "r"(acc[S][3]))
+      IP_MMA(0, c0, d0);
+      IP_MMA(1, c1, d1);
+      IP_MMA(2, c2, d2);
+      IP_MMA(3, c3, d3);
+#undef IP_MMA
     }
 
     if (knext < K) {
@@ -1287,35 +1320,51 @@ void imma_moe_grouped(const signed char *q8, const int *tokid,
   IPG_STORE(0);
   __syncthreads();
 
+  // Same ldmatrix lane addressing as imma_gemm_pipe (see the notes there).
+  const int lrow_a = wm * 16 + (lane & 7) + ((lane & 8) ? 8 : 0);
+  const int lkb_a = (lane & 16) ? 16 : 0;
+  const int lrow_b = wn * 32 + (lane >> 3) * 8 + (lane & 7);
+  const unsigned pa_buf[2] = {
+    ip_sh((const signed char *)Asv[0] + lrow_a * IP_LD + lkb_a),
+    ip_sh((const signed char *)Asv[1] + lrow_a * IP_LD + lkb_a)};
+  const unsigned pb_buf[2] = {
+    ip_sh((const signed char *)Wsv[0] + lrow_b * IP_LD),
+    ip_sh((const signed char *)Wsv[1] + lrow_b * IP_LD)};
+
   int cur = 0;
   for (int k0 = 0; k0 < K; k0 += IP_BK) {
     const int knext = k0 + IP_BK;
     if (knext < K)
       IPG_LOAD(knext);
 
-    const signed char *Ab =
-      (const signed char *)Asv[cur] + (wm * 16 + g) * IP_LD;
-    const signed char *Bb =
-      (const signed char *)Wsv[cur] + (wn * 32 + g) * IP_LD;
+    const unsigned pa = pa_buf[cur], pb = pb_buf[cur];
 #pragma unroll
     for (int h = 0; h < 2; ++h) {
-      const int ko = h * 32 + 4 * t;
-      int a0 = *(const int *)(Ab + ko);
-      int a1 = *(const int *)(Ab + 8 * IP_LD + ko);
-      int a2 = *(const int *)(Ab + ko + 16);
-      int a3 = *(const int *)(Ab + 8 * IP_LD + ko + 16);
-#pragma unroll
-      for (int s = 0; s < 4; ++s) {
-        const signed char *Bs = Bb + s * 8 * IP_LD;
-        int b0 = *(const int *)(Bs + ko);
-        int b1 = *(const int *)(Bs + ko + 16);
-        asm volatile(
-          "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32.satfinite "
-          "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
-          : "=r"(acc[s][0]), "=r"(acc[s][1]), "=r"(acc[s][2]), "=r"(acc[s][3])
-          : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1),
-            "r"(acc[s][0]), "r"(acc[s][1]), "r"(acc[s][2]), "r"(acc[s][3]));
-      }
+      int a0, a1, a2, a3, c0, c1, c2, c3, d0, d1, d2, d3;
+      asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+        : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)
+        : "r"(pa + h * 32));
+      asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+        : "=r"(c0), "=r"(c1), "=r"(c2), "=r"(c3)
+        : "r"(pb + h * 32));
+      asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+        : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3)
+        : "r"(pb + h * 32 + 16));
+#define IPG_MMA(S, B0, B1)                                                     \
+  asm volatile(                                                                \
+    "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32.satfinite "               \
+    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"              \
+    : "=r"(acc[S][0]), "=r"(acc[S][1]), "=r"(acc[S][2]), "=r"(acc[S][3])       \
+    : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(B0), "r"(B1),                    \
+      "r"(acc[S][0]), "r"(acc[S][1]), "r"(acc[S][2]), "r"(acc[S][3]))
+      IPG_MMA(0, c0, d0);
+      IPG_MMA(1, c1, d1);
+      IPG_MMA(2, c2, d2);
+      IPG_MMA(3, c3, d3);
+#undef IPG_MMA
     }
 
     if (knext < K) {
