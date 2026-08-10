@@ -331,6 +331,361 @@ void gdn_scan_prefill(const float *conv, const float *z, const float *pb,
       state[((long)vh*HKD + (a0+j))*HVD + b] = S[j];
   }
 }
+
+// ==================== chunked (WY / UT-transform) prefill ====================
+// The delta-rule recurrence re-expressed as chunk-of-64 matrix work (vLLM's
+// fla decomposition, read from source 2026-08-10). Consumes the SAME buffers
+// the sequential scan does (conv output with l2normed q/k, pb/pa, alog/dtb),
+// preserves the SAME algebraic contract:
+//   lg_t = -exp(A_log[vh]) * softplus(pa + dt_bias)   (log decay, <= 0)
+//   b_t  = sigmoid(pb)
+//   S_t  = e^{lg_t} (I - b_t k_t k_t^T) S_{t-1} + b_t k_t v_t^T
+//   o_t  = scale * S_t^T q_t          (UPDATED state; the inclusive causal
+//                                      mask in the output kernel carries the
+//                                      current token's own contribution)
+// and hands the result to the unchanged gated-RMSNorm + out_proj tail. All
+// fp32 (the sequential scan is fp32 end to end; the only difference is
+// summation ORDER: exp-of-cumsum-differences instead of per-token products).
+// State orientation is OURS: S[a=key][b=value], so v_new = u - w @ S and
+// S += k^T @ (v_new decayed) with no transposes.
+//
+// Per chunk i (C = 64):
+//   gc   = inclusive cumsum of lg within the chunk (fp32)
+//   A[c,d] = b_c (k_c . k_d) e^{gc_c - gc_d}, strictly lower, else 0
+//   Tv   = (I + A)^-1 by forward substitution (fp32)
+//   w    = Tv @ (b * e^{gc} * k)    u = Tv @ (b * v)
+//   h_i  = S  (chunk-INITIAL state, stored for the output kernel)
+//   v_new = u - w @ h_i             (stored un-decayed)
+//   S    = e^{gl} S + k^T @ (v_new * e^{gl - gc})     gl = gc at chunk end
+//   o[c] = scale * ( e^{gc_c} (q_c @ h_i)
+//                    + sum_{d<=c} e^{gc_c-gc_d} (q_c . k_d) v_new[d] )
+
+// per-token log-decay + beta, then the in-chunk inclusive cumsum.
+// grid (NT, NVH), block 64 (= C). gc[t,vh], beta[t,vh]; glast[chunk,vh].
+__global__ void gdn_ck_gcum(const float *pa, const float *pb,
+                            const float *alog, const float *dtb, float *gc,
+                            float *beta, float *glast, int T, int NVH){
+  const int ck = blockIdx.x, vh = blockIdx.y;
+  const int c = threadIdx.x;
+  const int t = ck*64 + c;
+  __shared__ float lg[64];
+  float l = 0.0f;
+  if (t < T) {
+    const float aa = pa[(long)t*NVH + vh] + dtb[vh];
+    const float sp = aa > 20.0f ? aa : log1pf(expf(aa));
+    l = -expf(alog[vh]) * sp;
+    beta[(long)t*NVH + vh] = 1.0f/(1.0f + expf(-pb[(long)t*NVH + vh]));
+  }
+  lg[c] = l;
+  __syncthreads();
+  if (c == 0) {                      // 64-wide serial cumsum: trivial next to
+    float acc = 0.0f;                // the GEMM work, and bit-stable
+    for (int j = 0; j < 64; ++j) { acc += lg[j]; lg[j] = acc; }
+  }
+  __syncthreads();
+  if (t < T) gc[(long)t*NVH + vh] = lg[c];
+  const int cn = (T - ck*64 < 64) ? (T - ck*64) : 64;
+  if (c == 0) glast[(long)ck*NVH + vh] = lg[cn-1];
+}
+
+// A[c,d] = beta_c (k_c . k_d) e^{gc_c - gc_d}, strictly lower triangular.
+// grid (NT, NVH), block 256. k tile staged once (fp32, 32 KB).
+__global__ void gdn_ck_kkt(const float *conv, const float *gc,
+                           const float *beta, float *A, int T, int CONV,
+                           int KEY, int NVH, int NKH, int HKD){
+  const int ck = blockIdx.x, vh = blockIdx.y;
+  const int kh = vh / (NVH / NKH);
+  const int cn = (T - ck*64 < 64) ? (T - ck*64) : 64;
+  __shared__ float ks[64][128];
+  __shared__ float gs[64], bs[64];
+  const int tid = threadIdx.x;
+  for (int i = tid; i < 64*128; i += 256) {
+    const int c = i >> 7, d = i & 127;
+    ks[c][d] = (c < cn) ? conv[(long)(ck*64 + c)*CONV + KEY + kh*HKD + d]
+                        : 0.0f;
+  }
+  if (tid < 64) {
+    const int t = ck*64 + tid;
+    gs[tid] = (tid < cn) ? gc[(long)t*NVH + vh] : 0.0f;
+    bs[tid] = (tid < cn) ? beta[(long)t*NVH + vh] : 0.0f;
+  }
+  __syncthreads();
+  float *Ab = A + ((long)ck*NVH + vh)*4096;
+  for (int p = tid; p < 4096; p += 256) {
+    const int c = p >> 6, d = p & 63;
+    float v = 0.0f;
+    if (c > d && c < cn) {
+      float acc = 0.0f;
+      #pragma unroll 8
+      for (int e = 0; e < 128; ++e) acc += ks[c][e]*ks[d][e];
+      v = bs[c]*acc*expf(gs[c] - gs[d]);
+    }
+    Ab[p] = v;
+  }
+}
+
+// Tv = (I + A)^-1 by forward substitution, in place over A.
+// grid (NT, NVH), block 64 (thread = column). fp32 throughout.
+__global__ void gdn_ck_tril(float *A, int NVH){
+  const long base = ((long)blockIdx.x*NVH + blockIdx.y)*4096;
+  const int d = threadIdx.x;
+  __shared__ float M[64][64];
+  __shared__ float Tv[64][64];
+  for (int r = 0; r < 64; ++r) M[r][d] = A[base + r*64 + d];
+  __syncthreads();
+  for (int r = 0; r < 64; ++r) {
+    float s = (r == d) ? 1.0f : 0.0f;
+    for (int j = 0; j < r; ++j) s -= M[r][j]*Tv[j][d];
+    Tv[r][d] = s;
+    __syncthreads();
+  }
+  for (int r = 0; r < 64; ++r) A[base + r*64 + d] = Tv[r][d];
+}
+
+// w = Tv @ (beta e^{gc} k), u = Tv @ (beta v). grid (NT, NVH), block 128
+// (thread = feature dim). One staging buffer reused for both passes:
+// Tv 16 KB + xb 32 KB = 48 KB static shared, the sm_87 per-block limit.
+__global__ void gdn_ck_wu(const float *conv, const float *A, const float *gc,
+                          const float *beta, float *w, float *u, int T,
+                          int CONV, int KEY, int NVH, int NKH, int HKD,
+                          int HVD){
+  const int ck = blockIdx.x, vh = blockIdx.y;
+  const int kh = vh / (NVH / NKH);
+  const int cn = (T - ck*64 < 64) ? (T - ck*64) : 64;
+  const int dim = threadIdx.x;
+  __shared__ float Tv[64][64];
+  __shared__ float xb[64][128];
+  const float *Ab = A + ((long)ck*NVH + vh)*4096;
+  for (int i = dim; i < 4096; i += 128) Tv[i >> 6][i & 63] = Ab[i];
+  for (int c = 0; c < 64; ++c) {
+    float x = 0.0f;
+    if (c < cn) {
+      const long t = (long)ck*64 + c;
+      x = beta[t*NVH + vh]*expf(gc[t*NVH + vh])*
+          conv[t*CONV + KEY + kh*HKD + dim];
+    }
+    xb[c][dim] = x;
+  }
+  __syncthreads();
+  for (int c = 0; c < cn; ++c) {
+    float acc = 0.0f;
+    #pragma unroll 8
+    for (int d = 0; d < 64; ++d) acc += Tv[c][d]*xb[d][dim];
+    w[(((long)ck*64 + c)*NVH + vh)*HKD + dim] = acc;
+  }
+  __syncthreads();
+  for (int c = 0; c < 64; ++c) {
+    float x = 0.0f;
+    if (c < cn) {
+      const long t = (long)ck*64 + c;
+      x = beta[t*NVH + vh]*conv[t*CONV + 2*KEY + vh*HVD + dim];
+    }
+    xb[c][dim] = x;
+  }
+  __syncthreads();
+  for (int c = 0; c < cn; ++c) {
+    float acc = 0.0f;
+    #pragma unroll 8
+    for (int d = 0; d < 64; ++d) acc += Tv[c][d]*xb[d][dim];
+    u[(((long)ck*64 + c)*NVH + vh)*HVD + dim] = acc;
+  }
+}
+
+// The only sequential piece: state propagation across chunks. grid NVH,
+// block 512 -- the scan's exact register geometry (thread (ag,b) owns
+// S[a0+j][b], j<32) but per CHUNK instead of per token. Per chunk:
+// store h_i, v_new = u - w @ S (whole chunk vs the chunk-INITIAL S),
+// then S = e^{gl} S + k^T @ (v_new e^{gl - gc}).
+__global__ void __launch_bounds__(512, 2)
+gdn_ck_state(const float *conv, const float *w, const float *u,
+             const float *gc, const float *glast, float *h, float *vnew,
+             float *state, int T, int CONV, int KEY, int NVH, int NKH,
+             int HKD, int HVD, int seed_state, int save_state){
+  const int vh = blockIdx.x;
+  const int kh = vh / (NVH / NKH);
+  const int NT = (T + 63) >> 6;
+  const int tid = threadIdx.x;
+  const int b = tid & 127, ag = tid >> 7, a0 = ag*32;
+  __shared__ float dv[64][128];
+  __shared__ float rk[4][128];
+  float S[32];
+  #pragma unroll
+  for (int j = 0; j < 32; ++j)
+    S[j] = seed_state ? state[((long)vh*HKD + (a0+j))*HVD + b] : 0.0f;
+
+  for (int ck = 0; ck < NT; ++ck) {
+    const int cn = (T - ck*64 < 64) ? (T - ck*64) : 64;
+    const float gl = glast[(long)ck*NVH + vh];
+    // h_i = chunk-initial state
+    float *hb = h + ((long)ck*NVH + vh)*16384;
+    #pragma unroll
+    for (int j = 0; j < 32; ++j) hb[(a0+j)*128 + b] = S[j];
+    // v_new for the whole chunk against h_i
+    for (int c = 0; c < cn; ++c) {
+      const long t = (long)ck*64 + c;
+      const float *wr = w + (t*NVH + vh)*HKD;
+      float pk = 0.0f;
+      #pragma unroll
+      for (int j = 0; j < 32; ++j) pk += wr[a0+j]*S[j];
+      rk[ag][b] = pk;
+      __syncthreads();
+      if (ag == 0) {
+        const float vn = u[(t*NVH + vh)*HVD + b] -
+                         (rk[0][b]+rk[1][b]+rk[2][b]+rk[3][b]);
+        vnew[(t*NVH + vh)*HVD + b] = vn;
+        dv[c][b] = vn*expf(gl - gc[t*NVH + vh]);
+      }
+      __syncthreads();
+    }
+    // S = e^{gl} S + k^T @ dv
+    const float egl = expf(gl);
+    #pragma unroll
+    for (int j = 0; j < 32; ++j) S[j] *= egl;
+    for (int c = 0; c < cn; ++c) {
+      const float *kr = conv + ((long)ck*64 + c)*CONV + KEY + kh*HKD;
+      const float d_b = dv[c][b];
+      #pragma unroll
+      for (int j = 0; j < 32; ++j) S[j] += kr[a0+j]*d_b;
+    }
+    __syncthreads();
+  }
+  if (save_state) {
+    #pragma unroll
+    for (int j = 0; j < 32; ++j)
+      state[((long)vh*HKD + (a0+j))*HVD + b] = S[j];
+  }
+}
+
+// o[c] = scale * ( e^{gc_c} (q_c @ h_i) + sum_{d<=c} coef[c][d] v_new[d] ),
+// coef[c][d] = (q_c . k_d) e^{gc_c - gc_d}, INCLUSIVE mask (the diagonal is
+// the current token's own contribution -- the sequential scan reads the
+// UPDATED state). grid (NT, NVH), block 128 (thread = b).
+__global__ void gdn_ck_out(const float *conv, const float *gc,
+                           const float *h, const float *vnew, float *o,
+                           float scale, int T, int CONV, int KEY, int NVH,
+                           int NKH, int HKD, int HVD){
+  const int ck = blockIdx.x, vh = blockIdx.y;
+  const int kh = vh / (NVH / NKH);
+  const int cn = (T - ck*64 < 64) ? (T - ck*64) : 64;
+  const int b = threadIdx.x;
+  // 48 KB static-shared budget exactly: ks 32 KB + coef 16 KB. The 64 gc
+  // values are read from global (L2-resident) -- a gs[64] array here was 256
+  // bytes over the sm_87 per-block limit and failed ptxas.
+  __shared__ float ks[64][128];
+  __shared__ float coef[64][64];
+  for (int i = b; i < 64*128; i += 128) {
+    const int c = i >> 7, d = i & 127;
+    ks[c][d] = (c < cn) ? conv[(long)(ck*64 + c)*CONV + KEY + kh*HKD + d]
+                        : 0.0f;
+  }
+  __syncthreads();
+  const float *gcb = gc;
+  for (int p = b; p < 4096; p += 128) {
+    const int c = p >> 6, d = p & 63;
+    float v = 0.0f;
+    if (d <= c && c < cn) {
+      const float *qr = conv + (long)(ck*64 + c)*CONV + kh*HKD;
+      float acc = 0.0f;
+      #pragma unroll 8
+      for (int e = 0; e < 128; ++e) acc += qr[e]*ks[d][e];
+      v = acc*expf(gcb[((long)ck*64 + c)*NVH + vh] -
+                   gcb[((long)ck*64 + d)*NVH + vh]);
+    }
+    coef[c][d] = v;
+  }
+  __syncthreads();
+  // Phase 2: intra term entirely from shared memory -- reuse ks[] as the
+  // v_new tile (its k data is consumed; coef[] holds the masked products).
+  for (int i = b; i < 64*128; i += 128) {
+    const int c = i >> 7, d = i & 127;
+    ks[c][d] = (c < cn)
+                 ? vnew[(((long)ck*64 + c)*NVH + vh)*HVD + d]
+                 : 0.0f;
+  }
+  __syncthreads();
+  const long obase = ((long)ck*64)*(long)(NVH*HVD) + vh*HVD + b;
+  for (int c = 0; c < cn; ++c) {
+    float intra = 0.0f;
+    #pragma unroll 8
+    for (int d = 0; d < 64; ++d) intra += coef[c][d]*ks[d][b];
+    o[obase + (long)c*(NVH*HVD)] = intra; // unscaled; phase 3 completes it
+  }
+  __syncthreads();
+  // Phase 3: inter term with h staged in 32-row a-tiles (16 KB each, reusing
+  // ks[]) and 16-wide c-blocks accumulated in registers -- one global RMW per
+  // output instead of the 64x re-read of h that made v1 16 ms per block.
+  const float *hb = h + ((long)ck*NVH + vh)*16384;
+  for (int cb = 0; cb < 4; ++cb) {
+    float acc[16];
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) acc[i] = 0.0f;
+    for (int at = 0; at < 4; ++at) {
+      __syncthreads();
+      for (int i = b; i < 32*128; i += 128)
+        ks[i >> 7][i & 127] = hb[(at*32 + (i >> 7))*128 + (i & 127)];
+      __syncthreads();
+      for (int ci = 0; ci < 16; ++ci) {
+        const int c = cb*16 + ci;
+        if (c >= cn) break;
+        const float *qr = conv + ((long)ck*64 + c)*CONV + kh*HKD + at*32;
+        float p = 0.0f;
+        #pragma unroll 8
+        for (int j = 0; j < 32; ++j) p += qr[j]*ks[j][b];
+        acc[ci] += p;
+      }
+    }
+    for (int ci = 0; ci < 16; ++ci) {
+      const int c = cb*16 + ci;
+      if (c >= cn) break;
+      const long t = (long)ck*64 + c;
+      const long oi = t*(long)(NVH*HVD) + vh*HVD + b;
+      o[oi] = scale*(acc[ci]*expf(gcb[t*NVH + vh]) + o[oi]);
+    }
+  }
+}
+
+// gated RMSNorm + silu(z) gate -> fp16, VERBATIM the scan's fused tail.
+// grid T*NVH, block 128 (thread = b).
+__global__ void gdn_ck_gate(const float *o, const float *z,
+                            const float *wnorm, unsigned short *normed,
+                            float eps, int NVH, int HVD){
+  const int vh = blockIdx.x % NVH;
+  const long t = blockIdx.x / NVH;
+  const int b = threadIdx.x;
+  __shared__ float red[128];
+  const long off = t*(long)(NVH*HVD) + vh*HVD + b;
+  const float ov = o[off];
+  red[b] = ov*ov;
+  __syncthreads();
+  for (int s = 64; s > 0; s >>= 1) {
+    if (b < s) red[b] += red[b + s];
+    __syncthreads();
+  }
+  const float inv = 1.0f/sqrtf(red[0]/(float)HVD + eps);
+  const float zv = z[off];
+  normed[off] = f2h(ov*inv*wnorm[b]*gdn_silu(zv));
+}
+
+// Device conv-ring rebuild: the byte-exact replacement for the layer's host
+// save_ring loop (전부 GPU). One thread per conv channel; the old ring is
+// read into registers FIRST, so the in-place update is race-free even when
+// the chunk is shorter than the ring.
+__global__ void gdn_save_ring(const float *qkv, float *ring, int T, int CONV,
+                              int KS, int has_prev){
+  const int c = blockIdx.x*blockDim.x + threadIdx.x;
+  if (c >= CONV) return;
+  float prev[8]; // KS <= 9 in practice (KS-1 slots); 4 here
+  for (int j = 0; j < KS-1; ++j)
+    prev[j] = has_prev ? ring[(long)c*(KS-1) + j] : 0.0f;
+  for (int j = 0; j < KS-1; ++j) {
+    const int ti = T - (KS-1) + j;
+    float v;
+    if (ti >= 0)            v = qkv[(long)ti*CONV + c];
+    else if (has_prev)      v = prev[(KS-1) + ti];
+    else                    v = 0.0f;
+    ring[(long)c*(KS-1) + j] = v;
+  }
+}
 } // extern "C"
 )CU";
 
@@ -533,6 +888,272 @@ bool cuda_gdn_prefill_fp16(const float *p_qkv, const float *p_z,
     return false;
   }
   return true;
+}
+
+// chunked-prefill scratch (fp32, grow-once, shared by all 30 layers)
+namespace {
+float *g_ck_gc = nullptr, *g_ck_beta = nullptr, *g_ck_gl = nullptr;
+float *g_ck_A = nullptr, *g_ck_w = nullptr, *g_ck_u = nullptr;
+float *g_ck_vn = nullptr, *g_ck_h = nullptr, *g_ck_o = nullptr;
+size_t c_ck_gc = 0, c_ck_beta = 0, c_ck_gl = 0, c_ck_A = 0, c_ck_w = 0,
+       c_ck_u = 0, c_ck_vn = 0, c_ck_h = 0, c_ck_o = 0;
+} // namespace
+
+bool cuda_gdn_prefill_chunked_fp16(
+  const float *p_qkv, const float *p_z, const float *p_b, const float *p_a,
+  const unsigned short *wout, const float *h_wconv, const float *h_alog,
+  const float *h_dtb, const float *h_wnorm, float *state, const float *ring,
+  unsigned short *out, unsigned int T, unsigned int H, unsigned int NVH,
+  unsigned int NKH, unsigned int HKD, unsigned int HVD, unsigned int KS,
+  float eps, bool seed_state, bool save_state) {
+  const unsigned int KEY = NKH * HKD, VAL = NVH * HVD;
+  const unsigned int CONV = 2 * KEY + VAL;
+  // Same geometry pins as the sequential scan (S in registers, C=64 tiles).
+  if (T == 0 || HKD != 128 || HVD != 128 || NVH == 0 || NKH == 0 ||
+      NVH % NKH != 0 || KS < 2 || KS > 8 || p_qkv == nullptr || out == nullptr)
+    return false;
+  const unsigned int NT = (T + 63) / 64;
+  std::lock_guard<std::mutex> lk(g_gdn_mtx);
+  if (!grow((void **)&g_pf_conv, &g_pf_conv_cap, (size_t)T * CONV * 4) ||
+      !grow((void **)&g_pf_normed, &g_pf_normed_cap, (size_t)T * VAL * 2) ||
+      !grow((void **)&g_pf_qkdot, &g_pf_qkdot_cap, (size_t)T * NKH * 4) ||
+      !grow((void **)&g_ck_gc, &c_ck_gc, (size_t)T * NVH * 4) ||
+      !grow((void **)&g_ck_beta, &c_ck_beta, (size_t)T * NVH * 4) ||
+      !grow((void **)&g_ck_gl, &c_ck_gl, (size_t)NT * NVH * 4) ||
+      !grow((void **)&g_ck_A, &c_ck_A, (size_t)NT * NVH * 4096 * 4) ||
+      !grow((void **)&g_ck_w, &c_ck_w, (size_t)T * NVH * HKD * 4) ||
+      !grow((void **)&g_ck_u, &c_ck_u, (size_t)T * NVH * HVD * 4) ||
+      !grow((void **)&g_ck_vn, &c_ck_vn, (size_t)T * NVH * HVD * 4) ||
+      !grow((void **)&g_ck_h, &c_ck_h, (size_t)NT * NVH * 16384 * 4) ||
+      !grow((void **)&g_ck_o, &c_ck_o, (size_t)T * VAL * 4)) {
+    fprintf(stderr, "[cuda_gdn] chunked scratch alloc FAILED (T=%u): %s\n", T,
+            cudaGetErrorString(cudaGetLastError()));
+    return false;
+  }
+  auto &sm = StreamManager::Global();
+  cudaStream_t stream = sm.GetStream();
+  const DevParams *dp =
+    ensure_params(h_wconv, h_alog, h_dtb, h_wnorm, CONV, KS, NVH, HVD, stream);
+  if (!dp)
+    return false;
+  auto &ctx = CudaContext::Global();
+  auto kcv = ctx.registerCudaKernel(GDN_SRC, "gdn_conv_prefill");
+  auto kln = ctx.registerCudaKernel(GDN_SRC, "gdn_l2norm_prefill");
+  auto kgc = ctx.registerCudaKernel(GDN_SRC, "gdn_ck_gcum");
+  auto kkt = ctx.registerCudaKernel(GDN_SRC, "gdn_ck_kkt");
+  auto ktr = ctx.registerCudaKernel(GDN_SRC, "gdn_ck_tril");
+  auto kwu = ctx.registerCudaKernel(GDN_SRC, "gdn_ck_wu");
+  auto kst = ctx.registerCudaKernel(GDN_SRC, "gdn_ck_state");
+  auto kou = ctx.registerCudaKernel(GDN_SRC, "gdn_ck_out");
+  auto kga = ctx.registerCudaKernel(GDN_SRC, "gdn_ck_gate");
+  if (!kcv || !kln || !kgc || !kkt || !ktr || !kwu || !kst || !kou || !kga) {
+    ml_loge("[CUDA] gdn: chunked kernel registration failed");
+    return false;
+  }
+  int iT = (int)T, iCONV = (int)CONV, iKS = (int)KS, iKEY = (int)KEY;
+  int iNVH = (int)NVH, iNKH = (int)NKH, iHKD = (int)HKD, iHVD = (int)HVD;
+  int has_ring = (seed_state && ring != nullptr) ? 1 : 0;
+  int i_seed = seed_state ? 1 : 0, i_save = save_state ? 1 : 0;
+  float scale = 1.0f / std::sqrt((float)HKD);
+
+  // NNTR_GDN_CK_DBG=1: per-kernel GPU ms via events (first few calls only).
+  static const bool ck_dbg = []() {
+    const char *e = std::getenv("NNTR_GDN_CK_DBG");
+    return e != nullptr && e[0] == '1';
+  }();
+  static int ck_dbg_n = 0;
+  cudaEvent_t ev[10];
+  const bool dbg_this = ck_dbg && ck_dbg_n < 3;
+  if (dbg_this)
+    for (int i = 0; i < 10; ++i)
+      cudaEventCreate(&ev[i]);
+  auto stamp = [&](int i) {
+    if (dbg_this)
+      cudaEventRecord(ev[i], stream);
+  };
+  stamp(0);
+
+  { // conv1d + SiLU (identical to the sequential path)
+    kcv->SetKernelArguments(0, &p_qkv, sizeof(p_qkv));
+    kcv->SetKernelArguments(1, &dp->wconv, sizeof(dp->wconv));
+    kcv->SetKernelArguments(2, &ring, sizeof(ring));
+    kcv->SetKernelArguments(3, &g_pf_conv, sizeof(g_pf_conv));
+    kcv->SetKernelArguments(4, &iT, sizeof(iT));
+    kcv->SetKernelArguments(5, &iCONV, sizeof(iCONV));
+    kcv->SetKernelArguments(6, &iKS, sizeof(iKS));
+    kcv->SetKernelArguments(7, &has_ring, sizeof(has_ring));
+    const long total = (long)T * CONV;
+    const int g[3] = {(int)((total + 255) / 256), 1, 1}, b3[3] = {256, 1, 1};
+    if (!sm.DispatchCommand(*kcv, g, b3))
+      return false;
+  }
+  stamp(1);
+  { // l2norm(q,k) in place (qkdot is computed but unused by the chunked form)
+    kln->SetKernelArguments(0, &g_pf_conv, sizeof(g_pf_conv));
+    kln->SetKernelArguments(1, &g_pf_qkdot, sizeof(g_pf_qkdot));
+    kln->SetKernelArguments(2, &iCONV, sizeof(iCONV));
+    kln->SetKernelArguments(3, &iKEY, sizeof(iKEY));
+    kln->SetKernelArguments(4, &iNKH, sizeof(iNKH));
+    kln->SetKernelArguments(5, &iHKD, sizeof(iHKD));
+    kln->SetKernelArguments(6, &eps, sizeof(eps));
+    const int g[3] = {(int)(T * NKH), 1, 1}, b3[3] = {iHKD, 1, 1};
+    if (!sm.DispatchCommand(*kln, g, b3))
+      return false;
+  }
+  stamp(2);
+  { // per-token log-decay + beta + in-chunk cumsum
+    kgc->SetKernelArguments(0, &p_a, sizeof(p_a));
+    kgc->SetKernelArguments(1, &p_b, sizeof(p_b));
+    kgc->SetKernelArguments(2, &dp->alog, sizeof(dp->alog));
+    kgc->SetKernelArguments(3, &dp->dtb, sizeof(dp->dtb));
+    kgc->SetKernelArguments(4, &g_ck_gc, sizeof(g_ck_gc));
+    kgc->SetKernelArguments(5, &g_ck_beta, sizeof(g_ck_beta));
+    kgc->SetKernelArguments(6, &g_ck_gl, sizeof(g_ck_gl));
+    kgc->SetKernelArguments(7, &iT, sizeof(iT));
+    kgc->SetKernelArguments(8, &iNVH, sizeof(iNVH));
+    const int g[3] = {(int)NT, iNVH, 1}, b3[3] = {64, 1, 1};
+    if (!sm.DispatchCommand(*kgc, g, b3))
+      return false;
+  }
+  stamp(3);
+  { // A = beta (k k^T) e^{gdiff}, strictly lower
+    kkt->SetKernelArguments(0, &g_pf_conv, sizeof(g_pf_conv));
+    kkt->SetKernelArguments(1, &g_ck_gc, sizeof(g_ck_gc));
+    kkt->SetKernelArguments(2, &g_ck_beta, sizeof(g_ck_beta));
+    kkt->SetKernelArguments(3, &g_ck_A, sizeof(g_ck_A));
+    kkt->SetKernelArguments(4, &iT, sizeof(iT));
+    kkt->SetKernelArguments(5, &iCONV, sizeof(iCONV));
+    kkt->SetKernelArguments(6, &iKEY, sizeof(iKEY));
+    kkt->SetKernelArguments(7, &iNVH, sizeof(iNVH));
+    kkt->SetKernelArguments(8, &iNKH, sizeof(iNKH));
+    kkt->SetKernelArguments(9, &iHKD, sizeof(iHKD));
+    const int g[3] = {(int)NT, iNVH, 1}, b3[3] = {256, 1, 1};
+    if (!sm.DispatchCommand(*kkt, g, b3))
+      return false;
+  }
+  stamp(4);
+  { // (I+A)^-1 in place
+    ktr->SetKernelArguments(0, &g_ck_A, sizeof(g_ck_A));
+    ktr->SetKernelArguments(1, &iNVH, sizeof(iNVH));
+    const int g[3] = {(int)NT, iNVH, 1}, b3[3] = {64, 1, 1};
+    if (!sm.DispatchCommand(*ktr, g, b3))
+      return false;
+  }
+  stamp(5);
+  { // w, u
+    kwu->SetKernelArguments(0, &g_pf_conv, sizeof(g_pf_conv));
+    kwu->SetKernelArguments(1, &g_ck_A, sizeof(g_ck_A));
+    kwu->SetKernelArguments(2, &g_ck_gc, sizeof(g_ck_gc));
+    kwu->SetKernelArguments(3, &g_ck_beta, sizeof(g_ck_beta));
+    kwu->SetKernelArguments(4, &g_ck_w, sizeof(g_ck_w));
+    kwu->SetKernelArguments(5, &g_ck_u, sizeof(g_ck_u));
+    kwu->SetKernelArguments(6, &iT, sizeof(iT));
+    kwu->SetKernelArguments(7, &iCONV, sizeof(iCONV));
+    kwu->SetKernelArguments(8, &iKEY, sizeof(iKEY));
+    kwu->SetKernelArguments(9, &iNVH, sizeof(iNVH));
+    kwu->SetKernelArguments(10, &iNKH, sizeof(iNKH));
+    kwu->SetKernelArguments(11, &iHKD, sizeof(iHKD));
+    kwu->SetKernelArguments(12, &iHVD, sizeof(iHVD));
+    const int g[3] = {(int)NT, iNVH, 1}, b3[3] = {128, 1, 1};
+    if (!sm.DispatchCommand(*kwu, g, b3))
+      return false;
+  }
+  stamp(6);
+  { // state propagation (the only sequential piece)
+    kst->SetKernelArguments(0, &g_pf_conv, sizeof(g_pf_conv));
+    kst->SetKernelArguments(1, &g_ck_w, sizeof(g_ck_w));
+    kst->SetKernelArguments(2, &g_ck_u, sizeof(g_ck_u));
+    kst->SetKernelArguments(3, &g_ck_gc, sizeof(g_ck_gc));
+    kst->SetKernelArguments(4, &g_ck_gl, sizeof(g_ck_gl));
+    kst->SetKernelArguments(5, &g_ck_h, sizeof(g_ck_h));
+    kst->SetKernelArguments(6, &g_ck_vn, sizeof(g_ck_vn));
+    kst->SetKernelArguments(7, &state, sizeof(state));
+    kst->SetKernelArguments(8, &iT, sizeof(iT));
+    kst->SetKernelArguments(9, &iCONV, sizeof(iCONV));
+    kst->SetKernelArguments(10, &iKEY, sizeof(iKEY));
+    kst->SetKernelArguments(11, &iNVH, sizeof(iNVH));
+    kst->SetKernelArguments(12, &iNKH, sizeof(iNKH));
+    kst->SetKernelArguments(13, &iHKD, sizeof(iHKD));
+    kst->SetKernelArguments(14, &iHVD, sizeof(iHVD));
+    kst->SetKernelArguments(15, &i_seed, sizeof(i_seed));
+    kst->SetKernelArguments(16, &i_save, sizeof(i_save));
+    const int g[3] = {iNVH, 1, 1}, b3[3] = {512, 1, 1};
+    if (!sm.DispatchCommand(*kst, g, b3))
+      return false;
+  }
+  stamp(7);
+  { // outputs (fully parallel over chunks)
+    kou->SetKernelArguments(0, &g_pf_conv, sizeof(g_pf_conv));
+    kou->SetKernelArguments(1, &g_ck_gc, sizeof(g_ck_gc));
+    kou->SetKernelArguments(2, &g_ck_h, sizeof(g_ck_h));
+    kou->SetKernelArguments(3, &g_ck_vn, sizeof(g_ck_vn));
+    kou->SetKernelArguments(4, &g_ck_o, sizeof(g_ck_o));
+    kou->SetKernelArguments(5, &scale, sizeof(scale));
+    kou->SetKernelArguments(6, &iT, sizeof(iT));
+    kou->SetKernelArguments(7, &iCONV, sizeof(iCONV));
+    kou->SetKernelArguments(8, &iKEY, sizeof(iKEY));
+    kou->SetKernelArguments(9, &iNVH, sizeof(iNVH));
+    kou->SetKernelArguments(10, &iNKH, sizeof(iNKH));
+    kou->SetKernelArguments(11, &iHKD, sizeof(iHKD));
+    kou->SetKernelArguments(12, &iHVD, sizeof(iHVD));
+    const int g[3] = {(int)NT, iNVH, 1}, b3[3] = {128, 1, 1};
+    if (!sm.DispatchCommand(*kou, g, b3))
+      return false;
+  }
+  stamp(8);
+  { // gated RMSNorm + silu(z) -> fp16 (the scan's fused tail, un-fused)
+    kga->SetKernelArguments(0, &g_ck_o, sizeof(g_ck_o));
+    kga->SetKernelArguments(1, &p_z, sizeof(p_z));
+    kga->SetKernelArguments(2, &dp->wnorm, sizeof(dp->wnorm));
+    kga->SetKernelArguments(3, &g_pf_normed, sizeof(g_pf_normed));
+    kga->SetKernelArguments(4, &eps, sizeof(eps));
+    kga->SetKernelArguments(5, &iNVH, sizeof(iNVH));
+    kga->SetKernelArguments(6, &iHVD, sizeof(iHVD));
+    const int g[3] = {(int)(T * NVH), 1, 1}, b3[3] = {iHVD, 1, 1};
+    if (!sm.DispatchCommand(*kga, g, b3))
+      return false;
+  }
+  stamp(9);
+  if (dbg_this) {
+    cudaEventSynchronize(ev[9]);
+    float ms[9];
+    const char *nm[9] = {"conv", "l2norm", "gcum", "kkt", "tril",
+                         "wu",   "state",  "out",  "gate"};
+    fprintf(stderr, "[gdn_ck_dbg] T=%u ", T);
+    for (int i = 0; i < 9; ++i) {
+      cudaEventElapsedTime(&ms[i], ev[i], ev[i + 1]);
+      fprintf(stderr, "%s=%.2fms ", nm[i], ms[i]);
+    }
+    fprintf(stderr, "\n");
+    for (int i = 0; i < 10; ++i)
+      cudaEventDestroy(ev[i]);
+    ++ck_dbg_n;
+  }
+  if (!cuda_fc_dense_gemm_fp16(g_pf_normed, wout, out, T, H, VAL)) {
+    fprintf(stderr, "[cuda_gdn] chunked out_proj FAILED\n");
+    return false;
+  }
+  return true;
+}
+
+bool cuda_gdn_save_ring_dev(const float *p_qkv, float *ring, unsigned int T,
+                            unsigned int CONV, unsigned int KS,
+                            bool has_prev) {
+  if (p_qkv == nullptr || ring == nullptr || CONV == 0 || KS < 2 || KS > 8)
+    return false;
+  auto k = CudaContext::Global().registerCudaKernel(GDN_SRC, "gdn_save_ring");
+  if (!k)
+    return false;
+  int iT = (int)T, iCONV = (int)CONV, iKS = (int)KS;
+  int ihp = has_prev ? 1 : 0;
+  k->SetKernelArguments(0, &p_qkv, sizeof(p_qkv));
+  k->SetKernelArguments(1, &ring, sizeof(ring));
+  k->SetKernelArguments(2, &iT, sizeof(iT));
+  k->SetKernelArguments(3, &iCONV, sizeof(iCONV));
+  k->SetKernelArguments(4, &iKS, sizeof(iKS));
+  k->SetKernelArguments(5, &ihp, sizeof(ihp));
+  const int g[3] = {(int)((CONV + 255) / 256), 1, 1}, b3[3] = {256, 1, 1};
+  return StreamManager::Global().DispatchCommand(*k, g, b3);
 }
 
 bool cuda_gdn_decode_fp16(const unsigned short *x, const unsigned short *wqkv,

@@ -103,6 +103,32 @@ bool cuda_gdn_prefill_fp16(const float *p_qkv, const float *p_z,
                            unsigned int KS, float eps, bool seed_state,
                            bool save_state);
 
+/**
+ * @brief The chunked (WY/UT-transform) prefill: the delta-rule scan
+ *        re-expressed as chunk-of-64 matrix work (vLLM's fla decomposition),
+ *        same signature, same algebraic contract, same buffers in and out.
+ *        Not bit-identical to the sequential scan (exp-of-cumsum-differences
+ *        replaces per-token products), fp32 throughout; validate with
+ *        NNTR_CUDA_GDN_CHUNK=2 against the sequential device path.
+ */
+bool cuda_gdn_prefill_chunked_fp16(
+  const float *p_qkv, const float *p_z, const float *p_b, const float *p_a,
+  const unsigned short *wout, const float *h_wconv, const float *h_alog,
+  const float *h_dtb, const float *h_wnorm, float *state, const float *ring,
+  unsigned short *out, unsigned int T, unsigned int H, unsigned int NVH,
+  unsigned int NKH, unsigned int HKD, unsigned int HVD, unsigned int KS,
+  float eps, bool seed_state, bool save_state);
+
+/**
+ * @brief Device conv-ring rebuild -- the byte-exact replacement for the
+ *        layer's host save_ring loop. Reads the RAW projections (pre-conv)
+ *        exactly as the host lambda did; in-place safe (old ring is staged
+ *        in registers first). has_prev = the old ring carries over when the
+ *        chunk is shorter than the ring (seed_state).
+ */
+bool cuda_gdn_save_ring_dev(const float *p_qkv, float *ring, unsigned int T,
+                            unsigned int CONV, unsigned int KS, bool has_prev);
+
 } // namespace nntrainer::cuda
 
 #endif /* __CUDA_GDN_H__ */

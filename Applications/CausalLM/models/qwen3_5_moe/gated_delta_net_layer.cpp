@@ -18,6 +18,7 @@
 #include <cuda_context_manager.h>
 #include <cuda_fc_dense.h>
 #include <cuda_gdn.h>
+#include <cuda_stream_manager.h>
 #endif
 
 // The retired lane's per-token GDN device kernel (nntrainer/cuda/cuda_gdn.*) is
@@ -419,16 +420,90 @@ void GatedDeltaNetLayer::runForward(nntrainer::RunLayerContext &context,
         nntrainer::cuda::dev_accessible(Wout.getData<_FP16>()) &&
         nntrainer::cuda::dev_accessible(output.getData<_FP16>()) &&
         nntrainer::cuda::dev_accessible(st)) {
-      if (nntrainer::cuda::cuda_gdn_prefill_fp16(
-            pq_w, pz_w, pb_w, pa_w,
-            reinterpret_cast<const unsigned short *>(Wout.getData<_FP16>()),
-            wconv_f.data(), alog_f.data(), dtb_f.data(), wnorm_f.data(), st, rg,
-            reinterpret_cast<unsigned short *>(output.getData<_FP16>()),
-            (unsigned)T, (unsigned)H, (unsigned)NVH, (unsigned)NKH,
-            (unsigned)HKD, (unsigned)HVD, (unsigned)KS, eps, seed_state,
-            save_state)) {
+      // NNTR_CUDA_GDN_CHUNK: 0 = the sequential scan (default), 1 = the
+      // chunked WY form (cuda_gdn_prefill_chunked_fp16, falls back to the
+      // scan on decline), 2 = run BOTH and report max|d| out/state, keeping
+      // the sequential result (the scan is the semantic reference; the CPU
+      // golden harness is red for GDN).
+      static const int gdn_chunk = [] {
+        const char *e = std::getenv("NNTR_CUDA_GDN_CHUNK");
+        return e ? atoi(e) : 0;
+      }();
+      const auto *wout16 =
+        reinterpret_cast<const unsigned short *>(Wout.getData<_FP16>());
+      auto *out16 = reinterpret_cast<unsigned short *>(output.getData<_FP16>());
+      bool dev_ok = false;
+      if (gdn_chunk == 2 && T > 1) {
+        // Diagnostic A/B: snapshot state, run chunked, capture, restore, run
+        // sequential, diff. Liberal drains -- this is not a perf path. The
+        // kernels only READ the ring, so it needs no restore.
+        auto &smg = nntrainer::cuda::StreamManager::Global();
+        smg.finish();
+        std::vector<float> s_bak(st, st + (size_t)NVH * HKD * HVD);
+        const bool ck_ok = nntrainer::cuda::cuda_gdn_prefill_chunked_fp16(
+          pq_w, pz_w, pb_w, pa_w, wout16, wconv_f.data(), alog_f.data(),
+          dtb_f.data(), wnorm_f.data(), st, rg, out16, (unsigned)T,
+          (unsigned)H, (unsigned)NVH, (unsigned)NKH, (unsigned)HKD,
+          (unsigned)HVD, (unsigned)KS, eps, seed_state, save_state);
+        smg.finish();
+        std::vector<float> o_ck, s_ck;
+        if (ck_ok) {
+          o_ck.resize((size_t)T * H);
+          const _FP16 *o16r = output.getData<_FP16>();
+          for (size_t i = 0; i < (size_t)T * H; ++i)
+            o_ck[i] = static_cast<float>(o16r[i]);
+          s_ck.assign(st, st + (size_t)NVH * HKD * HVD);
+        }
+        std::copy(s_bak.begin(), s_bak.end(), st);
+        dev_ok = nntrainer::cuda::cuda_gdn_prefill_fp16(
+          pq_w, pz_w, pb_w, pa_w, wout16, wconv_f.data(), alog_f.data(),
+          dtb_f.data(), wnorm_f.data(), st, rg, out16, (unsigned)T,
+          (unsigned)H, (unsigned)NVH, (unsigned)NKH, (unsigned)HKD,
+          (unsigned)HVD, (unsigned)KS, eps, seed_state, save_state);
+        smg.finish();
+        if (ck_ok && dev_ok) {
+          float md_o = 0.f, md_s = 0.f;
+          const _FP16 *o16r = output.getData<_FP16>();
+          for (size_t i = 0; i < (size_t)T * H; ++i)
+            md_o = std::max(md_o,
+                            std::fabs(o_ck[i] - static_cast<float>(o16r[i])));
+          if (save_state)
+            for (size_t i = 0; i < (size_t)NVH * HKD * HVD; ++i)
+              md_s = std::max(md_s, std::fabs(s_ck[i] - st[i]));
+          fprintf(stderr,
+                  "[gdn_ck_cmp] %s T=%d seed=%d max|chunked-seq| out=%g "
+                  "state=%g\n",
+                  context.getName().c_str(), (int)T, seed_state ? 1 : 0, md_o,
+                  md_s);
+        } else {
+          fprintf(stderr, "[gdn_ck_cmp] %s T=%d chunked=%d seq=%d (a path "
+                          "declined)\n",
+                  context.getName().c_str(), (int)T, ck_ok ? 1 : 0,
+                  dev_ok ? 1 : 0);
+        }
+      } else if (gdn_chunk == 1 && T > 1) {
+        dev_ok = nntrainer::cuda::cuda_gdn_prefill_chunked_fp16(
+          pq_w, pz_w, pb_w, pa_w, wout16, wconv_f.data(), alog_f.data(),
+          dtb_f.data(), wnorm_f.data(), st, rg, out16, (unsigned)T,
+          (unsigned)H, (unsigned)NVH, (unsigned)NKH, (unsigned)HKD,
+          (unsigned)HVD, (unsigned)KS, eps, seed_state, save_state);
+      }
+      if (!dev_ok)
+        dev_ok = nntrainer::cuda::cuda_gdn_prefill_fp16(
+          pq_w, pz_w, pb_w, pa_w, wout16, wconv_f.data(), alog_f.data(),
+          dtb_f.data(), wnorm_f.data(), st, rg, out16, (unsigned)T,
+          (unsigned)H, (unsigned)NVH, (unsigned)NKH, (unsigned)HKD,
+          (unsigned)HVD, (unsigned)KS, eps, seed_state, save_state);
+      if (dev_ok) {
         if (gdn_gpu_p < 2) {
-          save_ring();
+          // 전부 GPU: the ring rebuild is a device kernel, stream-ordered
+          // after the conv kernel that read the old ring -- no drain needed,
+          // in any mode. The host lambda stays for the host lane below.
+          if (save_state &&
+              !nntrainer::cuda::cuda_gdn_save_ring_dev(
+                pq_w, context.getTensor(conv_state_idx).getData<float>(),
+                (unsigned)T, (unsigned)CONV, (unsigned)KS, seed_state))
+            save_ring();
           return;
         }
         // NNTR_CUDA_GDN=2: keep the device result and fall through to the host
