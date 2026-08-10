@@ -646,6 +646,19 @@ __global__ void gdn_ck_out(const float *conv, const float *gc,
 
 // gated RMSNorm + silu(z) gate -> fp16, VERBATIM the scan's fused tail.
 // grid T*NVH, block 128 (thread = b).
+// fp16 round-trip stub (NNTR_GDN_CK_F16STUB=1, =2 harness only): rounds a
+// buffer through fp16 in place, emulating what a tensor-core rewrite would
+// feed as fp16 mma operands. Used on the conv plane (q/k/v), w/u (before the
+// state sweep reads them) and h/v_new (before the out kernel) to measure the
+// INTRINSIC fp16-input error envelope that sets the acceptance gate.
+__global__ void gdn_ck_f16rt(float *x, long n){
+  long i = (long)blockIdx.x*blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  unsigned short hh; asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hh) : "f"(x[i]));
+  float f; asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(hh));
+  x[i] = f;
+}
+
 __global__ void gdn_ck_gate(const float *o, const float *z,
                             const float *wnorm, unsigned short *normed,
                             float eps, int NVH, int HVD){
@@ -980,6 +993,23 @@ bool cuda_gdn_prefill_chunked_fp16(
   auto kst = ctx.registerCudaKernel(GDN_SRC, "gdn_ck_state");
   auto kou = ctx.registerCudaKernel(GDN_SRC, "gdn_ck_out");
   auto kga = ctx.registerCudaKernel(GDN_SRC, "gdn_ck_gate");
+  // fp16-input stub for the acceptance-gate measurement (task #11).
+  static const bool g_f16stub = []() {
+    const char *e = std::getenv("NNTR_GDN_CK_F16STUB");
+    return e != nullptr && e[0] == '1';
+  }();
+  auto kf16 = g_f16stub ? ctx.registerCudaKernel(GDN_SRC, "gdn_ck_f16rt")
+                        : nullptr;
+  auto f16rt = [&](float *p, long n) -> bool {
+    if (!g_f16stub)
+      return true;
+    if (!kf16)
+      return false;
+    kf16->SetKernelArguments(0, &p, sizeof(p));
+    kf16->SetKernelArguments(1, &n, sizeof(n));
+    const int gg[3] = {(int)((n + 255) / 256), 1, 1}, bb[3] = {256, 1, 1};
+    return sm.DispatchCommand(*kf16, gg, bb);
+  };
   if (!kcv || !kln || !kgc || !kkt || !ktr || !kwu || !kst || !kou || !kga) {
     ml_loge("[CUDA] gdn: chunked kernel registration failed");
     return false;
@@ -1049,6 +1079,11 @@ bool cuda_gdn_prefill_chunked_fp16(
     if (!sm.DispatchCommand(*kgc, g, b3))
       return false;
   }
+  // stub point 1: q/k/v as the TC tiles would see them (conv plane).
+  if (!f16rt(g_pf_conv, (long)T * CONV))
+    return false;
+  {
+  }
   stamp(3);
   { // A = beta (k k^T) e^{gdiff}, strictly lower
     kkt->SetKernelArguments(0, &g_pf_conv, sizeof(g_pf_conv));
@@ -1092,6 +1127,10 @@ bool cuda_gdn_prefill_chunked_fp16(
     if (!sm.DispatchCommand(*kwu, g, b3))
       return false;
   }
+  // stub point 2: w/u before the state sweep consumes them.
+  if (!f16rt(g_ck_w, (long)T * NVH * HKD) ||
+      !f16rt(g_ck_u, (long)T * NVH * HVD))
+    return false;
   stamp(6);
   { // state propagation (the only sequential piece)
     kst->SetKernelArguments(0, &g_pf_conv, sizeof(g_pf_conv));
@@ -1115,6 +1154,10 @@ bool cuda_gdn_prefill_chunked_fp16(
     if (!sm.DispatchCommand(*kst, g, b3))
       return false;
   }
+  // stub point 3: h and v_new before the out kernel consumes them.
+  if (!f16rt(g_ck_h, (long)NT * NVH * 16384) ||
+      !f16rt(g_ck_vn, (long)T * NVH * HVD))
+    return false;
   stamp(7);
   { // outputs (fully parallel over chunks)
     kou->SetKernelArguments(0, &g_pf_conv, sizeof(g_pf_conv));
