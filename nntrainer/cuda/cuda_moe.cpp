@@ -1051,8 +1051,14 @@ bool cuda_moe_route_grouped_fp32(const float *logits, int *rows, float *wts,
       !grow_dev((void **)&d_cur, &c_cur, (size_t)E * 4) ||
       !grow_dev((void **)&d_cnt, &c_cnt, (size_t)E * 4))
     return false;
-  (void)counts;
-  counts = d_cnt;
+  // NNTR_MOE_ROUTE_DEV=0 restores the caller's mapped counts (A/B isolation
+  // switch; the device histogram is the default and the 12.4x win).
+  static const bool g_route_dev = []() {
+    const char *e = std::getenv("NNTR_MOE_ROUTE_DEV");
+    return e == nullptr || e[0] != '0';
+  }();
+  if (g_route_dev)
+    counts = d_cnt;
   auto &sm = StreamManager::Global();
   auto &ctx = CudaContext::Global();
   cudaStream_t st = sm.GetStream();

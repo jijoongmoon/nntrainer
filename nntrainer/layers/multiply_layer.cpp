@@ -40,8 +40,15 @@ void MultiplyLayer::forwarding_operation(const Tensor &input0,
   // host loop (an fp16 x fp16 product is exact in fp32; one rn round), and it
   // removes both the full-stream drain below and the single-threaded host
   // multiply over the whole chunk (10 nodes/chunk on the 35B's attention
-  // gate).
-  if (input0.getDataType() == ml::train::TensorDim::DataType::FP16 &&
+  // gate). Size-gated: at decode (m=1, ~4K elements) the launch+sync
+  // machinery costs more than the host loop it replaces -- the un-gated
+  // version measured ~-2.5 ms/token of decode. NNTR_EW_DEV=0 kills the path.
+  static const bool g_ew_dev = []() {
+    const char *e = std::getenv("NNTR_EW_DEV");
+    return e == nullptr || e[0] != '0';
+  }();
+  if (g_ew_dev && input0.size() >= 32768 &&
+      input0.getDataType() == ml::train::TensorDim::DataType::FP16 &&
       input1.getDataType() == ml::train::TensorDim::DataType::FP16 &&
       hidden.getDataType() == ml::train::TensorDim::DataType::FP16 &&
       input0.size() == input1.size() && input0.size() == hidden.size() &&

@@ -58,7 +58,12 @@ static void bcast_mul_dispatch(nntrainer::Tensor &a, nntrainer::Tensor &g,
   // stream drain in front of it (40 nodes/chunk = 200 drains per 20K prefill)
   // and then multiplies the whole chunk on one core; both go away here.
   // Identical arithmetic: fp32 multiply, one fp16 rounding.
-  if (a.getDataType() == ml::train::TensorDim::DataType::FP16 &&
+  static const bool g_ew_dev = []() {
+    const char *e = std::getenv("NNTR_EW_DEV");
+    return e == nullptr || e[0] != '0';
+  }();
+  if (g_ew_dev && (size_t)rows * a.width() >= 32768 &&
+      a.getDataType() == ml::train::TensorDim::DataType::FP16 &&
       a.batch() == 1 && a.channel() == 1) {
     const auto *ap =
       reinterpret_cast<const unsigned short *>(a.getData<_FP16>());
