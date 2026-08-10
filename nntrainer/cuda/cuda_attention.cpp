@@ -1330,12 +1330,12 @@ bool attention_splitkv_decode(const unsigned short *q, const unsigned short *k,
 float *g_scores = nullptr;
 size_t g_scores_cap = 0;
 std::mutex g_ga_mtx;
-bool attention_gemm_prefill_fp16(const unsigned short *q,
-                                 const unsigned short *k,
-                                 const unsigned short *v, unsigned short *o,
-                                 int HQ, int HKV, int N_q, int N_kv,
-                                 int cache_from, int d, int window,
-                                 float softcap) {
+static bool attn_gemm_prefill_block(const unsigned short *q,
+                                    const unsigned short *k,
+                                    const unsigned short *v, unsigned short *o,
+                                    int HQ, int HKV, int N_q, int N_kv,
+                                    int cache_from, int d, int window,
+                                    float softcap) {
   std::lock_guard<std::mutex> lk(g_ga_mtx);
   cublasHandle_t bh = BlasManager::Global().handle();
   if (!bh)
@@ -1486,6 +1486,40 @@ bool attention_gemm_prefill_fp16(const unsigned short *q,
             N_q, N_kv, cache_from, t_qkt, t_sm, t_pv, t_qkt + t_sm + t_pv);
     for (int i = 0; i < 1 + 3 * HQ; ++i)
       cudaEventDestroy(aev[i]);
+  }
+  return true;
+}
+
+bool attention_gemm_prefill_fp16(const unsigned short *q,
+                                 const unsigned short *k,
+                                 const unsigned short *v, unsigned short *o,
+                                 int HQ, int HKV, int N_q, int N_kv,
+                                 int cache_from, int d, int window,
+                                 float softcap) {
+  // Q sub-tiling: a 4096-row Q chunk computes its causal diagonal block as a
+  // full square, so 16.7% of QK^T/softmax/PV touches masked elements. Sub-
+  // blocks of 1024 rows shrink each sub-block's kv ceiling to its own causal
+  // limit (total score elements -12.5% at 20K). Numerics: each row's softmax
+  // span [j_lo..j_hi] is untouched, so probabilities are identical; only the
+  // exactly-zero masked tail of the PV reduction is dropped.
+  // NNTR_ATTN_QSUB overrides the sub-block rows (0 disables).
+  static const int g_qsub = []() {
+    const char *e = std::getenv("NNTR_ATTN_QSUB");
+    return e != nullptr ? atoi(e) : 1024;
+  }();
+  if (g_qsub <= 0 || N_q <= g_qsub)
+    return attn_gemm_prefill_block(q, k, v, o, HQ, HKV, N_q, N_kv, cache_from,
+                                   d, window, softcap);
+  const long ldq = (long)HQ * d;
+  for (int q0 = 0; q0 < N_q; q0 += g_qsub) {
+    const int nsub = (N_q - q0 < g_qsub) ? (N_q - q0) : g_qsub;
+    const int cf = cache_from + q0;
+    int nkv = cf + nsub; // this sub-block's causal ceiling
+    if (nkv > N_kv)
+      nkv = N_kv;
+    if (!attn_gemm_prefill_block(q + q0 * ldq, k, v, o + q0 * ldq, HQ, HKV,
+                                 nsub, nkv, cf, d, window, softcap))
+      return false;
   }
   return true;
 }
