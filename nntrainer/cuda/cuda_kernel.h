@@ -67,8 +67,16 @@ public:
    */
   bool valid() const { return function_ != nullptr; }
 
+  /**
+   * @brief Function name this kernel was resolved as (for diagnostics: a
+   *        failed cuLaunchKernel is otherwise anonymous, and under deferred
+   *        drains an async fault surfaces at a launch far from its cause).
+   */
+  const std::string &name() const { return name_; }
+
 private:
   CUfunction function_{nullptr};
+  std::string name_;
   std::vector<std::vector<char>> arg_storage_;
 };
 

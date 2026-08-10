@@ -20,6 +20,10 @@
 #include <vector>
 
 #include <activation_layer.h>
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_context_manager.h>
+#endif
 #include <common_properties.h>
 #include <cpu_backend.h>
 #include <layer_context.h>
@@ -125,6 +129,12 @@ void ActivationLayer::incremental_forwarding(RunLayerContext &context,
       hidden_step.getOps()->apply_activation(hidden_step,
                                              (int)acti_func.getType());
     } else {
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+      // run_fn has no backend dispatch: a host loop over a device-written
+      // input. Ordered by per-op drains in sync mode; supply the drain when
+      // those are deferred.
+      nntrainer::cuda::drain_if_async();
+#endif
       acti_func.run_fn(input_step, hidden_step);
     }
   }

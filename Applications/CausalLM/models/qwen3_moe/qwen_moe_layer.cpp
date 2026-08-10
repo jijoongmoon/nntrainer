@@ -770,7 +770,29 @@ void MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
 
     // reshape output: [B,1,S,H] -> [B*S,1,1,H]
     output.reshape({total_tokens, 1, 1, hidden_size});
-    output.setZero();
+    {
+      // A host memset into a planner-pooled slot is ordered against earlier
+      // device work only by the per-op drains; inside a deferred-drain region
+      // an earlier-enqueued kernel may still be reading the slot's previous
+      // occupant. A stream-ordered memset keeps the region intact.
+      bool zeroed = false;
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+      char *op_ = output.getData<char>();
+      auto &sm_ = nntrainer::cuda::StreamManager::Global();
+      if (nntrainer::cuda::dev_accessible(op_) && sm_.GetStream() != nullptr &&
+          cudaMemsetAsync(op_, 0, output.bytes(), sm_.GetStream()) ==
+            cudaSuccess)
+        zeroed = true;
+      else
+        cudaGetLastError();
+#endif
+      if (!zeroed) {
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+        nntrainer::cuda::drain_if_async();
+#endif
+        output.setZero();
+      }
+    }
     // expert_mask is WRITE-ONLY on this path: nothing in this layer, and
     // nothing outside it (the tensor is layer-local, FORWARD_FUNC_LIFESPAN),
     // ever reads it. Zeroing it cost an 8 MB memset and filling it cost 32,768
@@ -826,6 +848,12 @@ void MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     }
 #endif
     if (!router_dev) {
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+      // Host router fallback reads the device-written layer input (and, under
+      // a deferred-drain region, must not run ahead of the queued memsetAsync
+      // on `output` above).
+      nntrainer::cuda::drain_if_async();
+#endif
       if (input.getDataType() == ml::train::TensorDim::DataType::FP32) {
         input.dot(gate_weights, router_logits);
       } else {

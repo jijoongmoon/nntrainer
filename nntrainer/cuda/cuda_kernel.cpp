@@ -19,6 +19,7 @@ namespace nntrainer::cuda {
 bool Kernel::CreateKernelFromModule(const Module &module,
                                     const std::string &function_name) {
   arg_storage_.clear();
+  name_ = function_name;
   if (!module.valid()) {
     ml_loge("[CUDA] CreateKernelFromModule: module not loaded (%s)",
             function_name.c_str());

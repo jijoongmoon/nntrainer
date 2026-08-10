@@ -350,6 +350,10 @@ void GatedDeltaNetLayer::runForward(nntrainer::RunLayerContext &context,
   }
 #endif
   if (!proj_gpu) {
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+    // Host projection fallback reads the device-written layer input.
+    nntrainer::cuda::drain_if_async();
+#endif
     std::vector<float> xin_v;
     readAsF32(input, (size_t)T * H, xin_v);
     nntrainer::Tensor xin = wrapF32(xin_v.data(), T, H);
@@ -370,6 +374,15 @@ void GatedDeltaNetLayer::runForward(nntrainer::RunLayerContext &context,
   auto save_ring = [&]() {
     if (!save_state)
       return;
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+    // This rebuild host-READS the cuBLAS-written projections (pq) and
+    // host-WRITES the conv ring that the just-enqueued gdn_conv_prefill kernel
+    // reads. Both orderings ride the per-op drains in sync mode; inside a
+    // deferred-drain prefill region nothing else supplies them, and the
+    // projection slots are POOLED across all 30 GDN layers, so a stale read
+    // is another layer's projections, not zeros.
+    nntrainer::cuda::drain_if_async();
+#endif
     float *cs = context.getTensor(conv_state_idx).getData<float>();
     // Snapshot first: when this chunk is SHORTER than the ring (S < KS-1) the
     // oldest slots must carry over from the previous ring, and we are writing
@@ -436,6 +449,11 @@ void GatedDeltaNetLayer::runForward(nntrainer::RunLayerContext &context,
   }
 #endif
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // Host conv/scan lane: pq/pz/pb/pa may be cuBLAS-written (proj_gpu with the
+  // device scan declined) and the ring is device-read scratch.
+  nntrainer::cuda::drain_if_async();
+#endif
   // causal depthwise conv1d + SiLU (per sequence, left-pad K-1). On a resumed
   // chunk the left pad is the persistent ring, not zeros -- read before
   // save_ring() overwrites it below.

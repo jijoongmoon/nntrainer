@@ -19,6 +19,10 @@
 
 #include <layer_context.h>
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_context_manager.h>
+#endif
+
 namespace nntrainer {
 
 void MultiplyLayer::finalize(InitLayerContext &context) {
@@ -29,6 +33,14 @@ void MultiplyLayer::finalize(InitLayerContext &context) {
 
 void MultiplyLayer::forwarding_operation(const Tensor &input0,
                                          const Tensor &input1, Tensor &hidden) {
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // Tensor::multiply is a pure host element loop with no ComputeOps dispatch:
+  // on a CUDA graph both operands are device-written (attention output, gate
+  // sigmoid) and the only ordering is the producers' per-op drains. Inside a
+  // deferred-drain or async region this supplies the missing drain; in plain
+  // sync mode it is a no-op.
+  nntrainer::cuda::drain_if_async();
+#endif
   input0.multiply(input1, hidden);
 }
 

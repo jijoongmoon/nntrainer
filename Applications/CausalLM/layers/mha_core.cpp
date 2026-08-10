@@ -3107,6 +3107,10 @@ void MHACoreLayer::gemm_attention(nntrainer::Tensor &query_step,
       }
     }
   }
+  // Host attention fallback: Q/K/V below are device-written (RoPE, KV-cache
+  // copies). In sync mode the producers' per-op drains order this; inside a
+  // deferred-drain or async region this is the missing drain.
+  nntrainer::cuda::drain_if_async();
 #endif
 
   // Phase 1: de-interleave heads once into shared contiguous buffers.
