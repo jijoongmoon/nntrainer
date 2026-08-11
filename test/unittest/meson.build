@@ -118,7 +118,8 @@ foreach target: test_target
     include_directories: include_directories('models'),
     dependencies: unittest_nntrainer_deps,
     install: get_option('enable-test'),
-    install_dir: application_install_dir
+    install_dir: application_install_dir,
+    pie: true
   )
   test(target[0], exe,
     args: ['--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), target[0])],
