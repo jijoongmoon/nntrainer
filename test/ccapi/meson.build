@@ -13,7 +13,8 @@ exec = executable(
   ccapi_targets,
   dependencies: unittest_ccapi_deps,
   install: get_option('enable-test'),
-  install_dir: application_install_dir
+  install_dir: application_install_dir,
+  pie: true
 )
 
 if host_machine.system() != 'windows'
