@@ -251,16 +251,17 @@ if get_option('enable-opencl')
     clblast_root = subprojects_dir_absolute / 'CLBlast'
     opencl_root = meson.build_root() / 'opencl'
     clblast_dep = declare_dependency()
-  else 
+  else
     clblast_options = cmake.subproject_options()
     clblast_options.add_cmake_defines({'CMAKE_POLICY_VERSION_MINIMUM': '3.10'})
     clblast_options.add_cmake_defines({'CMAKE_CXX_STANDARD': '17'})
+    clblast_options.add_cmake_defines({'CMAKE_POSITION_INDEPENDENT_CODE': 'True'})
     clblast_options.add_cmake_defines({'TUNERS': false})
     clblast_options.add_cmake_defines({'CMAKE_BUILD_TYPE': cmake_build_type})
-    if get_option('default_library') == 'static'
-      clblast_options.add_cmake_defines({'OVERRIDE_MSVC_FLAGS_TO_MT': false})
-      clblast_options.add_cmake_defines({'BUILD_SHARED_LIBS': false})
-    endif
+    # Always build CLBlast as static library with PIC to avoid linker issues
+    # with shared nntrainer + test executables
+    clblast_options.add_cmake_defines({'OVERRIDE_MSVC_FLAGS_TO_MT': false})
+    clblast_options.add_cmake_defines({'BUILD_SHARED_LIBS': false})
     clblast_proj = cmake.subproject('clblast', options: clblast_options, required: true)
     clblast_dep = clblast_proj.dependency('clblast')
   endif
