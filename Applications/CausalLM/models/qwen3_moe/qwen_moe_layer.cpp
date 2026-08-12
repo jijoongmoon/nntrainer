@@ -674,6 +674,49 @@ bool MoELayer::ensureMoeG3Tables(nntrainer::RunLayerContext &context,
       ok = cudaMalloc(&rs_up, (size_t)E * I * 4) == cudaSuccess &&
            cudaMalloc(&rs_gate, (size_t)E * I * 4) == cudaSuccess &&
            cudaMalloc(&rs_down, (size_t)E * hidden_size * 4) == cudaSuccess;
+    // Device-resident expert payload slab (2026-08-13): the model arena is
+    // pinned-mapped, which is not GPU-L2-cached on Tegra, and the grouped
+    // tile streams ~400 MB of payload per layer-chunk from it. The g3tax R9
+    // rung reproduced the WHOLE in-tree MoE residual (~1.2 ms/launch on
+    // gate/up) with a pinned W pool alone. Copy every expert payload into a
+    // device slab and repoint the table BEFORE the repack, so the repack,
+    // the rowsum and every later stream run on device memory. The pinned
+    // originals stay pristine (raw byte order). A failed slab leaves that
+    // projection on the arena -- correct, just unaccelerated.
+    // NNTR_MOE_WDEV=0 opts out (in-place arena repack, as before).
+    static const bool wdev = []() {
+      const char *e = std::getenv("NNTR_MOE_WDEV");
+      return e == nullptr || e[0] != '0';
+    }();
+    if (ok && wdev) {
+      auto to_dev = [&](unsigned int base, unsigned int Nn,
+                        unsigned int Kk) -> bool {
+        const size_t sz = (size_t)Nn * (Kk >> 1);
+        uint8_t *slab = nullptr;
+        if (cudaMalloc(&slab, sz * E) != cudaSuccess) {
+          cudaGetLastError();
+          return false;
+        }
+        for (unsigned int e = 0; e < E; ++e) {
+          if (cudaMemcpy(slab + (size_t)e * sz, moe_wptr[base + e], sz,
+                         cudaMemcpyDefault) != cudaSuccess) {
+            cudaGetLastError();
+            cudaFree(slab);
+            return false;
+          }
+        }
+        for (unsigned int e = 0; e < E; ++e)
+          moe_wptr[base + e] = slab + (size_t)e * sz;
+        return true;
+      };
+      const bool m0 = to_dev(0, I, hidden_size);
+      const bool m1 = to_dev(E, I, hidden_size);
+      const bool m2 = to_dev(2 * E, hidden_size, I);
+      if (!(m0 && m1 && m2))
+        ml_logw("[MoE][G3] device payload slab partial (%d/%d/%d) -- "
+                "unmoved projections stream from the pinned arena",
+                (int)m0, (int)m1, (int)m2);
+    }
     if (ok) {
       auto rp = [&](unsigned int base, int *rs, unsigned int Nn,
                     unsigned int Kk) -> bool {
