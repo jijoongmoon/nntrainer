@@ -552,6 +552,53 @@ __global__ void moe_actq_wl(const unsigned short *Xh, signed char *q8,
   }
 }
 
+// SwiGLU and the int8 re-quant in ONE pass over the gathered row. The
+// two-kernel sequence rounds silu(g)*u to fp16 (the g_S plane) and quantizes
+// what it reads back; here that round happens in-register (moe_f2h then
+// moe_h2f), so per-thread min/max, the reduction, scale/zp and every q8 byte
+// are identical -- g_S never exists. v[] carries the row's fp16 values across
+// the reduction: capacity 8*blockDim elements, driver guards K <= 2048.
+__global__ void moe_swiglu_actq_wl(const unsigned short *gate,
+                                   const unsigned short *up, signed char *q8,
+                                   float *ascale, int *azp, const int *wl_e,
+                                   int K){
+  if (wl_e[blockIdx.y] < 0) return;
+  const int m = blockIdx.y*64 + blockIdx.x; // gathered row
+  const unsigned short *gr = gate + (long)m*K;
+  const unsigned short *ur = up + (long)m*K;
+  __shared__ float smn[256];
+  __shared__ float smx[256];
+  unsigned short v[8];
+  float lmn = 0.f, lmx = 0.f;
+  int c = 0;
+  for (int k = threadIdx.x; k < K; k += blockDim.x, ++c) {
+    const float g = moe_h2f(gr[k]);
+    const unsigned short h =
+      moe_f2h((g / (1.0f + expf(-g))) * moe_h2f(ur[k]));
+    v[c] = h;
+    const float f = moe_h2f(h);
+    lmn = fminf(lmn, f); lmx = fmaxf(lmx, f);
+  }
+  smn[threadIdx.x] = lmn; smx[threadIdx.x] = lmx;
+  __syncthreads();
+  for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+    if (threadIdx.x < s) {
+      smn[threadIdx.x] = fminf(smn[threadIdx.x], smn[threadIdx.x+s]);
+      smx[threadIdx.x] = fmaxf(smx[threadIdx.x], smx[threadIdx.x+s]);
+    }
+    __syncthreads();
+  }
+  float scale_q, recip; int zp;
+  moe_asym(smn[0], smx[0], scale_q, recip, zp);
+  if (threadIdx.x == 0) { ascale[m] = recip; azp[m] = zp; }
+  c = 0;
+  for (int k = threadIdx.x; k < K; k += blockDim.x, ++c) {
+    int q = (int)rintf(moe_h2f(v[c]) * scale_q) + zp;
+    q = max(-128, min(127, q));
+    q8[(long)m*K + k] = (signed char)q;
+  }
+}
+
 // Sequential-rounding combine: bit-identical to the per-expert path's
 // moe_scatter_add_h sequence (one fp16 round after EVERY expert, dst starting
 // from zero), walked in slots' j order == e-ascending. moe_combine_h (fp32
@@ -1166,9 +1213,19 @@ bool cuda_moe_grouped_ffn_imma(const unsigned short *input,
     return false; // the tile has no k tail and needs N%64==0 too (H,I serve
                   // as both N and K across the three projections)
   std::lock_guard<std::mutex> lk(g_moe_mtx);
+  // MoE glue: SwiGLU and the re-quant run as ONE work-list kernel, with the
+  // inter-kernel fp16 round reproduced in-register -- bytes match the
+  // two-kernel arm exactly and the g_S plane is never allocated.
+  // NNTR_MOE_GLUE=0 restores the two-kernel arm. The v[] register carry caps
+  // K at 8*blockDim (2048); I beyond that falls back too.
+  static const bool g_glue = []() {
+    const char *e = std::getenv("NNTR_MOE_GLUE");
+    return e == nullptr || e[0] != '0';
+  }();
+  const bool glue = g_glue && I <= 2048u;
   if (!grow_dev((void **)&g_G, &c_G, (size_t)Pcap * I * 2) ||
       !grow_dev((void **)&g_U, &c_U, (size_t)Pcap * I * 2) ||
-      !grow_dev((void **)&g_S, &c_S, (size_t)Pcap * I * 2) ||
+      (!glue && !grow_dev((void **)&g_S, &c_S, (size_t)Pcap * I * 2)) ||
       !grow_dev((void **)&g_Y, &c_Y, (size_t)Pcap * H * 2) ||
       !grow_dev((void **)&g_qa, &c_qa, (size_t)T * H) ||
       !grow_dev((void **)&g_qb, &c_qb, (size_t)Pcap * I) ||
@@ -1266,6 +1323,24 @@ bool cuda_moe_grouped_ffn_imma(const unsigned short *input,
       return false;
     stamp(3);
   }
+  if (glue) { // fused silu(gate)*up + re-quant, one block per gathered row
+    // (dbg labels unchanged: the fused time prints as "swiglu", "actq2"~0)
+    auto k = ctx.registerCudaKernel(MOE_SRC, "moe_swiglu_actq_wl");
+    if (!k)
+      return false;
+    k->SetKernelArguments(0, &g_G, PS);
+    k->SetKernelArguments(1, &g_U, PS);
+    k->SetKernelArguments(2, &g_qb, PS);
+    k->SetKernelArguments(3, &g_sb, PS);
+    k->SetKernelArguments(4, &g_zb, PS);
+    k->SetKernelArguments(5, &p.wl_e, PS);
+    k->SetKernelArguments(6, &iI, sizeof(int));
+    const int g[3] = {64, (int)Wcap, 1}, b[3] = {256, 1, 1};
+    if (!sm.DispatchCommand(*k, g, b))
+      return false;
+    stamp(4);
+    stamp(5);
+  } else {
   { // silu(gate) * up, work-list-indexed: padding blocks self-discard
     auto k = ctx.registerCudaKernel(MOE_SRC, "moe_swiglu_wl");
     if (!k)
@@ -1295,6 +1370,7 @@ bool cuda_moe_grouped_ffn_imma(const unsigned short *input,
       return false;
   }
   stamp(5);
+  }
   // down stays on the 64x64 tile: with K=512 (8 k-steps) the wide tile's
   // doubled W staging outweighs its fragment savings -- measured 8.7 -> 9.5
   // ms. The wide tile pays only on the K=2048 gate/up shapes (-5% each).
