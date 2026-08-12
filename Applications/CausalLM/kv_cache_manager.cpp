@@ -124,8 +124,20 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
   // attention kernel re-reads each K/V tile from up to 8 resident CTAs, so
   // an uncached cache plane costs it the whole cross-CTA L2 reuse.
   {
+    // DEFAULT ON for the cuda engine on integrated GPUs (2026-08-13): the
+    // pinned house pool is not GPU-L2-cached there, and the flash K/V
+    // stream alone measured 348 -> 252 ms/layer (prefill +7%) with a
+    // device-resident cache. =0 opts out; =1 forces on any platform. The
+    // cache is written by the GPU RoPE/V-copy kernels and read by GPU
+    // attention; a profile that still host-touches it throws loudly in
+    // mha_core rather than corrupting.
     const char *kv_dev_pre = std::getenv("NNTR_CUDA_KV_DEV");
-    if (kv_dev_pre != nullptr && kv_dev_pre[0] == '1') {
+    bool kv_dev_on;
+    if (kv_dev_pre != nullptr)
+      kv_dev_on = (kv_dev_pre[0] == '1');
+    else
+      kv_dev_on = nntrainer::cuda::ContextManager::Global().isIntegrated();
+    if (kv_dev_on) {
       auto allocs = nntrainer::Engine::Global().getAllocators();
       if (allocs.find("cuda") != allocs.end())
         svm_alloc =
