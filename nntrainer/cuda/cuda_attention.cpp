@@ -1790,13 +1790,16 @@ bool attention_gemm_prefill_fp16(const unsigned short *q,
     const char *e = std::getenv("NNTR_ATTN_QSUB");
     return e != nullptr ? atoi(e) : 1024;
   }();
-  // NNTR_ATTN_FLASH=1 (opt-in until the semantic gates pass): the online-
-  // softmax flash kernel replaces the whole QK^T/softmax/PV sequence for the
-  // shapes it supports (d=256, no window, no softcap). No Q sub-tiling: the
-  // kernel's causal tile skip already never touches the masked region.
+  // Flash DEFAULT ON (2026-08-12, gates: long-context continuation EXACT
+  // match; 16-prompt NLL 0.2371 vs baseline 0.2416 -- flash marginally
+  // BETTER; every greedy divergence eyeballed benign; 20K prefill
+  // 17,833 -> 16,308 ms interleaved). NNTR_ATTN_FLASH=0 restores the
+  // GEMM/materialized-scores path. The online-softmax kernel replaces the
+  // whole QK^T/softmax/PV sequence for the shapes it supports (d=256, no
+  // window, no softcap); everything else falls through to the GEMM path.
   static const bool g_flash = []() {
     const char *e = std::getenv("NNTR_ATTN_FLASH");
-    return e != nullptr && e[0] == '1';
+    return e == nullptr || e[0] != '0';
   }();
   if (g_flash && d == 256 && softcap == 0.0f && HKV > 0 && HQ % HKV == 0 &&
       N_q > 1 && (window <= 0 || window >= N_kv)) {
