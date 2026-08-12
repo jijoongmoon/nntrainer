@@ -3249,6 +3249,21 @@ bool cuda_fc_qs4cx_moe_grouped_gemm_g3(
                                                      "imma_moe_grouped_g3");
   if (!kg)
     return false;
+  static bool attr_once = true;
+  if (attr_once) {
+    attr_once = false;
+    int nregs = 0, lmem = 0, smem = 0, maxthr = 0;
+    cuFuncGetAttribute(&nregs, CU_FUNC_ATTRIBUTE_NUM_REGS, kg->GetFunction());
+    cuFuncGetAttribute(&lmem, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,
+                       kg->GetFunction());
+    cuFuncGetAttribute(&smem, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES,
+                       kg->GetFunction());
+    cuFuncGetAttribute(&maxthr, CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
+                       kg->GetFunction());
+    fprintf(stderr,
+            "[g3_attr] regs=%d local=%dB smem_static=%dB maxthreads=%d\n",
+            nregs, lmem, smem, maxthr);
+  }
   const int n = (int)N, k = (int)K;
   kg->SetKernelArguments(0, &q8, sizeof(q8));
   kg->SetKernelArguments(1, &tokid, sizeof(tokid));
