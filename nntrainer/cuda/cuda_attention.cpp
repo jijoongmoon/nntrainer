@@ -1319,6 +1319,289 @@ bool attention_splitkv_decode(const unsigned short *q, const unsigned short *k,
   return true;
 }
 
+
+// ---- T2 flash prefill (head_dim 256): online softmax, no score plane -----
+// The tile_bench/attention_bench.cu kernel in NVRTC dialect. One CTA =
+// (q-head, 128-row Q tile); 8 warps x 16 rows; KV tiles of 64 rows staged
+// once (single buffer; a 2-ring exceeds the 163KB cap); S via f16-acc
+// m16n8k16 off proven fragment recipes; P stays in C-fragment registers and
+// feeds P@V as the A operand with zero relayout; O in fp32 C-frags.
+// Semantic contract (NOT byte): bench-validated max|d| <= 1.3e-4 vs fp64.
+static const char *ATTN_FLASH_SRC = R"CU(
+#define AFD 256
+#define AFBR 128
+#define AFBC 64
+#define AFLD (AFD + 8)
+__device__ __forceinline__ float af_h2f(unsigned short h){
+  float f; asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h)); return f;
+}
+__device__ __forceinline__ unsigned short af_f2h(float f){
+  unsigned short h; asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(f)); return h;
+}
+__device__ __forceinline__ unsigned af_sh(const void *p){
+  unsigned r;
+  asm("{ .reg .u64 t; cvta.to.shared.u64 t, %1; cvt.u32.u64 %0, t; }"
+      : "=r"(r) : "l"(p));
+  return r;
+}
+extern "C" __global__ void __launch_bounds__(256, 1)
+attn_flash_d256(const unsigned short *Q, const unsigned short *K,
+                const unsigned short *V, unsigned short *O, int Nq, int Nkv,
+                int qpos0, int nqh, int nkvh, float scale) {
+  extern __shared__ unsigned short smem[];
+  unsigned short *Qs = smem;
+  unsigned short *Ks = Qs + AFBR * AFLD;
+  unsigned short *Vs = Ks + AFBC * AFLD;
+  const int qh = blockIdx.y, kvh = qh / (nqh / nkvh);
+  const int r0 = blockIdx.x * AFBR;
+  if (r0 >= Nq) return;
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  const int qstride = nqh * AFD, kstride = nkvh * AFD;
+  const unsigned short *Qg = Q + (long)qh * AFD;
+  const unsigned short *Kg = K + (long)kvh * AFD;
+  const unsigned short *Vg = V + (long)kvh * AFD;
+  {
+    const int row = tid >> 1, h8 = (tid & 1) * (AFD / 2);
+    const unsigned short *srcq = Qg + (long)(r0 + row) * qstride + h8;
+    const unsigned dst = af_sh(Qs + row * AFLD + h8);
+    const int ok = (r0 + row) < Nq ? 16 : 0;
+#pragma unroll
+    for (int i = 0; i < AFD / 2 / 8; ++i)
+      asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(
+                     dst + i * 16),
+                   "l"(srcq + i * 8), "r"(ok));
+    asm volatile("cp.async.commit_group;\n");
+  }
+  float o[32][4];
+#pragma unroll
+  for (int i = 0; i < 32; ++i)
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+      o[i][j] = 0.f;
+  float m_lo = -1e30f, m_hi = -1e30f, l_lo = 0.f, l_hi = 0.f;
+  const int g = lane >> 2, t = lane & 3;
+  const int wrow = warp * 16;
+  const int q_hi_pos = qpos0 + r0 + AFBR - 1;
+  const int kv_stop = Nkv < q_hi_pos + 1 ? Nkv : q_hi_pos + 1;
+  asm volatile("cp.async.wait_group 0;\n");
+  __syncthreads();
+  for (int kbase = 0; kbase < kv_stop; kbase += AFBC) {
+    {
+      const int row = tid >> 1, h8 = (tid & 1) * (AFD / 2);
+      const int kr = kbase + (row & (AFBC - 1));
+      const int isv = row >= AFBC;
+      const unsigned short *srckv =
+        (isv ? Vg : Kg) + (long)kr * kstride + h8;
+      const unsigned dst =
+        af_sh((isv ? Vs : Ks) + (row & (AFBC - 1)) * AFLD + h8);
+      const int ok = kr < Nkv ? 16 : 0;
+#pragma unroll
+      for (int i = 0; i < AFD / 2 / 8; ++i)
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(
+                       dst + i * 16),
+                     "l"(srckv + i * 8), "r"(ok));
+      asm volatile("cp.async.commit_group;\n");
+      asm volatile("cp.async.wait_group 0;\n");
+    }
+    __syncthreads();
+    unsigned sh2[8][2];
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+      sh2[i][0] = sh2[i][1] = 0u;
+#pragma unroll
+    for (int k0 = 0; k0 < AFD; k0 += 16) {
+      int a0, a1, a2, a3;
+      asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+        : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)
+        : "r"(af_sh(Qs + (wrow + (lane & 15)) * AFLD + k0 +
+                    ((lane >> 4) & 1) * 8)));
+      int bl0, bl1, bl2, bl3, bh0, bh1, bh2, bh3;
+#pragma unroll
+      for (int half32 = 0; half32 < 2; ++half32) {
+        const int nb = half32 * 32;
+        asm volatile(
+          "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+          : "=r"(bl0), "=r"(bl1), "=r"(bl2), "=r"(bl3)
+          : "r"(af_sh(Ks + (nb + (lane >> 3) * 8 + (lane & 7)) * AFLD + k0)));
+        asm volatile(
+          "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+          : "=r"(bh0), "=r"(bh1), "=r"(bh2), "=r"(bh3)
+          : "r"(af_sh(Ks + (nb + (lane >> 3) * 8 + (lane & 7)) * AFLD + k0 +
+                      8)));
+#define AF_SMMA(SS, BL, BH)                                                    \
+  asm volatile(                                                                \
+    "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "                       \
+    "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"                              \
+    : "+r"(sh2[SS][0]), "+r"(sh2[SS][1])                                       \
+    : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(BL), "r"(BH))
+        AF_SMMA(half32 * 4 + 0, bl0, bh0);
+        AF_SMMA(half32 * 4 + 1, bl1, bh1);
+        AF_SMMA(half32 * 4 + 2, bl2, bh2);
+        AF_SMMA(half32 * 4 + 3, bl3, bh3);
+#undef AF_SMMA
+      }
+    }
+    float s[8][4];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      s[i][0] = af_h2f((unsigned short)(sh2[i][0] & 0xFFFFu));
+      s[i][1] = af_h2f((unsigned short)(sh2[i][0] >> 16));
+      s[i][2] = af_h2f((unsigned short)(sh2[i][1] & 0xFFFFu));
+      s[i][3] = af_h2f((unsigned short)(sh2[i][1] >> 16));
+    }
+    const int qlo = qpos0 + r0 + wrow + g, qhi = qlo + 8;
+#pragma unroll
+    for (int n8 = 0; n8 < 8; ++n8) {
+      const int c = kbase + n8 * 8 + 2 * t;
+      s[n8][0] = (c <= qlo && c < Nkv) ? s[n8][0] * scale : -1e30f;
+      s[n8][1] = (c + 1 <= qlo && c + 1 < Nkv) ? s[n8][1] * scale : -1e30f;
+      s[n8][2] = (c <= qhi && c < Nkv) ? s[n8][2] * scale : -1e30f;
+      s[n8][3] = (c + 1 <= qhi && c + 1 < Nkv) ? s[n8][3] * scale : -1e30f;
+    }
+    float tm0 = -1e30f, tm1 = -1e30f;
+#pragma unroll
+    for (int n8 = 0; n8 < 8; ++n8) {
+      tm0 = fmaxf(tm0, fmaxf(s[n8][0], s[n8][1]));
+      tm1 = fmaxf(tm1, fmaxf(s[n8][2], s[n8][3]));
+    }
+    tm0 = fmaxf(tm0, __shfl_xor_sync(0xffffffffu, tm0, 1));
+    tm0 = fmaxf(tm0, __shfl_xor_sync(0xffffffffu, tm0, 2));
+    tm1 = fmaxf(tm1, __shfl_xor_sync(0xffffffffu, tm1, 1));
+    tm1 = fmaxf(tm1, __shfl_xor_sync(0xffffffffu, tm1, 2));
+    const float mn0 = fmaxf(m_lo, tm0), mn1 = fmaxf(m_hi, tm1);
+    const float rs0 = expf(m_lo - mn0), rs1 = expf(m_hi - mn1);
+    unsigned pf[8][2];
+    float tl0 = 0.f, tl1 = 0.f;
+#pragma unroll
+    for (int n8 = 0; n8 < 8; ++n8) {
+      const float p00 = expf(s[n8][0] - mn0), p01 = expf(s[n8][1] - mn0);
+      const float p10 = expf(s[n8][2] - mn1), p11 = expf(s[n8][3] - mn1);
+      tl0 += p00 + p01;
+      tl1 += p10 + p11;
+      pf[n8][0] = (unsigned)af_f2h(p00) | ((unsigned)af_f2h(p01) << 16);
+      pf[n8][1] = (unsigned)af_f2h(p10) | ((unsigned)af_f2h(p11) << 16);
+    }
+    tl0 += __shfl_xor_sync(0xffffffffu, tl0, 1);
+    tl0 += __shfl_xor_sync(0xffffffffu, tl0, 2);
+    tl1 += __shfl_xor_sync(0xffffffffu, tl1, 1);
+    tl1 += __shfl_xor_sync(0xffffffffu, tl1, 2);
+    l_lo = l_lo * rs0 + tl0;
+    l_hi = l_hi * rs1 + tl1;
+    m_lo = mn0;
+    m_hi = mn1;
+#pragma unroll
+    for (int i = 0; i < 32; ++i) {
+      o[i][0] *= rs0;
+      o[i][1] *= rs0;
+      o[i][2] *= rs1;
+      o[i][3] *= rs1;
+    }
+#pragma unroll
+    for (int k16 = 0; k16 < AFBC / 16; ++k16) {
+      const unsigned pa0 = pf[k16 * 2][0], pa1 = pf[k16 * 2][1];
+      const unsigned pa2 = pf[k16 * 2 + 1][0], pa3 = pf[k16 * 2 + 1][1];
+#pragma unroll
+      for (int q4 = 0; q4 < 8; ++q4) {
+        const int nb = q4 * 32;
+        int bl0, bl1, bl2, bl3, bh0, bh1, bh2, bh3;
+        asm volatile(
+          "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, "
+          "[%4];\n"
+          : "=r"(bl0), "=r"(bl1), "=r"(bl2), "=r"(bl3)
+          : "r"(af_sh(Vs + (k16 * 16 + (lane & 7)) * AFLD + nb +
+                      (lane >> 3) * 8)));
+        asm volatile(
+          "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, "
+          "[%4];\n"
+          : "=r"(bh0), "=r"(bh1), "=r"(bh2), "=r"(bh3)
+          : "r"(af_sh(Vs + (k16 * 16 + 8 + (lane & 7)) * AFLD + nb +
+                      (lane >> 3) * 8)));
+#define AF_PMMA(NS, BL, BH)                                                    \
+  asm volatile(                                                                \
+    "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "                       \
+    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"                  \
+    : "+f"(o[NS][0]), "+f"(o[NS][1]), "+f"(o[NS][2]), "+f"(o[NS][3])           \
+    : "r"(pa0), "r"(pa1), "r"(pa2), "r"(pa3), "r"(BL), "r"(BH))
+        AF_PMMA(q4 * 4 + 0, bl0, bh0);
+        AF_PMMA(q4 * 4 + 1, bl1, bh1);
+        AF_PMMA(q4 * 4 + 2, bl2, bh2);
+        AF_PMMA(q4 * 4 + 3, bl3, bh3);
+#undef AF_PMMA
+      }
+    }
+    __syncthreads();
+  }
+  const float il0 = l_lo > 0.f ? 1.f / l_lo : 0.f;
+  const float il1 = l_hi > 0.f ? 1.f / l_hi : 0.f;
+#pragma unroll
+  for (int n8 = 0; n8 < 32; ++n8) {
+    const int c = n8 * 8 + 2 * t;
+    const int rlo = r0 + wrow + g, rhi = rlo + 8;
+    if (rlo < Nq) {
+      unsigned short *dp = O + (long)rlo * qstride + qh * AFD + c;
+      dp[0] = af_f2h(o[n8][0] * il0);
+      dp[1] = af_f2h(o[n8][1] * il0);
+    }
+    if (rhi < Nq) {
+      unsigned short *dp = O + (long)rhi * qstride + qh * AFD + c;
+      dp[0] = af_f2h(o[n8][2] * il1);
+      dp[1] = af_f2h(o[n8][3] * il1);
+    }
+  }
+}
+)CU";
+
+static bool attn_flash_prefill_d256(const unsigned short *q,
+                                    const unsigned short *k,
+                                    const unsigned short *v, unsigned short *o,
+                                    int HQ, int HKV, int N_q, int N_kv,
+                                    int cache_from, int d) {
+  auto kf = CudaContext::Global().registerCudaKernel(ATTN_FLASH_SRC,
+                                                     "attn_flash_d256");
+  if (!kf)
+    return false;
+  constexpr int SMEM = (128 + 2 * 64) * (256 + 8) * 2; // 135,168 B
+  static bool attr_ok = []() { return true; }();
+  static bool attr_done = false;
+  if (!attr_done) {
+    attr_done = true;
+    if (cuFuncSetAttribute(kf->GetFunction(),
+                           CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                           SMEM) != CUDA_SUCCESS)
+      attr_ok = false;
+  }
+  if (!attr_ok)
+    return false;
+  static bool rdbg = []() {
+    const char *e = std::getenv("NNTR_ATTN_DBG");
+    if (e == nullptr || e[0] == '0')
+      return false;
+    return true;
+  }();
+  if (rdbg) {
+    rdbg = false;
+    int nr = 0, lm = 0;
+    cuFuncGetAttribute(&nr, CU_FUNC_ATTRIBUTE_NUM_REGS, kf->GetFunction());
+    cuFuncGetAttribute(&lm, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,
+                       kf->GetFunction());
+    fprintf(stderr, "[attn_flash] regs=%d local=%dB smem=%d\n", nr, lm, SMEM);
+  }
+  const float scale = 1.0f / sqrtf((float)d);
+  kf->SetKernelArguments(0, &q, sizeof(q));
+  kf->SetKernelArguments(1, &k, sizeof(k));
+  kf->SetKernelArguments(2, &v, sizeof(v));
+  kf->SetKernelArguments(3, &o, sizeof(o));
+  kf->SetKernelArguments(4, &N_q, sizeof(N_q));
+  kf->SetKernelArguments(5, &N_kv, sizeof(N_kv));
+  kf->SetKernelArguments(6, &cache_from, sizeof(cache_from));
+  kf->SetKernelArguments(7, &HQ, sizeof(HQ));
+  kf->SetKernelArguments(8, &HKV, sizeof(HKV));
+  kf->SetKernelArguments(9, &scale, sizeof(scale));
+  const int g[3] = {(N_q + 127) / 128, HQ, 1}, b[3] = {256, 1, 1};
+  return StreamManager::Global().DispatchCommand(*kf, g, b, (unsigned)SMEM);
+}
+
 // GEMM-based multi-row prefill attention. The per-key flash kernel
 // (attn_core_il) is fetch/sync-bound (~0.4% of peak on d=128) because it
 // serial- reduces every key; for prefill (N_q>1) materialising scores via
@@ -1507,6 +1790,19 @@ bool attention_gemm_prefill_fp16(const unsigned short *q,
     const char *e = std::getenv("NNTR_ATTN_QSUB");
     return e != nullptr ? atoi(e) : 1024;
   }();
+  // NNTR_ATTN_FLASH=1 (opt-in until the semantic gates pass): the online-
+  // softmax flash kernel replaces the whole QK^T/softmax/PV sequence for the
+  // shapes it supports (d=256, no window, no softcap). No Q sub-tiling: the
+  // kernel's causal tile skip already never touches the masked region.
+  static const bool g_flash = []() {
+    const char *e = std::getenv("NNTR_ATTN_FLASH");
+    return e != nullptr && e[0] == '1';
+  }();
+  if (g_flash && d == 256 && softcap == 0.0f && HKV > 0 && HQ % HKV == 0 &&
+      N_q > 1 && (window <= 0 || window >= N_kv)) {
+    if (attn_flash_prefill_d256(q, k, v, o, HQ, HKV, N_q, N_kv, cache_from, d))
+      return true; // launch failure falls through to the GEMM path
+  }
   if (g_qsub <= 0 || N_q <= g_qsub)
     return attn_gemm_prefill_block(q, k, v, o, HQ, HKV, N_q, N_kv, cache_from,
                                    d, window, softcap);
