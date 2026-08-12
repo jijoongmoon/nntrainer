@@ -506,8 +506,8 @@ void gdn_ck_kkt_tc(const unsigned short *conv, const float *gc, const float *bet
 // gate arbitrates, and out's coef precedent passed with 16x margin).
 __global__ __launch_bounds__(256, 2)
 void gdn_ck_wu_tc(const unsigned short *conv, const float *A, const float *gc,
-                  const float *beta, float *w, float *u, int T, int CONV,
-                  int KEY, int NVH, int NKH, int HKD, int HVD){
+                  const float *beta, unsigned short *w, float *u, int T,
+                  int CONV, int KEY, int NVH, int NKH, int HKD, int HVD){
   const int ck = blockIdx.x, vh = blockIdx.y;
   const int kh = vh / (NVH / NKH);
   const int cn = (T - ck*64 < 64) ? (T - ck*64) : 64;
@@ -606,7 +606,13 @@ void gdn_ck_wu_tc(const unsigned short *conv, const float *A, const float *gc,
       const int dim = wn*64 + s*8 + 2*tq + (r & 1);
       if (c < cn) {
         const long t = (long)ck*64 + c;
-        w[(t*NVH + vh)*HKD + dim] = aw[s][r];
+        // w stores fp16: its only consumer (gdn_ck_state_tc) rounded it to
+        // fp16 at load anyway, so rounding at the store is bit-identical
+        // and halves the plane's traffic. u stays fp32 (consumed unrounded
+        // in the vn = u - vpre subtract).
+        unsigned short hw;
+        asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hw) : "f"(aw[s][r]));
+        w[(t*NVH + vh)*HKD + dim] = hw;
         u[(t*NVH + vh)*HVD + dim] = au[s][r];
       }
     }
@@ -843,8 +849,9 @@ __global__ void gdn_ck_out(const float *conv, const float *gc,
 //   B from [k][n] row-major: ldmatrix.trans.x4 -> 4 n8-subtile k8-halves
 //   B from [n][k] row-major: ldmatrix.x4 (non-trans), reg s = subtile s
 __global__ __launch_bounds__(256, 2)
-void gdn_ck_out_tc(const unsigned short *conv, const float *gc, const float *h,
-                   const float *vnew, float *o, float scale, int T, int CONV,
+void gdn_ck_out_tc(const unsigned short *conv, const float *gc,
+                   const unsigned short *h, const unsigned short *vnew,
+                   float *o, float scale, int T, int CONV,
                    int KEY, int NVH, int NKH, int HKD, int HVD){
   const int ck = blockIdx.x, vh = blockIdx.y;
   const int kh = vh / (NVH / NKH);
@@ -942,17 +949,14 @@ void gdn_ck_out_tc(const unsigned short *conv, const float *gc, const float *h,
   for (int s = 0; s < 8; ++s)
     #pragma unroll
     for (int r = 0; r < 4; ++r) acc[s][r] = 0.f;
-  const float *hb = h + ((long)ck*NVH + vh)*16384;
+  const unsigned short *hb = h + ((long)ck*NVH + vh)*16384;
   const int a_row = wm*16 + (lane & 15);
   const int a_kh8 = (lane >> 4) & 1;
   for (int eh = 0; eh < 2; ++eh) {
-    // restage kx <- h rows [eh*64, eh*64+64) as fp16
+    // restage kx <- h rows [eh*64, eh*64+64) (h plane is already fp16)
     for (int i = tid; i < 64*128; i += 256) {
       const int e = i >> 7, bcol = i & 127;
-      unsigned short hh;
-      float hv = hb[(eh*64 + e)*128 + bcol];
-      asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hh) : "f"(hv));
-      kx[e*LD + bcol] = hh;
+      kx[e*LD + bcol] = hb[(eh*64 + e)*128 + bcol];
     }
     __syncthreads();
     #pragma unroll
@@ -993,12 +997,11 @@ void gdn_ck_out_tc(const unsigned short *conv, const float *gc, const float *h,
   }
 
   // ---- T2: acc += coef @ vn (A = coef [c][d], B = vn [d][b] row-major) ----
-  for (int i = tid; i < 64*128; i += 256) { // restage kx <- vn as fp16
+  for (int i = tid; i < 64*128; i += 256) { // restage kx <- vn (fp16 plane)
     const int d = i >> 7, bcol = i & 127;
-    float vv = (d < cn) ? vnew[(((long)ck*64 + d)*NVH + vh)*HVD + bcol] : 0.f;
-    unsigned short hv;
-    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hv) : "f"(vv));
-    kx[d*LD + bcol] = hv;
+    kx[d*LD + bcol] = (d < cn)
+      ? vnew[(((long)ck*64 + d)*NVH + vh)*HVD + bcol]
+      : (unsigned short)0;
   }
   __syncthreads();
   #pragma unroll
@@ -1051,8 +1054,9 @@ void gdn_ck_out_tc(const unsigned short *conv, const float *gc, const float *h,
 //   addr = (k0 + (lane&7) + ((lane&16)?8:0))*LD + m0 + ((lane&8)?8:0)
 // Bench-validated rel<=1e-3; 20.05 -> 4.13 ms at the T=4096 shape.
 __global__ __launch_bounds__(512, 1)
-void gdn_ck_state_tc(const unsigned short *conv, const float *w, const float *u,
-                     const float *gc, const float *gl, float *h, float *vnew,
+void gdn_ck_state_tc(const unsigned short *conv, const unsigned short *w,
+                     const float *u, const float *gc, const float *gl,
+                     unsigned short *h, unsigned short *vnew,
                      float *state, int T, int CONV, int KEY, int NVH, int NKH,
                      int HKD, int HVD, int seed_state, int save_state){
   const int vh = blockIdx.x;
@@ -1096,17 +1100,17 @@ void gdn_ck_state_tc(const unsigned short *conv, const float *w, const float *u,
             unsigned short hv;
             asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hv) : "f"(S[s][r]));
             Sh[(j - jh*64)*SLD + b] = hv;
-            h[((long)c*NVH + vh)*16384 + j*128 + b] = S[s][r];
+            // fp16 h plane: gdn_ck_out_tc rounded h at load anyway, and hv
+            // IS that rounding -- bit-identical, half the traffic.
+            h[((long)c*NVH + vh)*16384 + j*128 + b] = hv;
           }
         }
       __syncthreads();
       for (int i = tid; i < 64*64; i += 512) {
         const int cc = i >> 6, jj = i & 63;
-        float wv = (cc < cn)
-          ? w[(((long)c*64 + cc)*NVH + vh)*HKD + jh*64 + jj] : 0.0f;
-        unsigned short hv;
-        asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hv) : "f"(wv));
-        Tb[cc*SLD + jj] = hv;
+        Tb[cc*SLD + jj] = (cc < cn)
+          ? w[(((long)c*64 + cc)*NVH + vh)*HKD + jh*64 + jj]
+          : (unsigned short)0;
       }
       __syncthreads();
       if (wm < 4) {
@@ -1159,7 +1163,11 @@ void gdn_ck_state_tc(const unsigned short *conv, const float *w, const float *u,
           if (cc < cn) {
             const long t = (long)c*64 + cc;
             const float vn = u[(t*NVH + vh)*HVD + b] - vp[s][r];
-            vnew[(t*NVH + vh)*HVD + b] = vn;
+            // fp16 vnew plane (out_tc rounded it at load anyway); dv below
+            // keeps the unrounded fp32 vn, exactly as before.
+            unsigned short hvn;
+            asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hvn) : "f"(vn));
+            vnew[(t*NVH + vh)*HVD + b] = hvn;
             dvv = vn*expf(gl[(long)c*NVH + vh] - gc[t*NVH + vh]);
           }
           unsigned short hv;
@@ -1779,7 +1787,10 @@ bool cuda_gdn_prefill_chunked_fp16(
       return false;
   }
   // stub point 2: w/u before the state sweep consumes them.
-  if (!f16rt(g_ck_w, (long)T * NVH * HKD) ||
+  // Under the TC arm w is ALREADY an fp16 plane (stored rounded because its
+  // only consumer rounded at load anyway) -- the f16 round-trip stub only
+  // applies to the fp32 arms. u stays fp32 on both.
+  if ((!g_ck_tc && !f16rt(g_ck_w, (long)T * NVH * HKD)) ||
       !f16rt(g_ck_u, (long)T * NVH * HVD))
     return false;
   stamp(6);
@@ -1805,9 +1816,11 @@ bool cuda_gdn_prefill_chunked_fp16(
     if (!sm.DispatchCommand(*kst, g, b3))
       return false;
   }
-  // stub point 3: h and v_new before the out kernel consumes them.
-  if (!f16rt(g_ck_h, (long)NT * NVH * 16384) ||
-      !f16rt(g_ck_vn, (long)T * NVH * HVD))
+  // stub point 3: h and v_new before the out kernel consumes them. Under the
+  // TC arm both are fp16 planes now -- the stub is the fp32 arms' instrument.
+  if (!g_ck_tc &&
+      (!f16rt(g_ck_h, (long)NT * NVH * 16384) ||
+       !f16rt(g_ck_vn, (long)T * NVH * HVD)))
     return false;
   stamp(7);
   { // outputs (fully parallel over chunks)
