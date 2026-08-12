@@ -115,9 +115,27 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
   // (a raw NNTR_ENGINE read also treats "gpu on a build without OpenCL" as
   // gpu, which the resolver refuses loudly).
   std::shared_ptr<nntrainer::MemAllocator> svm_alloc;
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // NNTR_CUDA_KV_DEV=1 must be checked BEFORE the generic SVM-pool branch:
+  // its own doc says it "takes precedence", but the pool branch used to fill
+  // svm_alloc first, leaving this one dead. The distinction matters on
+  // Tegra: the pool's cuda-uvm allocator is cudaMallocManaged, whose GPU
+  // mappings are IO-COHERENT (not L2-cached) on Jetson -- the flash
+  // attention kernel re-reads each K/V tile from up to 8 resident CTAs, so
+  // an uncached cache plane costs it the whole cross-CTA L2 reuse.
+  {
+    const char *kv_dev_pre = std::getenv("NNTR_CUDA_KV_DEV");
+    if (kv_dev_pre != nullptr && kv_dev_pre[0] == '1') {
+      auto allocs = nntrainer::Engine::Global().getAllocators();
+      if (allocs.find("cuda") != allocs.end())
+        svm_alloc =
+          std::make_shared<nntrainer::CudaMemAllocator>(/*device_only=*/true);
+    }
+  }
+#endif
   const char *_svm_pool_env = std::getenv("NNTR_GPU_SVM_POOL");
   const bool svm_pool_on = !_svm_pool_env || std::atoi(_svm_pool_env) != 0;
-  if (svm_pool_on) {
+  if (!svm_alloc && svm_pool_on) {
     const std::string engine = causallm_engine();
     auto allocs = nntrainer::Engine::Global().getAllocators();
     auto it = allocs.find(engine);

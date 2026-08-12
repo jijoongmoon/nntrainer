@@ -1573,20 +1573,36 @@ static bool attn_flash_prefill_d256(const unsigned short *q,
   }
   if (!attr_ok)
     return false;
-  static bool rdbg = []() {
+  // NNTR_ATTN_DBG=N: attrs once + cudaEvent-time the first N flash launches
+  // (=1 -> 12). The flash path had NO timer before this — the per-stage
+  // timer lives in the unreachable GEMM arm (attribution-run finding).
+  static const int fdbg = []() {
     const char *e = std::getenv("NNTR_ATTN_DBG");
-    if (e == nullptr || e[0] == '0')
-      return false;
-    return true;
+    return e ? std::atoi(e) : 0;
   }();
-  if (rdbg) {
-    rdbg = false;
+  static bool attr_printed = false;
+  if (fdbg && !attr_printed) {
+    attr_printed = true;
     int nr = 0, lm = 0;
     cuFuncGetAttribute(&nr, CU_FUNC_ATTRIBUTE_NUM_REGS, kf->GetFunction());
     cuFuncGetAttribute(&lm, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,
                        kf->GetFunction());
     fprintf(stderr, "[attn_flash] regs=%d local=%dB smem=%d\n", nr, lm, SMEM);
+    // one-shot: what MEMORY KIND does each operand actually live in?
+    // (0=unregistered/host 1=host-pinned 2=device 3=managed)
+    auto pkind = [](const void *p) {
+      cudaPointerAttributes a{};
+      if (cudaPointerGetAttributes(&a, p) != cudaSuccess) {
+        cudaGetLastError();
+        return -1;
+      }
+      return (int)a.type;
+    };
+    fprintf(stderr, "[attn_flash] ptr kinds q=%d k=%d v=%d o=%d\n", pkind(q),
+            pkind(k), pkind(v), pkind(o));
   }
+  static int fdbg_n = 0;
+  const bool time_this = fdbg && fdbg_n < (fdbg == 1 ? 12 : fdbg);
   const float scale = 1.0f / sqrtf((float)d);
   kf->SetKernelArguments(0, &q, sizeof(q));
   kf->SetKernelArguments(1, &k, sizeof(k));
@@ -1599,7 +1615,24 @@ static bool attn_flash_prefill_d256(const unsigned short *q,
   kf->SetKernelArguments(8, &HKV, sizeof(HKV));
   kf->SetKernelArguments(9, &scale, sizeof(scale));
   const int g[3] = {(N_q + 127) / 128, HQ, 1}, b[3] = {256, 1, 1};
-  return StreamManager::Global().DispatchCommand(*kf, g, b, (unsigned)SMEM);
+  if (!time_this)
+    return StreamManager::Global().DispatchCommand(*kf, g, b, (unsigned)SMEM);
+  auto &sm = StreamManager::Global();
+  cudaEvent_t e0, e1;
+  cudaEventCreate(&e0);
+  cudaEventCreate(&e1);
+  cudaEventRecord(e0, sm.GetStream());
+  const bool ok = sm.DispatchCommand(*kf, g, b, (unsigned)SMEM);
+  cudaEventRecord(e1, sm.GetStream());
+  cudaEventSynchronize(e1);
+  float ms = 0.f;
+  cudaEventElapsedTime(&ms, e0, e1);
+  fprintf(stderr, "[attn_flash] Nq=%d Nkv=%d from=%d HQ=%d %.2fms\n", N_q,
+          N_kv, cache_from, HQ, ms);
+  cudaEventDestroy(e0);
+  cudaEventDestroy(e1);
+  ++fdbg_n;
+  return ok;
 }
 
 // GEMM-based multi-row prefill attention. The per-key flash kernel
