@@ -2377,7 +2377,7 @@ void imma_moe_grouped_g3(const signed char *q8, const int *tokid,
                          const unsigned long long *wr_tab,
                          const int *block_expert, const float *ascale,
                          const int *azp, float *Y, int N, int K,
-                         int out_fp16) {
+                         int out_fp16, const int *wl_n) {
   const int e = block_expert[blockIdx.y];
   if (e < 0)
     return;
@@ -2398,6 +2398,11 @@ void imma_moe_grouped_g3(const signed char *q8, const int *tokid,
   if (tid < 64)
     toks[tid] = tokid ? tokid[blockM + tid] : (blockM + tid);
   __syncthreads();
+  // dead-subtile skip: a warp whose 16-row m-subtile is entirely padding
+  // (row >= the window's live count) skips its fragment loads, mma and
+  // epilogue. Barriers and staging stay warp-uniform. g3tax R8: -8.1%.
+  const int live = wl_n ? wl_n[blockIdx.y] : 64;
+  const bool mdead = (wm * 16 >= live);
 
   // staging: 4 threads per row; A carries 2x16B per 128-K stage, W 1x16B of
   // the row's 64 packed bytes.
@@ -2459,8 +2464,11 @@ void imma_moe_grouped_g3(const signed char *q8, const int *tokid,
     : "=r"(R0), "=r"(R1), "=r"(R2), "=r"(R3) : "r"(P))
 
   int na0, na1, na2, na3, np0, np1, np2, np3;
-  IPX_FRAG(pa, na0, na1, na2, na3);
-  IPX_FRAG(pw, np0, np1, np2, np3);
+  na0 = na1 = na2 = na3 = np0 = np1 = np2 = np3 = 0;
+  if (!mdead) {
+    IPX_FRAG(pa, na0, na1, na2, na3);
+    IPX_FRAG(pw, np0, np1, np2, np3);
+  }
 
   for (int c = 0; c < ksteps; ++c) {
 #pragma unroll
@@ -2469,8 +2477,10 @@ void imma_moe_grouped_g3(const signed char *q8, const int *tokid,
       const int p0 = np0, p1 = np1, p2 = np2, p3 = np3;
       if (h == 2) {
         // h3 fragments BEFORE the barrier (they read the current stage)
-        IPX_FRAG(pa + 3 * 32, na0, na1, na2, na3);
-        IPX_FRAG(pw + 3 * 16, np0, np1, np2, np3);
+        if (!mdead) {
+          IPX_FRAG(pa + 3 * 32, na0, na1, na2, na3);
+          IPX_FRAG(pw + 3 * 16, np0, np1, np2, np3);
+        }
         if (kt < ksteps) {
           IPX_IN(wa, ww, kt << 7);
           ++kt;
@@ -2489,11 +2499,11 @@ void imma_moe_grouped_g3(const signed char *q8, const int *tokid,
         pa = (pa >= pa_end) ? pa - IPX_ST * A_ST : pa;
         pw += W_ST;
         pw = (pw >= pw_end) ? pw - IPX_ST * W_ST : pw;
-        if (c + 1 < ksteps) {
+        if (c + 1 < ksteps && !mdead) {
           IPX_FRAG(pa, na0, na1, na2, na3);
           IPX_FRAG(pw, np0, np1, np2, np3);
         }
-      } else {
+      } else if (!mdead) {
         IPX_FRAG(pa + (h + 1) * 32, na0, na1, na2, na3);
         IPX_FRAG(pw + (h + 1) * 16, np0, np1, np2, np3);
       }
@@ -2508,10 +2518,12 @@ void imma_moe_grouped_g3(const signed char *q8, const int *tokid,
       : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1),                  \
         "r"(acc[S][0]), "r"(acc[S][1]), "r"(acc[S][2]), "r"(acc[S][3]));       \
   } while (0)
-      IPX_MMA(0, p0);
-      IPX_MMA(1, p1);
-      IPX_MMA(2, p2);
-      IPX_MMA(3, p3);
+      if (!mdead) {
+        IPX_MMA(0, p0);
+        IPX_MMA(1, p1);
+        IPX_MMA(2, p2);
+        IPX_MMA(3, p3);
+      }
 #undef IPX_MMA
     }
   }
@@ -2524,6 +2536,8 @@ void imma_moe_grouped_g3(const signed char *q8, const int *tokid,
   // adjacent columns store as one 4B/8B word (the wrapper guarantees
   // N % 64 == 0 so a pair never crosses the edge). g3tax ladder: the old
   // per-element software-cvt epilogue was 0.8 ms of the 4.2 ms launch.
+  if (mdead)
+    return; // all barriers are behind us; padding rows are never read
   const int lr0 = wm * 16 + g, lr1 = lr0 + 8;
   const int tk0 = toks[lr0], tk1 = toks[lr1];
   const int az0 = tk0 >= 0 ? azp[tk0] : 0;
@@ -2573,7 +2587,7 @@ void imma_moe_grouped_g3d(const signed char *q8,
                           const unsigned long long *wr_tab,
                           const int *block_expert, const float *ascale,
                           const int *azp, float *Y, int N, int K,
-                          int out_fp16) {
+                          int out_fp16, const int *wl_n) {
   const int e = block_expert[blockIdx.y];
   if (e < 0)
     return;
@@ -2591,6 +2605,8 @@ void imma_moe_grouped_g3d(const signed char *q8,
   const int blockM = blockIdx.y * 64;
   const int Kh = K >> 1;
   const int NT = N >> 6;
+  const int live = wl_n ? wl_n[blockIdx.y] : 64; // dead-subtile skip (R8)
+  const bool mdead = (wm * 16 >= live);
 
   const int srow = tid >> 2, ssub = tid & 3;
   const long a_src = (long)(blockM + srow) * K + (ssub << 4);
@@ -2653,8 +2669,11 @@ void imma_moe_grouped_g3d(const signed char *q8,
     : "=r"(R0), "=r"(R1), "=r"(R2), "=r"(R3) : "r"(P))
 
   int na0, na1, na2, na3, np0, np1, np2, np3;
-  IPD_FRAG(pa0, na0, na1, na2, na3);
-  IPD_FRAG(pw, np0, np1, np2, np3);
+  na0 = na1 = na2 = na3 = np0 = np1 = np2 = np3 = 0;
+  if (!mdead) {
+    IPD_FRAG(pa0, na0, na1, na2, na3);
+    IPD_FRAG(pw, np0, np1, np2, np3);
+  }
 
   // epilogue v2 row-side hoist: each thread's two output rows are fixed for
   // the whole CTA, so their zero-point/scale load ONCE (was per n-tile).
@@ -2671,6 +2690,8 @@ void imma_moe_grouped_g3d(const signed char *q8,
     float cf_ws[8];
 #pragma unroll
     for (int s = 0; s < 4; ++s) {
+      if (mdead)
+        break;
       const int pc0 = (j << 6) + wn * 32 + s * 8 + 2 * t;
       cf_rs[2 * s] = wrsum[pc0];
       cf_rs[2 * s + 1] = wrsum[pc0 + 1];
@@ -2683,8 +2704,10 @@ void imma_moe_grouped_g3d(const signed char *q8,
         const int a0 = na0, a1 = na1, a2 = na2, a3 = na3;
         const int p0 = np0, p1 = np1, p2 = np2, p3 = np3;
         if (h == 2) {
-          IPD_FRAG(pa0 + ka + 3 * 32, na0, na1, na2, na3);
-          IPD_FRAG(pw + 3 * 16, np0, np1, np2, np3);
+          if (!mdead) {
+            IPD_FRAG(pa0 + ka + 3 * 32, na0, na1, na2, na3);
+            IPD_FRAG(pw + 3 * 16, np0, np1, np2, np3);
+          }
           if (kt < kmax) {
             IPD_WIN(wwf, kt);
             ++kt;
@@ -2700,11 +2723,11 @@ void imma_moe_grouped_g3d(const signed char *q8,
           pw = (pw >= pw_end) ? pw - IPX_ST * W_ST : pw;
           ka += 128;
           ka = (ka >= K) ? 0 : ka;
-          if ((j * 4 + cs) + 1 < kmax) {
+          if ((j * 4 + cs) + 1 < kmax && !mdead) {
             IPD_FRAG(pa0 + ka, na0, na1, na2, na3);
             IPD_FRAG(pw, np0, np1, np2, np3);
           }
-        } else {
+        } else if (!mdead) {
           IPD_FRAG(pa0 + ka + (h + 1) * 32, na0, na1, na2, na3);
           IPD_FRAG(pw + (h + 1) * 16, np0, np1, np2, np3);
         }
@@ -2719,16 +2742,20 @@ void imma_moe_grouped_g3d(const signed char *q8,
       : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1),                  \
         "r"(acc[S][0]), "r"(acc[S][1]), "r"(acc[S][2]), "r"(acc[S][3]));       \
   } while (0)
-        IPD_MMA(0, p0);
-        IPD_MMA(1, p1);
-        IPD_MMA(2, p2);
-        IPD_MMA(3, p3);
+        if (!mdead) {
+          IPD_MMA(0, p0);
+          IPD_MMA(1, p1);
+          IPD_MMA(2, p2);
+          IPD_MMA(3, p3);
+        }
 #undef IPD_MMA
       }
     }
     const int blockN = j << 6;
 #pragma unroll
     for (int s = 0; s < 4; ++s) {
+      if (mdead)
+        break; // padding rows: outputs never read
       const int c0 = blockN + wn * 32 + s * 8 + 2 * t;
       const float v00 =
         (float)(acc[s][0] - eaz0 * cf_rs[2 * s]) * eas0 * cf_ws[2 * s];
@@ -3525,7 +3552,8 @@ bool cuda_fc_qs4cx_moe_grouped_gemm_g3(
   const signed char *q8, const int *tokid, const unsigned long long *wp_tab,
   const unsigned long long *ws_tab, const unsigned long long *wr_tab,
   const int *block_expert, const float *ascale, const int *azp, void *Y,
-  unsigned int n_mblocks, unsigned int N, unsigned int K, int out_fp16) {
+  unsigned int n_mblocks, unsigned int N, unsigned int K, int out_fp16,
+  const int *wl_n) {
   if (q8 == nullptr || wp_tab == nullptr || ws_tab == nullptr ||
       wr_tab == nullptr || block_expert == nullptr || Y == nullptr ||
       n_mblocks == 0 || (N & 63u) != 0u || (K & 127u) != 0u || K < 256u)
@@ -3565,6 +3593,7 @@ bool cuda_fc_qs4cx_moe_grouped_gemm_g3(
   kg->SetKernelArguments(9, &n, sizeof(n));
   kg->SetKernelArguments(10, &k, sizeof(k));
   kg->SetKernelArguments(11, &out_fp16, sizeof(out_fp16));
+  kg->SetKernelArguments(12, &wl_n, sizeof(wl_n));
   const int ib[3] = {256, 1, 1};
   const int ig[3] = {(int)(N / 64u), (int)n_mblocks, 1};
   return StreamManager::Global().DispatchCommand(*kg, ig, ib);
@@ -3575,7 +3604,8 @@ bool cuda_fc_qs4cx_moe_grouped_gemm_g3d(
   const signed char *q8, const unsigned long long *wp_tab,
   const unsigned long long *ws_tab, const unsigned long long *wr_tab,
   const int *block_expert, const float *ascale, const int *azp, void *Y,
-  unsigned int n_mblocks, unsigned int N, unsigned int K, int out_fp16) {
+  unsigned int n_mblocks, unsigned int N, unsigned int K, int out_fp16,
+  const int *wl_n) {
   if (q8 == nullptr || wp_tab == nullptr || ws_tab == nullptr ||
       wr_tab == nullptr || block_expert == nullptr || Y == nullptr ||
       n_mblocks == 0 || (N & 63u) != 0u || (K & 127u) != 0u || K < 256u ||
@@ -3597,6 +3627,7 @@ bool cuda_fc_qs4cx_moe_grouped_gemm_g3d(
   kg->SetKernelArguments(8, &n, sizeof(n));
   kg->SetKernelArguments(9, &k, sizeof(k));
   kg->SetKernelArguments(10, &out_fp16, sizeof(out_fp16));
+  kg->SetKernelArguments(11, &wl_n, sizeof(wl_n));
   const int ib[3] = {256, 1, 1};
   const int ig[3] = {1, (int)n_mblocks, 1};
   return StreamManager::Global().DispatchCommand(*kg, ig, ib);

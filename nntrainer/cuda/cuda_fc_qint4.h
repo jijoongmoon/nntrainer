@@ -112,14 +112,16 @@ bool cuda_fc_qs4cx_moe_grouped_gemm_g3(
   const signed char *q8, const int *tokid, const unsigned long long *wp_tab,
   const unsigned long long *ws_tab, const unsigned long long *wr_tab,
   const int *block_expert, const float *ascale, const int *azp, void *Y,
-  unsigned int n_mblocks, unsigned int N, unsigned int K, int out_fp16);
+  unsigned int n_mblocks, unsigned int N, unsigned int K, int out_fp16,
+                                       const int *wl_n = nullptr);
 
 /** @brief G3 down variant (K <= 512): persistent-N, grid (1, W). */
 bool cuda_fc_qs4cx_moe_grouped_gemm_g3d(
   const signed char *q8, const unsigned long long *wp_tab,
   const unsigned long long *ws_tab, const unsigned long long *wr_tab,
   const int *block_expert, const float *ascale, const int *azp, void *Y,
-  unsigned int n_mblocks, unsigned int N, unsigned int K, int out_fp16);
+  unsigned int n_mblocks, unsigned int N, unsigned int K, int out_fp16,
+                                        const int *wl_n = nullptr);
 
 /** @brief In-place fragment repack of ALL E payloads via the pointer table. */
 bool cuda_fc_qs4cx_moe_repack_g3(const unsigned long long *wp_tab,

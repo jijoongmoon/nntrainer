@@ -484,16 +484,20 @@ __global__ void moe_tk_esort(int *tk_idx, float *tk_wt, int T, int K){
 // never reads any of this: Wcap is the data-independent worst case
 // ceil(T*K/BM) + E, computed from shapes alone.
 __global__ void moe_route_scan_pad(const int *counts, int *cursor, int *wl_e,
-                                   int E, int BM, int Wcap){
+                                   int *wl_n, int E, int BM, int Wcap){
   if (threadIdx.x != 0) return;
   int accp = 0, w = 0;
   for (int e = 0; e < E; ++e) {
     cursor[e] = accp;
     const int nb = (counts[e] + BM - 1) / BM;
-    for (int i = 0; i < nb && w < Wcap; ++i) wl_e[w++] = e;
+    for (int i = 0; i < nb && w < Wcap; ++i) {
+      const int rem = counts[e] - i * BM;
+      wl_n[w] = rem < BM ? rem : BM; // live rows of this window
+      wl_e[w++] = e;
+    }
     accp += nb * BM;
   }
-  for (; w < Wcap; ++w) wl_e[w] = -1;
+  for (; w < Wcap; ++w) { wl_n[w] = 0; wl_e[w] = -1; }
 }
 
 // bucket + reverse map: slots[t*K+j] = the gathered row of token t's j-th
@@ -1151,8 +1155,8 @@ bool cuda_moe_expert_ffn_fp16(const unsigned short *input,
 // stays on the device: the grid is sized from shapes alone (Wcap, Pcap) and
 // padding blocks self-discard on wl_e == -1. No finish() anywhere.
 bool cuda_moe_route_grouped_fp32(const float *logits, int *rows, float *wts,
-                                 int *counts, int *wl_e, int *slots,
-                                 unsigned int T, unsigned int E,
+                                 int *counts, int *wl_e, int *wl_n,
+                                 int *slots, unsigned int T, unsigned int E,
                                  unsigned int K, unsigned int BM,
                                  unsigned int Wcap, unsigned int Pcap) {
   if (T == 0 || E == 0 || K == 0 || BM == 0 || Wcap == 0 || Pcap == 0)
@@ -1234,12 +1238,13 @@ bool cuda_moe_route_grouped_fp32(const float *logits, int *rows, float *wts,
   rstamp(2);
   { // padded offsets + block work list, single-threaded over E like the scan
     void *a[] = {(void *)&counts, (void *)&d_cur, (void *)&wl_e,
-                 &iE,             &iBM,           &iW};
-    const size_t s[] = {PS, PS, PS, sizeof(int), sizeof(int), sizeof(int)};
+                 (void *)&wl_n,   &iE,            &iBM,          &iW};
+    const size_t s[] = {PS,          PS,          PS,          PS,
+                        sizeof(int), sizeof(int), sizeof(int)};
     auto k = ctx.registerCudaKernel(MOE_SRC, "moe_route_scan_pad");
     if (!k)
       return false;
-    for (int i = 0; i < 6; ++i)
+    for (int i = 0; i < 7; ++i)
       k->SetKernelArguments(i, a[i], s[i]);
     const int g[3] = {1, 1, 1}, b[3] = {32, 1, 1};
     if (!sm.DispatchCommand(*k, g, b))
@@ -1398,13 +1403,13 @@ bool cuda_moe_grouped_ffn_imma(const unsigned short *input,
     if (!cuda_fc_qs4cx_moe_grouped_gemm_g3(g_qa, p.rows, wp64 + p.off_gate,
                                            ws64 + p.off_gate,
                                            wr64 + p.off_gate, p.wl_e, g_sa,
-                                           g_za, g_G, Wcap, I, H, 1))
+                                           g_za, g_G, Wcap, I, H, 1, p.wl_n))
       return false;
     stamp(2);
     if (!cuda_fc_qs4cx_moe_grouped_gemm_g3(g_qa, p.rows, wp64 + p.off_up,
                                            ws64 + p.off_up, wr64 + p.off_up,
                                            p.wl_e, g_sa, g_za, g_U, Wcap, I, H,
-                                           1))
+                                           1, p.wl_n))
       return false;
     stamp(3);
   } else if (g_wt) {
@@ -1496,14 +1501,16 @@ bool cuda_moe_grouped_ffn_imma(const unsigned short *input,
     if (!cuda_fc_qs4cx_moe_grouped_gemm_g3d(g_qb, wp64 + p.off_down,
                                             ws64 + p.off_down,
                                             wr64 + p.off_down, p.wl_e, g_sb,
-                                            g_zb, g_Y, Wcap, H, I, 1))
+                                            g_zb, g_Y, Wcap, H, I, 1,
+                                            p.wl_n))
       return false;
   } else if (g3) {
     if (!cuda_fc_qs4cx_moe_grouped_gemm_g3(g_qb, /*tokid=*/nullptr,
                                            wp64 + p.off_down,
                                            ws64 + p.off_down,
                                            wr64 + p.off_down, p.wl_e, g_sb,
-                                           g_zb, g_Y, Wcap, H, I, 1))
+                                           g_zb, g_Y, Wcap, H, I, 1,
+                                           p.wl_n))
       return false;
   } else if (!cuda_fc_qs4cx_moe_grouped_gemm(g_qb, /*tokid=*/nullptr,
                                              wp64 + p.off_down,

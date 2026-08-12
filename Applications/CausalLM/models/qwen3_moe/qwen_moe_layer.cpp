@@ -795,7 +795,7 @@ bool MoELayer::runGroupedMoEImma(nntrainer::RunLayerContext &context,
     return false;
   if (!nntrainer::cuda::cuda_moe_route_grouped_fp32(
         router_logits.getData<float>(), plan.rows, plan.wts, cp, plan.wl_e,
-        plan.slots, total_tokens, E, topk, BM, Wcap, Pcap))
+        plan.wl_n, plan.slots, total_tokens, E, topk, BM, Wcap, Pcap))
     return false;
   if (!nntrainer::cuda::cuda_moe_grouped_ffn_imma(
         reinterpret_cast<const unsigned short *>(input.getData<_FP16>()),

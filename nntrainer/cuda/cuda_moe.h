@@ -206,8 +206,8 @@ bool cuda_moe_expert_ffn_fp16(const unsigned short *input,
  * @param Pcap  Wcap * BM         (padded gathered row capacity)
  */
 bool cuda_moe_route_grouped_fp32(const float *logits, int *rows, float *wts,
-                                 int *counts, int *wl_e, int *slots,
-                                 unsigned int T, unsigned int E,
+                                 int *counts, int *wl_e, int *wl_n,
+                                 int *slots, unsigned int T, unsigned int E,
                                  unsigned int K, unsigned int BM,
                                  unsigned int Wcap, unsigned int Pcap);
 
