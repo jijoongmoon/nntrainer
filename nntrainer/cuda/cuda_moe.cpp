@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <mutex>
 #include <nntrainer_log.h>
+#include <vector>
 
 namespace nntrainer::cuda {
 
@@ -249,8 +250,16 @@ __global__ void moe_combine_h(const unsigned short *Y, unsigned short *out,
 // float so the 4-wide column reads do not all land in one bank.
 __global__ void moe_router_gemm(const unsigned short *X, const float *Wg,
                                 float *L, int T, int H, int E){
-  __shared__ float As[16][65];   // [k][m]
-  __shared__ float Bs[16][65];   // [k][n]
+  // 68-float row stride: 16B-aligned rows so the inner-loop fragment loads
+  // are two lds.128 instead of eight lds.32. The fma ORDER is untouched, so
+  // the fp32 logits match the previous tile bit-for-bit given the same
+  // input (2.28 -> 2.01 ms measured; NOT load-bound beyond that -- see the
+  // calibration bank). NOTE the top-k census still wobbles RUN TO RUN by
+  // layer ~2 -- that is upstream nondeterminism (present on the old tile
+  // too, same binary back-to-back), not this kernel's doing.
+  struct alignas(16) RV4 { float x, y, z, w; };
+  __shared__ float As[16][68];   // [k][m]
+  __shared__ float Bs[16][68];   // [k][n]
   const int tid = threadIdx.x;                 // 256
   const int tm = (tid >> 4) * 4, tn = (tid & 15) * 4;
   const int m0 = blockIdx.y * 64, n0 = blockIdx.x * 64;
@@ -275,11 +284,10 @@ __global__ void moe_router_gemm(const unsigned short *X, const float *Wg,
     __syncthreads();
 #pragma unroll
     for (int kk = 0; kk < 16; ++kk) {
-      float a[4], b[4];
-#pragma unroll
-      for (int i = 0; i < 4; ++i) a[i] = As[kk][tm + i];
-#pragma unroll
-      for (int j = 0; j < 4; ++j) b[j] = Bs[kk][tn + j];
+      const RV4 av = *(const RV4 *)&As[kk][tm];
+      const RV4 bv = *(const RV4 *)&Bs[kk][tn];
+      const float a[4] = {av.x, av.y, av.z, av.w};
+      const float b[4] = {bv.x, bv.y, bv.z, bv.w};
 #pragma unroll
       for (int i = 0; i < 4; ++i)
 #pragma unroll
@@ -1256,6 +1264,28 @@ bool cuda_moe_route_grouped_fp32(const float *logits, int *rows, float *wts,
       fprintf(stderr, "%s=%.3fms ", nm[i], ms);
     }
     fprintf(stderr, "\n");
+    { // real padding census (the sync above already drained the stream)
+      std::vector<int> hc(E);
+      if (cudaMemcpy(hc.data(), counts, (size_t)E * 4,
+                     cudaMemcpyDeviceToHost) == cudaSuccess) {
+        long p = 0;
+        int wu = 0, mx = 0, ze = 0;
+        for (unsigned int e = 0; e < E; ++e) {
+          p += hc[e];
+          wu += (hc[e] + (int)BM - 1) / (int)BM;
+          if (hc[e] > mx)
+            mx = hc[e];
+          if (hc[e] == 0)
+            ++ze;
+        }
+        fprintf(stderr,
+                "[moe_r_dbg] pairs=%ld rows_padded=%d (pad %.1f%%) Wcap=%u "
+                "max_c=%d zero_e=%d\n",
+                p, wu * (int)BM,
+                p ? 100.0 * (wu * (int)BM - p) / (double)p : 0.0,
+                (unsigned int)Wcap, mx, ze);
+      }
+    }
     for (int i = 0; i < 5; ++i)
       cudaEventDestroy(rev[i]);
     ++g_rdbg_n;
