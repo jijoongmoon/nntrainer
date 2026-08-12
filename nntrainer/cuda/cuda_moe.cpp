@@ -599,6 +599,51 @@ __global__ void moe_swiglu_actq_wl(const unsigned short *gate,
   }
 }
 
+// Warp-per-row variant of the fused kernel: 8 warps = 8 rows per block, the
+// min/max reduced by shuffles -- no shared memory, no __syncthreads (the
+// 256-thread tree above pays 8 barriers for a 512-element row). min/max is
+// order-insensitive (fminf/fmaxf drop NaN identically in any order, and a
+// signed-zero min feeds arithmetic where -0 == +0), so the different lane
+// mapping still produces the two-kernel arm's exact scale/zp and q8 bytes.
+// v[16] caps K at 512; the driver falls back to the block variant above.
+__global__ void moe_swiglu_actq_w32(const unsigned short *gate,
+                                    const unsigned short *up, signed char *q8,
+                                    float *ascale, int *azp, const int *wl_e,
+                                    int K){
+  if (wl_e[blockIdx.y] < 0) return;
+  const int wid = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int m = blockIdx.y*64 + blockIdx.x*8 + wid; // gathered row
+  const unsigned short *gr = gate + (long)m*K;
+  const unsigned short *ur = up + (long)m*K;
+  unsigned short v[16];
+  float lmn = 0.f, lmx = 0.f;
+  int c = 0;
+  for (int k = lane; k < K; k += 32, ++c) {
+    const float g = moe_h2f(gr[k]);
+    const unsigned short h =
+      moe_f2h((g / (1.0f + expf(-g))) * moe_h2f(ur[k]));
+    v[c] = h;
+    const float f = moe_h2f(h);
+    lmn = fminf(lmn, f); lmx = fmaxf(lmx, f);
+  }
+  for (int o = 16; o > 0; o >>= 1) {
+    lmn = fminf(lmn, __shfl_down_sync(0xffffffffu, lmn, o));
+    lmx = fmaxf(lmx, __shfl_down_sync(0xffffffffu, lmx, o));
+  }
+  lmn = __shfl_sync(0xffffffffu, lmn, 0);
+  lmx = __shfl_sync(0xffffffffu, lmx, 0);
+  float scale_q, recip; int zp;
+  moe_asym(lmn, lmx, scale_q, recip, zp);
+  if (lane == 0) { ascale[m] = recip; azp[m] = zp; }
+  c = 0;
+  for (int k = lane; k < K; k += 32, ++c) {
+    int q = (int)rintf(moe_h2f(v[c]) * scale_q) + zp;
+    q = max(-128, min(127, q));
+    q8[(long)m*K + k] = (signed char)q;
+  }
+}
+
 // Sequential-rounding combine: bit-identical to the per-expert path's
 // moe_scatter_add_h sequence (one fp16 round after EVERY expert, dst starting
 // from zero), walked in slots' j order == e-ascending. moe_combine_h (fp32
@@ -1323,9 +1368,11 @@ bool cuda_moe_grouped_ffn_imma(const unsigned short *input,
       return false;
     stamp(3);
   }
-  if (glue) { // fused silu(gate)*up + re-quant, one block per gathered row
+  if (glue) { // fused silu(gate)*up + re-quant; warp-per-row when it fits
     // (dbg labels unchanged: the fused time prints as "swiglu", "actq2"~0)
-    auto k = ctx.registerCudaKernel(MOE_SRC, "moe_swiglu_actq_wl");
+    const bool w32 = I <= 512u;
+    auto k = ctx.registerCudaKernel(MOE_SRC, w32 ? "moe_swiglu_actq_w32"
+                                                 : "moe_swiglu_actq_wl");
     if (!k)
       return false;
     k->SetKernelArguments(0, &g_G, PS);
@@ -1335,7 +1382,7 @@ bool cuda_moe_grouped_ffn_imma(const unsigned short *input,
     k->SetKernelArguments(4, &g_zb, PS);
     k->SetKernelArguments(5, &p.wl_e, PS);
     k->SetKernelArguments(6, &iI, sizeof(int));
-    const int g[3] = {64, (int)Wcap, 1}, b[3] = {256, 1, 1};
+    const int g[3] = {w32 ? 8 : 64, (int)Wcap, 1}, b[3] = {256, 1, 1};
     if (!sm.DispatchCommand(*k, g, b))
       return false;
     stamp(4);
