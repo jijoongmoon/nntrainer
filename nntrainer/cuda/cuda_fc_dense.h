@@ -27,6 +27,8 @@
 #ifndef __CUDA_FC_DENSE_H__
 #define __CUDA_FC_DENSE_H__
 
+#include <cstddef>
+
 namespace nntrainer::cuda {
 
 /**
@@ -42,6 +44,13 @@ namespace nntrainer::cuda {
  *         reports failure -- the caller must then fall through to its own
  *         fallback chain.
  */
+/**
+ * @brief Lazy device mirror for a pinned-host dense WEIGHT plane (Tegra:
+ *        the pinned pool is not GPU-L2-cached). Returns the device copy,
+ *        or the original pointer when mirroring is off/unneeded/failed.
+ */
+const void *cuda_dense_w_dev(const void *w, size_t bytes);
+
 bool cuda_fc_dense_gemm_fp16(const void *Xh, const void *Wh, void *Yh,
                              unsigned int M, unsigned int N, unsigned int K);
 

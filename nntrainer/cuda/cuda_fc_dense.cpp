@@ -21,6 +21,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include <unordered_map>
+#include <utility>
 
 #include <cuda_runtime.h>
 
@@ -134,6 +136,111 @@ bool gemm_ex(int M, int N, int K, const void *A, cudaDataType a_type,
 
 } // namespace
 
+// Device mirror for dense fp16 WEIGHTS (2026-08-13). The model arena is
+// pinned-mapped, which is not GPU-L2-cached on Tegra; streaming W from it
+// costs ~1.38x on these BW-bound GEMMs (flashmem + g3tax R9 receipts).
+// Weights are written once at load, so a lazy per-pointer device copy is
+// safe. Only HOST-kind (pinned) pointers are mirrored; alloc failure falls
+// back to the original. NNTR_DENSE_WDEV=0 opts out.
+namespace {
+struct WMir {
+  void *dev = nullptr;   // nullptr = permanently unmirrored (alloc failed)
+  size_t bytes = 0;
+  cudaEvent_t ev = nullptr; // outstanding async copy; nullptr once ready
+};
+std::mutex g_wmir_mtx;
+std::unordered_map<const void *, WMir> g_wmir;
+cudaStream_t g_wmir_stream = nullptr;
+} // namespace
+const void *cuda_dense_w_dev(const void *w, size_t bytes) {
+  static const bool on = []() {
+    const char *e = std::getenv("NNTR_DENSE_WDEV");
+    return e == nullptr || e[0] != '0';
+  }();
+  if (!on || w == nullptr || bytes == 0)
+    return w;
+  std::lock_guard<std::mutex> lk(g_wmir_mtx);
+  auto it = g_wmir.find(w);
+  if (it != g_wmir.end()) {
+    WMir &m = it->second;
+    if (m.dev == nullptr || m.bytes != bytes)
+      return w;
+    if (m.ev != nullptr) { // async copy still in flight?
+      const cudaError_t q = cudaEventQuery(m.ev);
+      if (q == cudaErrorNotReady)
+        return w; // keep reading the pinned original, no stall
+      cudaGetLastError();
+      cudaEventDestroy(m.ev);
+      m.ev = nullptr;
+      if (q != cudaSuccess) { // copy failed: stay on the original forever
+        cudaFree(m.dev);
+        m.dev = nullptr;
+        return w;
+      }
+    }
+    return m.dev;
+  }
+  // first sight: verify it IS a pinned-host plane, then kick an ASYNC copy
+  // on a side stream and keep returning the original until it lands -- the
+  // caller never stalls (the first lm_head decode token used to eat a
+  // ~200-350 ms synchronous copy inside the generation window).
+  cudaPointerAttributes pa{};
+  if (cudaPointerGetAttributes(&pa, w) != cudaSuccess) {
+    cudaGetLastError();
+    return w;
+  }
+  if (pa.type != cudaMemoryTypeHost) // already device/managed: nothing to fix
+    return w;
+  WMir m;
+  m.bytes = bytes;
+  if (g_wmir_stream == nullptr &&
+      cudaStreamCreateWithFlags(&g_wmir_stream, cudaStreamNonBlocking) !=
+        cudaSuccess) {
+    cudaGetLastError();
+    g_wmir_stream = nullptr;
+  }
+  // cudaMallocAsync: a plain cudaMalloc of a 100s-of-MB plane is a
+  // host-SYNCHRONOUS 100-250 ms page-table stall on Tegra -- that, not the
+  // copy, was what the first lm_head decode token was eating. Stream-ordered
+  // alloc moves it off the caller entirely; fall back to sync malloc when
+  // pools are unsupported.
+  bool async_alloc = false;
+  if (g_wmir_stream != nullptr &&
+      cudaMallocAsync(&m.dev, bytes, g_wmir_stream) == cudaSuccess)
+    async_alloc = true;
+  else {
+    cudaGetLastError();
+    if (cudaMalloc(&m.dev, bytes) != cudaSuccess) {
+      cudaGetLastError();
+      m.dev = nullptr;
+      g_wmir.emplace(w, m); // negative-cache: never retry this pointer
+      return w;
+    }
+  }
+  bool kicked = false;
+  if (g_wmir_stream != nullptr &&
+      cudaMemcpyAsync(m.dev, w, bytes, cudaMemcpyDefault, g_wmir_stream) ==
+        cudaSuccess &&
+      cudaEventCreateWithFlags(&m.ev, cudaEventDisableTiming) == cudaSuccess &&
+      cudaEventRecord(m.ev, g_wmir_stream) == cudaSuccess)
+    kicked = true;
+  (void)async_alloc;
+  if (!kicked) { // fall back to a one-time synchronous copy (load-time path)
+    cudaGetLastError();
+    if (m.ev != nullptr) {
+      cudaEventDestroy(m.ev);
+      m.ev = nullptr;
+    }
+    if (cudaMemcpy(m.dev, w, bytes, cudaMemcpyDefault) != cudaSuccess) {
+      cudaGetLastError();
+      cudaFree(m.dev);
+      m.dev = nullptr;
+    }
+  }
+  g_wmir.emplace(w, m);
+  return m.ev != nullptr || m.dev == nullptr ? w : m.dev;
+}
+
 bool cuda_fc_dense_gemm_fp16(const void *Xh, const void *Wh, void *Yh,
                              unsigned int M, unsigned int N, unsigned int K) {
   if (!dense_on() || Xh == nullptr || Wh == nullptr || Yh == nullptr || M == 0 ||
@@ -144,7 +251,12 @@ bool cuda_fc_dense_gemm_fp16(const void *Xh, const void *Wh, void *Yh,
   // which over K in the thousands is a visible drift from the host dot()
   // this arm replaces; the 32F accumulate is the closer match and costs
   // nothing on Tensor Cores.
-  const bool ok = gemm_ex((int)M, (int)N, (int)K, Xh, CUDA_R_16F, Wh, Yh,
+  // Mirror only for M > 1 (prefill-shaped GEMMs). The 64-token EOS-banned
+  // A/B measured decode ~7% SLOWER with device-mirrored W on its M=1
+  // single-touch streams (mechanism unresolved -- banked as open); the
+  // prefill projections are where the mirror's +26 TPS lives.
+  const void *Wd = M > 1 ? cuda_dense_w_dev(Wh, (size_t)N * K * 2u) : Wh;
+  const bool ok = gemm_ex((int)M, (int)N, (int)K, Xh, CUDA_R_16F, Wd, Yh,
                           CUDA_R_16F, CUBLAS_COMPUTE_32F);
   trace("fp16", M, N, K, ok);
   return ok;
@@ -159,7 +271,8 @@ bool cuda_fc_dense_gemm_fp16_f32out(const void *Xh, const void *Wh, float *Y,
   // Same fp32 accumulate as the fp16 entry point, just not rounded back down
   // on store. cublasGemmEx supports 16F/16F -> 32F with COMPUTE_32F directly,
   // so this costs an output buffer, not a conversion pass.
-  const bool ok = gemm_ex((int)M, (int)N, (int)K, Xh, CUDA_R_16F, Wh, Y,
+  const void *Wd = M > 1 ? cuda_dense_w_dev(Wh, (size_t)N * K * 2u) : Wh;
+  const bool ok = gemm_ex((int)M, (int)N, (int)K, Xh, CUDA_R_16F, Wd, Y,
                           CUDA_R_32F, CUBLAS_COMPUTE_32F);
   trace("fp16->fp32", M, N, K, ok);
   return ok;
