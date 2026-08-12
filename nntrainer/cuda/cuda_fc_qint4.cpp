@@ -1205,6 +1205,56 @@ void imma_gemm_pipe(const signed char *q8, const unsigned char *plain,
       rsh[srow] = v;
     __syncthreads();
   }
+  if ((N & 1) == 0) {
+    // epilogue v2 (g3tax ladder): row-side loads hoist to the thread's two
+    // fixed rows, fp16<->fp32 use the hardware cvt (bit-identical to the
+    // software pair on finite values), and the (r&1) column pair -- same
+    // row, adjacent columns -- stores as one 4B/8B word. Even N makes the
+    // pair edge-safe (c0 is even, so c0 < N implies c0+1 < N); the odd-N
+    // caller, if one ever appears, takes the scalar path below unchanged.
+    const int row0 = blockM + wm * 16 + g, row1 = row0 + 8;
+    const int az0 = row0 < M ? azp[row0] : 0;
+    const int az1 = row1 < M ? azp[row1] : 0;
+    const float as0 = row0 < M ? ascale[row0] : 0.0f;
+    const float as1 = row1 < M ? ascale[row1] : 0.0f;
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+      const int cb0 = wn * 32 + s * 8 + 2 * t;
+      const int c0 = blockN + cb0;
+      if (c0 < N) {
+        const int rs0 = raw ? rsh[cb0] : wrowsum[c0];
+        const int rs1 = raw ? rsh[cb0 + 1] : wrowsum[c0 + 1];
+        const float ws0 = hw_h2f(wscale[c0]), ws1 = hw_h2f(wscale[c0 + 1]);
+        if (row0 < M) {
+          const float v00 = (float)(acc[s][0] - az0 * rs0) * as0 * ws0;
+          const float v01 = (float)(acc[s][1] - az0 * rs1) * as0 * ws1;
+          if (out_fp16)
+            *(unsigned int *)((unsigned short *)Y + (long)row0 * N + c0) =
+              (unsigned int)hw_f2h(v00) | ((unsigned int)hw_f2h(v01) << 16);
+          else {
+            IPf2 p;
+            p.x = v00;
+            p.y = v01;
+            *(IPf2 *)(Y + (long)row0 * N + c0) = p;
+          }
+        }
+        if (row1 < M) {
+          const float v10 = (float)(acc[s][2] - az1 * rs0) * as1 * ws0;
+          const float v11 = (float)(acc[s][3] - az1 * rs1) * as1 * ws1;
+          if (out_fp16)
+            *(unsigned int *)((unsigned short *)Y + (long)row1 * N + c0) =
+              (unsigned int)hw_f2h(v10) | ((unsigned int)hw_f2h(v11) << 16);
+          else {
+            IPf2 p;
+            p.x = v10;
+            p.y = v11;
+            *(IPf2 *)(Y + (long)row1 * N + c0) = p;
+          }
+        }
+      }
+    }
+    return;
+  }
 #pragma unroll
   for (int s = 0; s < 4; ++s) {
 #pragma unroll
