@@ -984,10 +984,13 @@ bool cuda_moe_new_ptr_table(unsigned int n, const unsigned char ***wp,
 }
 
 bool moe_g3_enabled() {
-  // v1 opt-in (flip to default after the byte-identity + perf gates pass).
+  // DEFAULT ON (2026-08-12): gates passed -- byte-identical output, prefill
+  // 1,123.2 -> 1,129.3 TPS (repack included; down 9.9 -> 7.52 ms via the
+  // persistent-N g3d), decode 6.05 -> 7.04 TPS. =0 restores the classic
+  // unpacked-payload arms (and skips the repack, so they stay valid).
   static const bool v = []() {
     const char *e = std::getenv("NNTR_MOE_G3");
-    return e != nullptr && e[0] == '1';
+    return e == nullptr || e[0] != '0';
   }();
   return v;
 }
@@ -1458,7 +1461,14 @@ bool cuda_moe_grouped_ffn_imma(const unsigned short *input,
   // down stays on the 64x64 tile: with K=512 (8 k-steps) the wide tile's
   // doubled W staging outweighs its fragment savings -- measured 8.7 -> 9.5
   // ms. The wide tile pays only on the K=2048 gate/up shapes (-5% each).
-  if (g3) {
+  if (g3 && I <= 512u) {
+    // persistent-N down: A loads once, W ring never drains between n-tiles
+    if (!cuda_fc_qs4cx_moe_grouped_gemm_g3d(g_qb, wp64 + p.off_down,
+                                            ws64 + p.off_down,
+                                            wr64 + p.off_down, p.wl_e, g_sb,
+                                            g_zb, g_Y, Wcap, H, I, 1))
+      return false;
+  } else if (g3) {
     if (!cuda_fc_qs4cx_moe_grouped_gemm_g3(g_qb, /*tokid=*/nullptr,
                                            wp64 + p.off_down,
                                            ws64 + p.off_down,

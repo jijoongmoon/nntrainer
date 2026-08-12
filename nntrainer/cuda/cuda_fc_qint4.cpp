@@ -2473,6 +2473,179 @@ void imma_moe_grouped_g3(const signed char *q8, const int *tokid,
   }
 }
 
+// down-projection variant (K <= 512, K % 128 == 0): persistent-N. One CTA
+// owns an m-block and LOOPS over all N/64 tiles: A (64 x K int8 <= 32 KB)
+// loads ONCE with no ring, W streams through the 3-stage ring CONTINUOUSLY
+// across tiles, one prologue per CTA instead of one per (m,n) tile, and the
+// grid drops from (N/64, W) to (1, W). Down is DIRECT mode only (the SwiGLU
+// output already lives in gathered space), so there is no tokid path; the
+// epilogue math is identical to imma_moe_grouped_g3's tok>=0 branch.
+// Bench: DOWN shape 15.9 -> 20.4 TOPS single / 19.6 multi (tile_g6).
+#define IPD_ALD 528
+__global__ __launch_bounds__(256, 2)
+void imma_moe_grouped_g3d(const signed char *q8,
+                          const unsigned long long *wp_tab,
+                          const unsigned long long *ws_tab,
+                          const unsigned long long *wr_tab,
+                          const int *block_expert, const float *ascale,
+                          const int *azp, float *Y, int N, int K,
+                          int out_fp16) {
+  const int e = block_expert[blockIdx.y];
+  if (e < 0)
+    return;
+  const unsigned char *plain =
+    (const unsigned char *)(unsigned long long)wp_tab[e];
+  const unsigned short *wscale =
+    (const unsigned short *)(unsigned long long)ws_tab[e];
+  const int *wrsum = (const int *)(unsigned long long)wr_tab[e];
+  __shared__ signed char As[64 * IPD_ALD];
+  __shared__ unsigned char Ws[IPX_ST][64 * IPX_WLD];
+  const int tid = threadIdx.x;
+  const int lane = tid & 31, warp = tid >> 5;
+  const int wm = warp >> 1, wn = warp & 1;
+  const int g = lane >> 2, t = lane & 3;
+  const int blockM = blockIdx.y * 64;
+  const int Kh = K >> 1;
+  const int NT = N >> 6;
+
+  const int srow = tid >> 2, ssub = tid & 3;
+  const long a_src = (long)(blockM + srow) * K + (ssub << 4);
+  const int a_dst = srow * IPD_ALD + (ssub << 4);
+  const long w_src = (long)srow * Kh + (ssub << 4);
+  const int w_dst = srow * IPX_WLD + (ssub << 4);
+
+  const unsigned W_ST = 64 * IPX_WLD;
+  unsigned ww = ip_sh((const unsigned char *)Ws[0] + w_dst);
+  const unsigned ww_end = ww + IPX_ST * W_ST;
+
+#define IPD_WIN(WW, KT)                                                        \
+  do {                                                                         \
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(WW),      \
+                 "l"(plain + ((long)((KT) >> 2) << 6) * Kh + w_src +           \
+                     (((KT) & 3) << 6)));                                      \
+    asm volatile("cp.async.commit_group;\n");                                  \
+  } while (0)
+
+  {
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      if ((ssub << 4) + i * 64 < K)
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(
+                       ip_sh((const signed char *)As + a_dst + i * 64)),
+                     "l"(q8 + a_src + i * 64));
+    }
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(ww),
+                 "l"(plain + w_src));
+    asm volatile("cp.async.commit_group;\n");
+  }
+  int kt = 1;
+  const int kmax = NT << 2;
+  IPD_WIN(ww + W_ST, 1);
+  ++kt;
+  unsigned wwf = ww + 2 * W_ST;
+
+  int acc[4][4];
+#pragma unroll
+  for (int s = 0; s < 4; ++s)
+#pragma unroll
+    for (int r = 0; r < 4; ++r)
+      acc[s][r] = 0;
+
+  const int lrow_a = wm * 16 + (lane & 7) + ((lane & 8) ? 8 : 0);
+  const int lkb_a = (lane & 16) ? 16 : 0;
+  const int lrow_b = wn * 32 + (lane >> 3) * 8 + (lane & 7);
+  const unsigned pa0 =
+    ip_sh((const signed char *)As + lrow_a * IPD_ALD + lkb_a);
+  unsigned pw = ip_sh((const unsigned char *)Ws[0] + lrow_b * IPX_WLD);
+  const unsigned pw_end = pw + IPX_ST * W_ST;
+  int ka = 0;
+
+  asm volatile("cp.async.wait_group %0;\n" ::"n"(IPX_ST - 2));
+  __syncthreads();
+
+#define IPD_FRAG(P, R0, R1, R2, R3)                                            \
+  asm volatile(                                                                \
+    "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"          \
+    : "=r"(R0), "=r"(R1), "=r"(R2), "=r"(R3) : "r"(P))
+
+  int na0, na1, na2, na3, np0, np1, np2, np3;
+  IPD_FRAG(pa0, na0, na1, na2, na3);
+  IPD_FRAG(pw, np0, np1, np2, np3);
+
+  for (int j = 0; j < NT; ++j) {
+    for (int cs = 0; cs < 4; ++cs) {
+#pragma unroll
+      for (int h = 0; h < 4; ++h) {
+        const int a0 = na0, a1 = na1, a2 = na2, a3 = na3;
+        const int p0 = np0, p1 = np1, p2 = np2, p3 = np3;
+        if (h == 2) {
+          IPD_FRAG(pa0 + ka + 3 * 32, na0, na1, na2, na3);
+          IPD_FRAG(pw + 3 * 16, np0, np1, np2, np3);
+          if (kt < kmax) {
+            IPD_WIN(wwf, kt);
+            ++kt;
+            wwf += W_ST;
+            wwf = (wwf >= ww_end) ? wwf - IPX_ST * W_ST : wwf;
+          } else {
+            asm volatile("cp.async.commit_group;\n");
+          }
+          asm volatile("cp.async.wait_group %0;\n" ::"n"(IPX_ST - 2));
+          __syncthreads();
+        } else if (h == 3) {
+          pw += W_ST;
+          pw = (pw >= pw_end) ? pw - IPX_ST * W_ST : pw;
+          ka += 128;
+          ka = (ka >= K) ? 0 : ka;
+          if ((j * 4 + cs) + 1 < kmax) {
+            IPD_FRAG(pa0 + ka, na0, na1, na2, na3);
+            IPD_FRAG(pw, np0, np1, np2, np3);
+          }
+        } else {
+          IPD_FRAG(pa0 + ka + (h + 1) * 32, na0, na1, na2, na3);
+          IPD_FRAG(pw + (h + 1) * 16, np0, np1, np2, np3);
+        }
+#define IPD_MMA(S, PK)                                                         \
+  do {                                                                         \
+    const unsigned b0 = ip_nib2i8((PK) & 0x0F0F0F0Fu, 0u);                     \
+    const unsigned b1 = ip_nib2i8(((unsigned)(PK) >> 4) & 0x0F0F0F0Fu, 0u);    \
+    asm volatile(                                                              \
+      "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32.satfinite "             \
+      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"            \
+      : "=r"(acc[S][0]), "=r"(acc[S][1]), "=r"(acc[S][2]), "=r"(acc[S][3])     \
+      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1),                  \
+        "r"(acc[S][0]), "r"(acc[S][1]), "r"(acc[S][2]), "r"(acc[S][3]));       \
+  } while (0)
+        IPD_MMA(0, p0);
+        IPD_MMA(1, p1);
+        IPD_MMA(2, p2);
+        IPD_MMA(3, p3);
+#undef IPD_MMA
+      }
+    }
+    const int blockN = j << 6;
+#pragma unroll
+    for (int s = 0; s < 4; ++s)
+#pragma unroll
+      for (int r = 0; r < 4; ++r) {
+        const int lrow = wm * 16 + g + ((r >> 1) ? 8 : 0);
+        const int cb = wn * 32 + s * 8 + 2 * t + (r & 1);
+        const int col = blockN + cb;
+        if (col < N) {
+          const int row = blockM + lrow;
+          const float v = (float)(acc[s][r] - azp[row] * wrsum[col]) *
+                          ascale[row] * dp4a_h2f(wscale[col]);
+          if (out_fp16)
+            ((unsigned short *)Y)[(long)row * N + col] = dp4a_f2h(v);
+          else
+            Y[(long)row * N + col] = v;
+        }
+        acc[s][r] = 0;
+      }
+  }
+}
+#undef IPD_FRAG
+#undef IPD_WIN
+
 // Batched, IN-PLACE fragment repack: the permutation is 16B-slot-local, so a
 // thread loads its slot, permutes in registers and stores back -- no scratch,
 // no copy. One launch covers EVERY expert of a projection via the pointer
@@ -3249,7 +3422,10 @@ bool cuda_fc_qs4cx_moe_grouped_gemm_g3(
                                                      "imma_moe_grouped_g3");
   if (!kg)
     return false;
-  static bool attr_once = true;
+  static bool attr_once = []() {
+    const char *e = std::getenv("NNTR_MOE_G_DBG");
+    return e != nullptr && e[0] != '0';
+  }();
   if (attr_once) {
     attr_once = false;
     int nregs = 0, lmem = 0, smem = 0, maxthr = 0;
@@ -3279,6 +3455,38 @@ bool cuda_fc_qs4cx_moe_grouped_gemm_g3(
   kg->SetKernelArguments(11, &out_fp16, sizeof(out_fp16));
   const int ib[3] = {256, 1, 1};
   const int ig[3] = {(int)(N / 64u), (int)n_mblocks, 1};
+  return StreamManager::Global().DispatchCommand(*kg, ig, ib);
+}
+
+// down (K <= 512) persistent-N launcher: grid (1, W) -- see the kernel note.
+bool cuda_fc_qs4cx_moe_grouped_gemm_g3d(
+  const signed char *q8, const unsigned long long *wp_tab,
+  const unsigned long long *ws_tab, const unsigned long long *wr_tab,
+  const int *block_expert, const float *ascale, const int *azp, void *Y,
+  unsigned int n_mblocks, unsigned int N, unsigned int K, int out_fp16) {
+  if (q8 == nullptr || wp_tab == nullptr || ws_tab == nullptr ||
+      wr_tab == nullptr || block_expert == nullptr || Y == nullptr ||
+      n_mblocks == 0 || (N & 63u) != 0u || (K & 127u) != 0u || K < 256u ||
+      K > 512u)
+    return false;
+  auto kg = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
+                                                     "imma_moe_grouped_g3d");
+  if (!kg)
+    return false;
+  const int n = (int)N, k = (int)K;
+  kg->SetKernelArguments(0, &q8, sizeof(q8));
+  kg->SetKernelArguments(1, &wp_tab, sizeof(wp_tab));
+  kg->SetKernelArguments(2, &ws_tab, sizeof(ws_tab));
+  kg->SetKernelArguments(3, &wr_tab, sizeof(wr_tab));
+  kg->SetKernelArguments(4, &block_expert, sizeof(block_expert));
+  kg->SetKernelArguments(5, &ascale, sizeof(ascale));
+  kg->SetKernelArguments(6, &azp, sizeof(azp));
+  kg->SetKernelArguments(7, &Y, sizeof(Y));
+  kg->SetKernelArguments(8, &n, sizeof(n));
+  kg->SetKernelArguments(9, &k, sizeof(k));
+  kg->SetKernelArguments(10, &out_fp16, sizeof(out_fp16));
+  const int ib[3] = {256, 1, 1};
+  const int ig[3] = {1, (int)n_mblocks, 1};
   return StreamManager::Global().DispatchCommand(*kg, ig, ib);
 }
 
