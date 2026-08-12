@@ -983,6 +983,26 @@ bool cuda_moe_new_ptr_table(unsigned int n, const unsigned char ***wp,
   return true;
 }
 
+bool moe_g3_enabled() {
+  // v1 opt-in (flip to default after the byte-identity + perf gates pass).
+  static const bool v = []() {
+    const char *e = std::getenv("NNTR_MOE_G3");
+    return e != nullptr && e[0] == '1';
+  }();
+  return v;
+}
+
+bool cuda_moe_new_wr_table(unsigned int n, const int ***wr) {
+  void *a = nullptr;
+  const size_t sz = (size_t)n * sizeof(void *);
+  if (cudaHostAlloc(&a, sz, cudaHostAllocMapped) != cudaSuccess) {
+    cudaGetLastError();
+    return false;
+  }
+  *wr = (const int **)a;
+  return true;
+}
+
 namespace {
 bool dispatch1d(const char *name, void **argp, const size_t *argsz, int nargs,
                 long total, int block) {
@@ -1289,13 +1309,13 @@ bool cuda_moe_grouped_ffn_imma(const unsigned short *input,
   int iT = (int)T, iH = (int)H, iI = (int)I, iP = (int)Pcap, ik = (int)topk;
 
   // NNTR_MOE_G_DBG=1: per-launch GPU ms via events (first few calls only).
-  static const bool g_dbg = []() {
+  static const int g_dbg = []() {
     const char *e = std::getenv("NNTR_MOE_G_DBG");
-    return e != nullptr && e[0] == '1';
+    return e ? std::atoi(e) : 0; // N = print the first N calls (1 -> 3)
   }();
   static int g_dbg_n = 0;
   cudaEvent_t ev[8];
-  const bool dbg_this = g_dbg && g_dbg_n < 3;
+  const bool dbg_this = g_dbg && g_dbg_n < (g_dbg == 1 ? 3 : g_dbg);
   if (dbg_this)
     for (int i = 0; i < 8; ++i)
       cudaEventCreate(&ev[i]);
@@ -1337,7 +1357,24 @@ bool cuda_moe_grouped_ffn_imma(const unsigned short *input,
     const char *e = std::getenv("NNTR_MOE_WT");
     return e == nullptr || e[0] != '0';
   }();
-  if (g_wt) {
+  const auto *wr64 = reinterpret_cast<const unsigned long long *>(p.wrs);
+  const bool g3 = moe_g3_enabled() && p.wrs != nullptr;
+  if (g3) {
+    // packed fragment-order tile; wide/_g2 arms stand aside (they read the
+    // raw nibble order, which no longer exists once the repack ran)
+    if (!cuda_fc_qs4cx_moe_grouped_gemm_g3(g_qa, p.rows, wp64 + p.off_gate,
+                                           ws64 + p.off_gate,
+                                           wr64 + p.off_gate, p.wl_e, g_sa,
+                                           g_za, g_G, Wcap, I, H, 1))
+      return false;
+    stamp(2);
+    if (!cuda_fc_qs4cx_moe_grouped_gemm_g3(g_qa, p.rows, wp64 + p.off_up,
+                                           ws64 + p.off_up, wr64 + p.off_up,
+                                           p.wl_e, g_sa, g_za, g_U, Wcap, I, H,
+                                           1))
+      return false;
+    stamp(3);
+  } else if (g_wt) {
     if (!cuda_fc_qs4cx_moe_grouped_gemm_w(g_qa, p.rows, wp64 + p.off_gate,
                                           ws64 + p.off_gate, p.wl_e, g_sa,
                                           g_za, g_G, Wcap, I, H, 1))
@@ -1421,9 +1458,17 @@ bool cuda_moe_grouped_ffn_imma(const unsigned short *input,
   // down stays on the 64x64 tile: with K=512 (8 k-steps) the wide tile's
   // doubled W staging outweighs its fragment savings -- measured 8.7 -> 9.5
   // ms. The wide tile pays only on the K=2048 gate/up shapes (-5% each).
-  if (!cuda_fc_qs4cx_moe_grouped_gemm(g_qb, /*tokid=*/nullptr,
-                                      wp64 + p.off_down, ws64 + p.off_down,
-                                      p.wl_e, g_sb, g_zb, g_Y, Wcap, H, I, 1))
+  if (g3) {
+    if (!cuda_fc_qs4cx_moe_grouped_gemm_g3(g_qb, /*tokid=*/nullptr,
+                                           wp64 + p.off_down,
+                                           ws64 + p.off_down,
+                                           wr64 + p.off_down, p.wl_e, g_sb,
+                                           g_zb, g_Y, Wcap, H, I, 1))
+      return false;
+  } else if (!cuda_fc_qs4cx_moe_grouped_gemm(g_qb, /*tokid=*/nullptr,
+                                             wp64 + p.off_down,
+                                             ws64 + p.off_down, p.wl_e, g_sb,
+                                             g_zb, g_Y, Wcap, H, I, 1))
     return false;
   stamp(6);
   { // sequential-rounding combine: bit-identical to the per-expert scatter

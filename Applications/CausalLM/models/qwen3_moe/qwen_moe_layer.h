@@ -148,6 +148,9 @@ private:
   // lifetime. Per LAYER, not shared: each layer has its own experts.
   const unsigned char **moe_wptr = nullptr;
   const unsigned short **moe_wsc = nullptr;
+  const int **moe_wrs = nullptr; /**< NNTR_MOE_G3 per-expert rowsum table */
+  bool moe_g3_done = false;      /**< G3 repack/rowsum attempted once */
+  bool moe_g3_ok = false;        /**< payloads ARE fragment-order repacked */
   bool moe_tbl_built = false;
   // false when any expert payload fails the imma tile's 8-byte alignment
   // check at table-build time; the grouped-imma path then declines for good.

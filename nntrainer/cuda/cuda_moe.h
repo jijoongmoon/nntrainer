@@ -122,6 +122,12 @@ struct MoePlan {
    */
   const unsigned char **wptr;
   const unsigned short **wsc; /**< [3E] fp16 scale pointers, same indexing */
+  /**
+   * [3E] per-expert int rowsum pointers (NNTR_MOE_G3 only), same indexing.
+   * nullptr = the G3 tables were not built; the driver must use the classic
+   * unpacked-payload kernels (and the payload is guaranteed un-repacked).
+   */
+  const int **wrs = nullptr;
   unsigned int off_up;        /**< start of the `up` block (= 0) */
   unsigned int off_gate;      /**< start of the `gate` block (= E) */
   unsigned int off_down;      /**< start of the `down` block (= 2E) */
@@ -157,6 +163,16 @@ bool cuda_moe_plan_stage_dev(unsigned int A, unsigned int T, unsigned int topk,
  * allocate-once and there is no FSU here) and owned for the process lifetime;
  * 40 layers x 768 pointers x 2 tables is ~500 KB.
  */
+/**
+ * @brief NNTR_MOE_G3=1: the packed fragment-order grouped tile is active.
+ * Read once; every payload consumer must agree for the process lifetime
+ * (the repack is in-place, so raw-order arms are invalid once it ran).
+ */
+bool moe_g3_enabled();
+
+/** @brief Mapped [n] table of per-expert rowsum pointers (G3). */
+bool cuda_moe_new_wr_table(unsigned int n, const int ***wr);
+
 bool cuda_moe_new_ptr_table(unsigned int n, const unsigned char ***wp,
                             const unsigned short ***ws);
 

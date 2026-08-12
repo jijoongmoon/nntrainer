@@ -22,6 +22,7 @@
  *
  */
 
+#include <cuda_runtime.h>
 #include <acti_func.h>
 #include <algorithm>
 #include <cmath>
@@ -643,6 +644,58 @@ bool MoELayer::runGroupedMoEImma(nntrainer::RunLayerContext &context,
   }
   if (!moe_tbl_ok)
     return false;
+  // NNTR_MOE_G3: one-time in-place fragment repack of every expert payload +
+  // the per-expert rowsum tables the packed tile needs. ALL-OR-NOTHING: the
+  // preflight (alignment, table/buffer allocs, kernel registration) happens
+  // before the first byte is repacked, so a preflight failure leaves every
+  // payload raw and the classic arms valid (plan.wrs stays nullptr).
+  if (nntrainer::cuda::moe_g3_enabled() && !moe_g3_done) {
+    moe_g3_done = true;
+    bool ok = (hidden_size & 127u) == 0u && (I & 127u) == 0u;
+    auto aligned16 = [&](const std::vector<unsigned int> &idx) {
+      for (unsigned int e = 0; e < E; ++e)
+        if ((reinterpret_cast<uintptr_t>(
+              context.getWeight(idx[e]).getData<uint8_t>()) &
+             15u) != 0u)
+          return false;
+      return true;
+    };
+    ok = ok && aligned16(expert_up_proj_indices) &&
+         aligned16(expert_gate_proj_indices) &&
+         aligned16(expert_down_proj_indices);
+    ok = ok && nntrainer::cuda::cuda_moe_new_wr_table(3 * E, &moe_wrs);
+    int *rs_up = nullptr, *rs_gate = nullptr, *rs_down = nullptr;
+    if (ok)
+      ok = cudaMalloc(&rs_up, (size_t)E * I * 4) == cudaSuccess &&
+           cudaMalloc(&rs_gate, (size_t)E * I * 4) == cudaSuccess &&
+           cudaMalloc(&rs_down, (size_t)E * hidden_size * 4) == cudaSuccess;
+    if (ok) {
+      auto rp = [&](unsigned int base, int *rs, unsigned int Nn,
+                    unsigned int Kk) -> bool {
+        const auto *tab =
+          reinterpret_cast<const unsigned long long *>(moe_wptr + base);
+        if (!nntrainer::cuda::cuda_fc_qs4cx_moe_repack_g3(tab, E, Nn, Kk) ||
+            !nntrainer::cuda::cuda_fc_qs4cx_moe_rowsum_g3(tab, E, Nn, Kk, rs))
+          return false;
+        for (unsigned int e = 0; e < E; ++e)
+          moe_wrs[base + e] = rs + (size_t)e * Nn;
+        return true;
+      };
+      // A mid-run launch failure would leave payloads HALF-repacked -- every
+      // arm is then wrong. Loud and fatal is the only honest handling.
+      if (!rp(0, rs_up, I, hidden_size) ||
+          !rp(E, rs_gate, I, hidden_size) ||
+          !rp(2 * E, rs_down, hidden_size, I)) {
+        ml_loge("[MoE][G3] batched repack/rowsum FAILED: expert payloads may "
+                "be in a mixed byte order; no arm can run. Aborting.");
+        std::abort();
+      }
+      moe_g3_ok = true;
+    }
+    if (!ok)
+      ml_logw("[MoE][G3] preflight failed (alignment/alloc); staying on the "
+              "classic unpacked-payload arms");
+  }
 
   // Worst-case padded geometry from SHAPES ALONE -- the host reads nothing
   // the routing kernels produce, which is the whole point of this path.
@@ -654,6 +707,7 @@ bool MoELayer::runGroupedMoEImma(nntrainer::RunLayerContext &context,
   nntrainer::cuda::MoePlan plan{};
   plan.wptr = moe_wptr;
   plan.wsc = moe_wsc;
+  plan.wrs = moe_g3_ok ? moe_wrs : nullptr;
   plan.off_up = 0;
   plan.off_gate = E;
   plan.off_down = 2 * E;
@@ -995,7 +1049,11 @@ void MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       const char *e = std::getenv("NNTR_CUDA_MOE_GROUPED");
       return e ? std::atoi(e) : 2;
     }();
-    if (router_dev && grouped2_env == 2 && total_tokens > 1 &&
+    // Under NNTR_MOE_G3 the payload is fragment-order repacked, so the
+    // per-expert ops->fc decode arm (a raw-order reader) must not run:
+    // decode goes through the grouped path too.
+    if (router_dev && grouped2_env == 2 &&
+        (total_tokens > 1 || nntrainer::cuda::moe_g3_enabled()) &&
         input.getDataType() == ml::train::TensorDim::DataType::FP16 &&
         output.getDataType() == ml::train::TensorDim::DataType::FP16 &&
         nntrainer::cuda::dev_accessible(input.getData<_FP16>()) &&

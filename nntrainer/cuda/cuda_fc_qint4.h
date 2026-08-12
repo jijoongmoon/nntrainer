@@ -102,6 +102,28 @@ bool cuda_fc_qs4cx_dp4a_gemm_fp16(const unsigned short *Xh,
  *        down projection). Bit-identical to per-expert imma_gemm_pipe calls.
  *        N and K must be multiples of 64; buffers are caller-owned.
  */
+/**
+ * @brief NNTR_MOE_G3 grouped GEMM (cp.async ring + packed fragment-order W +
+ *        precomputed per-expert rowsum table). Payload must be repacked via
+ *        cuda_fc_qs4cx_moe_repack_g3 first. Output bytes identical to
+ *        cuda_fc_qs4cx_moe_grouped_gemm on the same inputs.
+ */
+bool cuda_fc_qs4cx_moe_grouped_gemm_g3(
+  const signed char *q8, const int *tokid, const unsigned long long *wp_tab,
+  const unsigned long long *ws_tab, const unsigned long long *wr_tab,
+  const int *block_expert, const float *ascale, const int *azp, void *Y,
+  unsigned int n_mblocks, unsigned int N, unsigned int K, int out_fp16);
+
+/** @brief In-place fragment repack of ALL E payloads via the pointer table. */
+bool cuda_fc_qs4cx_moe_repack_g3(const unsigned long long *wp_tab,
+                                 unsigned int E, unsigned int N,
+                                 unsigned int K);
+
+/** @brief Batched per-channel int4 rowsum into rs[e*N + n], one projection. */
+bool cuda_fc_qs4cx_moe_rowsum_g3(const unsigned long long *wp_tab,
+                                 unsigned int E, unsigned int N,
+                                 unsigned int K, int *rs);
+
 bool cuda_fc_qs4cx_moe_grouped_gemm(
   const signed char *q8, const int *tokid, const unsigned long long *wp_tab,
   const unsigned long long *ws_tab, const int *block_expert,

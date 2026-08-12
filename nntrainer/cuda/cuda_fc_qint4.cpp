@@ -2280,7 +2280,265 @@ __global__ void dequant_i32_fp16(const int *C, const float *ascale,
   Y[(long)m * N + n] = dp4a_f2h(r);
 }
 
+// ---- NNTR_MOE_G3: grouped tile, cp.async ring + PACKED fragment-order W ----
+// The tile_bench E1/E2 transplant (25.4-25.7 TOPS standalone vs 23.7 for the
+// pre-STS-unpack pipeline above; see tile_bench/MARLIN_DISSECTION_20260812.md):
+//  - the weight payload is REPACKED ONCE at load into per-thread fragment
+//    order (moe_repack_frag_g3), so staging is a verbatim cp.async copy: no
+//    register round-trip, no unpack ALU in the store phase, and W stays
+//    PACKED in shared memory (half the bytes);
+//  - dequant is two ip_nib2i8 in registers between ldmatrix and mma;
+//  - ONE __syncthreads per 128-K stage (fetch -> wait_group(ST-2) -> sync),
+//    and the fragments for step k+1 load BEFORE the barrier, so the first
+//    post-barrier instruction is an mma on resident registers;
+//  - the A-side zero-point rowsum comes from the PRECOMPUTED per-expert
+//    table (packed staging cannot re-derive it in-loop). The table holds the
+//    same integer sum the in-loop __dp4a produced, and int32 accumulation is
+//    exact, so the epilogue floats -- and the output bytes -- are unchanged
+//    from imma_moe_grouped.
+// A rows with tok < 0 stage as ZEROS via the cp.async src-size-0 form (16B
+// window, 0 source bytes = zero-fill, no dereference), preserving the
+// IPG_LOAD zero semantics for padding rows.
+#define IPX_ST 3
+#define IPX_ALD 144
+#define IPX_WLD 80
+__global__ __launch_bounds__(256, 2)
+void imma_moe_grouped_g3(const signed char *q8, const int *tokid,
+                         const unsigned long long *wp_tab,
+                         const unsigned long long *ws_tab,
+                         const unsigned long long *wr_tab,
+                         const int *block_expert, const float *ascale,
+                         const int *azp, float *Y, int N, int K,
+                         int out_fp16) {
+  const int e = block_expert[blockIdx.y];
+  if (e < 0)
+    return;
+  const unsigned char *plain =
+    (const unsigned char *)(unsigned long long)wp_tab[e];
+  const unsigned short *wscale =
+    (const unsigned short *)(unsigned long long)ws_tab[e];
+  const int *wrsum = (const int *)(unsigned long long)wr_tab[e];
+  __shared__ signed char As[IPX_ST][64 * IPX_ALD];
+  __shared__ unsigned char Ws[IPX_ST][64 * IPX_WLD];
+  __shared__ int toks[64];
+  const int tid = threadIdx.x;
+  const int lane = tid & 31, warp = tid >> 5;
+  const int wm = warp >> 1, wn = warp & 1; // 4 x 2 warp grid over 64x64
+  const int g = lane >> 2, t = lane & 3;
+  const int blockM = blockIdx.y * 64, blockN = blockIdx.x * 64;
+  const int Kh = K >> 1;
+  if (tid < 64)
+    toks[tid] = tokid ? tokid[blockM + tid] : (blockM + tid);
+  __syncthreads();
+
+  // staging: 4 threads per row; A carries 2x16B per 128-K stage, W 1x16B of
+  // the row's 64 packed bytes.
+  const int srow = tid >> 2, ssub = tid & 3;
+  const int atok = toks[srow];
+  const signed char *aptr = q8 + (long)atok * K + (ssub << 4);
+  const int a_sz = atok >= 0 ? 16 : 0; // src-size 0 = zero-fill
+  const unsigned char *wptr = plain + (long)(blockN + srow) * Kh + (ssub << 4);
+  const int a_dst = srow * IPX_ALD + (ssub << 4);
+  const int w_dst = srow * IPX_WLD + (ssub << 4);
+
+  const unsigned A_ST = 64 * IPX_ALD, W_ST = 64 * IPX_WLD;
+  unsigned wa = ip_sh((const signed char *)As[0] + a_dst);
+  unsigned ww = ip_sh((const unsigned char *)Ws[0] + w_dst);
+  const unsigned wa_end = wa + IPX_ST * A_ST, ww_end = ww + IPX_ST * W_ST;
+
+#define IPX_IN(WA, WW, K0)                                                     \
+  do {                                                                         \
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(WA),  \
+                 "l"(aptr + (K0)), "r"(a_sz));                                 \
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(      \
+                   (WA) + 64),                                                 \
+                 "l"(aptr + (K0) + 64), "r"(a_sz));                            \
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(WW),      \
+                 "l"(wptr + ((K0) >> 1)));                                     \
+    asm volatile("cp.async.commit_group;\n");                                  \
+  } while (0)
+
+  int kt = 0;
+  const int ksteps = K >> 7;
+#pragma unroll
+  for (int s = 0; s < IPX_ST - 1; ++s) {
+    IPX_IN(wa, ww, kt << 7);
+    ++kt;
+    wa += A_ST;
+    ww += W_ST;
+  }
+
+  int acc[4][4];
+#pragma unroll
+  for (int s = 0; s < 4; ++s)
+#pragma unroll
+    for (int r = 0; r < 4; ++r)
+      acc[s][r] = 0;
+
+  const int lrow_a = wm * 16 + (lane & 7) + ((lane & 8) ? 8 : 0);
+  const int lkb_a = (lane & 16) ? 16 : 0;
+  const int lrow_b = wn * 32 + (lane >> 3) * 8 + (lane & 7);
+  unsigned pa = ip_sh((const signed char *)As[0] + lrow_a * IPX_ALD + lkb_a);
+  unsigned pw = ip_sh((const unsigned char *)Ws[0] + lrow_b * IPX_WLD);
+  const unsigned pa_end = pa + IPX_ST * A_ST, pw_end = pw + IPX_ST * W_ST;
+
+  asm volatile("cp.async.wait_group %0;\n" ::"n"(IPX_ST - 2));
+  __syncthreads();
+
+#define IPX_FRAG(P, R0, R1, R2, R3)                                            \
+  asm volatile(                                                                \
+    "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"          \
+    : "=r"(R0), "=r"(R1), "=r"(R2), "=r"(R3) : "r"(P))
+
+  int na0, na1, na2, na3, np0, np1, np2, np3;
+  IPX_FRAG(pa, na0, na1, na2, na3);
+  IPX_FRAG(pw, np0, np1, np2, np3);
+
+  for (int c = 0; c < ksteps; ++c) {
+#pragma unroll
+    for (int h = 0; h < 4; ++h) {
+      const int a0 = na0, a1 = na1, a2 = na2, a3 = na3;
+      const int p0 = np0, p1 = np1, p2 = np2, p3 = np3;
+      if (h == 2) {
+        // h3 fragments BEFORE the barrier (they read the current stage)
+        IPX_FRAG(pa + 3 * 32, na0, na1, na2, na3);
+        IPX_FRAG(pw + 3 * 16, np0, np1, np2, np3);
+        if (kt < ksteps) {
+          IPX_IN(wa, ww, kt << 7);
+          ++kt;
+          wa += A_ST;
+          wa = (wa >= wa_end) ? wa - IPX_ST * A_ST : wa;
+          ww += W_ST;
+          ww = (ww >= ww_end) ? ww - IPX_ST * W_ST : ww;
+        } else {
+          asm volatile("cp.async.commit_group;\n");
+        }
+        asm volatile("cp.async.wait_group %0;\n" ::"n"(IPX_ST - 2));
+        __syncthreads();
+      } else if (h == 3) {
+        // advance to the just-published stage, prefetch its h0
+        pa += A_ST;
+        pa = (pa >= pa_end) ? pa - IPX_ST * A_ST : pa;
+        pw += W_ST;
+        pw = (pw >= pw_end) ? pw - IPX_ST * W_ST : pw;
+        if (c + 1 < ksteps) {
+          IPX_FRAG(pa, na0, na1, na2, na3);
+          IPX_FRAG(pw, np0, np1, np2, np3);
+        }
+      } else {
+        IPX_FRAG(pa + (h + 1) * 32, na0, na1, na2, na3);
+        IPX_FRAG(pw + (h + 1) * 16, np0, np1, np2, np3);
+      }
+#define IPX_MMA(S, PK)                                                         \
+  do {                                                                         \
+    const unsigned b0 = ip_nib2i8((PK) & 0x0F0F0F0Fu, 0u);                     \
+    const unsigned b1 = ip_nib2i8(((unsigned)(PK) >> 4) & 0x0F0F0F0Fu, 0u);    \
+    asm volatile(                                                              \
+      "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32.satfinite "             \
+      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"            \
+      : "=r"(acc[S][0]), "=r"(acc[S][1]), "=r"(acc[S][2]), "=r"(acc[S][3])     \
+      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1),                  \
+        "r"(acc[S][0]), "r"(acc[S][1]), "r"(acc[S][2]), "r"(acc[S][3]));       \
+  } while (0)
+      IPX_MMA(0, p0);
+      IPX_MMA(1, p1);
+      IPX_MMA(2, p2);
+      IPX_MMA(3, p3);
+#undef IPX_MMA
+    }
+  }
+#undef IPX_FRAG
+#undef IPX_IN
+
+  // epilogue: identical scalars to imma_moe_grouped, rowsum from the table
+#pragma unroll
+  for (int s = 0; s < 4; ++s) {
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+      const int lrow = wm * 16 + g + ((r >> 1) ? 8 : 0);
+      const int cb = wn * 32 + s * 8 + 2 * t + (r & 1);
+      const int col = blockN + cb;
+      if (col < N) {
+        const int tok = toks[lrow];
+        float v = 0.0f;
+        if (tok >= 0)
+          v = (float)(acc[s][r] - azp[tok] * wrsum[col]) * ascale[tok] *
+              dp4a_h2f(wscale[col]);
+        if (out_fp16)
+          ((unsigned short *)Y)[(long)(blockM + lrow) * N + col] = dp4a_f2h(v);
+        else
+          Y[(long)(blockM + lrow) * N + col] = v;
+      }
+    }
+  }
 }
+
+// Batched, IN-PLACE fragment repack: the permutation is 16B-slot-local, so a
+// thread loads its slot, permutes in registers and stores back -- no scratch,
+// no copy. One launch covers EVERY expert of a projection via the pointer
+// table (the per-expert launch+memcpy version of this cost 9.3 s of first-
+// prefill wall; this one is ~bandwidth: 15 GB r+w over all layers).
+// QS4CX byte order (byte b: lo = k[2b], hi = k[2b+1]) -> fragment order
+// (byte p, q = p>>2, j = p&3: lo = k[4q+j], hi = k[16+4q+j]).
+__global__ void moe_repack_frag_g3(const unsigned long long *wp_tab, int E,
+                                   long nslots) {
+  unsigned char *pl = (unsigned char *)(unsigned long long)wp_tab[blockIdx.y];
+  for (long s = (long)blockIdx.x * blockDim.x + threadIdx.x; s < nslots;
+       s += (long)gridDim.x * blockDim.x) {
+    IPv16 *slot = (IPv16 *)(pl + s * 16);
+    const IPv16 v = *slot; // ONE 16B load (byte loads ran at ~9 GB/s)
+    unsigned int w[4];
+    w[0] = v.a; w[1] = v.b; w[2] = v.c; w[3] = v.d;
+    unsigned char nib[32];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+      const unsigned int byi = (w[i >> 2] >> ((i & 3) * 8)) & 0xFFu;
+      nib[2 * i] = (unsigned char)(byi & 0x0F);
+      nib[2 * i + 1] = (unsigned char)(byi >> 4);
+    }
+    unsigned int o[4] = {0u, 0u, 0u, 0u};
+#pragma unroll
+    for (int p = 0; p < 16; ++p) {
+      const int q = p >> 2, j = p & 3;
+      const unsigned int byo =
+        (unsigned int)(nib[4 * q + j] | (nib[16 + 4 * q + j] << 4));
+      o[p >> 2] |= byo << ((p & 3) * 8);
+    }
+    IPv16 ov;
+    ov.a = o[0]; ov.b = o[1]; ov.c = o[2]; ov.d = o[3];
+    *slot = ov; // ONE 16B store
+  }
+}
+
+// Batched per-output-channel nibble sum minus the offset, one launch per
+// projection (rs[e*N + n]). Permutation-invariant: valid on raw OR repacked
+// payload, and integer-equal to the unpacked arms' in-loop __dp4a rowsum.
+__global__ void moe_rowsum_g3(const unsigned long long *wp_tab, int *rs,
+                              int E, int N, int Kh) {
+  // one WARP per row, lane-strided 4B reads (the thread-per-row byte walk
+  // was ~3% coalescing-efficient and cost seconds over 15 GB of payload)
+  const int e = blockIdx.y;
+  const int wid = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int n = blockIdx.x * 8 + wid;
+  if (n >= N)
+    return;
+  const unsigned int *row = (const unsigned int *)(
+    (const unsigned char *)(unsigned long long)wp_tab[e] + (long)n * Kh);
+  const int nw = Kh >> 2;
+  int s = 0;
+  for (int i = lane; i < nw; i += 32) {
+    const unsigned int u = row[i];
+    s = __dp4a((int)0x01010101, (int)(u & 0x0F0F0F0Fu), s);
+    s = __dp4a((int)0x01010101, (int)((u >> 4) & 0x0F0F0F0Fu), s);
+  }
+  for (int o = 16; o > 0; o >>= 1)
+    s += __shfl_down_sync(0xffffffffu, s, o);
+  if (lane == 0)
+    rs[(long)e * N + n] = s - 16 * Kh;
+}
+
+}
+
 )CU";
 
 // [single weight copy] The QS4CX plain payload is consumed by the CUDA FC path
@@ -2972,6 +3230,88 @@ bool cuda_fc_qs4cx_moe_grouped_gemm_w(
   const int ib[3] = {256, 1, 1};
   const int ig[3] = {(int)(N / 128u), (int)n_mblocks, 1};
   return StreamManager::Global().DispatchCommand(*kg, ig, ib);
+}
+
+// NNTR_MOE_G3 launcher: same shape/steering as the _gemm entry plus the
+// per-expert rowsum pointer table. Requires the payload to have been through
+// cuda_fc_qs4cx_moe_repack_g3 (fragment order) -- the caller owns that
+// invariant; nothing here can verify it.
+bool cuda_fc_qs4cx_moe_grouped_gemm_g3(
+  const signed char *q8, const int *tokid, const unsigned long long *wp_tab,
+  const unsigned long long *ws_tab, const unsigned long long *wr_tab,
+  const int *block_expert, const float *ascale, const int *azp, void *Y,
+  unsigned int n_mblocks, unsigned int N, unsigned int K, int out_fp16) {
+  if (q8 == nullptr || wp_tab == nullptr || ws_tab == nullptr ||
+      wr_tab == nullptr || block_expert == nullptr || Y == nullptr ||
+      n_mblocks == 0 || (N & 63u) != 0u || (K & 127u) != 0u || K < 256u)
+    return false;
+  auto kg = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
+                                                     "imma_moe_grouped_g3");
+  if (!kg)
+    return false;
+  const int n = (int)N, k = (int)K;
+  kg->SetKernelArguments(0, &q8, sizeof(q8));
+  kg->SetKernelArguments(1, &tokid, sizeof(tokid));
+  kg->SetKernelArguments(2, &wp_tab, sizeof(wp_tab));
+  kg->SetKernelArguments(3, &ws_tab, sizeof(ws_tab));
+  kg->SetKernelArguments(4, &wr_tab, sizeof(wr_tab));
+  kg->SetKernelArguments(5, &block_expert, sizeof(block_expert));
+  kg->SetKernelArguments(6, &ascale, sizeof(ascale));
+  kg->SetKernelArguments(7, &azp, sizeof(azp));
+  kg->SetKernelArguments(8, &Y, sizeof(Y));
+  kg->SetKernelArguments(9, &n, sizeof(n));
+  kg->SetKernelArguments(10, &k, sizeof(k));
+  kg->SetKernelArguments(11, &out_fp16, sizeof(out_fp16));
+  const int ib[3] = {256, 1, 1};
+  const int ig[3] = {(int)(N / 64u), (int)n_mblocks, 1};
+  return StreamManager::Global().DispatchCommand(*kg, ig, ib);
+}
+
+// One launch per projection: in-place fragment repack of ALL E expert
+// payloads through the (mapped) pointer table. See the kernel note; the
+// per-expert scratch/memcpy version measured 9.3 s of first-prefill wall.
+bool cuda_fc_qs4cx_moe_repack_g3(const unsigned long long *wp_tab,
+                                 unsigned int E, unsigned int N,
+                                 unsigned int K) {
+  const size_t bytes = (size_t)N * (K >> 1);
+  if (wp_tab == nullptr || E == 0 || (K & 127u) != 0u || bytes == 0 ||
+      (bytes & 15u) != 0u)
+    return false;
+  auto k = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
+                                                    "moe_repack_frag_g3");
+  if (!k)
+    return false;
+  const int e = (int)E;
+  const long nslots = (long)(bytes >> 4);
+  k->SetKernelArguments(0, &wp_tab, sizeof(void *));
+  k->SetKernelArguments(1, &e, sizeof(int));
+  k->SetKernelArguments(2, &nslots, sizeof(long));
+  const int b[3] = {256, 1, 1};
+  const int gx = (int)((nslots + 255) / 256) < 128
+                   ? (int)((nslots + 255) / 256)
+                   : 128;
+  const int g[3] = {gx, (int)E, 1};
+  return StreamManager::Global().DispatchCommand(*k, g, b);
+}
+
+bool cuda_fc_qs4cx_moe_rowsum_g3(const unsigned long long *wp_tab,
+                                 unsigned int E, unsigned int N,
+                                 unsigned int K, int *rs) {
+  if (wp_tab == nullptr || rs == nullptr || E == 0)
+    return false;
+  auto k = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
+                                                    "moe_rowsum_g3");
+  if (!k)
+    return false;
+  const int e = (int)E, n = (int)N, kh = (int)(K >> 1);
+  k->SetKernelArguments(0, &wp_tab, sizeof(void *));
+  k->SetKernelArguments(1, &rs, sizeof(void *));
+  k->SetKernelArguments(2, &e, sizeof(int));
+  k->SetKernelArguments(3, &n, sizeof(int));
+  k->SetKernelArguments(4, &kh, sizeof(int));
+  const int b[3] = {256, 1, 1}; // 8 warps = 8 rows per block
+  const int g[3] = {(int)((N + 7u) / 8u), (int)E, 1};
+  return StreamManager::Global().DispatchCommand(*k, g, b);
 }
 
 bool cuda_fc_qs4cx_gemm_fp32(const float *X, const unsigned char *plain_w,
