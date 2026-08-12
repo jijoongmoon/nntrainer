@@ -1030,6 +1030,24 @@ __device__ __forceinline__ unsigned ip_sh(const void *p) {
       : "=r"(r) : "l"(p));
   return r;
 }
+// fp16 <-> fp32 through the hardware cvt unit (no headers under NVRTC).
+// h2f is exact; f2h is cvt.rn = RNE, bit-identical to dp4a_f2h on every
+// finite value, so an epilogue may use either without changing output bytes.
+__device__ __forceinline__ float hw_h2f(unsigned short h) {
+  float f;
+  asm("{ .reg .f16 t; mov.b16 t, %1; cvt.f32.f16 %0, t; }"
+      : "=f"(f) : "h"(h));
+  return f;
+}
+__device__ __forceinline__ unsigned short hw_f2h(float f) {
+  unsigned short h;
+  asm("{ .reg .f16 t; cvt.rn.f16.f32 t, %1; mov.b16 %0, t; }"
+      : "=h"(h) : "f"(f));
+  return h;
+}
+struct alignas(8) IPf2 {
+  float x, y;
+};
 __global__ __launch_bounds__(256, 2)
 void imma_gemm_pipe(const signed char *q8, const unsigned char *plain,
                     const float *ascale, const int *azp, const int *wrowsum,
@@ -2450,25 +2468,41 @@ void imma_moe_grouped_g3(const signed char *q8, const int *tokid,
 #undef IPX_FRAG
 #undef IPX_IN
 
-  // epilogue: identical scalars to imma_moe_grouped, rowsum from the table
+  // epilogue v2: same scalar math as imma_moe_grouped (rowsum from the
+  // table), but the row-side token loads hoist to the thread's two fixed
+  // rows, fp16<->fp32 use the hardware cvt (bit-identical, see hw_f2h), and
+  // adjacent columns store as one 4B/8B word (the wrapper guarantees
+  // N % 64 == 0 so a pair never crosses the edge). g3tax ladder: the old
+  // per-element software-cvt epilogue was 0.8 ms of the 4.2 ms launch.
+  const int lr0 = wm * 16 + g, lr1 = lr0 + 8;
+  const int tk0 = toks[lr0], tk1 = toks[lr1];
+  const int az0 = tk0 >= 0 ? azp[tk0] : 0;
+  const int az1 = tk1 >= 0 ? azp[tk1] : 0;
+  const float as0 = tk0 >= 0 ? ascale[tk0] : 0.0f;
+  const float as1 = tk1 >= 0 ? ascale[tk1] : 0.0f;
 #pragma unroll
   for (int s = 0; s < 4; ++s) {
-#pragma unroll
-    for (int r = 0; r < 4; ++r) {
-      const int lrow = wm * 16 + g + ((r >> 1) ? 8 : 0);
-      const int cb = wn * 32 + s * 8 + 2 * t + (r & 1);
-      const int col = blockN + cb;
-      if (col < N) {
-        const int tok = toks[lrow];
-        float v = 0.0f;
-        if (tok >= 0)
-          v = (float)(acc[s][r] - azp[tok] * wrsum[col]) * ascale[tok] *
-              dp4a_h2f(wscale[col]);
-        if (out_fp16)
-          ((unsigned short *)Y)[(long)(blockM + lrow) * N + col] = dp4a_f2h(v);
-        else
-          Y[(long)(blockM + lrow) * N + col] = v;
-      }
+    const int c0 = blockN + wn * 32 + s * 8 + 2 * t;
+    const int rs0 = wrsum[c0], rs1 = wrsum[c0 + 1];
+    const float ws0 = hw_h2f(wscale[c0]), ws1 = hw_h2f(wscale[c0 + 1]);
+    const float v00 =
+      tk0 >= 0 ? (float)(acc[s][0] - az0 * rs0) * as0 * ws0 : 0.0f;
+    const float v01 =
+      tk0 >= 0 ? (float)(acc[s][1] - az0 * rs1) * as0 * ws1 : 0.0f;
+    const float v10 =
+      tk1 >= 0 ? (float)(acc[s][2] - az1 * rs0) * as1 * ws0 : 0.0f;
+    const float v11 =
+      tk1 >= 0 ? (float)(acc[s][3] - az1 * rs1) * as1 * ws1 : 0.0f;
+    if (out_fp16) {
+      *(unsigned int *)((unsigned short *)Y + (long)(blockM + lr0) * N + c0) =
+        (unsigned int)hw_f2h(v00) | ((unsigned int)hw_f2h(v01) << 16);
+      *(unsigned int *)((unsigned short *)Y + (long)(blockM + lr1) * N + c0) =
+        (unsigned int)hw_f2h(v10) | ((unsigned int)hw_f2h(v11) << 16);
+    } else {
+      IPf2 lo, hi;
+      lo.x = v00; lo.y = v01; hi.x = v10; hi.y = v11;
+      *(IPf2 *)(Y + (long)(blockM + lr0) * N + c0) = lo;
+      *(IPf2 *)(Y + (long)(blockM + lr1) * N + c0) = hi;
     }
   }
 }
@@ -2572,7 +2606,27 @@ void imma_moe_grouped_g3d(const signed char *q8,
   IPD_FRAG(pa0, na0, na1, na2, na3);
   IPD_FRAG(pw, np0, np1, np2, np3);
 
+  // epilogue v2 row-side hoist: each thread's two output rows are fixed for
+  // the whole CTA, so their zero-point/scale load ONCE (was per n-tile).
+  const int epr0 = blockM + wm * 16 + g, epr1 = epr0 + 8;
+  const int eaz0 = azp[epr0], eaz1 = azp[epr1];
+  const float eas0 = ascale[epr0], eas1 = ascale[epr1];
+
   for (int j = 0; j < NT; ++j) {
+    // col-side prefetch: issues before this tile's mma burst and is resident
+    // by the time the per-tile epilogue runs (the load latency used to sit
+    // exposed inside the epilogue, 32 times per CTA -- g3tax ladder: that
+    // plus the software cvt was 3.1 ms of the 7.2 ms launch).
+    int cf_rs[8];
+    float cf_ws[8];
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+      const int pc0 = (j << 6) + wn * 32 + s * 8 + 2 * t;
+      cf_rs[2 * s] = wrsum[pc0];
+      cf_rs[2 * s + 1] = wrsum[pc0 + 1];
+      cf_ws[2 * s] = hw_h2f(wscale[pc0]);
+      cf_ws[2 * s + 1] = hw_h2f(wscale[pc0 + 1]);
+    }
     for (int cs = 0; cs < 4; ++cs) {
 #pragma unroll
       for (int h = 0; h < 4; ++h) {
@@ -2624,23 +2678,31 @@ void imma_moe_grouped_g3d(const signed char *q8,
     }
     const int blockN = j << 6;
 #pragma unroll
-    for (int s = 0; s < 4; ++s)
-#pragma unroll
-      for (int r = 0; r < 4; ++r) {
-        const int lrow = wm * 16 + g + ((r >> 1) ? 8 : 0);
-        const int cb = wn * 32 + s * 8 + 2 * t + (r & 1);
-        const int col = blockN + cb;
-        if (col < N) {
-          const int row = blockM + lrow;
-          const float v = (float)(acc[s][r] - azp[row] * wrsum[col]) *
-                          ascale[row] * dp4a_h2f(wscale[col]);
-          if (out_fp16)
-            ((unsigned short *)Y)[(long)row * N + col] = dp4a_f2h(v);
-          else
-            Y[(long)row * N + col] = v;
-        }
-        acc[s][r] = 0;
+    for (int s = 0; s < 4; ++s) {
+      const int c0 = blockN + wn * 32 + s * 8 + 2 * t;
+      const float v00 =
+        (float)(acc[s][0] - eaz0 * cf_rs[2 * s]) * eas0 * cf_ws[2 * s];
+      const float v01 =
+        (float)(acc[s][1] - eaz0 * cf_rs[2 * s + 1]) * eas0 *
+        cf_ws[2 * s + 1];
+      const float v10 =
+        (float)(acc[s][2] - eaz1 * cf_rs[2 * s]) * eas1 * cf_ws[2 * s];
+      const float v11 =
+        (float)(acc[s][3] - eaz1 * cf_rs[2 * s + 1]) * eas1 *
+        cf_ws[2 * s + 1];
+      if (out_fp16) {
+        *(unsigned int *)((unsigned short *)Y + (long)epr0 * N + c0) =
+          (unsigned int)hw_f2h(v00) | ((unsigned int)hw_f2h(v01) << 16);
+        *(unsigned int *)((unsigned short *)Y + (long)epr1 * N + c0) =
+          (unsigned int)hw_f2h(v10) | ((unsigned int)hw_f2h(v11) << 16);
+      } else {
+        IPf2 lo, hi;
+        lo.x = v00; lo.y = v01; hi.x = v10; hi.y = v11;
+        *(IPf2 *)(Y + (long)epr0 * N + c0) = lo;
+        *(IPf2 *)(Y + (long)epr1 * N + c0) = hi;
       }
+      acc[s][0] = acc[s][1] = acc[s][2] = acc[s][3] = 0;
+    }
   }
 }
 #undef IPD_FRAG
