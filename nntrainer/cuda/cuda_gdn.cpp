@@ -1892,7 +1892,7 @@ bool cuda_gdn_decode_fp16(const unsigned short *x, const unsigned short *wqkv,
                           float *state, float *ring, unsigned short *out,
                           unsigned int H, unsigned int NVH, unsigned int NKH,
                           unsigned int HKD, unsigned int HVD, unsigned int KS,
-                          float eps) {
+                          float eps, const float *qkv_pre) {
   const unsigned int KEY = NKH * HKD, VAL = NVH * HVD;
   const unsigned int CONV = 2 * KEY + VAL;
   // static shared/block limits of the kernels above
@@ -1943,8 +1943,11 @@ bool cuda_gdn_decode_fp16(const unsigned short *x, const unsigned short *wqkv,
     const int g[3] = {(lanes + B - 1) / B, 1, 1}, b[3] = {B, 1, 1};
     return sm.DispatchCommand(kk, g, b);
   };
-  // 1) projections
-  if (!gemv_h(wqkv, g_qkv, (int)H, (int)CONV) ||
+  // 1) projections. qkv may arrive PRE-PROJECTED (the gdnq bin runs it on
+  // the w4a8 int4 GEMV outside this entry, into qkv_pre) -- then wqkv is
+  // unused and the fp16 qkv GEMV is skipped.
+  const float *qkv_vec = qkv_pre != nullptr ? qkv_pre : g_qkv;
+  if ((qkv_pre == nullptr && !gemv_h(wqkv, g_qkv, (int)H, (int)CONV)) ||
       !gemv_h(wz, g_z, (int)H, (int)VAL) ||
       !gemv_h(wb, g_pb, (int)H, (int)NVH) ||
       !gemv_h(wa, g_pa, (int)H, (int)NVH)) {
@@ -1955,7 +1958,7 @@ bool cuda_gdn_decode_fp16(const unsigned short *x, const unsigned short *wqkv,
   // 2) conv + ring advance
   {
     int cv = (int)CONV, ks = (int)KS;
-    kc->SetKernelArguments(0, &g_qkv, sizeof(g_qkv));
+    kc->SetKernelArguments(0, &qkv_vec, sizeof(qkv_vec));
     kc->SetKernelArguments(1, &dp->wconv, sizeof(dp->wconv));
     kc->SetKernelArguments(2, &ring, sizeof(ring));
     kc->SetKernelArguments(3, &g_conv, sizeof(g_conv));

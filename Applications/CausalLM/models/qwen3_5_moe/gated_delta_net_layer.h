@@ -145,7 +145,7 @@ private:
   // (33.5 MB/layer, experiment-grade), so cuda_gdn_decode_fp16 runs
   // unchanged when in_proj_qkv is QS4CX. Without it decode would fall to the
   // numerically-wrong host GDN path and generate fluent garbage.
-  unsigned short *qkv_dev_fp16 = nullptr;
+  float *qkv_pre_dev = nullptr; // decode qkv w4a8 output plane (gdnq bin)
   void ensureWeightCache(nntrainer::RunLayerContext &context);
   /** @brief The five LARGE fp32 mirrors (qkv/z/b/a/out, ~134.7 MB/layer,
    *  4.04 GB over 30 layers). On the default fp16-qkv device path NOTHING

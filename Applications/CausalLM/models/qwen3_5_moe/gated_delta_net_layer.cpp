@@ -805,38 +805,37 @@ void GatedDeltaNetLayer::runDecode(nntrainer::RunLayerContext &context) {
       reinterpret_cast<const unsigned short *>(input.getData<_FP16>());
     unsigned short *op =
       reinterpret_cast<unsigned short *>(output.getData<_FP16>());
-    // gdnq bin: qkv is QS4CX; decode runs against a one-time fp16 device
-    // mirror of the dequantized weight (same values the prefill w4a8 path
-    // dequantizes), so the decode kernel stays unchanged. Built lazily on
-    // the first decode step -- ensureWeightCache has already produced the
-    // dequantized fp32 wqkv_f by then.
+    // gdnq bin: qkv is QS4CX; decode projects it on the SAME w4a8 entry the
+    // prefill path uses (M=1 rides the int4 GEMV, payload read in place)
+    // into a per-layer fp32 device plane handed to the decode step as
+    // qkv_pre. The old one-time fp16 device mirror cost ~3 s of host
+    // dequant + ~1.6 s upload on the FIRST decode step and multi-GB of RSS
+    // (wqkv_f + h16 + the mirror), and its steady state read 4x the weight
+    // bytes per token.
     const unsigned short *wqkv16 = nullptr;
+    const float *qkv_pre = nullptr;
     if (Wqkv.getDataType() == FP16D) {
       wqkv16 = reinterpret_cast<const unsigned short *>(Wqkv.getData<_FP16>());
     } else if (Wqkv.getDataType() ==
                ml::train::TensorDim::DataType::QS4CX) {
-      if (qkv_dev_fp16 == nullptr) {
-        ensureBigWeightCache(context); // gdnq mirror consumes wqkv_f
-        const size_t n = (size_t)hidden_size * conv_dim;
-        std::vector<unsigned short> h16(n);
-        for (size_t i = 0; i < n; ++i) {
-          const _FP16 v = (_FP16)wqkv_f[i];
-          std::memcpy(&h16[i], &v, sizeof(unsigned short));
-        }
+      if (qkv_pre_dev == nullptr) {
         void *d = nullptr;
-        if (cudaMalloc(&d, n * sizeof(unsigned short)) == cudaSuccess &&
-            cudaMemcpy(d, h16.data(), n * sizeof(unsigned short),
-                       cudaMemcpyHostToDevice) == cudaSuccess) {
-          qkv_dev_fp16 = static_cast<unsigned short *>(d);
-        } else {
+        if (cudaMalloc(&d, (size_t)conv_dim * sizeof(float)) == cudaSuccess)
+          qkv_pre_dev = static_cast<float *>(d);
+        else
           cudaGetLastError();
-          if (d)
-            cudaFree(d);
-        }
       }
-      wqkv16 = qkv_dev_fp16;
+      const unsigned short *qsc = nullptr;
+      if (qkv_pre_dev != nullptr &&
+          nntrainer::cuda::cuda_fc_qs4cx_scales_to_uvm_fp16(
+            Wqkv.getScale<float>(), conv_dim, &qsc) &&
+          nntrainer::cuda::cuda_fc_qs4cx_dp4a_gemm_fp16in_f32out(
+            xp, Wqkv.getData<uint8_t>(), qsc, qkv_pre_dev, 1U, conv_dim,
+            (unsigned)H))
+        qkv_pre = qkv_pre_dev;
     }
-    if (wqkv16 != nullptr && Wz.getDataType() == FP16D &&
+    if ((wqkv16 != nullptr || qkv_pre != nullptr) &&
+        Wz.getDataType() == FP16D &&
         Wb.getDataType() == FP16D && Wa.getDataType() == FP16D &&
         Wout.getDataType() == FP16D && nntrainer::cuda::dev_accessible(xp) &&
         nntrainer::cuda::dev_accessible(op) &&
@@ -854,7 +853,7 @@ void GatedDeltaNetLayer::runDecode(nntrainer::RunLayerContext &context) {
         reinterpret_cast<const unsigned short *>(Wa.getData<_FP16>()),
         reinterpret_cast<const unsigned short *>(Wout.getData<_FP16>()),
         wconv_f.data(), alog_f.data(), dtb_f.data(), wnorm_f.data(), state,
-        cs, op, H, NVH, NKH, HKD, HVD, KS, eps);
+        cs, op, H, NVH, NKH, HKD, HVD, KS, eps, qkv_pre);
       if (ok && gdn_gpu == 1)
         return;
       if (gdn_gpu >= 2) { // restore; the host path below reruns the step

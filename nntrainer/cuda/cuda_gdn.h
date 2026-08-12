@@ -51,7 +51,7 @@ bool cuda_gdn_decode_fp16(const unsigned short *x, const unsigned short *wqkv,
                           float *state, float *ring, unsigned short *out,
                           unsigned int H, unsigned int NVH, unsigned int NKH,
                           unsigned int HKD, unsigned int HVD, unsigned int KS,
-                          float eps);
+                          float eps, const float *qkv_pre = nullptr);
 
 /** @brief Pre-grow the GDN decode scratch (projection/conv/normed buffers). */
 bool cuda_gdn_prewarm(unsigned int H, unsigned int NVH, unsigned int NKH,
