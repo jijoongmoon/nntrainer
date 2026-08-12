@@ -96,16 +96,18 @@ void CudaMemAllocator::alloc(void **ptr, size_t size, size_t alignment,
     // device_only so the CPU never migrates its pages (the async thrash);
     // weights stay UVM (host writes them at load).
     //
-    // INTEGRATED GPU (Tegra/Jetson Orin): host and device share one physical
-    // memory pool, so a device-only cudaMalloc gives ZERO bandwidth benefit
-    // yet makes the buffer host-INCOHERENT -- the host RoPE/short-attention/
-    // norm fallbacks then dereference a device pointer and fault/garbage. Force
-    // the managed (host-coherent) pool there regardless of the device_only_
-    // request, so the same binary stays coherent on Orin even if a launch
-    // script leaks NNTR_CUDA_DEV_ACT. The dev()/dev_ok() GPU gates still pass
-    // because they accept Managed too. Discrete GPUs are unaffected.
+    // device_only_ is HONORED on integrated GPUs too (2026-08-13). The old
+    // force-off ("shared physical memory -> zero bandwidth benefit") missed
+    // GPU CACHEABILITY: on Orin the pinned-mapped pool is not GPU-L2-cached,
+    // and the flash-attention K/V stream measured 1.38x slower from pinned
+    // than from cudaMalloc at identical bandwidth (flashmem matrix,
+    // 123.3 vs 88.9 ms at the 20K chunk shape). Every device_only=true
+    // constructor site is an explicit kernel-only opt-in (the KV_DEV cache
+    // pool); the caller owns the no-host-access contract. The engine's
+    // default allocator stays host-coherent (pinned/managed) as before.
     const bool integrated = cuda::ContextManager::Global().isIntegrated();
-    const bool dev_only = device_only_ && !integrated;
+    (void)integrated;
+    const bool dev_only = device_only_;
     // Pinned host-mapped (zero-copy) pool replaces managed on cMA==0 devices
     // (see use_host_mapped above). Falls through to managed on any failure.
     if (!dev_only && use_host_mapped()) {
