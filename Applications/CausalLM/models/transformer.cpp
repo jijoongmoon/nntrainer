@@ -10,6 +10,8 @@
  * @brief  This file defines Transformer's basic actions
  */
 
+#include "moe_g3_prepare.h"
+#include <layer_node.h>
 #include <cstdio>
 #include <chrono>
 #include <fstream>
@@ -558,6 +560,15 @@ void Transformer::repack_weight() {
   std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
     fn = [](ml::train::Layer &l, nntrainer::RunLayerContext &context,
             void *user_data) {
+      // NNTR_MOE_G3: run the MoE table build + one-time payload repack HERE
+      // (load phase, where vLLM runs its Marlin repack) instead of on the
+      // first prefill chunk's timer. No-op unless the layer opts in.
+      // forEachLayer hands the LayerNode facade, so unwrap to the impl first.
+      if (auto *node = dynamic_cast<nntrainer::LayerNode *>(&l)) {
+        if (auto *g3 =
+              dynamic_cast<causallm::MoeG3Prepare *>(node->getLayerImpl()))
+          g3->prepareMoeG3(context);
+      }
       // Two independent narrowings, and the pack needs BOTH.
       //
       // (1) Layer type. The QS4CX pack is only ever read back through

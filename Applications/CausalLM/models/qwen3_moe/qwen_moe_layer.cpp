@@ -599,20 +599,25 @@ bool MoELayer::runGroupedMoE(
 #endif
 }
 
-bool MoELayer::runGroupedMoEImma(nntrainer::RunLayerContext &context,
-                                 const nntrainer::Tensor &input,
-                                 nntrainer::Tensor &output,
-                                 const nntrainer::Tensor &router_logits,
-                                 unsigned int total_tokens,
-                                 unsigned int hidden_size) {
+namespace {
+[[maybe_unused]] int moe_grouped_arm() {
+  static const int v = []() {
+    const char *e = std::getenv("NNTR_CUDA_MOE_GROUPED");
+    return e ? std::atoi(e) : 2;
+  }();
+  return v;
+}
+} // namespace
+
+// Pointer tables + (under NNTR_MOE_G3) the one-time fragment repack/rowsum.
+// Idempotent; callable from the load-time hook (prepareMoeG3) or lazily from
+// the first grouped forward. Returns false only when the tables themselves
+// are unusable; a G3 preflight failure leaves moe_g3_ok=false and the
+// classic unpacked arms valid (no byte of payload is repacked in that case).
+bool MoELayer::ensureMoeG3Tables(nntrainer::RunLayerContext &context,
+                                 unsigned int hidden_size, unsigned int I) {
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
   const unsigned int E = num_experts;
-  const unsigned int I =
-    context.getWeight(expert_gate_proj_indices[0]).getDim().width();
-  // The imma tile has no k tail and needs N % 64 == 0; H and I each serve as
-  // both N and K across the three projections.
-  if ((hidden_size & 63u) != 0u || (I & 63u) != 0u)
-    return false;
   if (!moe_tbl_built) {
     if (!nntrainer::cuda::cuda_moe_new_ptr_table(3 * E, &moe_wptr, &moe_wsc))
       return false;
@@ -696,6 +701,64 @@ bool MoELayer::runGroupedMoEImma(nntrainer::RunLayerContext &context,
       ml_logw("[MoE][G3] preflight failed (alignment/alloc); staying on the "
               "classic unpacked-payload arms");
   }
+  return moe_tbl_ok;
+#else
+  (void)context;
+  (void)hidden_size;
+  (void)I;
+  return false;
+#endif
+}
+
+void MoELayer::prepareMoeG3(nntrainer::RunLayerContext &context) {
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+  // Load-time hook (Transformer::repack_weight): run the table build and the
+  // G3 payload repack BEFORE generation, so the one-time ~0.7 s stops
+  // landing on the first prefill chunk's timer. Same arm guards as the
+  // forward path; the in-forward ensure remains as an idempotent fallback
+  // for entry points that skip repack_weight().
+  if (!nntrainer::cuda::moe_g3_enabled() || moe_grouped_arm() != 2)
+    return;
+  // Engine guard: repacking on a layer the graph resolved onto the host (or
+  // OpenCL) would corrupt the payload for the arm that will actually run.
+  if (context.getRunComputeEngine() != ml::train::LayerComputeEngine::CUDA)
+    return;
+  if (expert_gate_proj_indices.empty())
+    return;
+  try {
+    auto &w0 = context.getWeight(expert_gate_proj_indices[0]);
+    const unsigned int I = w0.getDim().width();
+    const unsigned int H = w0.getDim().height();
+    if ((H & 63u) != 0u || (I & 63u) != 0u)
+      return;
+    ensureMoeG3Tables(context, H, I);
+    // Drain HERE (load phase): without this the repack kernels sit queued on
+    // the stream and the first prefill chunk pays for them anyway.
+    nntrainer::cuda::StreamManager::Global().finish();
+  } catch (const std::exception &e) {
+    ml_logw("[MoE][G3] load-time prepare skipped: %s", e.what());
+  }
+#else
+  (void)context;
+#endif
+}
+
+bool MoELayer::runGroupedMoEImma(nntrainer::RunLayerContext &context,
+                                 const nntrainer::Tensor &input,
+                                 nntrainer::Tensor &output,
+                                 const nntrainer::Tensor &router_logits,
+                                 unsigned int total_tokens,
+                                 unsigned int hidden_size) {
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+  const unsigned int E = num_experts;
+  const unsigned int I =
+    context.getWeight(expert_gate_proj_indices[0]).getDim().width();
+  // The imma tile has no k tail and needs N % 64 == 0; H and I each serve as
+  // both N and K across the three projections.
+  if ((hidden_size & 63u) != 0u || (I & 63u) != 0u)
+    return false;
+  if (!ensureMoeG3Tables(context, hidden_size, I))
+    return false;
 
   // Worst-case padded geometry from SHAPES ALONE -- the host reads nothing
   // the routing kernels produce, which is the whole point of this path.
@@ -1045,10 +1108,7 @@ void MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     // at 1.3K and 20K: 20K prefill 669.7 -> 845.9 TPS, qwen_moe 14,047 ->
     // 7,722 ms, moe:3x fc 63,916 calls -> 0. =0 disables, =1 is the old dp4a
     // grouped arm (A/B only), decode is untouched either way.
-    static const int grouped2_env = []() {
-      const char *e = std::getenv("NNTR_CUDA_MOE_GROUPED");
-      return e ? std::atoi(e) : 2;
-    }();
+    const int grouped2_env = moe_grouped_arm();
     // Under NNTR_MOE_G3 the payload is fragment-order repacked, so the
     // per-expert ops->fc decode arm (a raw-order reader) must not run:
     // decode goes through the grouped path too.

@@ -64,6 +64,13 @@ class ComputeEngine;
 class LayerNode final : public ml::train::Layer, public GraphNode {
 public:
   /**
+   * @brief Public access to the effective layer implementation. Load-time
+   * hooks (e.g. Transformer::repack_weight's MoeG3Prepare pass) need the impl
+   * object to dynamic_cast against app-side interfaces; the LayerNode facade
+   * cannot express those.
+   */
+  nntrainer::Layer *getLayerImpl() { return getLayer(); }
+  /**
    * @brief Constructor of LayerNode class for v2
    * @param l layer to wrap with, the ownership is transferred to layer node
    *

@@ -29,6 +29,7 @@
 #endif
 #endif
 
+#include "../moe_g3_prepare.h"
 #include <acti_func.h>
 #include <causallm_common_properties.h>
 #include <common_properties.h>
@@ -44,8 +45,11 @@ namespace causallm {
  * @class   MoELayer
  * @brief   Mixture of Expert Layer
  */
-class WIN_EXPORT MoELayer : public nntrainer::LayerImpl {
+class WIN_EXPORT MoELayer : public nntrainer::LayerImpl,
+                            public MoeG3Prepare {
 public:
+  /** @brief MoeG3Prepare: load-time table build + payload repack. */
+  void prepareMoeG3(nntrainer::RunLayerContext &context) override;
   /**
    * @brief     Constructor of Mixture of Expert Layer
    */
@@ -150,6 +154,9 @@ private:
   const unsigned short **moe_wsc = nullptr;
   const int **moe_wrs = nullptr; /**< NNTR_MOE_G3 per-expert rowsum table */
   bool moe_g3_done = false;      /**< G3 repack/rowsum attempted once */
+  /** @brief tables + (under G3) repack; idempotent. false = tables unusable */
+  bool ensureMoeG3Tables(nntrainer::RunLayerContext &context,
+                         unsigned int hidden_size, unsigned int I);
   bool moe_g3_ok = false;        /**< payloads ARE fragment-order repacked */
   bool moe_tbl_built = false;
   // false when any expert payload fails the imma tile's 8-byte alignment
