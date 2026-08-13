@@ -103,6 +103,9 @@ bool gemm_ex(int M, int N, int K, const void *A, cudaDataType a_type,
   }();
   const size_t a_elem = (a_type == CUDA_R_16F) ? 2u : 4u;
   const size_t c_elem = (c_type == CUDA_R_16F) ? 2u : 4u;
+  // kprof bracket covers the whole M-chunk loop = one logical GEMM (the
+  // failure return precedes a dead context; its dropped pair is irrelevant).
+  void *kp = kprof_begin();
   for (int m0 = 0; m0 < M; m0 += mchunk) {
     const int mc = (M - m0 < mchunk) ? (M - m0) : mchunk;
     const void *Ai =
@@ -116,6 +119,11 @@ bool gemm_ex(int M, int N, int K, const void *A, cudaDataType a_type,
               (int)s, M, m0, mc, N, K);
       return false;
     }
+  }
+  if (kp != nullptr) {
+    char nm[48];
+    snprintf(nm, sizeof(nm), "cublas_dense N%d K%d c%d", N, K, (int)c_type);
+    kprof_end(kp, nm, StreamManager::Global().dispatchTag());
   }
   // Drain, exactly as every other device op does (cuda_fc_qint4.cpp:1601 and
   // friends). The stream binding above only orders this GEMM against other

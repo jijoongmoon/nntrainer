@@ -233,6 +233,30 @@ private:
 };
 
 /**
+ * @brief NNTR_KERN_PROF=1: per-launch cudaEvent GPU-time histogram.
+ *
+ * Every DispatchCommand launch (and the two cuBLAS GEMM entry points) is
+ * bracketed with a cudaEvent pair on the backend stream and accumulated into a
+ * table keyed by "kernel|role", where role is the dispatch tag with its
+ * leading "layer<NN>_" stripped so the 40 repeats of a node aggregate into one
+ * row. Pairs are drained lazily (a bounded pending ring; the oldest entry is
+ * synced only when the ring fills, by which time the GPU has long passed it),
+ * so the instrument adds host-side record cost but no stream drains. The table
+ * prints to stderr at process exit, sorted by total GPU ms. This measures
+ * KERNEL time under the production defer schedule -- the complement (wall
+ * minus table total) is memcpy + host gaps. Off (nullptr/zero-cost) unless the
+ * env is set; disabled during graph capture (events would record into the
+ * graph).
+ */
+bool kprof_enabled();
+/** @brief Record a start event; nullptr when off/capturing. */
+void *kprof_begin();
+/** @brief Record the stop event and file the pair under kern|role(tag). */
+void kprof_end(void *start_ev, const char *kern, const char *tag);
+/** @brief Drain pending pairs and print the table (idempotent; also atexit). */
+void kprof_dump();
+
+/**
  * @brief Process-lifetime device int[2] holding the per-token DECODE position:
  *        [0] = pos (== cache_index / RoPE `from`), [1] = N_kv (== pos+1). The
  *        M2-B single-capture decode graph bakes this FIXED device pointer into

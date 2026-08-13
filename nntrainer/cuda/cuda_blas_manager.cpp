@@ -141,6 +141,10 @@ bool BlasManager::igemmRowMajor(int M, int N, int K, const signed char *A,
     return ContextManager::Global().isIntegrated() ? 2048 : (1 << 28);
   }();
 
+  // kprof bracket covers the whole chunk loop = one logical GEMM. The failure
+  // returns below skip kprof_end: they precede a dead context, so the dropped
+  // pair is irrelevant.
+  void *kp = kprof_begin();
   for (int m0 = 0; m0 < M; m0 += mchunk) {
     const int mc = (M - m0 < mchunk) ? (M - m0) : mchunk;
     const signed char *Am = A + (size_t)m0 * (size_t)K;
@@ -191,6 +195,11 @@ bool BlasManager::igemmRowMajor(int M, int N, int K, const signed char *A,
     static int once = 0;
     if (once++ < 3)
       fprintf(stderr, "[IGEMM] OK M=%d N=%d K=%d\n", M, N, K);
+  }
+  if (kp != nullptr) {
+    char nm[48];
+    snprintf(nm, sizeof(nm), "cublas_i8 N%d K%d", N, K);
+    kprof_end(kp, nm, StreamManager::Global().dispatchTag());
   }
   return true;
 }

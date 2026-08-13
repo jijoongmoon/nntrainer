@@ -15,9 +15,16 @@
 #include "cuda_context_manager.h"
 #include "cuda_kernel.h"
 
+#include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <deque>
 #include <env_compat.h>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 namespace nntrainer::cuda {
 
@@ -32,6 +39,160 @@ static bool cap_audit_on() {
   static const bool on = nntr_env_on("NNTR_CUDA_CAP_AUDIT");
   return on;
 }
+
+// ---- NNTR_KERN_PROF: per-launch GPU-time histogram (see header) -----------
+// Single-threaded by construction: every bracketed call sits on the forward
+// path (one dispatching thread). The pending ring bounds live events; draining
+// syncs only the OLDEST pair, which the GPU has already retired by the time
+// the ring fills, so the schedule being measured is not perturbed by drains.
+namespace {
+
+struct KpAcc {
+  double ms = 0.0;
+  unsigned long long calls = 0;
+};
+
+struct KpPending {
+  cudaEvent_t s, e;
+  KpAcc *acc;
+};
+
+struct KpState {
+  std::unordered_map<std::string, KpAcc> table; // node-based: KpAcc* stable
+  std::vector<cudaEvent_t> free_ev;
+  std::deque<KpPending> pending;
+  std::string key; // reused per launch to avoid churn
+  unsigned long long launches = 0;
+};
+
+KpState &kp_state() {
+  static KpState *s = []() {
+    std::atexit([]() { kprof_dump(); });
+    return new KpState();
+  }();
+  return *s;
+}
+
+cudaEvent_t kp_take_event(KpState &st) {
+  if (!st.free_ev.empty()) {
+    cudaEvent_t ev = st.free_ev.back();
+    st.free_ev.pop_back();
+    return ev;
+  }
+  cudaEvent_t ev = nullptr;
+  cudaEventCreate(&ev); // timing enabled
+  return ev;
+}
+
+// Accumulate the oldest pending pair. Returns false if the events cannot be
+// resolved (context torn down at exit) -- callers stop draining then.
+bool kp_drain_one(KpState &st) {
+  KpPending p = st.pending.front();
+  st.pending.pop_front();
+  float f = 0.f;
+  if (cudaEventSynchronize(p.e) != cudaSuccess ||
+      cudaEventElapsedTime(&f, p.s, p.e) != cudaSuccess)
+    return false;
+  p.acc->ms += (double)f;
+  p.acc->calls += 1;
+  st.free_ev.push_back(p.s);
+  st.free_ev.push_back(p.e);
+  return true;
+}
+
+} // namespace
+
+bool kprof_enabled() {
+  static const bool on = []() {
+    const char *e = std::getenv("NNTR_KERN_PROF");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+
+void *kprof_begin() {
+  if (!kprof_enabled())
+    return nullptr;
+  auto &sm = StreamManager::Global();
+  if (sm.isCapturing()) // an event record would be captured into the graph
+    return nullptr;
+  KpState &st = kp_state();
+  cudaEvent_t ev = kp_take_event(st);
+  if (ev == nullptr)
+    return nullptr;
+  cudaEventRecord(ev, sm.GetStream());
+  return (void *)ev;
+}
+
+void kprof_end(void *start_ev, const char *kern, const char *tag) {
+  if (start_ev == nullptr)
+    return;
+  KpState &st = kp_state();
+  auto &sm = StreamManager::Global();
+  cudaEvent_t stop = kp_take_event(st);
+  if (stop == nullptr) {
+    st.free_ev.push_back((cudaEvent_t)start_ev);
+    return;
+  }
+  cudaEventRecord(stop, sm.GetStream());
+  // role = tag minus its "layer<NN>_" prefix, so node repeats aggregate.
+  const char *role = tag ? tag : "";
+  if (std::strncmp(role, "layer", 5) == 0) {
+    const char *p = role + 5;
+    while (*p >= '0' && *p <= '9')
+      ++p;
+    if (*p == '_' && p != role + 5)
+      role = p + 1;
+  }
+  st.key.assign(kern ? kern : "?");
+  st.key += '|';
+  st.key += role;
+  KpAcc &acc = st.table[st.key];
+  st.pending.push_back({(cudaEvent_t)start_ev, stop, &acc});
+  ++st.launches;
+  // Bound live events; the front of a 4096-deep ring is long retired.
+  constexpr size_t KP_RING = 4096;
+  if (st.pending.size() >= KP_RING) {
+    for (int i = 0; i < 512 && !st.pending.empty(); ++i)
+      if (!kp_drain_one(st))
+        break;
+  }
+}
+
+void kprof_dump() {
+  if (!kprof_enabled())
+    return;
+  KpState &st = kp_state();
+  static bool dumped = false;
+  if (dumped)
+    return;
+  dumped = true;
+  while (!st.pending.empty())
+    if (!kp_drain_one(st))
+      break; // context already gone: report what resolved
+  std::vector<std::pair<std::string, KpAcc>> rows(st.table.begin(),
+                                                  st.table.end());
+  std::sort(rows.begin(), rows.end(), [](const auto &a, const auto &b) {
+    return a.second.ms > b.second.ms;
+  });
+  double total = 0.0;
+  unsigned long long calls = 0;
+  for (const auto &r : rows) {
+    total += r.second.ms;
+    calls += r.second.calls;
+  }
+  std::fprintf(stderr,
+               "[kern_prof] ==== GPU ms by kernel|role: %.1f ms total, "
+               "%llu launches, %zu keys (unresolved pending=%zu) ====\n",
+               total, calls, rows.size(), st.pending.size());
+  for (const auto &r : rows)
+    std::fprintf(stderr, "[kern_prof] %10.1f ms %7llu calls %9.1f us/call  %s\n",
+                 r.second.ms, r.second.calls,
+                 r.second.calls ? 1000.0 * r.second.ms / (double)r.second.calls
+                                : 0.0,
+                 r.first.c_str());
+}
+// ---------------------------------------------------------------------------
 
 void StreamManager::initialize() noexcept {
   // make sure the device + primary context exist before creating a stream
@@ -74,11 +235,14 @@ bool StreamManager::DispatchCommand(Kernel &kernel, const int (&grid)[3],
   // own dispatches sees a value no other dispatch can reproduce.
   ++dispatch_seq_;
   auto params = kernel.getKernelParams();
+  void *kp = kprof_begin();
   CUresult r = cuLaunchKernel(
     kernel.GetFunction(), (unsigned)grid[0], (unsigned)grid[1],
     (unsigned)grid[2], (unsigned)block[0], (unsigned)block[1],
     (unsigned)block[2], shared_bytes, reinterpret_cast<CUstream>(stream_),
     params.empty() ? nullptr : params.data(), nullptr);
+  if (kp != nullptr)
+    kprof_end(kp, kernel.name().c_str(), dispatch_tag_);
   if (r != CUDA_SUCCESS && capturing_) {
     // Under capture a launch failure is normally CUDA_ERROR_STREAM_CAPTURE_
     // INVALIDATED -- something earlier already broke the capture and THIS
