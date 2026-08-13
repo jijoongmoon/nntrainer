@@ -2865,6 +2865,293 @@ __global__ void moe_rowsum_g3(const unsigned long long *wp_tab, int *rs,
     rs[(long)e * N + n] = s - 16 * Kh;
 }
 
+// -------------------------------------------------- Marlin-form m4 arm ----
+// ip_wide_bench 2026-08-13: P5 warp geometry (warp owns all 64 M rows, 4
+// n-warps x 2 k-warps) at BN=128 on a 4-stage cp.async ring = 30.2-30.9 TOPS
+// L2-defeating vs 20.2 for this file's imma_gemm_pipe twin (+52%), bit-exact
+// at every 35B projection shape. The two shapes that were REFUTED on the way
+// (banked): register-fragment double-buffering (-17%: our 4-mma batches are
+// too small to hide the same-slot WAR that Marlin's 16-32-mma batches bury),
+// and BN=256 at 1 CTA/SM (24-26 TOPS: Orin cannot hide latency at 12.5%
+// occupancy). BN widening pays ONLY on the P5 geometry -- the classic-tile
+// n128 arm stays flat.
+//
+// The weight is consumed in OFFLINE FRAGMENT ORDER (repack_marlin_m4): per
+// (128-col block bn, 64-k step ks) a 4096-B chunk of 256 16-B lane slots
+// [(nw*2+kw)*32+lane]; a slot's packed nibbles are stored in exactly the
+// order the in-kernel byte_perm/nib2i8 expand emits, so B needs ONE
+// ld.shared.v4 per lane per step (no ldmatrix) and one B fragment feeds all
+// four m-blocks: 16 mma per fetch, 3.2 mma/smem-instruction.
+// The repack BAKES the raw/cached nibble plane in (cxnib = 0 raw payload,
+// 8 for the ^0x88 DevWeightQ copy), so this kernel is cx-free; expanded
+// values equal nib_offset-8 either way and the epilogue math is the exact
+// arithmetic of imma_gemm_pipe's -- the result is BIT-IDENTICAL.
+__global__ void repack_marlin_m4(const unsigned char *src, unsigned char *dst,
+                                 int N, int K, int cxnib) {
+  // grid: (N/128, K/64); 256 threads = one 16-B slot each
+  const int bn = blockIdx.x, ks = blockIdx.y, nsteps = K >> 6;
+  const int t = threadIdx.x;
+  const int nw = t >> 6, kw = (t >> 5) & 1, lane = t & 31;
+  const int Kh = K >> 1;
+  unsigned char out[16];
+#pragma unroll
+  for (int j = 0; j < 16; ++j) {
+    unsigned nib[2];
+#pragma unroll
+    for (int jj = 0; jj < 2; ++jj) {
+      const int i = 2 * j + jj;
+      const int f = i >> 3, w = (i >> 2) & 1, m = i & 3;
+      const int row = bn * 128 + nw * 32 + f * 8 + (lane >> 2);
+      const int k = ks * 64 + kw * 32 + w * 16 + 4 * (lane & 3) + m;
+      const unsigned char b = src[(long)row * Kh + (k >> 1)];
+      nib[jj] = ((k & 1) ? (b >> 4) : (b & 0xFu)) ^ (unsigned)cxnib;
+    }
+    out[j] = (unsigned char)(nib[0] | (nib[1] << 4));
+  }
+  long off = (((long)bn * nsteps + ks) * 256 + t) * 16;
+#pragma unroll
+  for (int j = 0; j < 16; ++j)
+    dst[off + j] = out[j];
+}
+
+// Per-channel rowsum for the m4 arm when the source is the RAW offset-binary
+// payload (the cached DevWeightQ arm reuses its existing rowsum table). Same
+// integer semantic as weight_rowsum / the pipe's in-kernel rsacc:
+// rowsum[n] = sum_k (nib(n,k) - 8).
+__global__ void m4_rowsum(const unsigned char *src, int *rs, int N, int Kh) {
+  const int wid = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int n = blockIdx.x * 8 + wid;
+  if (n >= N)
+    return;
+  const unsigned int *row = (const unsigned int *)(src + (long)n * Kh);
+  const int nw = Kh >> 2;
+  int s = 0;
+  for (int i = lane; i < nw; i += 32) {
+    const unsigned int u = row[i];
+    s = __dp4a((int)0x01010101, (int)(u & 0x0F0F0F0Fu), s);
+    s = __dp4a((int)0x01010101, (int)((u >> 4) & 0x0F0F0F0Fu), s);
+  }
+  for (int o = 16; o > 0; o >>= 1)
+    s += __shfl_down_sync(0xffffffffu, s, o);
+  if (lane == 0)
+    rs[n] = s - 16 * Kh;
+}
+
+#define M4_EXPAND(V0, V1, V2, V3, P0, P1)                                      \
+  do {                                                                         \
+    unsigned int lo_ = (P0)&0x0F0F0F0Fu;                                       \
+    unsigned int hi_ = ((P0) >> 4) & 0x0F0F0F0Fu;                              \
+    V0 = ip_nib2i8(__byte_perm(lo_, hi_, 0x5140), 0u);                         \
+    V1 = ip_nib2i8(__byte_perm(lo_, hi_, 0x7362), 0u);                         \
+    lo_ = (P1)&0x0F0F0F0Fu;                                                    \
+    hi_ = ((P1) >> 4) & 0x0F0F0F0Fu;                                           \
+    V2 = ip_nib2i8(__byte_perm(lo_, hi_, 0x5140), 0u);                         \
+    V3 = ip_nib2i8(__byte_perm(lo_, hi_, 0x7362), 0u);                         \
+  } while (0)
+#define M4_MMA(ACC, AR, B0, B1)                                                \
+  asm volatile(                                                                \
+    "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32.satfinite "               \
+    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"              \
+    : "=r"(ACC[0]), "=r"(ACC[1]), "=r"(ACC[2]), "=r"(ACC[3])                   \
+    : "r"(AR[0]), "r"(AR[1]), "r"(AR[2]), "r"(AR[3]), "r"(B0), "r"(B1),        \
+      "r"(ACC[0]), "r"(ACC[1]), "r"(ACC[2]), "r"(ACC[3]))
+#define M4_LDM(D, P)                                                           \
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, "     \
+               "[%4];"                                                         \
+               : "=r"(D[0]), "=r"(D[1]), "=r"(D[2]), "=r"(D[3]) : "r"(P))
+__global__ __launch_bounds__(256, 2)
+void imma_gemm_m4(const signed char *q8, const unsigned char *wm,
+                  const float *ascale, const int *azp, const int *wrowsum,
+                  const unsigned short *wscale, float *Y, int M, int N, int K,
+                  int out_fp16) {
+  __shared__ IPv16 A4sv[4][64 * IP_LD / 16];
+  __shared__ IPv16 W4sv[4][256]; // 4096-B fragment-order packed stage
+  const int tid = threadIdx.x;
+  const int lane = tid & 31, warp = tid >> 5;
+  const int nw = warp & 3, kw = warp >> 2;
+  const int blockM = blockIdx.y * 64, blockN = blockIdx.x * 128;
+
+  const int srow = tid >> 2, ssub = tid & 3;
+  const signed char *aptr = q8 + (long)(blockM + srow) * K + (ssub << 4);
+  // M tail: an out-of-range row cp.asyncs with src-size 0, which zero-fills
+  // the 16 smem bytes -- zero rows add nothing to acc, the epilogue guards.
+  const int a_src_sz = (blockM + srow) < M ? 16 : 0;
+  const int sdst = srow * IP_LD + (ssub << 4);
+  const int nsteps = K >> 6; // caller gates K % 256 == 0
+  const unsigned char *wsrc = wm + (long)blockIdx.x * nsteps * 4096 + tid * 16;
+  unsigned adst[4], wdst[4];
+#pragma unroll
+  for (int b = 0; b < 4; ++b) {
+    adst[b] = ip_sh((signed char *)A4sv[b] + sdst);
+    wdst[b] = ip_sh((signed char *)W4sv[b] + tid * 16);
+  }
+
+  int acc[4][4][4]; // [m-block][n8-frag][reg]
+#pragma unroll
+  for (int mb = 0; mb < 4; ++mb)
+#pragma unroll
+    for (int f = 0; f < 4; ++f)
+#pragma unroll
+      for (int r = 0; r < 4; ++r)
+        acc[mb][f][r] = 0;
+
+#define M4_CPAW(BUF, KS)                                                       \
+  do {                                                                         \
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(     \
+                   adst[BUF]),                                                 \
+                 "l"(aptr + (KS)*64), "r"(a_src_sz));                          \
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(         \
+                   wdst[BUF]),                                                 \
+                 "l"(wsrc + (long)(KS)*4096));                                 \
+  } while (0)
+#define M4_CPC() asm volatile("cp.async.commit_group;\n" ::)
+#define M4_CPW1() asm volatile("cp.async.wait_group 1;\n" ::)
+
+  M4_CPAW(0, 0);
+  M4_CPC();
+  M4_CPAW(1, 1);
+  M4_CPC();
+  M4_CPAW(2, 2);
+  M4_CPC();
+  M4_CPW1();
+  __syncthreads();
+
+  const int lrow_a = (lane & 7) + ((lane & 8) ? 8 : 0);
+  const int lkb_a = kw * 32 + ((lane & 16) ? 16 : 0);
+  unsigned pa_buf[4], pw_buf[4];
+#pragma unroll
+  for (int b = 0; b < 4; ++b) {
+    pa_buf[b] = ip_sh((const signed char *)A4sv[b] + lrow_a * IP_LD + lkb_a);
+    pw_buf[b] =
+      ip_sh((const signed char *)W4sv[b] + ((nw * 2 + kw) * 32 + lane) * 16);
+  }
+
+  for (int kb = 0; kb < nsteps; kb += 4) {
+#pragma unroll
+    for (int u = 0; u < 4; ++u) {
+      const int k = kb + u;
+      const int u2 = (u + 2) & 3;
+      if (k > 0) {
+        if (k + 2 < nsteps)
+          M4_CPAW(u2, k + 2);
+        M4_CPC(); // unconditional (possibly empty): uniform group accounting
+        M4_CPW1();
+        __syncthreads();
+      }
+      const unsigned pa = pa_buf[u], pw = pw_buf[u];
+      unsigned p0, p1, p2, p3;
+      asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];\n"
+                   : "=r"(p0), "=r"(p1), "=r"(p2), "=r"(p3) : "r"(pw));
+      int a0[4], a1[4], a2[4], a3[4];
+      M4_LDM(a0, pa);
+      M4_LDM(a1, pa + 16 * IP_LD);
+      M4_LDM(a2, pa + 32 * IP_LD);
+      M4_LDM(a3, pa + 48 * IP_LD);
+      int c0, c1, c2, c3, c4, c5, c6, c7;
+      M4_EXPAND(c0, c1, c2, c3, p0, p1); // f0.b0 f0.b1 f1.b0 f1.b1
+      M4_EXPAND(c4, c5, c6, c7, p2, p3); // f2.b0 f2.b1 f3.b0 f3.b1
+      M4_MMA(acc[0][0], a0, c0, c1);
+      M4_MMA(acc[1][0], a1, c0, c1);
+      M4_MMA(acc[2][0], a2, c0, c1);
+      M4_MMA(acc[3][0], a3, c0, c1);
+      M4_MMA(acc[0][1], a0, c2, c3);
+      M4_MMA(acc[1][1], a1, c2, c3);
+      M4_MMA(acc[2][1], a2, c2, c3);
+      M4_MMA(acc[3][1], a3, c2, c3);
+      M4_MMA(acc[0][2], a0, c4, c5);
+      M4_MMA(acc[1][2], a1, c4, c5);
+      M4_MMA(acc[2][2], a2, c4, c5);
+      M4_MMA(acc[3][2], a3, c4, c5);
+      M4_MMA(acc[0][3], a0, c6, c7);
+      M4_MMA(acc[1][3], a1, c6, c7);
+      M4_MMA(acc[2][3], a2, c6, c7);
+      M4_MMA(acc[3][3], a3, c6, c7);
+    }
+  }
+#undef M4_CPAW
+#undef M4_CPC
+#undef M4_CPW1
+
+  // Cross-k-warp reduction in two 16-KB column halves through the (now dead)
+  // A stage buffers, with the pipe's dequant epilogue fused into the kw1
+  // pass. TOT = scr + acc is the full int32 accumulator -- int32 adds are
+  // exact and satfinite cannot fire at |acc| <= K*127*8 -- so
+  // (TOT - azp*rowsum) * ascale * wscale through the hardware cvt is the
+  // same arithmetic on the same integers as imma_gemm_pipe: bit-identical.
+  __syncthreads();
+  int *scr = (int *)A4sv;
+  const int g = lane >> 2, t2 = lane & 3;
+#pragma unroll
+  for (int half = 0; half < 2; ++half) {
+    if (kw == 0) {
+#pragma unroll
+      for (int mb = 0; mb < 4; ++mb)
+#pragma unroll
+        for (int ff = 0; ff < 2; ++ff)
+#pragma unroll
+          for (int r = 0; r < 4; ++r) {
+            const int f = half * 2 + ff;
+            const int row = mb * 16 + g + ((r >> 1) ? 8 : 0);
+            const int cidx = nw * 16 + ff * 8 + 2 * t2 + (r & 1);
+            scr[row * 64 + cidx] = acc[mb][f][r];
+          }
+    }
+    __syncthreads();
+    if (kw == 1) {
+#pragma unroll
+      for (int mb = 0; mb < 4; ++mb) {
+        const int row0 = blockM + mb * 16 + g, row1 = row0 + 8;
+        const int az0 = row0 < M ? azp[row0] : 0;
+        const int az1 = row1 < M ? azp[row1] : 0;
+        const float as0 = row0 < M ? ascale[row0] : 0.0f;
+        const float as1 = row1 < M ? ascale[row1] : 0.0f;
+#pragma unroll
+        for (int ff = 0; ff < 2; ++ff) {
+          const int f = half * 2 + ff;
+          const int c0 = blockN + nw * 32 + f * 8 + 2 * t2;
+          const int i0 = (mb * 16 + g) * 64 + nw * 16 + ff * 8 + 2 * t2;
+          const int rs0 = wrowsum[c0], rs1 = wrowsum[c0 + 1];
+          const float ws0 = hw_h2f(wscale[c0]), ws1 = hw_h2f(wscale[c0 + 1]);
+          if (row0 < M) {
+            const float v00 =
+              (float)(scr[i0] + acc[mb][f][0] - az0 * rs0) * as0 * ws0;
+            const float v01 =
+              (float)(scr[i0 + 1] + acc[mb][f][1] - az0 * rs1) * as0 * ws1;
+            if (out_fp16)
+              *(unsigned int *)((unsigned short *)Y + (long)row0 * N + c0) =
+                (unsigned int)hw_f2h(v00) | ((unsigned int)hw_f2h(v01) << 16);
+            else {
+              IPf2 p;
+              p.x = v00;
+              p.y = v01;
+              *(IPf2 *)(Y + (long)row0 * N + c0) = p;
+            }
+          }
+          if (row1 < M) {
+            const float v10 =
+              (float)(scr[i0 + 512] + acc[mb][f][2] - az1 * rs0) * as1 * ws0;
+            const float v11 =
+              (float)(scr[i0 + 513] + acc[mb][f][3] - az1 * rs1) * as1 * ws1;
+            if (out_fp16)
+              *(unsigned int *)((unsigned short *)Y + (long)row1 * N + c0) =
+                (unsigned int)hw_f2h(v10) | ((unsigned int)hw_f2h(v11) << 16);
+            else {
+              IPf2 p;
+              p.x = v10;
+              p.y = v11;
+              *(IPf2 *)(Y + (long)row1 * N + c0) = p;
+            }
+          }
+        }
+      }
+    }
+    __syncthreads();
+  }
+}
+#undef M4_EXPAND
+#undef M4_MMA
+#undef M4_LDM
+
 }
 
 )CU";
@@ -3063,6 +3350,86 @@ DevWeightQ *ensure_dp4a_cache_locked(const unsigned char *plain_w,
   return &it->second;
 }
 
+// --- Marlin-form m4 arm (opt-in NNTR_FC_MARLIN=1) --------------------------
+// Fragment-order device weight + rowsum table for imma_gemm_m4, keyed by the
+// pointer the pipe arm would have read (raw payload or DevWeightQ copy). The
+// repack bakes that arm's nibble plane in (cxnib), so the kernel is cx-free
+// and its output stays bit-identical to imma_gemm_pipe's. Building a device
+// copy also fixes the operand kind for house-pool payloads.
+struct M4WeightQ {
+  unsigned char *wm;
+  int *rowsum; // owned only when built here; the cached arm reuses DevWeightQ's
+  bool owns_rowsum;
+};
+static std::unordered_map<const void *, M4WeightQ> g_m4_cache;
+
+// DEFAULT ON (NNTR_FC_MARLIN=0 restores the pipe arm): 20K prefill
+// 1,968.9/1,963.8 -> 2,060.9/2,073.5 TPS (+5.1%), text byte-identical,
+// decode untouched (M >= 256 gate keeps the GEMV arms).
+static bool marlin_on() {
+  static const bool on = []() {
+    const char *e = std::getenv("NNTR_FC_MARLIN");
+    return !(e && e[0] == '0');
+  }();
+  return on;
+}
+
+// Caller holds g_dp4a_mtx.
+static M4WeightQ *ensure_m4_cache_locked(const void *src, unsigned int N,
+                                         unsigned int K, int cxnib,
+                                         int *rowsum_reuse) {
+  auto it = g_m4_cache.find(src);
+  if (it != g_m4_cache.end())
+    return &it->second;
+  auto kr = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
+                                                     "repack_marlin_m4");
+  auto ks = rowsum_reuse ? nullptr
+                         : CudaContext::Global().registerCudaKernel(
+                             FC_QINT4_DP4A_SRC, "m4_rowsum");
+  if (!kr || (!rowsum_reuse && !ks))
+    return nullptr;
+  M4WeightQ mw{};
+  const size_t bytes = (size_t)N * K / 2u;
+  if (cudaMalloc(&mw.wm, bytes) != cudaSuccess)
+    return nullptr;
+  const int n = (int)N, k = (int)K;
+  kr->SetKernelArguments(0, &src, sizeof(src));
+  kr->SetKernelArguments(1, &mw.wm, sizeof(mw.wm));
+  kr->SetKernelArguments(2, &n, sizeof(n));
+  kr->SetKernelArguments(3, &k, sizeof(k));
+  kr->SetKernelArguments(4, &cxnib, sizeof(cxnib));
+  const int rb[3] = {256, 1, 1};
+  const int rg[3] = {(int)(N / 128u), (int)(K / 64u), 1};
+  if (!StreamManager::Global().DispatchCommand(*kr, rg, rb)) {
+    cudaFree(mw.wm);
+    return nullptr;
+  }
+  if (rowsum_reuse) {
+    mw.rowsum = rowsum_reuse;
+    mw.owns_rowsum = false;
+  } else {
+    if (cudaMalloc(&mw.rowsum, sizeof(int) * (size_t)N) != cudaSuccess) {
+      cudaFree(mw.wm);
+      return nullptr;
+    }
+    mw.owns_rowsum = true;
+    const int kh = (int)(K / 2u);
+    ks->SetKernelArguments(0, &src, sizeof(src));
+    ks->SetKernelArguments(1, &mw.rowsum, sizeof(mw.rowsum));
+    ks->SetKernelArguments(2, &n, sizeof(n));
+    ks->SetKernelArguments(3, &kh, sizeof(kh));
+    const int sb[3] = {256, 1, 1};
+    const int sg[3] = {((int)N + 7) / 8, 1, 1};
+    if (!StreamManager::Global().DispatchCommand(*ks, sg, sb)) {
+      cudaFree(mw.wm);
+      cudaFree(mw.rowsum);
+      return nullptr;
+    }
+  }
+  it = g_m4_cache.emplace(src, mw).first;
+  return &it->second;
+}
+
 /** Do not BUILD the DevWeightQ cache in-path; read the QS4CX payload directly
  *  instead. An already-built cache is still used (see the call site).
  *  DEFAULT ON; NNTR_CUDA_FC_NOCACHE=0 restores the old always-build behaviour.
@@ -3186,6 +3553,36 @@ bool dp4a_repack_and_gemm(const unsigned char *plain_w,
   // cache pointers stay null and are never dereferenced.
   const void *w_arg = nocache ? (const void *)plain_w : (const void *)plain;
   const int raw_i = nocache ? 1 : 0;
+
+  // Marlin-form m4 arm: P5 warp geometry at BN=128 (bench +52% over the pipe
+  // at every 35B projection shape, bit-identical). Prefill-scale GEMMs only;
+  // any cache/registration failure falls through to the pipe arm untouched.
+  const bool use_m4 = use_pipe && marlin_on() && (N % 128u) == 0u &&
+                      (K % 256u) == 0u && M >= 256u;
+  if (use_m4) {
+    M4WeightQ *mw = ensure_m4_cache_locked(w_arg, N, K, raw_i ? 0 : 8,
+                                           raw_i ? nullptr : wrowsum);
+    auto k4 = mw ? CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
+                                                            "imma_gemm_m4")
+                 : nullptr;
+    if (k4) {
+      const int mm4 = (int)M;
+      k4->SetKernelArguments(0, &g_dp4a_q8, sizeof(g_dp4a_q8));
+      k4->SetKernelArguments(1, &mw->wm, sizeof(mw->wm));
+      k4->SetKernelArguments(2, &g_dp4a_ascale, sizeof(g_dp4a_ascale));
+      k4->SetKernelArguments(3, &g_dp4a_azp, sizeof(g_dp4a_azp));
+      k4->SetKernelArguments(4, &mw->rowsum, sizeof(mw->rowsum));
+      k4->SetKernelArguments(5, &scales_fp16, sizeof(scales_fp16));
+      k4->SetKernelArguments(6, &Yf, sizeof(Yf));
+      k4->SetKernelArguments(7, &mm4, sizeof(mm4));
+      k4->SetKernelArguments(8, &n, sizeof(n));
+      k4->SetKernelArguments(9, &k, sizeof(k));
+      k4->SetKernelArguments(10, &out_fp16, sizeof(out_fp16));
+      const int ib[3] = {256, 1, 1};
+      const int ig[3] = {(int)(N / 128u), ((int)M + 63) / 64, 1};
+      return StreamManager::Global().DispatchCommand(*k4, ig, ib);
+    }
+  }
 
   const int mm = (int)M;
   if (raw) {
