@@ -1897,6 +1897,47 @@ bool cuda_gdn_prewarm(unsigned int H, unsigned int NVH, unsigned int NKH,
   return ensure_scratch(2 * NKH * HKD + NVH * HVD, NVH * HVD, NVH);
 }
 
+// [zdev] Device scratch for the prefill z/b/a projection outputs plus a
+// device mirror of the shared input row-block. Rationale: the in-tree z GEMM
+// measured 17.1 TFLOPS against out_proj's 28.4 on identical FLOPs and the
+// same M-chunking -- the only differences were z's pinned-pool A operand
+// (re-read per N-tile sweep with no GPU L2 on Tegra) and its fp32 pool C.
+// The mirror is ONE stream-ordered D2D of T*H fp16 (~0.1 ms) amortized over
+// all four projections' A reads. Callers must only engage this when the
+// device GDN sink consumes the planes (nothing host-reads them; only pq is
+// host-read, by save_ring). NNTR_GDN_ZDEV=0 opts out.
+namespace {
+float *g_pf_z = nullptr, *g_pf_b = nullptr, *g_pf_a = nullptr;
+unsigned short *g_pf_x = nullptr;
+size_t g_pf_z_cap = 0, g_pf_b_cap = 0, g_pf_a_cap = 0, g_pf_x_cap = 0;
+} // namespace
+
+bool cuda_gdn_proj_dev(unsigned int T, unsigned int VAL, unsigned int NVH,
+                       unsigned int H, const void *x_pinned16,
+                       const void **x_dev16, float **z, float **b, float **a) {
+  static const bool on = []() {
+    const char *e = std::getenv("NNTR_GDN_ZDEV");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  if (!on || T == 0)
+    return false;
+  std::lock_guard<std::mutex> lk(g_gdn_mtx);
+  if (!grow((void **)&g_pf_z, &g_pf_z_cap, (size_t)T * VAL * 4) ||
+      !grow((void **)&g_pf_b, &g_pf_b_cap, (size_t)T * NVH * 4) ||
+      !grow((void **)&g_pf_a, &g_pf_a_cap, (size_t)T * NVH * 4) ||
+      !grow((void **)&g_pf_x, &g_pf_x_cap, (size_t)T * H * 2))
+    return false;
+  if (cudaMemcpyAsync(g_pf_x, x_pinned16, (size_t)T * H * 2,
+                      cudaMemcpyDefault,
+                      StreamManager::Global().GetStream()) != cudaSuccess)
+    return false;
+  *x_dev16 = g_pf_x;
+  *z = g_pf_z;
+  *b = g_pf_b;
+  *a = g_pf_a;
+  return true;
+}
+
 bool cuda_gdn_prefill_fp16(const float *p_qkv, const float *p_z,
                            const float *p_b, const float *p_a,
                            const unsigned short *wout, const float *h_wconv,

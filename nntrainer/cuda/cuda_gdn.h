@@ -58,6 +58,16 @@ bool cuda_gdn_prewarm(unsigned int H, unsigned int NVH, unsigned int NKH,
                       unsigned int HKD, unsigned int HVD);
 
 /**
+ * @brief Device scratch for the prefill z/b/a projection outputs + a device
+ * mirror of the shared input. Engage ONLY when the device GDN sink consumes
+ * the planes (the host lane reads host pointers). NNTR_GDN_ZDEV=0 opts out;
+ * returns false (pointers untouched) when disabled or on allocation failure.
+ */
+bool cuda_gdn_proj_dev(unsigned int T, unsigned int VAL, unsigned int NVH,
+                       unsigned int H, const void *x_pinned16,
+                       const void **x_dev16, float **z, float **b, float **a);
+
+/**
  * @brief Everything between the input projections and the layer output, for a
  *        whole prefill of T tokens, on the device.
  *

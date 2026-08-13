@@ -363,6 +363,11 @@ void GatedDeltaNetLayer::runForward(nntrainer::RunLayerContext &context,
   float *pz_w = context.getTensor(proj_z_idx).getData<float>();
   float *pb_w = context.getTensor(proj_b_idx).getData<float>();
   float *pa_w = context.getTensor(proj_a_idx).getData<float>();
+  // [zdev] The device GDN sink consumes z/b/a through these; when the sink
+  // gate holds they are steered to device scratch (pool operand kind is the
+  // measured z tax), otherwise they stay the pool planes above.
+  float *pzD = pz_w, *pbD = pb_w, *paD = pa_w;
+  bool zdev = false;
 
   bool proj_gpu = false;
   bool pf_cmp = false;
@@ -397,6 +402,31 @@ void GatedDeltaNetLayer::runForward(nntrainer::RunLayerContext &context,
         nntrainer::cuda::dev_accessible(pa_w)) {
       using nntrainer::cuda::cuda_fc_dense_gemm_fp16_f32out;
       const unsigned uT = (unsigned)T, uH = (unsigned)H;
+      // [zdev] Hoisted copy of the device-sink gate below (B==1, fp16 Wout/
+      // output, device-reachable state): only then does anything consume the
+      // device planes, so only then may the GEMMs write device C. Excludes
+      // the NNTR_CUDA_GDN=2 diagnostic (its host reference reads pz/pb/pa).
+      const void *xz = xp;
+      if (B == 1 && gdn_gpu_p < 2) {
+        nntrainer::Tensor &WoutZ = context.getWeight(w_out_proj);
+        float *stZ = context.getTensor(state_idx).getData<float>();
+        if (WoutZ.getDataType() == FP16D && output.getDataType() == FP16D &&
+            nntrainer::cuda::dev_accessible(WoutZ.getData<_FP16>()) &&
+            nntrainer::cuda::dev_accessible(output.getData<_FP16>()) &&
+            nntrainer::cuda::dev_accessible(stZ)) {
+          const void *xd = nullptr;
+          float *zd = nullptr, *bd = nullptr, *ad = nullptr;
+          if (nntrainer::cuda::cuda_gdn_proj_dev(uT, (unsigned)VAL,
+                                                 (unsigned)NVH, uH, xp, &xd,
+                                                 &zd, &bd, &ad)) {
+            xz = xd;
+            pzD = zd;
+            pbD = bd;
+            paD = ad;
+            zdev = true;
+          }
+        }
+      }
       int qkv_ok = 0;
       if (qkv_q4) {
         const unsigned short *qsc = nullptr;
@@ -404,10 +434,10 @@ void GatedDeltaNetLayer::runForward(nntrainer::RunLayerContext &context,
           (int)(nntrainer::cuda::cuda_fc_qs4cx_scales_to_uvm_fp16(
                   Wqkv.getScale<float>(), (unsigned)CONV, &qsc) &&
                 nntrainer::cuda::cuda_fc_qs4cx_dp4a_gemm_fp16in_f32out(
-                  reinterpret_cast<const unsigned short *>(xp),
+                  reinterpret_cast<const unsigned short *>(xz),
                   Wqkv.getData<uint8_t>(), qsc, pq_w, uT, (unsigned)CONV, uH));
       } else {
-        qkv_ok = (int)cuda_fc_dense_gemm_fp16_f32out(xp, Wqkv.getData<_FP16>(),
+        qkv_ok = (int)cuda_fc_dense_gemm_fp16_f32out(xz, Wqkv.getData<_FP16>(),
                                                      pq_w, uT, (unsigned)CONV,
                                                      uH);
       }
@@ -415,11 +445,11 @@ void GatedDeltaNetLayer::runForward(nntrainer::RunLayerContext &context,
       // written and others stale, and the host fallback rewrites all four.
       proj_gpu =
         qkv_ok &
-        (int)cuda_fc_dense_gemm_fp16_f32out(xp, Wz.getData<_FP16>(), pz_w, uT,
+        (int)cuda_fc_dense_gemm_fp16_f32out(xz, Wz.getData<_FP16>(), pzD, uT,
                                             (unsigned)VAL, uH) &
-        (int)cuda_fc_dense_gemm_fp16_f32out(xp, Wb.getData<_FP16>(), pb_w, uT,
+        (int)cuda_fc_dense_gemm_fp16_f32out(xz, Wb.getData<_FP16>(), pbD, uT,
                                             (unsigned)NVH, uH) &
-        (int)cuda_fc_dense_gemm_fp16_f32out(xp, Wa.getData<_FP16>(), pa_w, uT,
+        (int)cuda_fc_dense_gemm_fp16_f32out(xz, Wa.getData<_FP16>(), paD, uT,
                                             (unsigned)NVH, uH);
     }
   }
@@ -520,7 +550,7 @@ void GatedDeltaNetLayer::runForward(nntrainer::RunLayerContext &context,
         smg.finish();
         std::vector<float> s_bak(st, st + (size_t)NVH * HKD * HVD);
         const bool ck_ok = nntrainer::cuda::cuda_gdn_prefill_chunked_fp16(
-          pq_w, pz_w, pb_w, pa_w, wout16, wconv_f.data(), alog_f.data(),
+          pq_w, pzD, pbD, paD, wout16, wconv_f.data(), alog_f.data(),
           dtb_f.data(), wnorm_f.data(), st, rg, out16, (unsigned)T,
           (unsigned)H, (unsigned)NVH, (unsigned)NKH, (unsigned)HKD,
           (unsigned)HVD, (unsigned)KS, eps, seed_state, save_state);
@@ -535,7 +565,7 @@ void GatedDeltaNetLayer::runForward(nntrainer::RunLayerContext &context,
         }
         std::copy(s_bak.begin(), s_bak.end(), st);
         dev_ok = nntrainer::cuda::cuda_gdn_prefill_fp16(
-          pq_w, pz_w, pb_w, pa_w, wout16, wconv_f.data(), alog_f.data(),
+          pq_w, pzD, pbD, paD, wout16, wconv_f.data(), alog_f.data(),
           dtb_f.data(), wnorm_f.data(), st, rg, out16, (unsigned)T,
           (unsigned)H, (unsigned)NVH, (unsigned)NKH, (unsigned)HKD,
           (unsigned)HVD, (unsigned)KS, eps, seed_state, save_state);
@@ -562,14 +592,14 @@ void GatedDeltaNetLayer::runForward(nntrainer::RunLayerContext &context,
         }
       } else if (gdn_chunk == 1 && T > 1) {
         dev_ok = nntrainer::cuda::cuda_gdn_prefill_chunked_fp16(
-          pq_w, pz_w, pb_w, pa_w, wout16, wconv_f.data(), alog_f.data(),
+          pq_w, pzD, pbD, paD, wout16, wconv_f.data(), alog_f.data(),
           dtb_f.data(), wnorm_f.data(), st, rg, out16, (unsigned)T,
           (unsigned)H, (unsigned)NVH, (unsigned)NKH, (unsigned)HKD,
           (unsigned)HVD, (unsigned)KS, eps, seed_state, save_state);
       }
       if (!dev_ok)
         dev_ok = nntrainer::cuda::cuda_gdn_prefill_fp16(
-          pq_w, pz_w, pb_w, pa_w, wout16, wconv_f.data(), alog_f.data(),
+          pq_w, pzD, pbD, paD, wout16, wconv_f.data(), alog_f.data(),
           dtb_f.data(), wnorm_f.data(), st, rg, out16, (unsigned)T,
           (unsigned)H, (unsigned)NVH, (unsigned)NKH, (unsigned)HKD,
           (unsigned)HVD, (unsigned)KS, eps, seed_state, save_state);
@@ -603,6 +633,25 @@ void GatedDeltaNetLayer::runForward(nntrainer::RunLayerContext &context,
   }
 #endif
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+  // [zdev] Every device scan arm declined AFTER the projections were steered
+  // to device scratch: the pool z/b/a planes were never written, and the host
+  // lane below reads them. Recompute them host-visibly. (proj_gpu==false means
+  // the host projection fallback already rewrote the pool -- skip.)
+  if (zdev && proj_gpu) {
+    using nntrainer::cuda::cuda_fc_dense_gemm_fp16_f32out;
+    nntrainer::Tensor &Wz2 = context.getWeight(w_in_proj_z);
+    nntrainer::Tensor &Wb2 = context.getWeight(w_in_proj_b);
+    nntrainer::Tensor &Wa2 = context.getWeight(w_in_proj_a);
+    const void *xp2 = input.getData<_FP16>();
+    cuda_fc_dense_gemm_fp16_f32out(xp2, Wz2.getData<_FP16>(), pz_w,
+                                   (unsigned)T, (unsigned)VAL, (unsigned)H);
+    cuda_fc_dense_gemm_fp16_f32out(xp2, Wb2.getData<_FP16>(), pb_w,
+                                   (unsigned)T, (unsigned)NVH, (unsigned)H);
+    cuda_fc_dense_gemm_fp16_f32out(xp2, Wa2.getData<_FP16>(), pa_w,
+                                   (unsigned)T, (unsigned)NVH, (unsigned)H);
+  }
+#endif
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
   // Host conv/scan lane: pq/pz/pb/pa may be cuBLAS-written (proj_gpu with the
   // device scan declined) and the ring is device-read scratch.
