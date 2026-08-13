@@ -24,29 +24,20 @@ namespace nntrainer::cuda {
 // cos/sin LUTs.
 static const char *ROPE_FP16_SRC = R"CU(
 extern "C" {
+// Hardware cvt (bit-identical to the former software pair on every finite
+// and non-finite value -- same exhaustive verification as rms_h2f_hw /
+// dp4a_h2f). This was the one kernel source the scalar hw-cvt sweep missed:
+// the old software rp_f2h carried a data-dependent denormal `while` loop,
+// the exact defect the MoE header documents as blocking loop unrolling.
 __device__ __forceinline__ float rp_h2f(unsigned short h) {
-  unsigned int s = ((unsigned int)(h & 0x8000u)) << 16;
-  unsigned int e = (h >> 10) & 0x1Fu, m = h & 0x3FFu, o;
-  if (e == 0u) {
-    if (m == 0u) o = s;
-    else { int x=-1; do{m<<=1;x++;}while((m&0x400u)==0u); m&=0x3FFu;
-           o = s | ((unsigned int)(127-15-x)<<23) | (m<<13); }
-  } else if (e == 0x1Fu) o = s | 0x7F800000u | (m<<13);
-  else o = s | ((e + (127u-15u))<<23) | (m<<13);
-  return __int_as_float((int)o);
+  float f;
+  asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h));
+  return f;
 }
 __device__ __forceinline__ unsigned short rp_f2h(float f) {
-  unsigned int x=(unsigned int)__float_as_int(f), s=(x>>16)&0x8000u, mant=x&0x7FFFFFu;
-  int e=(int)((x>>23)&0xFFu);
-  if (e==0xFF) return (unsigned short)(s|0x7C00u|(mant?0x200u:0u));
-  int exp=e-127+15;
-  if (exp>=0x1F) return (unsigned short)(s|0x7C00u);
-  if (exp<=0){ if(exp<-10) return (unsigned short)s; mant|=0x800000u; int sh=14-exp;
-    unsigned int hh=mant>>sh, rem=mant&((1u<<sh)-1u), half=1u<<(sh-1);
-    if(rem>half||(rem==half&&(hh&1u))) hh++; return (unsigned short)(s|hh); }
-  unsigned int hh=((unsigned int)exp<<10)|(mant>>13), rem=mant&0x1FFFu;
-  if(rem>0x1000u||(rem==0x1000u&&(hh&1u))) hh++;
-  return (unsigned short)(s|hh);
+  unsigned short h;
+  asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(f));
+  return h;
 }
 __global__ void rope_fp16(const unsigned short *in, unsigned short *out,
                           const unsigned short *cos_lut,
