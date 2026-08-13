@@ -189,6 +189,51 @@ __global__ void rmsnorm_fp16_v4(const unsigned short *x,
     yv[i] = o;
   }
 }
+// Warp-per-row prefill variant: one warp owns a row, shuffle-only reduction
+// (no shared memory, no block sync), vec4 loads with an L1-hot re-read in
+// the scale pass instead of a register carry (the same carry-vs-occupancy
+// trade as act_quant_i8_h_v4p). Built for the narrow per-head norms -- q/k
+// norm at prefill is tens of thousands of rows x width 256, where a
+// 256-thread block per row idles 3/4 of its threads and pays two smem tree
+// reductions. Same ulp caveat as _v4: the sum-of-squares reduction order
+// differs from the scalar kernel, so `inv` can move by an ulp (NLL-gated,
+// NNTR_NORM_V4P=0 restores the scalar kernel).
+__global__ void rmsnorm_fp16_w4p(const unsigned short *x,
+                                 const unsigned short *gamma, unsigned short *y,
+                                 int width, int rows, float eps,
+                                 int has_gamma) {
+  const int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  if (row >= rows)
+    return;
+  const int lane = threadIdx.x & 31;
+  const uint2 *xv = (const uint2 *)(x + (size_t)row * width);
+  const uint2 *gv = (const uint2 *)gamma;
+  uint2 *yv = (uint2 *)(y + (size_t)row * width);
+  const int nv = width >> 2;
+  float p = 0.f;
+  for (int i = lane; i < nv; i += 32) {
+    float4 f = rms_load4(xv[i]);
+    p += f.x * f.x + f.y * f.y + f.z * f.z + f.w * f.w;
+  }
+  for (int sh = 16; sh > 0; sh >>= 1)
+    p += __shfl_down_sync(0xffffffffu, p, sh);
+  p = __shfl_sync(0xffffffffu, p, 0);
+  const float inv = rsqrtf(p / (float)width + eps);
+  for (int i = lane; i < nv; i += 32) {
+    float4 f = rms_load4(xv[i]);
+    float4 g = make_float4(1.f, 1.f, 1.f, 1.f);
+    if (has_gamma == 1)
+      g = rms_load4(gv[i]);
+    else if (has_gamma == 2)
+      g = rms_gather4(gamma + 4 * i);
+    uint2 o;
+    o.x = (unsigned int)rms_f2h_hw(f.x * inv * g.x) |
+          ((unsigned int)rms_f2h_hw(f.y * inv * g.y) << 16);
+    o.y = (unsigned int)rms_f2h_hw(f.z * inv * g.z) |
+          ((unsigned int)rms_f2h_hw(f.w * inv * g.w) << 16);
+    yv[i] = o;
+  }
+}
 // PLE post-norm (ReverseRMSNorm): t = x * w applied BEFORE the norm,
 // rms over t, then a SCALAR out_scale AFTER: y = (t / rms(t)) * out_scale.
 // Same 1-block-per-row FP32-accumulate reduction as rmsnorm_fp16 above;
@@ -223,33 +268,53 @@ __global__ void rms_reverse_norm_fp16(const unsigned short *x,
 }
 )CU";
 
+// NNTR_NORM_V4P (shared with cuda_fc_qint4.cpp's prefill norm arm): =0
+// restores the scalar prefill kernel; decode (rows<=32) keeps _v4.
+static bool rms_v4p_on() {
+  static const bool v = []() {
+    const char *e = std::getenv("NNTR_NORM_V4P");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  return v;
+}
+
 bool cuda_rmsnorm_fp16(const unsigned short *in, const unsigned short *gamma,
                        unsigned short *out, float eps, unsigned int rows,
                        unsigned int width) {
   if (rows == 0 || width == 0)
     return true;
-  const bool vec4 = cuda_vec4_rows_small(rows) &&
-                    cuda_vec4_rows_ok(width, in, out) &&
-                    cuda_fc_qs4cx_fused_normq_enabled();
+  const bool okv = cuda_vec4_rows_ok(width, in, out) &&
+                   cuda_fc_qs4cx_fused_normq_enabled();
+  const bool vec4 = okv && cuda_vec4_rows_small(rows);
+  const bool w4p = okv && !vec4 && rms_v4p_on();
   auto kernel = CudaContext::Global().registerCudaKernel(
-    RMSNORM_FP16_SRC, vec4 ? "rmsnorm_fp16_v4" : "rmsnorm_fp16");
+    RMSNORM_FP16_SRC, vec4  ? "rmsnorm_fp16_v4"
+                      : w4p ? "rmsnorm_fp16_w4p"
+                            : "rmsnorm_fp16");
   if (!kernel) {
     ml_loge("[CUDA] rmsnorm_fp16: kernel registration failed");
     return false;
   }
   int w = (int)width;
-  int has_gamma = (gamma == nullptr)                       ? 0
-                  : (!vec4 || cuda_vec4_rows_ok(4, gamma)) ? 1
-                                                           : 2;
+  int r = (int)rows;
+  int has_gamma = (gamma == nullptr) ? 0
+                  : (!(vec4 || w4p) || cuda_vec4_rows_ok(4, gamma)) ? 1
+                                                                    : 2;
   const unsigned short *gamma_ptr = gamma;
   kernel->SetKernelArguments(0, &in, sizeof(in));
   kernel->SetKernelArguments(1, &gamma_ptr, sizeof(gamma_ptr));
   kernel->SetKernelArguments(2, &out, sizeof(out));
   kernel->SetKernelArguments(3, &w, sizeof(w));
-  kernel->SetKernelArguments(4, &eps, sizeof(eps));
-  kernel->SetKernelArguments(5, &has_gamma, sizeof(has_gamma));
+  if (w4p) {
+    kernel->SetKernelArguments(4, &r, sizeof(r));
+    kernel->SetKernelArguments(5, &eps, sizeof(eps));
+    kernel->SetKernelArguments(6, &has_gamma, sizeof(has_gamma));
+  } else {
+    kernel->SetKernelArguments(4, &eps, sizeof(eps));
+    kernel->SetKernelArguments(5, &has_gamma, sizeof(has_gamma));
+  }
   const int block[3] = {vec4 ? 512 : 256, 1, 1};
-  const int grid[3] = {(int)rows, 1, 1};
+  const int grid[3] = {w4p ? (int)((rows + 7u) / 8u) : (int)rows, 1, 1};
   if (!StreamManager::Global().DispatchCommand(*kernel, grid, block))
     return false;
   rms_maybe_finish(out);

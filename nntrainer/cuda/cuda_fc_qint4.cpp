@@ -434,6 +434,77 @@ __global__ void rmsnorm_quant_i8_h_v4(const unsigned short *x,
   }
 }
 
+// Prefill-shaped variant of rmsnorm_quant_i8_h_v4: same vector loads,
+// hardware cvt, and warp-shuffle reductions, but NO per-thread register
+// carry -- the same trade as act_quant_i8_h_v4p (the carry is a decode win
+// and a measured prefill LOSS: 32 extra registers cut blocks/SM at large M).
+// Passes 2 and 3 re-read rows that are L1-hot from the pass before them.
+// Numerics match v4, not the scalar kernel: the sum of squares is reduced in
+// vector-of-4 order, so `inv` can differ from the scalar kernel by an ulp;
+// everything downstream of `inv` (including the quant of the ROUNDED fp16
+// stores) is the scalar arithmetic unchanged.
+__global__ void rmsnorm_quant_i8_h_v4p(const unsigned short *x,
+                                       const unsigned short *gamma,
+                                       unsigned short *y, signed char *q8,
+                                       float *ascale, int *azp, int M, int K,
+                                       float eps, int has_gamma) {
+  int m = blockIdx.x;
+  if (m >= M)
+    return;
+  const uint2 *xv = (const uint2 *)(x + (long)m * K);
+  const uint2 *gv = (const uint2 *)gamma;
+  uint2 *yv = (uint2 *)(y + (long)m * K);
+  int *q32 = (int *)(q8 + (long)m * K);
+  const int nv = K >> 2;
+  __shared__ float ssq[32];
+  __shared__ float smn[32];
+  __shared__ float smx[32];
+  float p = 0.f;
+  for (int i = threadIdx.x; i < nv; i += blockDim.x) {
+    float4 f = vq_load4(xv[i]);
+    p += f.x * f.x + f.y * f.y + f.z * f.z + f.w * f.w;
+  }
+  VQ_REDUCE(ssq, p, vq_add, 0.f);
+  const float inv = rsqrtf(ssq[0] / (float)K + eps);
+
+  float lmn = 0.f, lmx = 0.f;
+  for (int i = threadIdx.x; i < nv; i += blockDim.x) {
+    float4 f = vq_load4(xv[i]);
+    float4 g = make_float4(1.f, 1.f, 1.f, 1.f);
+    if (has_gamma == 1)
+      g = vq_load4(gv[i]);
+    else if (has_gamma == 2)
+      g = vq_gather4(gamma + 4 * i);
+    unsigned short h0 = vq_f2h(f.x * inv * g.x), h1 = vq_f2h(f.y * inv * g.y);
+    unsigned short h2 = vq_f2h(f.z * inv * g.z), h3 = vq_f2h(f.w * inv * g.w);
+    uint2 o;
+    o.x = (unsigned int)h0 | ((unsigned int)h1 << 16);
+    o.y = (unsigned int)h2 | ((unsigned int)h3 << 16);
+    yv[i] = o;
+    float4 r = make_float4(vq_h2f(h0), vq_h2f(h1), vq_h2f(h2), vq_h2f(h3));
+    lmn = fminf(lmn, fminf(fminf(r.x, r.y), fminf(r.z, r.w)));
+    lmx = fmaxf(lmx, fmaxf(fmaxf(r.x, r.y), fmaxf(r.z, r.w)));
+  }
+  VQ_REDUCE(smn, lmn, fminf, VQ_POSINF);
+  VQ_REDUCE(smx, lmx, fmaxf, VQ_NEGINF);
+  float scale_q, recip;
+  int zp;
+  asym_qparams(smn[0], smx[0], scale_q, recip, zp);
+  if (threadIdx.x == 0) {
+    ascale[m] = recip;
+    azp[m] = zp;
+  }
+  for (int i = threadIdx.x; i < nv; i += blockDim.x) {
+    float4 r = vq_load4(yv[i]);
+    int q0 = max(-128, min(127, (int)rintf(r.x * scale_q) + zp));
+    int q1 = max(-128, min(127, (int)rintf(r.y * scale_q) + zp));
+    int q2 = max(-128, min(127, (int)rintf(r.z * scale_q) + zp));
+    int q3 = max(-128, min(127, (int)rintf(r.w * scale_q) + zp));
+    q32[i] = (q0 & 0xFF) | ((q1 & 0xFF) << 8) | ((q2 & 0xFF) << 16) |
+             ((q3 & 0xFF) << 24);
+  }
+}
+
 // RMSNorm fused with the int8 activation quant its consumer FC needs.
 //
 // The decode norm and the quant that follows it are two single-block kernels
@@ -3991,6 +4062,19 @@ bool fused_normq_on() {
   return v;
 }
 
+// NNTR_NORM_V4P: vectorized prefill norms (rmsnorm_quant_i8_h_v4p here,
+// rmsnorm_fp16_w4p in cuda_rmsnorm.cpp). NOT bit-identical to the scalar
+// kernels -- the sum-of-squares reduction order changes, so `inv` can move
+// by an ulp (same deviation class as the decode v4 arm, NLL-gated). =0
+// restores the scalar prefill kernels; decode (rows<=32) is unaffected.
+bool norm_v4p_on() {
+  static const bool v = []() {
+    const char *e = std::getenv("NNTR_NORM_V4P");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  return v;
+}
+
 // Publish the staged quant as reusable by the very next FC on @p xh.
 void mark_quant_staged(const void *xh, int k) {
   g_last_quant_xh = xh;
@@ -4631,10 +4715,13 @@ bool cuda_fc_qs4cx_rmsnorm_prequant_fp16(const unsigned short *x,
     return false;
   if (rows == 0 || width == 0)
     return false;
-  const bool vec4 =
-    cuda_vec4_rows_small(rows) && cuda_vec4_rows_ok(width, x, y);
+  const bool okv = cuda_vec4_rows_ok(width, x, y);
+  const bool vec4 = okv && cuda_vec4_rows_small(rows);
+  const bool v4p = okv && !vec4 && norm_v4p_on();
   auto k = CudaContext::Global().registerCudaKernel(
-    FC_QINT4_DP4A_SRC, vec4 ? "rmsnorm_quant_i8_h_v4" : "rmsnorm_quant_i8_h");
+    FC_QINT4_DP4A_SRC, vec4  ? "rmsnorm_quant_i8_h_v4"
+                       : v4p ? "rmsnorm_quant_i8_h_v4p"
+                             : "rmsnorm_quant_i8_h");
   if (!k)
     return false;
   std::lock_guard<std::mutex> lk(g_dp4a_mtx);
@@ -4646,9 +4733,9 @@ bool cuda_fc_qs4cx_rmsnorm_prequant_fp16(const unsigned short *x,
   if (!dp4a_stage_scratch(rows, width))
     return false;
   int m = (int)rows, kk = (int)width;
-  int has_gamma = (gamma == nullptr)         ? 0
-                  : (!vec4 || cuda_vec4_rows_ok(4, gamma)) ? 1
-                                             : 2;
+  int has_gamma = (gamma == nullptr) ? 0
+                  : (!(vec4 || v4p) || cuda_vec4_rows_ok(4, gamma)) ? 1
+                                                                    : 2;
   k->SetKernelArguments(0, &x, sizeof(x));
   k->SetKernelArguments(1, &gamma, sizeof(gamma));
   k->SetKernelArguments(2, &y, sizeof(y));
