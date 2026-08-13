@@ -859,7 +859,9 @@ __global__ void gdn_ck_out(const float *conv, const float *gc,
 __global__ __launch_bounds__(256, 2)
 void gdn_ck_out_tc(const unsigned short *conv, const float *gc,
                    const unsigned short *h, const unsigned short *vnew,
-                   float *o, float scale, int T, int CONV,
+                   const float *z, const float *wnorm,
+                   unsigned short *normed, float eps,
+                   float scale, int T, int CONV,
                    int KEY, int NVH, int NKH, int HKD, int HVD){
   const int ck = blockIdx.x, vh = blockIdx.y;
   const int kh = vh / (NVH / NKH);
@@ -874,13 +876,17 @@ void gdn_ck_out_tc(const unsigned short *conv, const float *gc,
   //   [17408)  kx  64x136 fp16 (17,408 B)  -- k in phase A; h-half in T1;
   //                                            vn in T2
   //   [34816)  coef 64x72 fp16  (9,216 B)  -- written end of phase A
-  __shared__ __align__(16) unsigned char sb[44032];
+  // +1 KB tail (phase C fused gate): rss [64][2] fp32 + wns [128] fp32
+  __shared__ __align__(16) unsigned char sb[45056];
   unsigned short *qs = (unsigned short *)sb;
   unsigned short *kx = (unsigned short *)(sb + 17408);
   unsigned short *cf = (unsigned short *)(sb + 34816);
+  float *rss = (float *)(sb + 44032);
+  float *wns = (float *)(sb + 44544);
   const int LD = 136, LDC = 72;
 
-  // ---- stage q and k (fp32 -> fp16 round at load) ----
+  // ---- stage q and k (fp32 -> fp16 round at load) + wnorm ----
+  if (tid < 128) wns[tid] = wnorm[tid];
   for (int i = tid; i < 64*128; i += 256) {
     const int c = i >> 7, e = i & 127;
     unsigned short hq = 0, hk = 0;
@@ -1037,16 +1043,55 @@ void gdn_ck_out_tc(const unsigned short *conv, const float *gc,
   }
 #undef GOMMA
 
-  // ---- epilogue: o = scale * acc ----
-  #pragma unroll
-  for (int s = 0; s < 8; ++s) {
-    const int bcol = wn*64 + s*8 + 2*tq;
-    #pragma unroll
-    for (int r = 0; r < 4; ++r) {
-      const int c = wm*16 + g + ((r >> 1) ? 8 : 0);
-      if (c < cn) {
-        const long t = (long)ck*64 + c;
-        o[t*(long)(NVH*HVD) + vh*HVD + bcol + (r & 1)] = scale*acc[s][r];
+  // ---- fused epilogue (phase C): o never touches DRAM. RMSNorm over the
+  // 128 dims of each (t, vh) row + silu(z) gate, formerly gdn_ck_gate.
+  // fp32 throughout, same formula; only the ssq summation ORDER differs
+  // from the standalone kernel's b-tree reduction (semantic, text-gated).
+  // Tail rows (c >= cn) contribute zero ssq (their q staged as 0 -> acc 0)
+  // and are never written.
+  const int c0r = wm*16 + g, c1r = c0r + 8;
+  {
+    float s0 = 0.f, s1 = 0.f;
+#pragma unroll
+    for (int s = 0; s < 8; ++s) {
+#pragma unroll
+      for (int r = 0; r < 4; ++r) acc[s][r] *= scale;
+      s0 += acc[s][0]*acc[s][0] + acc[s][1]*acc[s][1];
+      s1 += acc[s][2]*acc[s][2] + acc[s][3]*acc[s][3];
+    }
+    s0 += __shfl_xor_sync(0xffffffffu, s0, 1);
+    s0 += __shfl_xor_sync(0xffffffffu, s0, 2);
+    s1 += __shfl_xor_sync(0xffffffffu, s1, 1);
+    s1 += __shfl_xor_sync(0xffffffffu, s1, 2);
+    if (tq == 0) {
+      rss[c0r*2 + wn] = s0;
+      rss[c1r*2 + wn] = s1;
+    }
+  }
+  __syncthreads();
+  {
+    const float i0 =
+      1.0f/sqrtf((rss[c0r*2] + rss[c0r*2 + 1])/(float)HVD + eps);
+    const float i1 =
+      1.0f/sqrtf((rss[c1r*2] + rss[c1r*2 + 1])/(float)HVD + eps);
+    const long t0 = (long)ck*64 + c0r, t1 = t0 + 8;
+#pragma unroll
+    for (int s = 0; s < 8; ++s) {
+      const int bcol = wn*64 + s*8 + 2*tq;
+      const float w0 = wns[bcol], w1 = wns[bcol + 1];
+      if (c0r < cn) {
+        const long off = t0*(long)(NVH*HVD) + vh*HVD + bcol;
+        const float2 zv = *(const float2 *)&z[off];
+        const unsigned short n0 = f2h(acc[s][0]*i0*w0*gdn_silu(zv.x));
+        const unsigned short n1 = f2h(acc[s][1]*i0*w1*gdn_silu(zv.y));
+        *(unsigned *)&normed[off] = (unsigned)n0 | ((unsigned)n1 << 16);
+      }
+      if (c1r < cn) {
+        const long off = t1*(long)(NVH*HVD) + vh*HVD + bcol;
+        const float2 zv = *(const float2 *)&z[off];
+        const unsigned short n0 = f2h(acc[s][2]*i1*w0*gdn_silu(zv.x));
+        const unsigned short n1 = f2h(acc[s][3]*i1*w1*gdn_silu(zv.y));
+        *(unsigned *)&normed[off] = (unsigned)n0 | ((unsigned)n1 << 16);
       }
     }
   }
@@ -1913,7 +1958,27 @@ bool cuda_gdn_prefill_chunked_fp16(
        !f16rt(g_ck_vn, (long)T * NVH * HVD)))
     return false;
   stamp(7);
-  { // outputs (fully parallel over chunks)
+  if (g_ck_tc) { // outputs + FUSED gate (phase C: o never touches DRAM)
+    kou->SetKernelArguments(0, &ck_conv, sizeof(ck_conv));
+    kou->SetKernelArguments(1, &g_ck_gc, sizeof(g_ck_gc));
+    kou->SetKernelArguments(2, &g_ck_h, sizeof(g_ck_h));
+    kou->SetKernelArguments(3, &g_ck_vn, sizeof(g_ck_vn));
+    kou->SetKernelArguments(4, &p_z, sizeof(p_z));
+    kou->SetKernelArguments(5, &dp->wnorm, sizeof(dp->wnorm));
+    kou->SetKernelArguments(6, &g_pf_normed, sizeof(g_pf_normed));
+    kou->SetKernelArguments(7, &eps, sizeof(eps));
+    kou->SetKernelArguments(8, &scale, sizeof(scale));
+    kou->SetKernelArguments(9, &iT, sizeof(iT));
+    kou->SetKernelArguments(10, &iCONV, sizeof(iCONV));
+    kou->SetKernelArguments(11, &iKEY, sizeof(iKEY));
+    kou->SetKernelArguments(12, &iNVH, sizeof(iNVH));
+    kou->SetKernelArguments(13, &iNKH, sizeof(iNKH));
+    kou->SetKernelArguments(14, &iHKD, sizeof(iHKD));
+    kou->SetKernelArguments(15, &iHVD, sizeof(iHVD));
+    const int g[3] = {(int)NT, iNVH, 1}, b3[3] = {256, 1, 1};
+    if (!sm.DispatchCommand(*kou, g, b3))
+      return false;
+  } else { // fp32 SIMT arm: separate out + gate, unchanged
     kou->SetKernelArguments(0, &ck_conv, sizeof(ck_conv));
     kou->SetKernelArguments(1, &g_ck_gc, sizeof(g_ck_gc));
     kou->SetKernelArguments(2, &g_ck_h, sizeof(g_ck_h));
@@ -1927,12 +1992,12 @@ bool cuda_gdn_prefill_chunked_fp16(
     kou->SetKernelArguments(10, &iNKH, sizeof(iNKH));
     kou->SetKernelArguments(11, &iHKD, sizeof(iHKD));
     kou->SetKernelArguments(12, &iHVD, sizeof(iHVD));
-    const int g[3] = {(int)NT, iNVH, 1}, b3[3] = {g_ck_tc ? 256 : 128, 1, 1};
+    const int g[3] = {(int)NT, iNVH, 1}, b3[3] = {128, 1, 1};
     if (!sm.DispatchCommand(*kou, g, b3))
       return false;
   }
   stamp(8);
-  { // gated RMSNorm + silu(z) -> fp16 (the scan's fused tail, un-fused)
+  if (!g_ck_tc) { // gated RMSNorm + silu(z) -> fp16 (fp32 arm only now)
     kga->SetKernelArguments(0, &g_ck_o, sizeof(g_ck_o));
     kga->SetKernelArguments(1, &p_z, sizeof(p_z));
     kga->SetKernelArguments(2, &dp->wnorm, sizeof(dp->wnorm));
