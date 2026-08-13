@@ -506,8 +506,9 @@ void gdn_ck_kkt_tc(const unsigned short *conv, const float *gc, const float *bet
 // gate arbitrates, and out's coef precedent passed with 16x margin).
 __global__ __launch_bounds__(256, 2)
 void gdn_ck_wu_tc(const unsigned short *conv, const float *A, const float *gc,
-                  const float *beta, unsigned short *w, float *u, int T,
-                  int CONV, int KEY, int NVH, int NKH, int HKD, int HVD){
+                  const float *beta, unsigned short *w, unsigned short *u,
+                  int T, int CONV, int KEY, int NVH, int NKH, int HKD,
+                  int HVD){
   const int ck = blockIdx.x, vh = blockIdx.y;
   const int kh = vh / (NVH / NKH);
   const int cn = (T - ck*64 < 64) ? (T - ck*64) : 64;
@@ -598,22 +599,29 @@ void gdn_ck_wu_tc(const unsigned short *conv, const float *A, const float *gc,
     }
 #undef WUMMA
   }
+  // Epilogue v2 form: a thread's (r&1) pair covers ADJACENT dims, so each
+  // (s, row-half) is one u32 fp16 pair store. w was already fp16 (state_tc
+  // rounded at load = bit-identical). u now stores fp16 TOO (FLA precedent:
+  // u/v_new live in bf16 there; the vn = u - vpre subtract consumes the
+  // rounded value) -- SEMANTIC change, gated by text A/B + NLL, and it
+  // halves the u plane's write+read traffic.
 #pragma unroll
   for (int s = 0; s < 8; ++s)
 #pragma unroll
-    for (int r = 0; r < 4; ++r) {
-      const int c = wm*16 + g + ((r >> 1) ? 8 : 0);
-      const int dim = wn*64 + s*8 + 2*tq + (r & 1);
+    for (int rh = 0; rh < 2; ++rh) {
+      const int c = wm*16 + g + rh*8;
+      const int dim = wn*64 + s*8 + 2*tq;
       if (c < cn) {
         const long t = (long)ck*64 + c;
-        // w stores fp16: its only consumer (gdn_ck_state_tc) rounded it to
-        // fp16 at load anyway, so rounding at the store is bit-identical
-        // and halves the plane's traffic. u stays fp32 (consumed unrounded
-        // in the vn = u - vpre subtract).
-        unsigned short hw;
-        asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hw) : "f"(aw[s][r]));
-        w[(t*NVH + vh)*HKD + dim] = hw;
-        u[(t*NVH + vh)*HVD + dim] = au[s][r];
+        unsigned short w0, w1, u0, u1;
+        asm("cvt.rn.f16.f32 %0, %1;" : "=h"(w0) : "f"(aw[s][rh*2 + 0]));
+        asm("cvt.rn.f16.f32 %0, %1;" : "=h"(w1) : "f"(aw[s][rh*2 + 1]));
+        asm("cvt.rn.f16.f32 %0, %1;" : "=h"(u0) : "f"(au[s][rh*2 + 0]));
+        asm("cvt.rn.f16.f32 %0, %1;" : "=h"(u1) : "f"(au[s][rh*2 + 1]));
+        *(unsigned *)&w[(t*NVH + vh)*HKD + dim] =
+          (unsigned)w0 | ((unsigned)w1 << 16);
+        *(unsigned *)&u[(t*NVH + vh)*HVD + dim] =
+          (unsigned)u0 | ((unsigned)u1 << 16);
       }
     }
 }
@@ -1055,7 +1063,7 @@ void gdn_ck_out_tc(const unsigned short *conv, const float *gc,
 // Bench-validated rel<=1e-3; 20.05 -> 4.13 ms at the T=4096 shape.
 __global__ __launch_bounds__(512, 1)
 void gdn_ck_state_tc(const unsigned short *conv, const unsigned short *w,
-                     const float *u, const float *gc, const float *gl,
+                     const unsigned short *u, const float *gc, const float *gl,
                      unsigned short *h, unsigned short *vnew,
                      float *state, int T, int CONV, int KEY, int NVH, int NKH,
                      int HKD, int HVD, int seed_state, int save_state){
@@ -1090,19 +1098,22 @@ void gdn_ck_state_tc(const unsigned short *conv, const unsigned short *w,
       for (int r = 0; r < 4; ++r) vp[s][r] = 0.0f;
     for (int jh = 0; jh < 2; ++jh) {
       __syncthreads();
+      // (r&1) pairs are adjacent b -> u32 fp16 pair stores (epilogue v2)
 #pragma unroll
       for (int s = 0; s < 8; ++s)
 #pragma unroll
-        for (int r = 0; r < 4; ++r) {
-          const int j = wm*16 + g + ((r >> 1) ? 8 : 0);
-          const int b = wn*64 + s*8 + 2*tq + (r & 1);
+        for (int rh = 0; rh < 2; ++rh) {
+          const int j = wm*16 + g + rh*8;
+          const int b = wn*64 + s*8 + 2*tq;
           if (j >= jh*64 && j < jh*64 + 64) {
-            unsigned short hv;
-            asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hv) : "f"(S[s][r]));
-            Sh[(j - jh*64)*SLD + b] = hv;
-            // fp16 h plane: gdn_ck_out_tc rounded h at load anyway, and hv
+            unsigned short h0, h1;
+            asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h0) : "f"(S[s][rh*2 + 0]));
+            asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h1) : "f"(S[s][rh*2 + 1]));
+            const unsigned pv = (unsigned)h0 | ((unsigned)h1 << 16);
+            *(unsigned *)&Sh[(j - jh*64)*SLD + b] = pv;
+            // fp16 h plane: gdn_ck_out_tc rounded h at load anyway, and pv
             // IS that rounding -- bit-identical, half the traffic.
-            h[((long)c*NVH + vh)*16384 + j*128 + b] = hv;
+            *(unsigned *)&h[((long)c*NVH + vh)*16384 + j*128 + b] = pv;
           }
         }
       __syncthreads();
@@ -1153,26 +1164,39 @@ void gdn_ck_state_tc(const unsigned short *conv, const unsigned short *w,
     }
     __syncthreads();
     if (wm < 4) {
+      // u is fp16 now (one u32 pair load); vnew/Tb pair-stored. vn is the
+      // fp16-rounded u minus fp32 vp -- the u rounding is the phase-A
+      // semantic change (FLA keeps u in bf16), gated by text A/B + NLL.
 #pragma unroll
       for (int s = 0; s < 8; ++s)
 #pragma unroll
-        for (int r = 0; r < 4; ++r) {
-          const int cc = wm*16 + g + ((r >> 1) ? 8 : 0);
-          const int b = wn*64 + s*8 + 2*tq + (r & 1);
-          float dvv = 0.0f;
+        for (int rh = 0; rh < 2; ++rh) {
+          const int cc = wm*16 + g + rh*8;
+          const int b = wn*64 + s*8 + 2*tq;
+          float dv0 = 0.0f, dv1 = 0.0f;
           if (cc < cn) {
             const long t = (long)c*64 + cc;
-            const float vn = u[(t*NVH + vh)*HVD + b] - vp[s][r];
-            // fp16 vnew plane (out_tc rounded it at load anyway); dv below
-            // keeps the unrounded fp32 vn, exactly as before.
-            unsigned short hvn;
-            asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hvn) : "f"(vn));
-            vnew[(t*NVH + vh)*HVD + b] = hvn;
-            dvv = vn*expf(gl[(long)c*NVH + vh] - gc[t*NVH + vh]);
+            const unsigned up = *(const unsigned *)&u[(t*NVH + vh)*HVD + b];
+            float u0, u1;
+            asm("cvt.f32.f16 %0, %1;" : "=f"(u0)
+                : "h"((unsigned short)(up & 0xFFFFu)));
+            asm("cvt.f32.f16 %0, %1;" : "=f"(u1)
+                : "h"((unsigned short)(up >> 16)));
+            const float vn0 = u0 - vp[s][rh*2 + 0];
+            const float vn1 = u1 - vp[s][rh*2 + 1];
+            unsigned short n0, n1;
+            asm("cvt.rn.f16.f32 %0, %1;" : "=h"(n0) : "f"(vn0));
+            asm("cvt.rn.f16.f32 %0, %1;" : "=h"(n1) : "f"(vn1));
+            *(unsigned *)&vnew[(t*NVH + vh)*HVD + b] =
+              (unsigned)n0 | ((unsigned)n1 << 16);
+            const float ee = expf(gl[(long)c*NVH + vh] - gc[t*NVH + vh]);
+            dv0 = vn0*ee;
+            dv1 = vn1*ee;
           }
-          unsigned short hv;
-          asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hv) : "f"(dvv));
-          Tb[cc*SLD + b] = hv;
+          unsigned short d0, d1;
+          asm("cvt.rn.f16.f32 %0, %1;" : "=h"(d0) : "f"(dv0));
+          asm("cvt.rn.f16.f32 %0, %1;" : "=h"(d1) : "f"(dv1));
+          *(unsigned *)&Tb[cc*SLD + b] = (unsigned)d0 | ((unsigned)d1 << 16);
         }
     }
     for (int i = tid; i < 64*128; i += 512) {
@@ -1787,11 +1811,11 @@ bool cuda_gdn_prefill_chunked_fp16(
       return false;
   }
   // stub point 2: w/u before the state sweep consumes them.
-  // Under the TC arm w is ALREADY an fp16 plane (stored rounded because its
-  // only consumer rounded at load anyway) -- the f16 round-trip stub only
-  // applies to the fp32 arms. u stays fp32 on both.
-  if ((!g_ck_tc && !f16rt(g_ck_w, (long)T * NVH * HKD)) ||
-      !f16rt(g_ck_u, (long)T * NVH * HVD))
+  // Under the TC arm BOTH w and u are fp16 planes now (phase A: u joined w,
+  // FLA precedent -- semantic change gated by text A/B + NLL) -- the f16
+  // round-trip stub only applies to the fp32 arms, where both stay fp32.
+  if (!g_ck_tc && (!f16rt(g_ck_w, (long)T * NVH * HKD) ||
+                   !f16rt(g_ck_u, (long)T * NVH * HVD)))
     return false;
   stamp(6);
   { // state propagation (the only sequential piece)
