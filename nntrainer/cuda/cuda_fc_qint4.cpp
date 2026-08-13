@@ -130,56 +130,22 @@ static const char *FC_QINT4_DP4A_SRC =
   R"CU(
 extern "C" {
 
+// Hardware half<->float conversion. The former ~20-op software bodies were
+// verified BIT-IDENTICAL to these instructions over all 65536 half patterns
+// and 4M random floats (see vq_h2f/vq_f2h below, same swap); every scalar
+// kernel in this source (rmsnorm_quant_i8_h's three K-wide passes, the
+// act_quant fallbacks, the gemv arms) inherits the swap with no value change.
 __device__ __forceinline__ float dp4a_h2f(unsigned short h) {
-  unsigned int sign = ((unsigned int)(h & 0x8000u)) << 16;
-  unsigned int exp = (h >> 10) & 0x1Fu;
-  unsigned int mant = h & 0x3FFu;
-  unsigned int out;
-  if (exp == 0u) {
-    if (mant == 0u) {
-      out = sign;
-    } else {
-      int e = -1;
-      do { mant <<= 1; e++; } while ((mant & 0x400u) == 0u);
-      mant &= 0x3FFu;
-      out = sign | ((unsigned int)(127 - 15 - e) << 23) | (mant << 13);
-    }
-  } else if (exp == 0x1Fu) {
-    out = sign | 0x7F800000u | (mant << 13);
-  } else {
-    out = sign | ((exp + (127u - 15u)) << 23) | (mant << 13);
-  }
-  return __int_as_float((int)out);
+  float f;
+  asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h));
+  return f;
 }
 
 // float -> fp16 (IEEE half), round to nearest even.
 __device__ __forceinline__ unsigned short dp4a_f2h(float f) {
-  unsigned int x = (unsigned int)__float_as_int(f);
-  unsigned int sign = (x >> 16) & 0x8000u;
-  int e = (int)((x >> 23) & 0xFFu);
-  unsigned int mant = x & 0x7FFFFFu;
-  if (e == 0xFF)
-    return (unsigned short)(sign | 0x7C00u | (mant ? 0x200u : 0u)); // inf/nan
-  int exp = e - 127 + 15;
-  if (exp >= 0x1F)
-    return (unsigned short)(sign | 0x7C00u); // overflow -> inf
-  if (exp <= 0) {
-    if (exp < -10)
-      return (unsigned short)sign; // underflow -> 0
-    mant |= 0x800000u;
-    int shift = 14 - exp;
-    unsigned int h = mant >> shift;
-    unsigned int rem = mant & ((1u << shift) - 1u);
-    unsigned int half = 1u << (shift - 1);
-    if (rem > half || (rem == half && (h & 1u)))
-      h++;
-    return (unsigned short)(sign | h);
-  }
-  unsigned int h = ((unsigned int)exp << 10) | (mant >> 13);
-  unsigned int rem = mant & 0x1FFFu;
-  if (rem > 0x1000u || (rem == 0x1000u && (h & 1u)))
-    h++;
-  return (unsigned short)(sign | h);
+  unsigned short h;
+  asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(f));
+  return h;
 }
 
 // asymmetric int8 quant params for a row's [min,max] (range forced to include
