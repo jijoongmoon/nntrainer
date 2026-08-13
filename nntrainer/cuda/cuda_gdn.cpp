@@ -519,6 +519,20 @@ void gdn_ck_wu_tc(const unsigned short *conv, const float *A, const float *gc,
   __shared__ __align__(16) unsigned short Th[64 * 72];
   __shared__ __align__(16) unsigned short xk[64 * 136];
   __shared__ __align__(16) unsigned short xv[64 * 136];
+  __shared__ float s_be[64], s_beg[64];
+  // per-ROW gate factors once (the old loop re-computed be*expf(gc) per
+  // ELEMENT = 8,192 expf per CTA for 64 distinct values). s_beg*kc keeps
+  // the exact multiply order of (be*expf(gc))*kc -- bit-identical.
+  if (tid < 64) {
+    float be = 0.0f, bg = 0.0f;
+    if (tid < cn) {
+      const long t = (long)ck*64 + tid;
+      be = beta[t*NVH + vh];
+      bg = be*expf(gc[t*NVH + vh]);
+    }
+    s_be[tid] = be;
+    s_beg[tid] = bg;
+  }
   const float *Ab = A + ((long)ck*NVH + vh)*4096;
   for (int i = tid; i < 4096; i += 256) {
     unsigned short hv;
@@ -526,19 +540,19 @@ void gdn_ck_wu_tc(const unsigned short *conv, const float *A, const float *gc,
     asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hv) : "f"(tv));
     Th[(i >> 6)*72 + (i & 63)] = hv;
   }
+  __syncthreads(); // s_be/s_beg visible to the tile build
   for (int i = tid; i < 64*128; i += 256) {
     const int c = i >> 7, dim = i & 127;
     float k_ = 0.0f, v_ = 0.0f;
     if (c < cn) {
       const long t = (long)ck*64 + c;
-      const float be = beta[t*NVH + vh];
       float kc, vc;
       asm("cvt.f32.f16 %0, %1;" : "=f"(kc)
           : "h"(conv[t*CONV + KEY + kh*HKD + dim]));
       asm("cvt.f32.f16 %0, %1;" : "=f"(vc)
           : "h"(conv[t*CONV + 2*KEY + vh*HVD + dim]));
-      k_ = be*expf(gc[t*NVH + vh])*kc;
-      v_ = be*vc;
+      k_ = s_beg[c]*kc;
+      v_ = s_be[c]*vc;
     }
     unsigned short hk, hvv;
     asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hk) : "f"(k_));
@@ -1632,6 +1646,55 @@ __global__ void gdn_l2norm_prefill_h(unsigned short *conv, int CONV, int KEY,
   asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hk) : "f"(kv));
   qr[d] = hq; kr[d] = hk;
 }
+// Warp-per-row twin: 8 warps/CTA each own one (t, kh) row -- ssq via
+// register partials + shfl, ZERO barriers (the tree twin pays ~16 per
+// row), u32 pair loads/stores. Requires HKD == 128. The reduction ORDER
+// differs from the tree (semantic, text-gated like the out/gate fusion).
+__global__ __launch_bounds__(256) void gdn_l2norm_prefill_hw(
+    unsigned short *conv, int CONV, int KEY, int NKH, int HKD, float eps,
+    int TN){
+  const int row = blockIdx.x*8 + (threadIdx.x >> 5);
+  if (row >= TN) return;
+  const int kh = row % NKH, t = row / NKH;
+  const int lane = threadIdx.x & 31;
+  unsigned short *qr = conv + (long)t*CONV + kh*HKD;
+  unsigned short *kr = conv + (long)t*CONV + KEY + kh*HKD;
+  const unsigned qp0 = *(const unsigned *)&qr[2*lane];
+  const unsigned qp1 = *(const unsigned *)&qr[64 + 2*lane];
+  const unsigned kp0 = *(const unsigned *)&kr[2*lane];
+  const unsigned kp1 = *(const unsigned *)&kr[64 + 2*lane];
+  float q0, q1, q2, q3, k0, k1, k2, k3;
+  asm("cvt.f32.f16 %0, %1;" : "=f"(q0) : "h"((unsigned short)(qp0 & 0xFFFFu)));
+  asm("cvt.f32.f16 %0, %1;" : "=f"(q1) : "h"((unsigned short)(qp0 >> 16)));
+  asm("cvt.f32.f16 %0, %1;" : "=f"(q2) : "h"((unsigned short)(qp1 & 0xFFFFu)));
+  asm("cvt.f32.f16 %0, %1;" : "=f"(q3) : "h"((unsigned short)(qp1 >> 16)));
+  asm("cvt.f32.f16 %0, %1;" : "=f"(k0) : "h"((unsigned short)(kp0 & 0xFFFFu)));
+  asm("cvt.f32.f16 %0, %1;" : "=f"(k1) : "h"((unsigned short)(kp0 >> 16)));
+  asm("cvt.f32.f16 %0, %1;" : "=f"(k2) : "h"((unsigned short)(kp1 & 0xFFFFu)));
+  asm("cvt.f32.f16 %0, %1;" : "=f"(k3) : "h"((unsigned short)(kp1 >> 16)));
+  float sq = q0*q0 + q1*q1 + q2*q2 + q3*q3;
+  float sk = k0*k0 + k1*k1 + k2*k2 + k3*k3;
+#pragma unroll
+  for (int o = 16; o >= 1; o >>= 1) {
+    sq += __shfl_xor_sync(0xffffffffu, sq, o);
+    sk += __shfl_xor_sync(0xffffffffu, sk, o);
+  }
+  const float iq = 1.0f/sqrtf(sq + eps);
+  const float ik = 1.0f/sqrtf(sk + eps);
+  unsigned short a, b;
+  asm("cvt.rn.f16.f32 %0, %1;" : "=h"(a) : "f"(q0*iq));
+  asm("cvt.rn.f16.f32 %0, %1;" : "=h"(b) : "f"(q1*iq));
+  *(unsigned *)&qr[2*lane] = (unsigned)a | ((unsigned)b << 16);
+  asm("cvt.rn.f16.f32 %0, %1;" : "=h"(a) : "f"(q2*iq));
+  asm("cvt.rn.f16.f32 %0, %1;" : "=h"(b) : "f"(q3*iq));
+  *(unsigned *)&qr[64 + 2*lane] = (unsigned)a | ((unsigned)b << 16);
+  asm("cvt.rn.f16.f32 %0, %1;" : "=h"(a) : "f"(k0*ik));
+  asm("cvt.rn.f16.f32 %0, %1;" : "=h"(b) : "f"(k1*ik));
+  *(unsigned *)&kr[2*lane] = (unsigned)a | ((unsigned)b << 16);
+  asm("cvt.rn.f16.f32 %0, %1;" : "=h"(a) : "f"(k2*ik));
+  asm("cvt.rn.f16.f32 %0, %1;" : "=h"(b) : "f"(k3*ik));
+  *(unsigned *)&kr[64 + 2*lane] = (unsigned)a | ((unsigned)b << 16);
+}
 
 // fp16 round-trip stub (NNTR_GDN_CK_F16STUB=1, =2 harness only): rounds a
 // buffer through fp16 in place, emulating what a tensor-core rewrite would
@@ -1992,8 +2055,15 @@ bool cuda_gdn_prefill_chunked_fp16(
   auto kcv = ctx.registerCudaKernel(
     GDN_SRC, conv2 ? "gdn_conv_prefill_h2"
                    : (g_ck_tc ? "gdn_conv_prefill_h" : "gdn_conv_prefill"));
+  // warp-per-row l2norm (zero barriers); =0 restores the tree twin
+  static const bool g_l2w = []() {
+    const char *e = std::getenv("NNTR_GDN_L2W");
+    return e == nullptr || e[0] != '0';
+  }();
+  const bool l2w = g_ck_tc && g_l2w && (HKD == 128);
   auto kln = ctx.registerCudaKernel(
-    GDN_SRC, g_ck_tc ? "gdn_l2norm_prefill_h" : "gdn_l2norm_prefill");
+    GDN_SRC, l2w ? "gdn_l2norm_prefill_hw"
+                 : (g_ck_tc ? "gdn_l2norm_prefill_h" : "gdn_l2norm_prefill"));
   auto kgc = ctx.registerCudaKernel(GDN_SRC, "gdn_ck_gcum");
   auto kkt = ctx.registerCudaKernel(GDN_SRC, g_ck_tc ? "gdn_ck_kkt_tc"
                                                      : "gdn_ck_kkt");
@@ -2086,6 +2156,10 @@ bool cuda_gdn_prefill_chunked_fp16(
       kln->SetKernelArguments(3, &iNKH, sizeof(iNKH));
       kln->SetKernelArguments(4, &iHKD, sizeof(iHKD));
       kln->SetKernelArguments(5, &eps, sizeof(eps));
+      if (l2w) {
+        const int tn = (int)(T * NKH);
+        kln->SetKernelArguments(6, &tn, sizeof(tn));
+      }
     } else {
       kln->SetKernelArguments(0, &g_pf_conv, sizeof(g_pf_conv));
       kln->SetKernelArguments(1, &g_pf_qkdot, sizeof(g_pf_qkdot));
@@ -2095,7 +2169,8 @@ bool cuda_gdn_prefill_chunked_fp16(
       kln->SetKernelArguments(5, &iHKD, sizeof(iHKD));
       kln->SetKernelArguments(6, &eps, sizeof(eps));
     }
-    const int g[3] = {(int)(T * NKH), 1, 1}, b3[3] = {iHKD, 1, 1};
+    const int g[3] = {l2w ? ((int)(T * NKH) + 7) / 8 : (int)(T * NKH), 1, 1};
+    const int b3[3] = {l2w ? 256 : iHKD, 1, 1};
     if (!sm.DispatchCommand(*kln, g, b3))
       return false;
   }
