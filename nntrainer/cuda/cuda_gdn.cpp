@@ -2384,6 +2384,15 @@ bool cuda_gdn_prefill_chunked_fp16(
     unsigned int st_smem = 0;
     if (state2) {
       st_smem = 71680u;
+      // NNTR_GDN_ST2_SMEMPAD: occupancy probe for the state+out fusion
+      // design -- pad the dynamic smem to the fused kernel's footprint
+      // (e.g. 26624 -> 98,304 B) to force 1 CTA/SM and price the loss of
+      // state2's deliberate 2-CTA co-residency BEFORE building the fusion.
+      static const unsigned st2_pad = []() {
+        const char *e = std::getenv("NNTR_GDN_ST2_SMEMPAD");
+        return e ? (unsigned)std::atoi(e) : 0u;
+      }();
+      st_smem += st2_pad;
       static bool st2_attr_done = false;
       if (!st2_attr_done) {
         st2_attr_done = true;
