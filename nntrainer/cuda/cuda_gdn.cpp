@@ -1297,6 +1297,199 @@ void gdn_ck_state_tc(const unsigned short *conv, const unsigned short *w,
   }
 }
 
+// Phase D split-V state sweep. The b-columns of S are INDEPENDENT in the
+// recurrence (S_new[j][b] depends only on column b), so the grid splits to
+// (vh, b-half): 64 CTAs of 256 threads instead of 32 x 512. Every mma phase
+// now uses ALL 8 warps (the tc twin idled half its 16 warps in w@S and the
+// vn epilogue), the jh-half loop disappears (S half fits smem whole), and
+// barriers drop 9 -> 4 per chunk. w and k tiles are re-read by both halves
+// (+67 MB/call) -- the FLA fwd_h makes the same trade and runs at 175 GB/s.
+// Same arithmetic order per element as the tc twin.
+#define SLD2 72
+__global__ __launch_bounds__(256, 2)
+void gdn_ck_state_tc2(const unsigned short *conv, const unsigned short *w,
+                      const unsigned short *u, const float *gc,
+                      const float *gl, unsigned short *h,
+                      unsigned short *vnew, float *state, int T, int CONV,
+                      int KEY, int NVH, int NKH, int HKD, int HVD,
+                      int seed_state, int save_state){
+  const int vh = blockIdx.x, bh = blockIdx.y; // b-half of 64
+  const int kh = vh / (NVH / NKH);
+  const int tid = threadIdx.x;
+  const int lane = tid & 31, warp = tid >> 5; // 8 warps: j-tile = warp*16
+  const int wm2 = warp >> 1, wn2 = warp & 1; // c-tile x b-32 for vp/vn
+  const int g = lane >> 2, tq = lane & 3;
+  const int NCH = (T + 63) >> 6;
+  __shared__ __align__(16) unsigned short Sh[128 * SLD2]; // S [j][b-half]
+  __shared__ __align__(16) unsigned short Wb[64 * 136];   // w tile, then k
+  __shared__ __align__(16) unsigned short Db[64 * SLD2];  // dv [c][b-half]
+
+  // S frags: warp j-tile 16 x the CTA's 64 b columns
+  float S[8][4];
+#pragma unroll
+  for (int s = 0; s < 8; ++s)
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+      const int j = warp*16 + g + ((r >> 1) ? 8 : 0);
+      const int b = s*8 + 2*tq + (r & 1);
+      S[s][r] = seed_state
+        ? state[((long)vh*HKD + j)*HVD + bh*64 + b] : 0.0f;
+    }
+
+  for (int c = 0; c < NCH; ++c) {
+    const int cn = (T - c*64 < 64) ? (T - c*64) : 64;
+    const float eglc = expf(gl[(long)c*NVH + vh]);
+    // 1) dump S -> Sh fp16 (whole half, no jh loop) + the h plane
+#pragma unroll
+    for (int s = 0; s < 8; ++s)
+#pragma unroll
+      for (int rh = 0; rh < 2; ++rh) {
+        const int j = warp*16 + g + rh*8;
+        const int b = s*8 + 2*tq;
+        unsigned short h0, h1;
+        asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h0) : "f"(S[s][rh*2 + 0]));
+        asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h1) : "f"(S[s][rh*2 + 1]));
+        const unsigned pv = (unsigned)h0 | ((unsigned)h1 << 16);
+        *(unsigned *)&Sh[j*SLD2 + b] = pv;
+        *(unsigned *)&h[((long)c*NVH + vh)*16384 + j*128 + bh*64 + b] = pv;
+      }
+    // 2) stage w tile [c][j]
+    for (int i = tid; i < 64*128; i += 256) {
+      const int cc = i >> 7, jj = i & 127;
+      Wb[cc*136 + jj] = (cc < cn)
+        ? w[(((long)c*64 + cc)*NVH + vh)*HKD + jj]
+        : (unsigned short)0;
+    }
+    __syncthreads();
+    // 3) vp = w @ S : c64 x b64, K=j128; warp = (c-tile 16, b-tile 32)
+    float vp[4][4];
+#pragma unroll
+    for (int s = 0; s < 4; ++s)
+#pragma unroll
+      for (int r = 0; r < 4; ++r) vp[s][r] = 0.0f;
+    {
+      const int a_row = wm2*16 + (lane & 15);
+      const int a_k8 = (lane >> 4) & 1;
+#pragma unroll
+      for (int k0 = 0; k0 < 128; k0 += 16) {
+        int a0,a1,a2,a3;
+        asm volatile(
+          "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+          : "=r"(a0),"=r"(a1),"=r"(a2),"=r"(a3)
+          : "r"((unsigned)__cvta_generic_to_shared(
+              &Wb[a_row*136 + k0 + a_k8*8])));
+        const int nb = wn2*32;
+        int bl0,bl1,bl2,bl3, bh0,bh1,bh2,bh3;
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
+          "{%0,%1,%2,%3}, [%4];\n"
+          : "=r"(bl0),"=r"(bl1),"=r"(bl2),"=r"(bl3)
+          : "r"((unsigned)__cvta_generic_to_shared(
+              &Sh[(k0 + (lane & 7))*SLD2 + nb + (lane >> 3)*8])));
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
+          "{%0,%1,%2,%3}, [%4];\n"
+          : "=r"(bh0),"=r"(bh1),"=r"(bh2),"=r"(bh3)
+          : "r"((unsigned)__cvta_generic_to_shared(
+              &Sh[(k0 + 8 + (lane & 7))*SLD2 + nb + (lane >> 3)*8])));
+#define ST2MMA(ACC,S_,BL,BH)                                                   \
+        asm volatile(                                                          \
+          "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "                 \
+          "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"            \
+          : "+f"(ACC[S_][0]),"+f"(ACC[S_][1]),"+f"(ACC[S_][2]),                \
+            "+f"(ACC[S_][3])                                                   \
+          : "r"(a0),"r"(a1),"r"(a2),"r"(a3), "r"(BL), "r"(BH))
+        ST2MMA(vp,0,bl0,bh0); ST2MMA(vp,1,bl1,bh1);
+        ST2MMA(vp,2,bl2,bh2); ST2MMA(vp,3,bl3,bh3);
+      }
+    }
+    __syncthreads(); // Wb reused for k next; Sh dump next chunk
+    // 4) vn = u - vp; dv -> Db; vnew pair store. Warp covers its (c,b) tile.
+#pragma unroll
+    for (int s = 0; s < 4; ++s)
+#pragma unroll
+      for (int rh = 0; rh < 2; ++rh) {
+        const int cc = wm2*16 + g + rh*8;
+        const int bl = wn2*32 + s*8 + 2*tq; // CTA-local b
+        float dv0 = 0.0f, dv1 = 0.0f;
+        if (cc < cn) {
+          const long t = (long)c*64 + cc;
+          const unsigned up =
+            *(const unsigned *)&u[(t*NVH + vh)*HVD + bh*64 + bl];
+          float u0, u1;
+          asm("cvt.f32.f16 %0, %1;" : "=f"(u0)
+              : "h"((unsigned short)(up & 0xFFFFu)));
+          asm("cvt.f32.f16 %0, %1;" : "=f"(u1)
+              : "h"((unsigned short)(up >> 16)));
+          const float vn0 = u0 - vp[s][rh*2 + 0];
+          const float vn1 = u1 - vp[s][rh*2 + 1];
+          unsigned short n0, n1;
+          asm("cvt.rn.f16.f32 %0, %1;" : "=h"(n0) : "f"(vn0));
+          asm("cvt.rn.f16.f32 %0, %1;" : "=h"(n1) : "f"(vn1));
+          *(unsigned *)&vnew[(t*NVH + vh)*HVD + bh*64 + bl] =
+            (unsigned)n0 | ((unsigned)n1 << 16);
+          const float ee = expf(gl[(long)c*NVH + vh] - gc[t*NVH + vh]);
+          dv0 = vn0*ee;
+          dv1 = vn1*ee;
+        }
+        unsigned short d0, d1;
+        asm("cvt.rn.f16.f32 %0, %1;" : "=h"(d0) : "f"(dv0));
+        asm("cvt.rn.f16.f32 %0, %1;" : "=h"(d1) : "f"(dv1));
+        *(unsigned *)&Db[cc*SLD2 + bl] = (unsigned)d0 | ((unsigned)d1 << 16);
+      }
+    // 5) stage k tile [c][j] into Wb
+    for (int i = tid; i < 64*128; i += 256) {
+      const int cc = i >> 7, jj = i & 127;
+      Wb[cc*136 + jj] = (cc < cn)
+        ? conv[((long)c*64 + cc)*CONV + KEY + kh*HKD + jj]
+        : (unsigned short)0;
+    }
+    __syncthreads();
+    // 6) S = S*e^{gl_c} + k^T @ dv : j128 x b64, K=c64
+#pragma unroll
+    for (int s = 0; s < 8; ++s)
+#pragma unroll
+      for (int r = 0; r < 4; ++r) S[s][r] *= eglc;
+#pragma unroll
+    for (int k0 = 0; k0 < 64; k0 += 16) {
+      int a0,a1,a2,a3;
+      asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+        : "=r"(a0),"=r"(a1),"=r"(a2),"=r"(a3)
+        : "r"((unsigned)__cvta_generic_to_shared(
+            &Wb[(k0 + (lane & 7) + ((lane & 16) ? 8 : 0))*136 +
+                warp*16 + ((lane & 8) ? 8 : 0)])));
+#pragma unroll
+      for (int s4 = 0; s4 < 2; ++s4) {
+        const int nb = s4*32;
+        int bl0,bl1,bl2,bl3, bh0,bh1,bh2,bh3;
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
+          "{%0,%1,%2,%3}, [%4];\n"
+          : "=r"(bl0),"=r"(bl1),"=r"(bl2),"=r"(bl3)
+          : "r"((unsigned)__cvta_generic_to_shared(
+              &Db[(k0 + (lane & 7))*SLD2 + nb + (lane >> 3)*8])));
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
+          "{%0,%1,%2,%3}, [%4];\n"
+          : "=r"(bh0),"=r"(bh1),"=r"(bh2),"=r"(bh3)
+          : "r"((unsigned)__cvta_generic_to_shared(
+              &Db[(k0 + 8 + (lane & 7))*SLD2 + nb + (lane >> 3)*8])));
+        ST2MMA(S,s4*4+0,bl0,bh0); ST2MMA(S,s4*4+1,bl1,bh1);
+        ST2MMA(S,s4*4+2,bl2,bh2); ST2MMA(S,s4*4+3,bl3,bh3);
+      }
+    }
+#undef ST2MMA
+    __syncthreads();
+  }
+  if (save_state) {
+#pragma unroll
+    for (int s = 0; s < 8; ++s)
+#pragma unroll
+      for (int r = 0; r < 4; ++r) {
+        const int j = warp*16 + g + ((r >> 1) ? 8 : 0);
+        const int b = s*8 + 2*tq + (r & 1);
+        state[((long)vh*HKD + j)*HVD + bh*64 + b] = S[s][r];
+      }
+  }
+}
+
 // gated RMSNorm + silu(z) gate -> fp16, VERBATIM the scan's fused tail.
 // grid T*NVH, block 128 (thread = b).
 // fp16 twins for the chunked-TC arm: the four TC kernels stage conv as fp16
@@ -1766,8 +1959,15 @@ bool cuda_gdn_prefill_chunked_fp16(
   auto ktr = ctx.registerCudaKernel(GDN_SRC, "gdn_ck_tril");
   auto kwu = ctx.registerCudaKernel(GDN_SRC, g_ck_tc ? "gdn_ck_wu_tc"
                                                      : "gdn_ck_wu");
-  auto kst = ctx.registerCudaKernel(GDN_SRC, g_ck_tc ? "gdn_ck_state_tc"
-                                                     : "gdn_ck_state");
+  // Phase D: split-V state sweep (all-warps-active, 64 CTAs). =0 -> tc twin.
+  static const bool g_state2 = []() {
+    const char *e = std::getenv("NNTR_GDN_STATE2");
+    return e == nullptr || e[0] != '0';
+  }();
+  const bool state2 = g_ck_tc && g_state2 && (HVD == 128) && (HKD == 128);
+  auto kst = ctx.registerCudaKernel(
+    GDN_SRC, state2 ? "gdn_ck_state_tc2"
+                    : (g_ck_tc ? "gdn_ck_state_tc" : "gdn_ck_state"));
   auto kou =
     ctx.registerCudaKernel(GDN_SRC, g_ck_tc ? "gdn_ck_out_tc" : "gdn_ck_out");
   auto kga = ctx.registerCudaKernel(GDN_SRC, "gdn_ck_gate");
@@ -1947,7 +2147,8 @@ bool cuda_gdn_prefill_chunked_fp16(
     kst->SetKernelArguments(14, &iHVD, sizeof(iHVD));
     kst->SetKernelArguments(15, &i_seed, sizeof(i_seed));
     kst->SetKernelArguments(16, &i_save, sizeof(i_save));
-    const int g[3] = {iNVH, 1, 1}, b3[3] = {512, 1, 1};
+    const int g[3] = {iNVH, state2 ? 2 : 1, 1};
+    const int b3[3] = {state2 ? 256 : 512, 1, 1};
     if (!sm.DispatchCommand(*kst, g, b3))
       return false;
   }
