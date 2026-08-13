@@ -1097,8 +1097,14 @@ void imma_gemm_pipe(const signed char *q8, const unsigned char *plain,
                     const float *ascale, const int *azp, const int *wrowsum,
                     const unsigned short *wscale, float *Y, int M, int N, int K,
                     int out_fp16, int raw) {
-  __shared__ IPv16 Asv[2][IP_BM * IP_LD / 16];
-  __shared__ IPv16 Wsv[2][IP_BN * IP_LD / 16];
+  // [d2] TRIPLE-buffered smem + depth-2 register prefetch: the single-step
+  // prefetch left <1 compute step of latency cover, measured as the binding
+  // term (ip_wide_bench 2026-08-13: depth-2 +4.3..+7% across shapes/runs;
+  // tile WIDENING and occupancy both flat -- this tile is NOT DRAM-traffic
+  // bound, x1.5 intensity moved nothing). Same store order, same integer
+  // accumulation: bit-identical (validated bit-exact in the bench).
+  __shared__ IPv16 Asv[3][IP_BM * IP_LD / 16];
+  __shared__ IPv16 Wsv[3][IP_BN * IP_LD / 16];
   __shared__ int rsh[IP_BN];
   const int tid = threadIdx.x;
   const int lane = tid & 31, warp = tid >> 5;
@@ -1165,8 +1171,11 @@ void imma_gemm_pipe(const signed char *q8, const unsigned char *plain,
     *(IPv16 *)((signed char *)Wsv[BUF] + sdst) = wv;                           \
   } while (0)
 
+  const int ip_nsteps = K >> 6; // K/IP_BK; K%64==0 is a caller invariant
   IP_LOAD(0);
   IP_STORE(0);
+  if (ip_nsteps > 1)
+    IP_LOAD(IP_BK); // k=1 tiles ride in registers until step 0's head store
   __syncthreads();
 
   // ldmatrix lane addressing (the fragment-load compression that lifts the
@@ -1182,22 +1191,27 @@ void imma_gemm_pipe(const signed char *q8, const unsigned char *plain,
   const int lrow_a = wm * 16 + (lane & 7) + ((lane & 8) ? 8 : 0);
   const int lkb_a = (lane & 16) ? 16 : 0;
   const int lrow_b = wn * 32 + (lane >> 3) * 8 + (lane & 7);
-  const unsigned pa_buf[2] = {
-    ip_sh((const signed char *)Asv[0] + lrow_a * IP_LD + lkb_a),
-    ip_sh((const signed char *)Asv[1] + lrow_a * IP_LD + lkb_a)};
-  const unsigned pb_buf[2] = {
-    ip_sh((const signed char *)Wsv[0] + lrow_b * IP_LD),
-    ip_sh((const signed char *)Wsv[1] + lrow_b * IP_LD)};
+  unsigned pa_buf[3], pb_buf[3];
+#pragma unroll
+  for (int b3 = 0; b3 < 3; ++b3) {
+    pa_buf[b3] = ip_sh((const signed char *)Asv[b3] + lrow_a * IP_LD + lkb_a);
+    pb_buf[b3] = ip_sh((const signed char *)Wsv[b3] + lrow_b * IP_LD);
+  }
 
-  int cur = 0;
-  for (int k0 = 0; k0 < K; k0 += IP_BK) {
-    const int knext = k0 + IP_BK;
-    // Issue the next tile's global loads FIRST: they are in flight for the
-    // whole compute below.
-    if (knext < K)
-      IP_LOAD(knext);
-
-    const unsigned pa = pa_buf[cur], pb = pb_buf[cur];
+  for (int ks = 0; ks < ip_nsteps; ++ks) {
+    // [d2] Step head: park step ks+1's tiles (loaded LAST step, so their
+    // global latency spanned a full compute step) into the third buffer,
+    // then issue ks+2's loads -- in flight through THIS step's mma too.
+    // One barrier per step, same as before: it separates this store from
+    // its readers next step; buffer (ks+1)%3 was last read at step ks-2,
+    // already separated by that step's barrier.
+    if (ks + 1 < ip_nsteps) {
+      IP_STORE((ks + 1) % 3);
+      if (ks + 2 < ip_nsteps)
+        IP_LOAD((ks + 2) * IP_BK);
+      __syncthreads();
+    }
+    const unsigned pa = pa_buf[ks % 3], pb = pb_buf[ks % 3];
 #pragma unroll
     for (int h = 0; h < 2; ++h) {
       int a0, a1, a2, a3, c0, c1, c2, c3, d0, d1, d2, d3;
@@ -1227,14 +1241,6 @@ void imma_gemm_pipe(const signed char *q8, const unsigned char *plain,
 #undef IP_MMA
     }
 
-    if (knext < K) {
-      // Safe without a second barrier: buffer cur^1 was last READ in the
-      // previous iteration, and that iteration's barrier already separated
-      // those reads from these writes.
-      IP_STORE(cur ^ 1);
-      __syncthreads();
-      cur ^= 1;
-    }
   }
 #undef IP_LOAD
 #undef IP_STORE
