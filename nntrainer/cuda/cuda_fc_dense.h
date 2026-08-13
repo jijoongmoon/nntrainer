@@ -73,6 +73,10 @@ bool cuda_fc_dense_gemm_fp32(const float *X, const float *W, float *Y,
  * @param Wh device fp16 weight [K,N] row-major (ld=N)
  * @param Y  device fp32 output [M,N] row-major (ld=N)
  */
+bool cuda_fc_dense_gemm_fp16_f32out_acc(const void *Xh, const void *Wh,
+                                        float *Y, unsigned int M,
+                                        unsigned int N, unsigned int K,
+                                        bool accumulate);
 bool cuda_fc_dense_gemm_fp16_f32out(const void *Xh, const void *Wh, float *Y,
                                     unsigned int M, unsigned int N,
                                     unsigned int K);

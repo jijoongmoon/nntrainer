@@ -7,7 +7,9 @@
 
 #include <cuda_context.h>
 #include <cuda_context_manager.h>
+#include <cuda_fc_dense.h>  // cuda_fc_dense_gemm_fp16_f32out_acc (router h2)
 #include <cuda_fc_qint4.h> // cuda_fc_qs4cx_moe_grouped_gemm (imma tile)
+#include <map>
 #include <cuda_runtime.h>
 #include <cuda_stream_manager.h>
 #include <cstdio>
@@ -248,6 +250,25 @@ __global__ void moe_combine_h(const unsigned short *Y, unsigned short *out,
 //
 // 64x64 tile, BK=16, 256 threads, 4x4 per thread. Shared rows are padded by 1
 // float so the 4-wide column reads do not all land in one bank.
+// [rgemm-h2] One-time split of the fp32 gate weight into hi=(half)w and
+// lo=(half)(w - (float)hi) planes: X*hi + X*lo with fp32 accumulate carries
+// ~22-24 mantissa bits of the fp32 product -- the dtype swap plain-fp16
+// cannot make (top-k is discrete; a flipped near-tie is a different model).
+__global__ void moe_rsplit(const float *w, unsigned short *hi,
+                           unsigned short *lo, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  float f = w[i];
+  unsigned short h;
+  float fh;
+  asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(f));
+  asm("cvt.f32.f16 %0, %1;" : "=f"(fh) : "h"(h));
+  unsigned short l;
+  float r = f - fh;
+  asm("cvt.rn.f16.f32 %0, %1;" : "=h"(l) : "f"(r));
+  hi[i] = h;
+  lo[i] = l;
+}
 __global__ void moe_router_gemm(const unsigned short *X, const float *Wg,
                                 float *L, int T, int H, int E){
   // 68-float row stride: 16B-aligned rows so the inner-loop fragment loads
@@ -796,6 +817,110 @@ bool cuda_moe_router_gemm_fp16(const unsigned short *X, const float *Wg,
                                unsigned int E) {
   if (T == 0 || H == 0 || E == 0)
     return true;
+  // [rgemm-h2] Split-fp16 dual-pass on cuBLAS fp16 tensor cores. The fp32
+  // SIMT tile runs 2.1 TFLOPS = 39% of SIMT peak (its structural ceiling);
+  // cuBLAS fp16 measures 22.5 TFLOPS at this very shape (dense_mchunk_probe
+  // (4096,256,2048) = 0.191 ms), so hi+lo at twice the FLOPs still lands
+  // ~4-5x. hi=(half)w, lo=(half)(w-hi): fp32-accumulated X*hi + X*lo carries
+  // ~22-24 mantissa bits of the fp32 product -- top-k is discrete, so plain
+  // fp16 W was never an option, and the gate is logits max|d| + top-1
+  // agreement (NNTR_MOE_R_DBG=1 compares the first calls against the tile)
+  // plus the e2e text/NLL gates. Prefill only (T>1); decode keeps the tile.
+  // NNTR_MOE_RGEMM_H2=0 opts out; any failure falls through to the tile.
+  static const bool h2_on = []() {
+    const char *e = std::getenv("NNTR_MOE_RGEMM_H2");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  static const bool rg_cmp = []() {
+    const char *e = std::getenv("NNTR_MOE_R_DBG");
+    return e != nullptr && e[0] == '1';
+  }();
+  if (h2_on && T > 1) {
+    static std::map<const float *, std::pair<unsigned short *, unsigned short *>>
+      g_rsplit;
+    auto it = g_rsplit.find(Wg);
+    if (it == g_rsplit.end() && !StreamManager::Global().isCapturing()) {
+      auto ks = CudaContext::Global().registerCudaKernel(MOE_SRC, "moe_rsplit");
+      unsigned short *hi = nullptr, *lo = nullptr;
+      const size_t n = (size_t)H * E;
+      bool built = false;
+      if (ks && cudaMalloc(&hi, n * 2) == cudaSuccess &&
+          cudaMalloc(&lo, n * 2) == cudaSuccess) {
+        int ni = (int)n;
+        ks->SetKernelArguments(0, &Wg, sizeof(Wg));
+        ks->SetKernelArguments(1, &hi, sizeof(hi));
+        ks->SetKernelArguments(2, &lo, sizeof(lo));
+        ks->SetKernelArguments(3, &ni, sizeof(ni));
+        const int gs[3] = {(int)((n + 255) / 256), 1, 1}, bs[3] = {256, 1, 1};
+        built = StreamManager::Global().DispatchCommand(*ks, gs, bs);
+      }
+      if (!built) {
+        if (hi)
+          cudaFree(hi);
+        if (lo)
+          cudaFree(lo);
+        hi = lo = nullptr; // negative-cache: do not retry every call
+      }
+      it = g_rsplit.emplace(Wg, std::make_pair(hi, lo)).first;
+    }
+    if (it != g_rsplit.end() && it->second.first != nullptr) {
+      if (cuda_fc_dense_gemm_fp16_f32out_acc(X, it->second.first, L, T, E, H,
+                                             false) &&
+          cuda_fc_dense_gemm_fp16_f32out_acc(X, it->second.second, L, T, E, H,
+                                             true)) {
+        static int cmp_n = 0;
+        if (rg_cmp && cmp_n < 3) {
+          ++cmp_n;
+          float *Lr = nullptr;
+          const size_t ln = (size_t)T * E;
+          if (cudaMalloc(&Lr, ln * 4) == cudaSuccess) {
+            auto kr =
+              CudaContext::Global().registerCudaKernel(MOE_SRC,
+                                                       "moe_router_gemm");
+            if (kr) {
+              int t2 = (int)T, h2 = (int)H, e2 = (int)E;
+              kr->SetKernelArguments(0, &X, sizeof(X));
+              kr->SetKernelArguments(1, &Wg, sizeof(Wg));
+              kr->SetKernelArguments(2, &Lr, sizeof(Lr));
+              kr->SetKernelArguments(3, &t2, sizeof(t2));
+              kr->SetKernelArguments(4, &h2, sizeof(h2));
+              kr->SetKernelArguments(5, &e2, sizeof(e2));
+              const int gg[3] = {(int)((E + 63) / 64), (int)((T + 63) / 64), 1};
+              const int bb[3] = {256, 1, 1};
+              if (StreamManager::Global().DispatchCommand(*kr, gg, bb)) {
+                StreamManager::Global().finish();
+                std::vector<float> a(ln), r(ln);
+                cudaMemcpy(a.data(), L, ln * 4, cudaMemcpyDeviceToHost);
+                cudaMemcpy(r.data(), Lr, ln * 4, cudaMemcpyDeviceToHost);
+                double md = 0;
+                unsigned t1d = 0;
+                for (unsigned rr = 0; rr < T; ++rr) {
+                  unsigned a1 = 0, b1 = 0;
+                  for (unsigned c = 0; c < E; ++c) {
+                    const size_t ix = (size_t)rr * E + c;
+                    const double d = fabsf(a[ix] - r[ix]);
+                    if (d > md)
+                      md = d;
+                    if (a[ix] > a[(size_t)rr * E + a1])
+                      a1 = c;
+                    if (r[ix] > r[(size_t)rr * E + b1])
+                      b1 = c;
+                  }
+                  if (a1 != b1)
+                    ++t1d;
+                }
+                fprintf(stderr,
+                        "[moe_r_h2] T=%u cmp-vs-tile max|d|=%.3e top1_diff=%u/%u\n",
+                        T, md, t1d, T);
+              }
+            }
+            cudaFree(Lr);
+          }
+        }
+        return true;
+      }
+    }
+  }
   auto k = CudaContext::Global().registerCudaKernel(MOE_SRC, "moe_router_gemm");
   if (!k)
     return false;

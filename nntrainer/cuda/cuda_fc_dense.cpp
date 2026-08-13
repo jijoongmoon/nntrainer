@@ -68,11 +68,11 @@ void trace(const char *kind, unsigned M, unsigned N, unsigned K, bool ok) {
  */
 bool gemm_ex(int M, int N, int K, const void *A, cudaDataType a_type,
              const void *B, void *C, cudaDataType c_type,
-             cublasComputeType_t compute) {
+             cublasComputeType_t compute, float beta = 0.0f) {
   cublasHandle_t h = BlasManager::Global().handle();
   if (h == nullptr)
     return false;
-  const float alpha = 1.0f, beta = 0.0f;
+  const float alpha = 1.0f;
   // The handle is bound to the backend stream in BlasManager::initialize(), so
   // this orders with the dequant / copy kernels around it without an extra
   // sync. Re-bind anyway: a caller that switched streams since would otherwise
@@ -283,6 +283,24 @@ bool cuda_fc_dense_gemm_fp16_f32out(const void *Xh, const void *Wh, float *Y,
   const bool ok = gemm_ex((int)M, (int)N, (int)K, Xh, CUDA_R_16F, Wd, Y,
                           CUDA_R_32F, CUBLAS_COMPUTE_32F);
   trace("fp16->fp32", M, N, K, ok);
+  return ok;
+}
+
+bool cuda_fc_dense_gemm_fp16_f32out_acc(const void *Xh, const void *Wh,
+                                        float *Y, unsigned int M,
+                                        unsigned int N, unsigned int K,
+                                        bool accumulate) {
+  if (!dense_on() || Xh == nullptr || Wh == nullptr || Y == nullptr || M == 0 ||
+      N == 0 || K == 0)
+    return false;
+  // f32out with an optional beta=1 accumulate into Y -- the second pass of a
+  // split-fp16 GEMM (hi + lo weight planes) sums here. The M-chunk row-slice
+  // stays valid under beta=1: each slice accumulates its own disjoint C rows.
+  const void *Wd = M > 1 ? cuda_dense_w_dev(Wh, (size_t)N * K * 2u) : Wh;
+  const bool ok = gemm_ex((int)M, (int)N, (int)K, Xh, CUDA_R_16F, Wd, Y,
+                          CUDA_R_32F, CUBLAS_COMPUTE_32F,
+                          accumulate ? 1.0f : 0.0f);
+  trace("fp16->fp32acc", M, N, K, ok);
   return ok;
 }
 
