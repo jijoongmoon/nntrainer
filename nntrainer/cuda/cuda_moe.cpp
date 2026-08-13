@@ -577,6 +577,46 @@ __global__ void moe_route_scan_pad(const int *counts, int *cursor, int *wl_e,
   }
   for (; w < Wcap; ++w) { wl_n[w] = 0; wl_e[w] = -1; }
 }
+// Parallel form of moe_route_scan_pad: ONE block; a Hillis-Steele scan over
+// the per-expert window counts replaces the single-thread serial walk, and
+// every window resolves its owning expert by binary search on the scanned
+// bases. Outputs are integer and deterministic — identical to the serial
+// kernel's, including the Wcap-overflow truncation (windows past Wcap are
+// simply never written, and the tail fill stops at Wcap). Requires
+// E <= blockDim (the launcher passes 256/256).
+__global__ void moe_route_scan_pad_p(const int *counts, int *cursor, int *wl_e,
+                                     int *wl_n, int E, int BM, int Wcap){
+  extern __shared__ int swb[]; // E+1 ints: exclusive scan of window counts
+  const int tid = threadIdx.x, nt = blockDim.x;
+  const int nb = (tid < E) ? (counts[tid] + BM - 1) / BM : 0;
+  // exclusive prefix over nb (Hillis-Steele on an inclusive scan, shifted)
+  swb[tid + 1] = nb;
+  if (tid == 0)
+    swb[0] = 0;
+  __syncthreads();
+  for (int off = 1; off < E; off <<= 1) {
+    int add = (tid >= off && tid < E) ? swb[tid + 1 - off] : 0;
+    __syncthreads();
+    if (tid < E)
+      swb[tid + 1] += add;
+    __syncthreads();
+  }
+  if (tid < E)
+    cursor[tid] = swb[tid] * BM;
+  const int wtot = swb[E];
+  for (int w = tid; w < Wcap; w += nt) {
+    if (w >= wtot) { wl_n[w] = 0; wl_e[w] = -1; continue; }
+    // find e with swb[e] <= w < swb[e+1]
+    int lo = 0, hi = E - 1;
+    while (lo < hi) {
+      const int mid = (lo + hi + 1) >> 1;
+      if (swb[mid] <= w) lo = mid; else hi = mid - 1;
+    }
+    const int rem = counts[lo] - (w - swb[lo]) * BM;
+    wl_n[w] = rem < BM ? rem : BM;
+    wl_e[w] = lo;
+  }
+}
 
 // bucket + reverse map: slots[t*K+j] = the gathered row of token t's j-th
 // assignment. With moe_tk_esort applied first, j order IS e-ascending order.
@@ -1521,13 +1561,17 @@ bool cuda_moe_route_grouped_fp32(const float *logits, int *rows, float *wts,
                  (void *)&wl_n,   &iE,            &iBM,          &iW};
     const size_t s[] = {PS,          PS,          PS,          PS,
                         sizeof(int), sizeof(int), sizeof(int)};
-    auto k = ctx.registerCudaKernel(MOE_SRC, "moe_route_scan_pad");
+    // _p = identical-output parallel form (block scan + binary search);
+    // needs E <= blockDim. The serial one-thread kernel stays for odd E.
+    const bool par = E <= 256u;
+    auto k = ctx.registerCudaKernel(
+      MOE_SRC, par ? "moe_route_scan_pad_p" : "moe_route_scan_pad");
     if (!k)
       return false;
     for (int i = 0; i < 7; ++i)
       k->SetKernelArguments(i, a[i], s[i]);
-    const int g[3] = {1, 1, 1}, b[3] = {32, 1, 1};
-    if (!sm.DispatchCommand(*k, g, b))
+    const int g[3] = {1, 1, 1}, b[3] = {par ? 256 : 32, 1, 1};
+    if (!sm.DispatchCommand(*k, g, b, par ? (E + 1) * 4 : 0))
       return false;
   }
   rstamp(3);
