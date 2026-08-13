@@ -890,28 +890,45 @@ void gdn_ck_out_tc(const unsigned short *conv, const float *gc,
   //   [17408)  kx  64x136 fp16 (17,408 B)  -- k in phase A; h-half in T1;
   //                                            vn in T2
   //   [34816)  coef 64x72 fp16  (9,216 B)  -- written end of phase A
-  // +1 KB tail (phase C fused gate): rss [64][2] fp32 + wns [128] fp32
-  __shared__ __align__(16) unsigned char sb[45056];
-  unsigned short *qs = (unsigned short *)sb;
-  unsigned short *kx = (unsigned short *)(sb + 17408);
-  unsigned short *cf = (unsigned short *)(sb + 34816);
-  float *rss = (float *)(sb + 44032);
-  float *wns = (float *)(sb + 44544);
+  // out-D2: dynamic smem with a SECOND staging buffer (kx2) so the h/vn
+  // restages cp.async-prefetch under the mma phases (the same schedule that
+  // took state 3.42 -> 2.27); gc staged once (the coef epilogue was reading
+  // gc[c] and gc[d] from global PER ELEMENT).
+  extern __shared__ __align__(16) unsigned char sb[];
+  unsigned short *qs = (unsigned short *)sb;             // q      17,408
+  unsigned short *kx = (unsigned short *)(sb + 17408);   // k / h1 17,408
+  unsigned short *kx2 = (unsigned short *)(sb + 34816);  // h0 / vn 17,408
+  unsigned short *cf = (unsigned short *)(sb + 52224);   // coef    9,216
+  float *rss = (float *)(sb + 61440);
+  float *wns = (float *)(sb + 61952);
+  float *gcs = (float *)(sb + 62464); // 64 floats; total 62,720 B
   const int LD = 136, LDC = 72;
 
-  // ---- stage q and k (fp32 -> fp16 round at load) + wnorm ----
+// one 64-row x 128-half fp16 tile via cp.async, one commit group
+#define OUT_TILE_IN(BUFP, ROWPTR_EXPR, CNV)                                    \
+  do {                                                                         \
+    const int rr = tid >> 2;                                                   \
+    const int cq = (tid & 3) * 32;                                             \
+    const unsigned short *src = (ROWPTR_EXPR) + cq;                            \
+    const unsigned db_ =                                                       \
+      (unsigned)__cvta_generic_to_shared(&(BUFP)[rr*LD + cq]);                 \
+    const int ok = (rr < (CNV)) ? 16 : 0;                                      \
+    _Pragma("unroll") for (int i = 0; i < 4; ++i)                              \
+      asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(   \
+                     db_ + i * 16),                                            \
+                   "l"(src + i * 8), "r"(ok));                                 \
+    asm volatile("cp.async.commit_group;\n");                                  \
+  } while (0)
+
+  // ---- prologue: wnorm + gc row factors; async q (g1), k (g2), h0 (g3) ----
   if (tid < 128) wns[tid] = wnorm[tid];
-  for (int i = tid; i < 64*128; i += 256) {
-    const int c = i >> 7, e = i & 127;
-    unsigned short hq = 0, hk = 0;
-    if (c < cn) {
-      const long tbase = (long)(ck*64 + c)*CONV + kh*HKD;
-      hq = conv[tbase + e];
-      hk = conv[tbase + KEY + e];
-    }
-    qs[c*LD + e] = hq;
-    kx[c*LD + e] = hk;
-  }
+  if (tid < 64)
+    gcs[tid] = (tid < cn) ? gc[((long)ck*64 + tid)*NVH + vh] : 0.0f;
+  const unsigned short *hb0 = h + ((long)ck*NVH + vh)*16384;
+  OUT_TILE_IN(qs, conv + (long)(ck*64 + (tid >> 2))*CONV + kh*HKD, cn);
+  OUT_TILE_IN(kx, conv + (long)(ck*64 + (tid >> 2))*CONV + KEY + kh*HKD, cn);
+  OUT_TILE_IN(kx2, hb0 + (tid >> 2)*128, 64);
+  asm volatile("cp.async.wait_group 1;\n"); // q,k landed; h0 in flight
   __syncthreads();
 
   // ---- phase A: S_qk[64][64] = q @ k^T; coef = masked gate(S_qk) ----
@@ -961,8 +978,7 @@ void gdn_ck_out_tc(const unsigned short *conv, const float *gc,
         const int d = wn*32 + s*8 + 2*tq + (r & 1);
         float v = 0.f;
         if (d <= c && c < cn)
-          v = acc2[s][r]*expf(gc[((long)ck*64 + c)*NVH + vh] -
-                              gc[((long)ck*64 + d)*NVH + vh]);
+          v = acc2[s][r]*expf(gcs[c] - gcs[d]);
         unsigned short hv;
         asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hv) : "f"(v));
         cf[c*LDC + d] = hv;
@@ -971,52 +987,61 @@ void gdn_ck_out_tc(const unsigned short *conv, const float *gc,
   }
   __syncthreads();
 
-  // ---- T1: acc = q @ h (h [e][b] row-major, staged in two k64 halves) ----
+  // ---- T1: acc = q @ h, halves PIPELINED: h0 prefetched under phase A,
+  // h1 lands under the h0 mma, vn under the h1 mma (out-D2) ----
   float acc[8][4];
   #pragma unroll
   for (int s = 0; s < 8; ++s)
     #pragma unroll
     for (int r = 0; r < 4; ++r) acc[s][r] = 0.f;
-  const unsigned short *hb = h + ((long)ck*NVH + vh)*16384;
   const int a_row = wm*16 + (lane & 15);
   const int a_kh8 = (lane >> 4) & 1;
-  for (int eh = 0; eh < 2; ++eh) {
-    // restage kx <- h rows [eh*64, eh*64+64) (h plane is already fp16)
-    for (int i = tid; i < 64*128; i += 256) {
-      const int e = i >> 7, bcol = i & 127;
-      kx[e*LD + bcol] = hb[(eh*64 + e)*128 + bcol];
-    }
-    __syncthreads();
-    #pragma unroll
-    for (int k0 = 0; k0 < 64; k0 += 16) {
-      int a0,a1,a2,a3;
-      asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-        : "=r"(a0),"=r"(a1),"=r"(a2),"=r"(a3)
-        : "r"((unsigned)__cvta_generic_to_shared(
-            &qs[a_row*LD + eh*64 + k0 + a_kh8*8])));
-      #pragma unroll
-      for (int s4 = 0; s4 < 2; ++s4) {
-        const int nb = wn*64 + s4*32;
-        int bl0,bl1,bl2,bl3, bh0,bh1,bh2,bh3;
-        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-          : "=r"(bl0),"=r"(bl1),"=r"(bl2),"=r"(bl3)
-          : "r"((unsigned)__cvta_generic_to_shared(
-              &kx[(k0 + (lane & 7))*LD + nb + (lane >> 3)*8])));
-        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-          : "=r"(bh0),"=r"(bh1),"=r"(bh2),"=r"(bh3)
-          : "r"((unsigned)__cvta_generic_to_shared(
-              &kx[(k0 + 8 + (lane & 7))*LD + nb + (lane >> 3)*8])));
-        GOMMA(acc,s4*4+0,bl0,bh0); GOMMA(acc,s4*4+1,bl1,bh1);
-        GOMMA(acc,s4*4+2,bl2,bh2); GOMMA(acc,s4*4+3,bl3,bh3);
-      }
-    }
-    __syncthreads(); // kx restaged next iteration
-  }
+  // commit h1 -> kx (the post-coef sync above fenced phase A's kx reads)
+  OUT_TILE_IN(kx, hb0 + 64*128 + (tid >> 2)*128, 64);
+#define OUT_T1_HALF(BUF, EH)                                                   \
+  do {                                                                         \
+    _Pragma("unroll") for (int k0 = 0; k0 < 64; k0 += 16) {                    \
+      int a0,a1,a2,a3;                                                         \
+      asm volatile(                                                            \
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"      \
+        : "=r"(a0),"=r"(a1),"=r"(a2),"=r"(a3)                                  \
+        : "r"((unsigned)__cvta_generic_to_shared(                              \
+            &qs[a_row*LD + (EH)*64 + k0 + a_kh8*8])));                         \
+      _Pragma("unroll") for (int s4 = 0; s4 < 2; ++s4) {                       \
+        const int nb = wn*64 + s4*32;                                          \
+        int bl0,bl1,bl2,bl3, bh0,bh1,bh2,bh3;                                  \
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "         \
+          "{%0,%1,%2,%3}, [%4];\n"                                             \
+          : "=r"(bl0),"=r"(bl1),"=r"(bl2),"=r"(bl3)                            \
+          : "r"((unsigned)__cvta_generic_to_shared(                            \
+              &(BUF)[(k0 + (lane & 7))*LD + nb + (lane >> 3)*8])));            \
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "         \
+          "{%0,%1,%2,%3}, [%4];\n"                                             \
+          : "=r"(bh0),"=r"(bh1),"=r"(bh2),"=r"(bh3)                            \
+          : "r"((unsigned)__cvta_generic_to_shared(                            \
+              &(BUF)[(k0 + 8 + (lane & 7))*LD + nb + (lane >> 3)*8])));        \
+        GOMMA(acc,s4*4+0,bl0,bh0); GOMMA(acc,s4*4+1,bl1,bh1);                  \
+        GOMMA(acc,s4*4+2,bl2,bh2); GOMMA(acc,s4*4+3,bl3,bh3);                  \
+      }                                                                        \
+    }                                                                          \
+  } while (0)
+  // half 0 on kx2: drain h0 (leaves h1 in flight)
+  asm volatile("cp.async.wait_group 1;\n");
+  __syncthreads();
+  OUT_T1_HALF(kx2, 0);
+  __syncthreads(); // kx2 free for vn
+  OUT_TILE_IN(kx2, vnew + (((long)ck*64 + (tid >> 2))*NVH + vh)*HVD, cn);
+  // half 1 on kx: drain h1 (leaves vn in flight)
+  asm volatile("cp.async.wait_group 1;\n");
+  __syncthreads();
+  OUT_T1_HALF(kx, 1);
+#undef OUT_T1_HALF
+#undef OUT_TILE_IN
   // scale the inter term by e^{gc_c} (row-dependent) before adding intra
   {
     const int c0 = wm*16 + g, c1 = c0 + 8;
-    const float e0 = (c0 < cn) ? expf(gc[((long)ck*64 + c0)*NVH + vh]) : 0.f;
-    const float e1 = (c1 < cn) ? expf(gc[((long)ck*64 + c1)*NVH + vh]) : 0.f;
+    const float e0 = (c0 < cn) ? expf(gcs[c0]) : 0.f;
+    const float e1 = (c1 < cn) ? expf(gcs[c1]) : 0.f;
     #pragma unroll
     for (int s = 0; s < 8; ++s) {
       acc[s][0] *= e0; acc[s][1] *= e0;
@@ -1024,13 +1049,8 @@ void gdn_ck_out_tc(const unsigned short *conv, const float *gc,
     }
   }
 
-  // ---- T2: acc += coef @ vn (A = coef [c][d], B = vn [d][b] row-major) ----
-  for (int i = tid; i < 64*128; i += 256) { // restage kx <- vn (fp16 plane)
-    const int d = i >> 7, bcol = i & 127;
-    kx[d*LD + bcol] = (d < cn)
-      ? vnew[(((long)ck*64 + d)*NVH + vh)*HVD + bcol]
-      : (unsigned short)0;
-  }
+  // ---- T2: acc += coef @ vn (vn prefetched into kx2 under T1 half 1) ----
+  asm volatile("cp.async.wait_group 0;\n");
   __syncthreads();
   #pragma unroll
   for (int k0 = 0; k0 < 64; k0 += 16) {
@@ -1046,11 +1066,11 @@ void gdn_ck_out_tc(const unsigned short *conv, const float *gc,
       asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
         : "=r"(bl0),"=r"(bl1),"=r"(bl2),"=r"(bl3)
         : "r"((unsigned)__cvta_generic_to_shared(
-            &kx[(k0 + (lane & 7))*LD + nb + (lane >> 3)*8])));
+            &kx2[(k0 + (lane & 7))*LD + nb + (lane >> 3)*8])));
       asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
         : "=r"(bh0),"=r"(bh1),"=r"(bh2),"=r"(bh3)
         : "r"((unsigned)__cvta_generic_to_shared(
-            &kx[(k0 + 8 + (lane & 7))*LD + nb + (lane >> 3)*8])));
+            &kx2[(k0 + 8 + (lane & 7))*LD + nb + (lane >> 3)*8])));
       GOMMA(acc,s4*4+0,bl0,bh0); GOMMA(acc,s4*4+1,bl1,bh1);
       GOMMA(acc,s4*4+2,bl2,bh2); GOMMA(acc,s4*4+3,bl3,bh3);
     }
@@ -2305,8 +2325,17 @@ bool cuda_gdn_prefill_chunked_fp16(
     kou->SetKernelArguments(13, &iNKH, sizeof(iNKH));
     kou->SetKernelArguments(14, &iHKD, sizeof(iHKD));
     kou->SetKernelArguments(15, &iHVD, sizeof(iHVD));
+    // out-D2: 62,720 B dynamic smem (qs/kx/kx2 17,408 each + cf 9,216 +
+    // rss/wns/gcs tail) -- one-time >48K opt-in like the state sweep.
+    static bool ou_attr_done = false;
+    if (!ou_attr_done) {
+      ou_attr_done = true;
+      cuFuncSetAttribute(kou->GetFunction(),
+                         CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                         62720);
+    }
     const int g[3] = {(int)NT, iNVH, 1}, b3[3] = {256, 1, 1};
-    if (!sm.DispatchCommand(*kou, g, b3))
+    if (!sm.DispatchCommand(*kou, g, b3, 62720u))
       return false;
   } else { // fp32 SIMT arm: separate out + gate, unchanged
     kou->SetKernelArguments(0, &ck_conv, sizeof(ck_conv));
