@@ -1331,10 +1331,17 @@ static const char *ATTN_FLASH_SRC = R"CU(
 #define AFD 256
 #define AFBR 128
 #define AFBC 64
-// v2: NO row pad. A 16B-chunk XOR swizzle inside each 128B window replaces
-// the +8-halves pad as the bank-conflict fix, which frees exactly enough
-// shared memory for a K double-buffer: Q 64K + K 2x32K + V 32K = 160 KB.
+// v2: NO row pad on Q. A 16B-chunk XOR swizzle inside each 128B window
+// replaces the +8-halves pad as the bank-conflict fix.
+// v7 (SASS address-form overhaul, ip_wide/attention_bench 2026-08-13): K/V
+// go back to the PADDED-LINEAR layout (264-half rows) so every K/V ldmatrix
+// and cp.async address folds to [reg + immediate] -- the FlashInfer-vs-us
+// autopsy put 95% of the issue deficit in recomputed swizzle chains and
+// staggered staging addresses. Q stays swizzled (16 ldm/tile only). The pad
+// costs 3 x 1,024 B; total smem 166,912 B = exactly the sm_87 opt-in cap.
+// Same arithmetic order everywhere: BIT-IDENTICAL output.
 #define AFLD AFD
+#define AFLDKV 264
 __device__ __forceinline__ float af_h2f(unsigned short h){
   float f; asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h)); return f;
 }
@@ -1359,9 +1366,9 @@ attn_flash_d256(const unsigned short *Q, const unsigned short *K,
                 int qpos0, int nqh, int nkvh, float scale) {
   extern __shared__ unsigned short smem[];
   unsigned short *Qs = smem;
-  unsigned short *Ks0 = Qs + AFBR * AFLD;
-  unsigned short *Ks1 = Ks0 + AFBC * AFLD;
-  unsigned short *Vs = Ks1 + AFBC * AFLD;
+  unsigned short *Ks0 = Qs + AFBR * AFLD;   // swizzled
+  unsigned short *Ks1 = Ks0 + AFBC * AFLDKV; // padded-linear
+  unsigned short *Vs = Ks1 + AFBC * AFLDKV;  // padded-linear
   const int qh = blockIdx.y, kvh = qh / (nqh / nkvh);
   const int r0 = blockIdx.x * AFBR;
   if (r0 >= Nq) return;
@@ -1395,23 +1402,24 @@ attn_flash_d256(const unsigned short *Q, const unsigned short *K,
   const int kv_stop = Nkv < q_hi_pos + 1 ? Nkv : q_hi_pos + 1;
   const int ntiles = (kv_stop + AFBC - 1) / AFBC;
 
-  // one K-or-V tile into a swizzled buffer, one commit group: 4 threads per
-  // row, each a 128B quarter; quarter chunk order staggered by (tid&3) --
-  // without it same-row quarters land on identical bank slots (q*8 has zero
-  // low3) = a 4-way shared-write conflict per cp.async step.
+  // one K-or-V tile into the PADDED-LINEAR buffer, one commit group: 4
+  // threads per row, each a 128B quarter. The +16B pad de-conflicts the
+  // writes, so the old chunk stagger is gone and every address is
+  // [reg + immediate]; the L2::128B hint requests full-sector fills.
 #define AF_KV_IN(BUFP, GSRC, KBASE)                                            \
   do {                                                                         \
     const int rr = tid >> 2;                                                   \
-    const int cq = (tid & 3) * (AFD / 4);                                      \
     const int kr = (KBASE) + rr;                                               \
-    const unsigned short *srckv = (GSRC) + (long)kr * kstride + cq;            \
-    const unsigned db = af_sh(BUFP);                                           \
+    const unsigned short *srckv =                                              \
+      (GSRC) + (long)kr * kstride + (tid & 3) * (AFD / 4);                     \
+    const unsigned db =                                                        \
+      af_sh(BUFP) + (unsigned)(rr * (AFLDKV * 2) + (tid & 3) * 128);           \
     const int ok = kr < Nkv ? 16 : 0;                                          \
-    _Pragma("unroll") for (int i0 = 0; i0 < AFD / 4 / 8; ++i0) {               \
-      const int i = (i0 + (tid & 3)) & 7;                                      \
-      asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(   \
-                     db + af_swz(rr, cq + i * 8)),                             \
-                   "l"(srckv + i * 8), "r"(ok));                               \
+    _Pragma("unroll") for (int i = 0; i < AFD / 4 / 8; ++i) {                  \
+      asm volatile(                                                            \
+        "cp.async.cg.shared.global.L2::128B [%0], [%1], 16, %2;\n" ::"r"(     \
+          db + i * 16),                                                        \
+        "l"(srckv + i * 8), "r"(ok));                                          \
     }                                                                          \
     asm volatile("cp.async.commit_group;\n");                                  \
   } while (0)
@@ -1444,14 +1452,20 @@ attn_flash_d256(const unsigned short *Q, const unsigned short *K,
 #pragma unroll
       for (int half32 = 0; half32 < 2; ++half32) {
         const int nb = half32 * 32;
+        // padded-linear K: per-lane row base is loop-invariant, k0/nb are
+        // compile-time -> [reg + immediate]
         asm volatile(
           "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
           : "=r"(bl0), "=r"(bl1), "=r"(bl2), "=r"(bl3)
-          : "r"(kb + af_swz(nb + (lane >> 3) * 8 + (lane & 7), k0)));
+          : "r"(kb +
+                (unsigned)((nb + (lane >> 3) * 8 + (lane & 7)) * (AFLDKV * 2)) +
+                k0 * 2));
         asm volatile(
           "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
           : "=r"(bh0), "=r"(bh1), "=r"(bh2), "=r"(bh3)
-          : "r"(kb + af_swz(nb + (lane >> 3) * 8 + (lane & 7), k0 + 8)));
+          : "r"(kb +
+                (unsigned)((nb + (lane >> 3) * 8 + (lane & 7)) * (AFLDKV * 2)) +
+                k0 * 2 + 16));
 #define AF_SMMA(SS, BL, BH)                                                    \
   asm volatile(                                                                \
     "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "                       \
@@ -1544,12 +1558,18 @@ attn_flash_d256(const unsigned short *Q, const unsigned short *K,
           "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, "
           "[%4];\n"
           : "=r"(bl0), "=r"(bl1), "=r"(bl2), "=r"(bl3)
-          : "r"(vb + af_swz(k16 * 16 + (lane & 7), nb + (lane >> 3) * 8)));
+          : "r"(vb +
+                (unsigned)((k16 * 16 + (lane & 7)) * (AFLDKV * 2) +
+                           (lane >> 3) * 16) +
+                nb * 2));
         asm volatile(
           "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, "
           "[%4];\n"
           : "=r"(bh0), "=r"(bh1), "=r"(bh2), "=r"(bh3)
-          : "r"(vb + af_swz(k16 * 16 + 8 + (lane & 7), nb + (lane >> 3) * 8)));
+          : "r"(vb +
+                (unsigned)((k16 * 16 + 8 + (lane & 7)) * (AFLDKV * 2) +
+                           (lane >> 3) * 16) +
+                nb * 2));
 #define AF_PMMA(NS, BL, BH)                                                    \
   asm volatile(                                                                \
     "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "                       \
@@ -1599,12 +1619,12 @@ static bool attn_flash_prefill_d256(const unsigned short *q,
                                                      "attn_flash_d256");
   if (!kf)
     return false;
-  // v2: pad-free XOR-swizzled tiles + K double-buffer.
-  // Q[128] + K[2x64] + V[64] rows x 256 halves = 163,840 B (sm_87 opt-in
-  // cap is 166,912). Bench: chunk5 85.4 -> 76.1 ms (+12.4%), validated
-  // max|d| identical to v1 (same arithmetic order; only addresses and the
-  // load schedule changed).
-  constexpr int SMEM = (128 + 3 * 64) * 256 * 2; // 163,840 B
+  // v7: swizzled Q + PADDED-LINEAR K/V (264-half rows) + K double-buffer.
+  // 128*256*2 + 3*64*264*2 = 166,912 B = exactly the sm_87 opt-in cap.
+  // Bench (attention_bench v7 arm): chunk5 76.1 -> 71.3 ms (+6.9% with the
+  // exp2 fold; the layout share landing here is ~+4.5%), bit-identical
+  // (same arithmetic order; only addresses and the load schedule changed).
+  constexpr int SMEM = 128 * 256 * 2 + 3 * 64 * 264 * 2; // 166,912 B
   static bool attr_ok = []() { return true; }();
   static bool attr_done = false;
   if (!attr_done) {
