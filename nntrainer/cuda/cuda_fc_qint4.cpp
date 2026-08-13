@@ -345,6 +345,50 @@ __global__ void act_quant_i8_h_v4(const unsigned short *Xh, signed char *q8,
   }
 }
 
+// Prefill-shaped variant of act_quant_i8_h_v4: same vector loads, hardware
+// cvt, and warp-shuffle reduction, but NO per-thread register carry -- the
+// carry is a decode win and a measured ~5% prefill LOSS (32 extra registers
+// cut blocks/SM at large M), which is why the v4 kernel is gated to
+// rows<=32. The quant pass re-reads the row instead; a K-wide row is
+// L1-hot by then. BIT-IDENTICAL to act_quant_i8_h for the same reason v4
+// is: min/max are order-independent, the conversions produce the same
+// values, and the rint/clamp is unchanged.
+__global__ void act_quant_i8_h_v4p(const unsigned short *Xh, signed char *q8,
+                                   float *ascale, int *azp, int M, int K) {
+  int m = blockIdx.x;
+  if (m >= M)
+    return;
+  const uint2 *xv = (const uint2 *)(Xh + (long)m * K);
+  int *q32 = (int *)(q8 + (long)m * K);
+  const int nv = K >> 2;
+  __shared__ float smn[32];
+  __shared__ float smx[32];
+  float lmn = 0.f, lmx = 0.f;
+  for (int i = threadIdx.x; i < nv; i += blockDim.x) {
+    float4 f = vq_load4(xv[i]);
+    lmn = fminf(lmn, fminf(fminf(f.x, f.y), fminf(f.z, f.w)));
+    lmx = fmaxf(lmx, fmaxf(fmaxf(f.x, f.y), fmaxf(f.z, f.w)));
+  }
+  VQ_REDUCE(smn, lmn, fminf, VQ_POSINF);
+  VQ_REDUCE(smx, lmx, fmaxf, VQ_NEGINF);
+  float scale_q, recip;
+  int zp;
+  asym_qparams(smn[0], smx[0], scale_q, recip, zp);
+  if (threadIdx.x == 0) {
+    ascale[m] = recip;
+    azp[m] = zp;
+  }
+  for (int i = threadIdx.x; i < nv; i += blockDim.x) {
+    float4 f = vq_load4(xv[i]);
+    int q0 = max(-128, min(127, (int)rintf(f.x * scale_q) + zp));
+    int q1 = max(-128, min(127, (int)rintf(f.y * scale_q) + zp));
+    int q2 = max(-128, min(127, (int)rintf(f.z * scale_q) + zp));
+    int q3 = max(-128, min(127, (int)rintf(f.w * scale_q) + zp));
+    q32[i] = (q0 & 0xFF) | ((q1 & 0xFF) << 8) | ((q2 & 0xFF) << 16) |
+             ((q3 & 0xFF) << 24);
+  }
+}
+
 // Vectorized RMSNorm + int8 quant of the normed row (see rmsnorm_quant_i8_h
 // below for the fusion rationale). The sum of squares is reduced in a
 // different ORDER than the scalar kernels (vector-of-4 per thread, then warp
@@ -3934,10 +3978,12 @@ bool cuda_fc_qs4cx_dp4a_gemm_fp16(const unsigned short *Xh,
                                   unsigned int N, unsigned int K) {
   if (M == 0 || N == 0 || K == 0)
     return true;
-  const bool q_vec4 = fused_normq_on() && cuda_vec4_rows_small(M) &&
-                      cuda_vec4_rows_ok(K, Xh);
+  const bool q_okv = fused_normq_on() && cuda_vec4_rows_ok(K, Xh);
+  const bool q_vec4 = q_okv && cuda_vec4_rows_small(M);
   auto kqh = CudaContext::Global().registerCudaKernel(
-    FC_QINT4_DP4A_SRC, q_vec4 ? "act_quant_i8_h_v4" : "act_quant_i8_h");
+    FC_QINT4_DP4A_SRC, q_vec4  ? "act_quant_i8_h_v4"
+                       : q_okv ? "act_quant_i8_h_v4p"
+                               : "act_quant_i8_h");
   auto kc =
     CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC, "cvt_f2h");
   if (!kqh || !kc) {
@@ -4027,10 +4073,12 @@ bool cuda_fc_qs4cx_dp4a_gemm_fp16in_f32out(const unsigned short *Xh,
                                            unsigned int N, unsigned int K) {
   if (M == 0 || N == 0 || K == 0)
     return true;
-  const bool q_vec4 = fused_normq_on() && cuda_vec4_rows_small(M) &&
-                      cuda_vec4_rows_ok(K, Xh);
+  const bool q_okv = fused_normq_on() && cuda_vec4_rows_ok(K, Xh);
+  const bool q_vec4 = q_okv && cuda_vec4_rows_small(M);
   auto kqh = CudaContext::Global().registerCudaKernel(
-    FC_QINT4_DP4A_SRC, q_vec4 ? "act_quant_i8_h_v4" : "act_quant_i8_h");
+    FC_QINT4_DP4A_SRC, q_vec4  ? "act_quant_i8_h_v4"
+                       : q_okv ? "act_quant_i8_h_v4p"
+                               : "act_quant_i8_h");
   if (!kqh) {
     ml_loge("[CUDA] fc_qint4 dp4a f32out: kernel registration failed");
     return false;
@@ -4257,10 +4305,12 @@ bool cuda_fc_qs4cx_cublas_i8_gemm_fp16(const unsigned short *Xh,
   if (imma_tile_level() >= 2 && M >= 8u && (K % 64u) == 0u &&
       (reinterpret_cast<uintptr_t>(plain_w) & 7u) == 0u)
     return false;
-  const bool q_vec4 = fused_normq_on() && cuda_vec4_rows_small(M) &&
-                      cuda_vec4_rows_ok(K, Xh);
+  const bool q_okv = fused_normq_on() && cuda_vec4_rows_ok(K, Xh);
+  const bool q_vec4 = q_okv && cuda_vec4_rows_small(M);
   auto kqh = CudaContext::Global().registerCudaKernel(
-    FC_QINT4_DP4A_SRC, q_vec4 ? "act_quant_i8_h_v4" : "act_quant_i8_h");
+    FC_QINT4_DP4A_SRC, q_vec4  ? "act_quant_i8_h_v4"
+                       : q_okv ? "act_quant_i8_h_v4p"
+                               : "act_quant_i8_h");
   auto kde = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
                                                       "dequant_i32_fp16");
   if (!kqh || !kde) {
