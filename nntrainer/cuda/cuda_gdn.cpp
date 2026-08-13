@@ -98,6 +98,37 @@ __global__ void gdn_gemv_h_f4(const unsigned short *x, const unsigned short *W,
   }
   out[n0]=a0; out[n0+1]=a1; out[n0+2]=a2; out[n0+3]=a3;
 }
+// Narrow-N cooperative GEMV for the decode b/a projections (N=32): the
+// per-thread-4-outputs form launches N/4 = 8 THREADS for these shapes --
+// one quarter-warp streaming 128 KB, pure latency. Here the whole 256-thread
+// block cooperates: thread t owns column t%N and k-slice t/N, so a full
+// sweep reads S=256/N consecutive k-rows coalesced; per-column partials
+// reduce across slices in shared memory. NOTE the k accumulation is split
+// across S slices and tree-summed -- a REORDER vs the ascending-k kernels
+// (ulp class, NLL-gated with the decode batch; NNTR_GDN_GEMVN=0 restores).
+__global__ void gdn_gemv_h_f4n(const unsigned short *x,
+                               const unsigned short *W, float *out, int K,
+                               int N){
+  __shared__ float xs[4096];
+  for (int i = threadIdx.x; i < K; i += blockDim.x) xs[i] = h2f(x[i]);
+  __syncthreads();
+  const int S = blockDim.x / N; // N must divide blockDim (launcher checks)
+  const int c = threadIdx.x % N, s = threadIdx.x / N;
+  float acc = 0.0f;
+  #pragma unroll 8
+  for (int k = s; k < K; k += S)
+    acc += xs[k] * h2f(W[(long)k*N + c]);
+  __shared__ float red[256];
+  red[threadIdx.x] = acc;
+  __syncthreads();
+  for (int st = S >> 1; st > 0; st >>= 1) {
+    if (s < st)
+      red[threadIdx.x] += red[threadIdx.x + st*N];
+    __syncthreads();
+  }
+  if (s == 0)
+    out[c] = red[c];
+}
 __global__ void gdn_gemv_f_h4(const float *x, const unsigned short *W,
                               unsigned short *out, int K, int N){
   __shared__ float xs[4096];
@@ -2561,7 +2592,24 @@ bool cuda_gdn_decode_fp16(const unsigned short *x, const unsigned short *wqkv,
   auto vec_ok = [](const unsigned short *W, int N) {
     return (N % 4 == 0) && ((reinterpret_cast<uintptr_t>(W) & 7u) == 0);
   };
+  static const bool gemvn_on = []() {
+    const char *e = std::getenv("NNTR_GDN_GEMVN");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  auto kgn = gemvn_on ? ctx.registerCudaKernel(GDN_SRC, "gdn_gemv_h_f4n")
+                      : decltype(kg){};
   auto gemv_h = [&](const unsigned short *W, float *dst, int K, int N) {
+    // Narrow rows (b/a: N=32) take the cooperative block kernel -- the
+    // 4-wide form would launch N/4 threads total.
+    if (gemvn_on && kgn && N <= 64 && (B % N) == 0) {
+      kgn->SetKernelArguments(0, &x, sizeof(x));
+      kgn->SetKernelArguments(1, &W, sizeof(W));
+      kgn->SetKernelArguments(2, &dst, sizeof(dst));
+      kgn->SetKernelArguments(3, &K, sizeof(K));
+      kgn->SetKernelArguments(4, &N, sizeof(N));
+      const int g[3] = {1, 1, 1}, b[3] = {B, 1, 1};
+      return sm.DispatchCommand(*kgn, g, b);
+    }
     const bool v4 = vec_ok(W, N);
     auto &kk = v4 ? *kg4 : *kg;
     kk.SetKernelArguments(0, &x, sizeof(x));
@@ -2627,16 +2675,21 @@ bool cuda_gdn_decode_fp16(const unsigned short *x, const unsigned short *wqkv,
       return false;
     }
   }
-  // 4) out_proj
+  // 4) out_proj. Stays on the SCALAR f_h deliberately: the vec-4 form was
+  // wired in and MEASURED SLOWER on the pinned weight (543 vs 361 us/call)
+  // -- pinned reads are latency-bound, so the 4x fewer threads of the
+  // 4-wide form lose more in-flight bytes than the wider loads gain. (On a
+  // device-mirrored weight the trade may reverse; re-measure then.)
   {
     int K = (int)VAL, N = (int)H;
-    ko->SetKernelArguments(0, &g_normed, sizeof(g_normed));
-    ko->SetKernelArguments(1, &wout, sizeof(wout));
-    ko->SetKernelArguments(2, &out, sizeof(out));
-    ko->SetKernelArguments(3, &K, sizeof(K));
-    ko->SetKernelArguments(4, &N, sizeof(N));
+    auto &kk = *ko;
+    kk.SetKernelArguments(0, &g_normed, sizeof(g_normed));
+    kk.SetKernelArguments(1, &wout, sizeof(wout));
+    kk.SetKernelArguments(2, &out, sizeof(out));
+    kk.SetKernelArguments(3, &K, sizeof(K));
+    kk.SetKernelArguments(4, &N, sizeof(N));
     const int g[3] = {((int)H + B - 1) / B, 1, 1}, b[3] = {B, 1, 1};
-    if (!sm.DispatchCommand(*ko, g, b)) {
+    if (!sm.DispatchCommand(kk, g, b)) {
       fprintf(stderr, "[cuda_gdn] out_proj dispatch FAILED: %s\n",
               cudaGetErrorString(cudaGetLastError()));
       return false;
