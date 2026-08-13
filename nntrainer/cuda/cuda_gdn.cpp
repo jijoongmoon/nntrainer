@@ -1320,9 +1320,39 @@ void gdn_ck_state_tc2(const unsigned short *conv, const unsigned short *w,
   const int wm2 = warp >> 1, wn2 = warp & 1; // c-tile x b-32 for vp/vn
   const int g = lane >> 2, tq = lane & 3;
   const int NCH = (T + 63) >> 6;
-  __shared__ __align__(16) unsigned short Sh[128 * SLD2]; // S [j][b-half]
-  __shared__ __align__(16) unsigned short Wb[64 * 136];   // w tile, then k
-  __shared__ __align__(16) unsigned short Db[64 * SLD2];  // dv [c][b-half]
+  // D2: dynamic smem, w and k in SEPARATE buffers so chunk c+1's tiles
+  // cp.async-prefetch under chunk c's compute (the flash-v2 schedule). The
+  // synchronous per-chunk tile loads were the phase-D residual suspect:
+  // occupancy/warp-idling/barriers all measured innocent.
+  extern __shared__ __align__(16) unsigned char sb2[];
+  unsigned short *Sh = (unsigned short *)sb2;            // S [128][72] fp16
+  unsigned short *Wb = (unsigned short *)(sb2 + 18432);  // w tile [64][136]
+  unsigned short *Kb = (unsigned short *)(sb2 + 35840);  // k tile [64][136]
+  unsigned short *Db = (unsigned short *)(sb2 + 53248);  // dv [64][72]
+
+  // one w-or-k tile via cp.async, one commit group; 4 thr/row x 64 B; rows
+  // past cn zero-fill through the src-size predicate.
+#define ST2_TILE_IN(BUFP, ROWPTR_EXPR, CK, CNV)                                \
+  do {                                                                         \
+    const int rr = tid >> 2;                                                   \
+    const int cq = (tid & 3) * 32;                                             \
+    const long tk = (long)(CK)*64 + rr;                                        \
+    const unsigned short *src = (ROWPTR_EXPR) + cq;                            \
+    const unsigned db_ =                                                       \
+      (unsigned)__cvta_generic_to_shared(&(BUFP)[rr*136 + cq]);                \
+    const int ok = (rr < (CNV)) ? 16 : 0;                                      \
+    (void)tk;                                                                  \
+    _Pragma("unroll") for (int i = 0; i < 4; ++i)                              \
+      asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(   \
+                     db_ + i * 16),                                            \
+                   "l"(src + i * 8), "r"(ok));                                 \
+    asm volatile("cp.async.commit_group;\n");                                  \
+  } while (0)
+#define ST2_W_IN(CK, CNV)                                                      \
+  ST2_TILE_IN(Wb, w + (((long)(CK)*64 + (tid >> 2))*NVH + vh)*HKD, CK, CNV)
+#define ST2_K_IN(CK, CNV)                                                      \
+  ST2_TILE_IN(Kb, conv + ((long)(CK)*64 + (tid >> 2))*CONV + KEY + kh*HKD,     \
+              CK, CNV)
 
   // S frags: warp j-tile 16 x the CTA's 64 b columns
   float S[8][4];
@@ -1336,8 +1366,14 @@ void gdn_ck_state_tc2(const unsigned short *conv, const unsigned short *w,
         ? state[((long)vh*HKD + j)*HVD + bh*64 + b] : 0.0f;
     }
 
+  { // prologue: w_0 then k_0 in flight (groups FIFO: w before k)
+    const int cn0 = (T < 64) ? T : 64;
+    ST2_W_IN(0, cn0);
+    ST2_K_IN(0, cn0);
+  }
   for (int c = 0; c < NCH; ++c) {
     const int cn = (T - c*64 < 64) ? (T - c*64) : 64;
+    const int cnn = (T - (c + 1)*64 < 64) ? (T - (c + 1)*64) : 64;
     const float eglc = expf(gl[(long)c*NVH + vh]);
     // 1) dump S -> Sh fp16 (whole half, no jh loop) + the h plane
 #pragma unroll
@@ -1353,13 +1389,8 @@ void gdn_ck_state_tc2(const unsigned short *conv, const unsigned short *w,
         *(unsigned *)&Sh[j*SLD2 + b] = pv;
         *(unsigned *)&h[((long)c*NVH + vh)*16384 + j*128 + bh*64 + b] = pv;
       }
-    // 2) stage w tile [c][j]
-    for (int i = tid; i < 64*128; i += 256) {
-      const int cc = i >> 7, jj = i & 127;
-      Wb[cc*136 + jj] = (cc < cn)
-        ? w[(((long)c*64 + cc)*NVH + vh)*HKD + jj]
-        : (unsigned short)0;
-    }
+    // 2) drain w_c (leaves k_c in flight; groups are FIFO)
+    asm volatile("cp.async.wait_group 1;\n");
     __syncthreads();
     // 3) vp = w @ S : c64 x b64, K=j128; warp = (c-tile 16, b-tile 32)
     float vp[4][4];
@@ -1401,7 +1432,13 @@ void gdn_ck_state_tc2(const unsigned short *conv, const unsigned short *w,
         ST2MMA(vp,2,bl2,bh2); ST2MMA(vp,3,bl3,bh3);
       }
     }
-    __syncthreads(); // Wb reused for k next; Sh dump next chunk
+    __syncthreads(); // all warps done reading Wb before its prefetch refill
+    // 3b) prefetch w_{c+1}: lands under vn + the S update. Empty commit on
+    // the last chunk keeps per-thread group counts uniform.
+    if (c + 1 < NCH)
+      ST2_W_IN(c + 1, cnn);
+    else
+      asm volatile("cp.async.commit_group;\n");
     // 4) vn = u - vp; dv -> Db; vnew pair store. Warp covers its (c,b) tile.
 #pragma unroll
     for (int s = 0; s < 4; ++s)
@@ -1435,13 +1472,8 @@ void gdn_ck_state_tc2(const unsigned short *conv, const unsigned short *w,
         asm("cvt.rn.f16.f32 %0, %1;" : "=h"(d1) : "f"(dv1));
         *(unsigned *)&Db[cc*SLD2 + bl] = (unsigned)d0 | ((unsigned)d1 << 16);
       }
-    // 5) stage k tile [c][j] into Wb
-    for (int i = tid; i < 64*128; i += 256) {
-      const int cc = i >> 7, jj = i & 127;
-      Wb[cc*136 + jj] = (cc < cn)
-        ? conv[((long)c*64 + cc)*CONV + KEY + kh*HKD + jj]
-        : (unsigned short)0;
-    }
+    // 5) drain k_c (leaves w_{c+1} in flight)
+    asm volatile("cp.async.wait_group 1;\n");
     __syncthreads();
     // 6) S = S*e^{gl_c} + k^T @ dv : j128 x b64, K=c64
 #pragma unroll
@@ -1455,7 +1487,7 @@ void gdn_ck_state_tc2(const unsigned short *conv, const unsigned short *w,
         "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
         : "=r"(a0),"=r"(a1),"=r"(a2),"=r"(a3)
         : "r"((unsigned)__cvta_generic_to_shared(
-            &Wb[(k0 + (lane & 7) + ((lane & 16) ? 8 : 0))*136 +
+            &Kb[(k0 + (lane & 7) + ((lane & 16) ? 8 : 0))*136 +
                 warp*16 + ((lane & 8) ? 8 : 0)])));
 #pragma unroll
       for (int s4 = 0; s4 < 2; ++s4) {
@@ -1476,8 +1508,14 @@ void gdn_ck_state_tc2(const unsigned short *conv, const unsigned short *w,
       }
     }
 #undef ST2MMA
-    __syncthreads();
+    __syncthreads(); // all warps done reading Kb/Db before refill
+    // 6b) prefetch k_{c+1}: lands under the next chunk's S dump + vp
+    if (c + 1 < NCH)
+      ST2_K_IN(c + 1, cnn);
+    else
+      asm volatile("cp.async.commit_group;\n");
   }
+  asm volatile("cp.async.wait_group 0;\n"); // retire trailing groups
   if (save_state) {
 #pragma unroll
     for (int s = 0; s < 8; ++s)
@@ -1489,6 +1527,9 @@ void gdn_ck_state_tc2(const unsigned short *conv, const unsigned short *w,
       }
   }
 }
+#undef ST2_TILE_IN
+#undef ST2_W_IN
+#undef ST2_K_IN
 
 // gated RMSNorm + silu(z) gate -> fp16, VERBATIM the scan's fused tail.
 // grid T*NVH, block 128 (thread = b).
@@ -2149,7 +2190,20 @@ bool cuda_gdn_prefill_chunked_fp16(
     kst->SetKernelArguments(16, &i_save, sizeof(i_save));
     const int g[3] = {iNVH, state2 ? 2 : 1, 1};
     const int b3[3] = {state2 ? 256 : 512, 1, 1};
-    if (!sm.DispatchCommand(*kst, g, b3))
+    // D2: 62,464 B dynamic smem (Sh 18,432 + Wb/Kb 17,408 each + Db 9,216)
+    // exceeds the 48 KB default -> one-time opt-in, flash-kernel precedent.
+    unsigned int st_smem = 0;
+    if (state2) {
+      st_smem = 62464u;
+      static bool st2_attr_done = false;
+      if (!st2_attr_done) {
+        st2_attr_done = true;
+        cuFuncSetAttribute(kst->GetFunction(),
+                           CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                           (int)st_smem);
+      }
+    }
+    if (!sm.DispatchCommand(*kst, g, b3, st_smem))
       return false;
   }
   // stub point 3: h and v_new before the out kernel consumes them. Under the
