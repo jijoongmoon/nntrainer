@@ -505,7 +505,8 @@ void gdn_ck_kkt_tc(const unsigned short *conv, const float *gc, const float *bet
 // both built fp16 in smem; T rounded to fp16 (a new fp16 surface -- the =2
 // gate arbitrates, and out's coef precedent passed with 16x margin).
 __global__ __launch_bounds__(256, 2)
-void gdn_ck_wu_tc(const unsigned short *conv, const float *A, const float *gc,
+void gdn_ck_wu_tc(const unsigned short *conv, const unsigned short *Ah,
+                  const float *gc,
                   const float *beta, unsigned short *w, unsigned short *u,
                   int T, int CONV, int KEY, int NVH, int NKH, int HKD,
                   int HVD){
@@ -533,12 +534,19 @@ void gdn_ck_wu_tc(const unsigned short *conv, const float *A, const float *gc,
     s_be[tid] = be;
     s_beg[tid] = bg;
   }
-  const float *Ab = A + ((long)ck*NVH + vh)*4096;
-  for (int i = tid; i < 4096; i += 256) {
-    unsigned short hv;
-    float tv = Ab[i];
-    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hv) : "f"(tv));
-    Th[(i >> 6)*72 + (i & 63)] = hv;
+  { // Ah (fp16 T from tril) -> Th via cp.async: flies under the xk/xv
+    // build below. dst row stride 144 B is 16B-aligned; 4 thr/row x 32 B.
+    const int rr = tid >> 2;
+    const int cq = (tid & 3) * 16;
+    const unsigned short *src = Ah + ((long)ck*NVH + vh)*4096 + rr*64 + cq;
+    const unsigned db_ =
+      (unsigned)__cvta_generic_to_shared(&Th[rr*72 + cq]);
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+      asm volatile("cp.async.cg.shared.global [%0], [%1], 16, 16;\n" ::"r"(
+                     db_ + i * 16),
+                   "l"(src + i * 8));
+    asm volatile("cp.async.commit_group;\n");
   }
   __syncthreads(); // s_be/s_beg visible to the tile build
   for (int i = tid; i < 64*128; i += 256) {
@@ -560,6 +568,7 @@ void gdn_ck_wu_tc(const unsigned short *conv, const float *A, const float *gc,
     xk[c*136 + dim] = hk;
     xv[c*136 + dim] = hvv;
   }
+  asm volatile("cp.async.wait_group 0;\n"); // Th landed
   __syncthreads();
   float aw[8][4], au[8][4];
 #pragma unroll
@@ -642,7 +651,7 @@ void gdn_ck_wu_tc(const unsigned short *conv, const float *A, const float *gc,
 
 // Tv = (I + A)^-1 by forward substitution, in place over A.
 // grid (NT, NVH), block 64 (thread = column). fp32 throughout.
-__global__ void gdn_ck_tril(float *A, int NVH){
+__global__ void gdn_ck_tril(float *A, int NVH, unsigned short *Ah){
   const long base = ((long)blockIdx.x*NVH + blockIdx.y)*4096;
   const int d = threadIdx.x;
   __shared__ float M[64][64];
@@ -655,7 +664,19 @@ __global__ void gdn_ck_tril(float *A, int NVH){
     Tv[r][d] = s;
     __syncthreads();
   }
-  for (int r = 0; r < 64; ++r) A[base + r*64 + d] = Tv[r][d];
+  if (Ah != 0) {
+    // TC arm: emit T as fp16 DIRECTLY -- the exact cvt.rn wu applied at
+    // load (bit-identical values), so wu skips its A-fp32 read + convert
+    // loop and the fp32 writeback (which nothing else reads) is dropped.
+    unsigned short *dst = Ah + base;
+    for (int r = 0; r < 64; ++r) {
+      unsigned short hv;
+      asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hv) : "f"(Tv[r][d]));
+      dst[r*64 + d] = hv;
+    }
+  } else {
+    for (int r = 0; r < 64; ++r) A[base + r*64 + d] = Tv[r][d];
+  }
 }
 
 // w = Tv @ (beta e^{gc} k), u = Tv @ (beta v). grid (NT, NVH), block 128
@@ -2011,6 +2032,8 @@ bool cuda_gdn_prefill_fp16(const float *p_qkv, const float *p_z,
 namespace {
 float *g_ck_gc = nullptr, *g_ck_beta = nullptr, *g_ck_gl = nullptr;
 float *g_ck_A = nullptr, *g_ck_w = nullptr, *g_ck_u = nullptr;
+unsigned short *g_ck_ah = nullptr; // fp16 T from tril (TC arm)
+size_t c_ck_ah = 0;
 float *g_ck_vn = nullptr, *g_ck_h = nullptr, *g_ck_o = nullptr;
 unsigned short *g_ck_convh = nullptr;
 size_t c_ck_convh = 0;
@@ -2040,6 +2063,7 @@ bool cuda_gdn_prefill_chunked_fp16(
       !grow((void **)&g_ck_beta, &c_ck_beta, (size_t)T * NVH * 4) ||
       !grow((void **)&g_ck_gl, &c_ck_gl, (size_t)NT * NVH * 4) ||
       !grow((void **)&g_ck_A, &c_ck_A, (size_t)NT * NVH * 4096 * 4) ||
+      !grow((void **)&g_ck_ah, &c_ck_ah, (size_t)NT * NVH * 4096 * 2) ||
       !grow((void **)&g_ck_w, &c_ck_w, (size_t)T * NVH * HKD * 4) ||
       !grow((void **)&g_ck_u, &c_ck_u, (size_t)T * NVH * HVD * 4) ||
       !grow((void **)&g_ck_vn, &c_ck_vn, (size_t)T * NVH * HVD * 4) ||
@@ -2234,6 +2258,8 @@ bool cuda_gdn_prefill_chunked_fp16(
   { // (I+A)^-1 in place
     ktr->SetKernelArguments(0, &g_ck_A, sizeof(g_ck_A));
     ktr->SetKernelArguments(1, &iNVH, sizeof(iNVH));
+    unsigned short *ah_arg = g_ck_tc ? g_ck_ah : nullptr;
+    ktr->SetKernelArguments(2, &ah_arg, sizeof(ah_arg));
     const int g[3] = {(int)NT, iNVH, 1}, b3[3] = {64, 1, 1};
     if (!sm.DispatchCommand(*ktr, g, b3))
       return false;
@@ -2241,7 +2267,10 @@ bool cuda_gdn_prefill_chunked_fp16(
   stamp(5);
   { // w, u
     kwu->SetKernelArguments(0, &ck_conv, sizeof(ck_conv));
-    kwu->SetKernelArguments(1, &g_ck_A, sizeof(g_ck_A));
+    if (g_ck_tc)
+      kwu->SetKernelArguments(1, &g_ck_ah, sizeof(g_ck_ah));
+    else
+      kwu->SetKernelArguments(1, &g_ck_A, sizeof(g_ck_A));
     kwu->SetKernelArguments(2, &g_ck_gc, sizeof(g_ck_gc));
     kwu->SetKernelArguments(3, &g_ck_beta, sizeof(g_ck_beta));
     kwu->SetKernelArguments(4, &g_ck_w, sizeof(g_ck_w));
