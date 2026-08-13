@@ -23,29 +23,21 @@ namespace nntrainer::cuda {
 
 static const char *ELTWISE_SRC = R"CU(
 extern "C" {
+// Hardware half<->float conversion. The previous software routines here were
+// ~20 integer ops each (with a data-dependent denormal loop); the hardware
+// instruction is one, and it was verified BIT-IDENTICAL to the software pair
+// over all 65536 half patterns and 4M random floats when the same swap
+// shipped in the fc_qint4 epilogues (commit c6b318763). Every kernel in this
+// source inherits the swap with no value change.
 __device__ __forceinline__ float ew_h2f(unsigned short h) {
-  unsigned int s = ((unsigned int)(h & 0x8000u)) << 16;
-  unsigned int e = (h >> 10) & 0x1Fu, m = h & 0x3FFu, o;
-  if (e == 0u) {
-    if (m == 0u) o = s;
-    else { int x=-1; do{m<<=1;x++;}while((m&0x400u)==0u); m&=0x3FFu;
-           o = s | ((unsigned int)(127-15-x)<<23) | (m<<13); }
-  } else if (e == 0x1Fu) o = s | 0x7F800000u | (m<<13);
-  else o = s | ((e + (127u-15u))<<23) | (m<<13);
-  return __int_as_float((int)o);
+  float f;
+  asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h));
+  return f;
 }
 __device__ __forceinline__ unsigned short ew_f2h(float f) {
-  unsigned int x=(unsigned int)__float_as_int(f), s=(x>>16)&0x8000u, mant=x&0x7FFFFFu;
-  int e=(int)((x>>23)&0xFFu);
-  if (e==0xFF) return (unsigned short)(s|0x7C00u|(mant?0x200u:0u));
-  int exp=e-127+15;
-  if (exp>=0x1F) return (unsigned short)(s|0x7C00u);
-  if (exp<=0){ if(exp<-10) return (unsigned short)s; mant|=0x800000u; int sh=14-exp;
-    unsigned int hh=mant>>sh, rem=mant&((1u<<sh)-1u), half=1u<<(sh-1);
-    if(rem>half||(rem==half&&(hh&1u))) hh++; return (unsigned short)(s|hh); }
-  unsigned int hh=((unsigned int)exp<<10)|(mant>>13), rem=mant&0x1FFFu;
-  if(rem>0x1000u||(rem==0x1000u&&(hh&1u))) hh++;
-  return (unsigned short)(s|hh);
+  unsigned short h;
+  asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(f));
+  return h;
 }
 __global__ void geglu_fp16(const unsigned short *gate, const unsigned short *up,
                            unsigned short *out, int n) {
@@ -166,6 +158,91 @@ __global__ void softcap_fp16(const unsigned short *in, unsigned short *out,
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
   out[i] = ew_f2h(cap * tanhf(ew_h2f(in[i]) / cap));
+}
+// ---- uint4 (8-half) vectorized variants of the volume kernels ----
+// Selection is host-side (n%8==0 and 16B-aligned pointers, else the scalar
+// kernel runs). Same per-element fp32 math and single RNE round; element
+// order never enters these ops, so the vector forms are bit-identical.
+__device__ __forceinline__ void ew_ld8(const uint4 *p, int i, float *f) {
+  uint4 v = p[i];
+  f[0] = ew_h2f((unsigned short)(v.x & 0xFFFFu));
+  f[1] = ew_h2f((unsigned short)(v.x >> 16));
+  f[2] = ew_h2f((unsigned short)(v.y & 0xFFFFu));
+  f[3] = ew_h2f((unsigned short)(v.y >> 16));
+  f[4] = ew_h2f((unsigned short)(v.z & 0xFFFFu));
+  f[5] = ew_h2f((unsigned short)(v.z >> 16));
+  f[6] = ew_h2f((unsigned short)(v.w & 0xFFFFu));
+  f[7] = ew_h2f((unsigned short)(v.w >> 16));
+}
+__device__ __forceinline__ uint4 ew_st8(const float *f) {
+  uint4 o;
+  o.x = (unsigned int)ew_f2h(f[0]) | ((unsigned int)ew_f2h(f[1]) << 16);
+  o.y = (unsigned int)ew_f2h(f[2]) | ((unsigned int)ew_f2h(f[3]) << 16);
+  o.z = (unsigned int)ew_f2h(f[4]) | ((unsigned int)ew_f2h(f[5]) << 16);
+  o.w = (unsigned int)ew_f2h(f[6]) | ((unsigned int)ew_f2h(f[7]) << 16);
+  return o;
+}
+__global__ void add_fp16_v8(const uint4 *a, const uint4 *b, uint4 *out,
+                            int nv) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= nv) return;
+  float fa[8], fb[8], fo[8];
+  ew_ld8(a, i, fa);
+  ew_ld8(b, i, fb);
+  #pragma unroll
+  for (int j = 0; j < 8; ++j) fo[j] = fa[j] + fb[j];
+  out[i] = ew_st8(fo);
+}
+__global__ void mul_fp16_v8(const uint4 *a, const uint4 *b, uint4 *out,
+                            int nv) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= nv) return;
+  float fa[8], fb[8], fo[8];
+  ew_ld8(a, i, fa);
+  ew_ld8(b, i, fb);
+  #pragma unroll
+  for (int j = 0; j < 8; ++j) fo[j] = fa[j] * fb[j];
+  out[i] = ew_st8(fo);
+}
+__global__ void act_sigmoid_fp16_v8(uint4 *x, int nv) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= nv) return;
+  float f[8];
+  ew_ld8(x, i, f);
+  #pragma unroll
+  for (int j = 0; j < 8; ++j) f[j] = 1.0f / (1.0f + expf(-f[j]));
+  x[i] = ew_st8(f);
+}
+__global__ void swiglu_fp16_v8(const uint4 *gate, const uint4 *up, uint4 *out,
+                               int nv) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= nv) return;
+  float fg[8], fu[8], fo[8];
+  ew_ld8(gate, i, fg);
+  ew_ld8(up, i, fu);
+  #pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    float s = fg[j] / (1.0f + expf(-fg[j]));
+    fo[j] = s * fu[j];
+  }
+  out[i] = ew_st8(fo);
+}
+// Row-per-block broadcast multiply: one block per row removes the per-element
+// i/W integer division entirely, and the row gate g[r] is one scalar load.
+__global__ void bcast_mul_fp16_v8(const uint4 *a, const unsigned short *g,
+                                  uint4 *out, int rows, int Wv) {
+  int r = blockIdx.x;
+  if (r >= rows) return;
+  float gv = ew_h2f(g[r]);
+  const uint4 *ar = a + (long)r * Wv;
+  uint4 *orow = out + (long)r * Wv;
+  for (int i = threadIdx.x; i < Wv; i += blockDim.x) {
+    float f[8];
+    ew_ld8(ar, i, f);
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) f[j] *= gv;
+    orow[i] = ew_st8(f);
+  }
 }
 }
 )CU";
@@ -356,6 +433,18 @@ template <typename K> static bool dispatch1d(K &kernel, unsigned int n) {
   return true;
 }
 
+// The uint4 (8-half) kernels need n divisible by 8 and 16B-aligned row bases;
+// anything else stays on the scalar kernel. nullptr entries are ignored.
+static inline bool ew_v8_ok(unsigned int n, const void *a, const void *b,
+                            const void *c) {
+  if ((n & 7u) != 0u)
+    return false;
+  auto aligned = [](const void *p) {
+    return p == nullptr || ((reinterpret_cast<uintptr_t>(p) & 15u) == 0u);
+  };
+  return aligned(a) && aligned(b) && aligned(c);
+}
+
 bool cuda_geglu_fp16(const unsigned short *gate, const unsigned short *up,
                      unsigned short *out, unsigned int n) {
   if (n == 0)
@@ -377,32 +466,35 @@ bool cuda_swiglu_fp16(const unsigned short *gate, const unsigned short *up,
                       unsigned short *out, unsigned int n) {
   if (n == 0)
     return true;
-  auto k = CudaContext::Global().registerCudaKernel(ELTWISE_SRC, "swiglu_fp16");
+  const bool v8 = ew_v8_ok(n, gate, up, out);
+  auto k = CudaContext::Global().registerCudaKernel(
+    ELTWISE_SRC, v8 ? "swiglu_fp16_v8" : "swiglu_fp16");
   if (!k) {
     ml_loge("[CUDA] swiglu_fp16: registration failed");
     return false;
   }
-  int ni = (int)n;
+  int ni = (int)(v8 ? n / 8 : n);
   k->SetKernelArguments(0, &gate, sizeof(gate));
   k->SetKernelArguments(1, &up, sizeof(up));
   k->SetKernelArguments(2, &out, sizeof(out));
   k->SetKernelArguments(3, &ni, sizeof(ni));
-  return dispatch1d(k, n);
+  return dispatch1d(k, (unsigned int)ni);
 }
 
 bool cuda_act_sigmoid_fp16(unsigned short *x, unsigned int n) {
   if (n == 0)
     return true;
-  auto k =
-    CudaContext::Global().registerCudaKernel(ELTWISE_SRC, "act_sigmoid_fp16");
+  const bool v8 = ew_v8_ok(n, x, nullptr, nullptr);
+  auto k = CudaContext::Global().registerCudaKernel(
+    ELTWISE_SRC, v8 ? "act_sigmoid_fp16_v8" : "act_sigmoid_fp16");
   if (!k) {
     ml_loge("[CUDA] act_sigmoid_fp16: registration failed");
     return false;
   }
-  int ni = (int)n;
+  int ni = (int)(v8 ? n / 8 : n);
   k->SetKernelArguments(0, &x, sizeof(x));
   k->SetKernelArguments(1, &ni, sizeof(ni));
-  return dispatch1d(k, n);
+  return dispatch1d(k, (unsigned int)ni);
 }
 
 bool cuda_act_sigmoid_fp32(float *x, unsigned int n) {
@@ -461,45 +553,67 @@ bool cuda_add_fp16(const unsigned short *a, const unsigned short *b,
                    unsigned short *out, unsigned int n) {
   if (n == 0)
     return true;
-  auto k = CudaContext::Global().registerCudaKernel(ELTWISE_SRC, "add_fp16");
+  const bool v8 = ew_v8_ok(n, a, b, out);
+  auto k = CudaContext::Global().registerCudaKernel(
+    ELTWISE_SRC, v8 ? "add_fp16_v8" : "add_fp16");
   if (!k) {
     ml_loge("[CUDA] add_fp16: registration failed");
     return false;
   }
-  int ni = (int)n;
+  int ni = (int)(v8 ? n / 8 : n);
   k->SetKernelArguments(0, &a, sizeof(a));
   k->SetKernelArguments(1, &b, sizeof(b));
   k->SetKernelArguments(2, &out, sizeof(out));
   k->SetKernelArguments(3, &ni, sizeof(ni));
-  return dispatch1d(k, n);
+  return dispatch1d(k, (unsigned int)ni);
 }
 
 bool cuda_mul_fp16(const unsigned short *a, const unsigned short *b,
                    unsigned short *out, unsigned int n) {
   if (n == 0)
     return true;
-  auto k = CudaContext::Global().registerCudaKernel(ELTWISE_SRC, "mul_fp16");
+  const bool v8 = ew_v8_ok(n, a, b, out);
+  auto k = CudaContext::Global().registerCudaKernel(
+    ELTWISE_SRC, v8 ? "mul_fp16_v8" : "mul_fp16");
   if (!k) {
     ml_loge("[CUDA] mul_fp16: registration failed");
     return false;
   }
-  int ni = (int)n;
+  int ni = (int)(v8 ? n / 8 : n);
   k->SetKernelArguments(0, &a, sizeof(a));
   k->SetKernelArguments(1, &b, sizeof(b));
   k->SetKernelArguments(2, &out, sizeof(out));
   k->SetKernelArguments(3, &ni, sizeof(ni));
-  return dispatch1d(k, n);
+  return dispatch1d(k, (unsigned int)ni);
 }
 
 bool cuda_bcast_mul_fp16(const unsigned short *a, const unsigned short *g,
                          unsigned short *out, unsigned int n, unsigned int W) {
   if (n == 0)
     return true;
-  auto k =
-    CudaContext::Global().registerCudaKernel(ELTWISE_SRC, "bcast_mul_fp16");
+  // Row-per-block vector form: needs whole rows of uint4 (W%8), row-aligned
+  // bases, and n an exact rows*W. The gate g is read as scalar halves.
+  const bool v8 =
+    W != 0 && (W & 7u) == 0u && (n % W) == 0u && ew_v8_ok(n, a, out, nullptr);
+  auto k = CudaContext::Global().registerCudaKernel(
+    ELTWISE_SRC, v8 ? "bcast_mul_fp16_v8" : "bcast_mul_fp16");
   if (!k) {
     ml_loge("[CUDA] bcast_mul_fp16: registration failed");
     return false;
+  }
+  if (v8) {
+    int rows = (int)(n / W), wv = (int)(W / 8);
+    k->SetKernelArguments(0, &a, sizeof(a));
+    k->SetKernelArguments(1, &g, sizeof(g));
+    k->SetKernelArguments(2, &out, sizeof(out));
+    k->SetKernelArguments(3, &rows, sizeof(rows));
+    k->SetKernelArguments(4, &wv, sizeof(wv));
+    const int block[3] = {256, 1, 1};
+    const int grid[3] = {rows, 1, 1};
+    if (!StreamManager::Global().DispatchCommand(*k, grid, block))
+      return false;
+    StreamManager::Global().maybeFinish();
+    return true;
   }
   int ni = (int)n, wi = (int)W;
   k->SetKernelArguments(0, &a, sizeof(a));
