@@ -354,6 +354,22 @@ const int CudaContext::registerFactory(const FactoryType<T> factory,
 }
 
 const CudaContext::SharedPtrCudaKernel
+CudaContext::registerCudaKernel(const char *kernel_source,
+                                const std::string &kernel_name,
+                                const std::string &compile_options) {
+  // Cache-hit fast path that never touches the source bytes: the std::string
+  // overload's implicit conversion cost a strlen+heap-copy of the full NVRTC
+  // source per call at every launch site (GDN: 9 registrations x 79 KB per
+  // layer-chunk), all of it thrown away on a hit.
+  const std::string kkey = kernel_name + compile_options;
+  auto it = cuda_kernel_map.find(kkey);
+  if (it != cuda_kernel_map.end())
+    return it->second;
+  return registerCudaKernel(std::string(kernel_source), kernel_name,
+                            compile_options);
+}
+
+const CudaContext::SharedPtrCudaKernel
 CudaContext::registerCudaKernel(const std::string &kernel_source,
                                 const std::string &kernel_name,
                                 const std::string &compile_options) {

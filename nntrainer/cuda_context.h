@@ -171,6 +171,19 @@ public:
                      const std::string &compile_options = {});
 
   /**
+   * @brief const char* overload: the cache-hit path never materializes the
+   *        source as a std::string. Every backend passes its NVRTC source as
+   *        a string literal / static const char*, and the std::string
+   *        overload charges a full strlen+copy of that (multi-KB) source to
+   *        EVERY call -- cache hit or not (the GDN prefill path alone copied
+   *        ~0.7 MB per layer-chunk call this way). Overload resolution picks
+   *        this one for char* call sites with no call-site changes.
+   */
+  const SharedPtrCudaKernel
+  registerCudaKernel(const char *kernel_source, const std::string &kernel_name,
+                     const std::string &compile_options = {});
+
+  /**
    * @brief Get the name of the context
    */
   std::string getName() override { return "cuda"; }
