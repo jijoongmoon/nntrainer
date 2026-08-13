@@ -494,7 +494,23 @@ std::vector<Weight *> Manager::requestWeights(
         dim_v.getDataType() == ml::train::TensorDim::DataType::QS4CX &&
         !enable_fsu && nntr_env_on("NNTR_QS4CX_HEAP_BYPASS");
 #else
-      const bool qs4cx_heap_bypass = false;
+      // [Tegra] Same mechanism, MoE EXPERT payloads only (name ":expert_").
+      // Dense QS4CX payloads are read ON DEVICE through the pinned-mapped
+      // pool (prewarm repack et al.), so they must stay pool-resident; the
+      // experts are consumed solely through the device slab built at
+      // prepareMoeG3(), which then drops these heap pages in place --
+      // keeping 15 GiB of nibbles out of the pinned arena entirely.
+      // Default ON. NNTR_QS4CX_HEAP_EXPERTS=0 restores pool residency, and
+      // is REQUIRED alongside NNTR_MOE_WDEV=0: with no slab the classic
+      // arms device-read the payload, and heap is not device-accessible.
+      static const bool heap_experts = []() {
+        const char *ev = std::getenv("NNTR_QS4CX_HEAP_EXPERTS");
+        return !(ev && ev[0] == '0');
+      }();
+      const bool qs4cx_heap_bypass =
+        heap_experts && !enable_fsu &&
+        dim_v.getDataType() == ml::train::TensorDim::DataType::QS4CX &&
+        name.find(":expert_") != std::string::npos;
 #endif
       if (qs4cx_heap_bypass) {
         // Real exec_order (graph bookkeeping like getMinMaxTensorExecutionOrder

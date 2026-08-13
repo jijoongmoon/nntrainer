@@ -38,6 +38,11 @@
 #endif
 #include <node_exporter.h>
 #include <qwen_moe_layer.h>
+#if defined(__linux__)
+#include <cstdint>
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 #include <stdexcept>
 #include <thread_manager.h>
 
@@ -689,6 +694,9 @@ bool MoELayer::ensureMoeG3Tables(nntrainer::RunLayerContext &context,
       return e == nullptr || e[0] != '0';
     }();
     bool slab0 = false, slab1 = false, slab2 = false;
+    // Originals captured before to_dev repoints the table: after the slabs
+    // and repack land, these (heap-bypassed on Tegra) pages are dropped.
+    std::vector<const unsigned char *> orig_wptr(moe_wptr, moe_wptr + 3 * E);
     if (ok && wdev) {
       auto to_dev = [&](unsigned int base, unsigned int Nn,
                         unsigned int Kk) -> bool {
@@ -783,6 +791,41 @@ bool MoELayer::ensureMoeG3Tables(nntrainer::RunLayerContext &context,
       }
       moe_g3_ok = true;
       moe_m4_ok = m4ok;
+#if defined(__linux__)
+      // The slabs are now the only live copy of the expert payloads: drop the
+      // originals' pages in place (madvise keeps the pointers valid for the
+      // pointer-keyed tables). On heap-bypassed payloads (Tegra default,
+      // NNTR_QS4CX_HEAP_EXPERTS) this reclaims ~15 GiB of RSS; on
+      // pool-resident payloads madvise fails EINVAL per range and this whole
+      // block is a no-op. Only slabbed projections are dropped.
+      {
+        auto drop_pages = [](const void *p, size_t bytes) -> size_t {
+          static const uintptr_t ps = (uintptr_t)sysconf(_SC_PAGESIZE);
+          const uintptr_t b = ((uintptr_t)p + ps - 1) & ~(ps - 1);
+          const uintptr_t en = ((uintptr_t)p + bytes) & ~(ps - 1);
+          if (en <= b)
+            return 0;
+          if (madvise((void *)b, en - b, MADV_DONTNEED) != 0)
+            return 0;
+          return (size_t)(en - b);
+        };
+        size_t dropped = 0;
+        const bool sl[3] = {slab0, slab1, slab2};
+        const unsigned int nn[3] = {I, I, hidden_size};
+        const unsigned int kk[3] = {hidden_size, hidden_size, I};
+        for (int pj = 0; pj < 3; ++pj) {
+          if (!sl[pj])
+            continue;
+          const size_t bytes = (size_t)nn[pj] * (kk[pj] >> 1) + 4u * nn[pj];
+          for (unsigned int e = 0; e < E; ++e)
+            dropped += drop_pages(orig_wptr[(size_t)pj * E + e], bytes);
+        }
+        if (dropped)
+          ml_logi("[MoE] dropped %.2f GiB of expert payload originals "
+                  "(device slabs are the live copy)",
+                  (double)dropped / (double)(1u << 30));
+      }
+#endif
     }
     if (!ok)
       ml_logw("[MoE][G3] preflight failed (alignment/alloc); staying on the "
