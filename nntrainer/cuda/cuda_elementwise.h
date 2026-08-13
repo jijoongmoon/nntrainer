@@ -42,6 +42,25 @@ bool cuda_sigmoid_add_fp16(const unsigned short *gate,
 bool cuda_add_fp16(const unsigned short *a, const unsigned short *b,
                    unsigned short *out, unsigned int n);
 
+/**
+ * @brief Pending residual-add side channel (NNTR_ADD_FUSE, default on).
+ *
+ * cuda_add_fp16 defers its launch by one backend call: the record is either
+ * consumed by the rmsnorm+quant entry (which fuses the add into its own
+ * pass-1 and writes BOTH the residual and the normed outputs -- the graph's
+ * add->norm pairs), or flushed as the plain add kernel by the very next
+ * dispatch/cuBLAS/finish entry. Ordering is therefore preserved exactly for
+ * every reader; the only change is which kernel performs the add.
+ *
+ * cuda_add_pending_take: if a pending add's OUT matches @p out with @p n
+ * elements, hand its inputs to the caller (who becomes responsible for
+ * writing out = a + b) and clear the record. cuda_add_flush_pending: launch
+ * any pending add now; safe to call re-entrantly (clears before launching).
+ */
+bool cuda_add_pending_take(const void *out, unsigned long long n,
+                           const unsigned short **a, const unsigned short **b);
+void cuda_add_flush_pending();
+
 /** @brief out[i] = a[i] * b[i] (same-shape eltwise multiply; bit-identical
  *  to the host loop -- fp16 products are exact in fp32) */
 bool cuda_mul_fp16(const unsigned short *a, const unsigned short *b,

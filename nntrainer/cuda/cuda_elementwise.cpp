@@ -17,6 +17,7 @@
 
 #include <nntrainer_log.h>
 
+#include <cstdlib>
 #include <cuda_runtime.h>
 
 namespace nntrainer::cuda {
@@ -549,10 +550,32 @@ bool cuda_sigmoid_add_fp16(const unsigned short *gate,
   return dispatch1d(k, n);
 }
 
-bool cuda_add_fp16(const unsigned short *a, const unsigned short *b,
-                   unsigned short *out, unsigned int n) {
-  if (n == 0)
-    return true;
+// The one-deep pending-add record (see the header). Single-slot on purpose:
+// pending is created at cuda_add_fp16 and resolved by the very next backend
+// entry, so two live records cannot exist. The dispatch path is single-
+// threaded (one stream, one graph walker); no lock, same as the staged-quant
+// record in cuda_fc_qint4.cpp.
+namespace {
+struct PendingAdd {
+  const unsigned short *a = nullptr;
+  const unsigned short *b = nullptr;
+  unsigned short *out = nullptr;
+  unsigned int n = 0;
+  bool valid = false;
+};
+PendingAdd g_pend_add;
+
+bool add_fuse_on() {
+  static const bool v = []() {
+    const char *e = std::getenv("NNTR_ADD_FUSE");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  return v;
+}
+
+// The immediate launch (also the flush body). Never touches g_pend_add.
+bool add_launch_now(const unsigned short *a, const unsigned short *b,
+                    unsigned short *out, unsigned int n) {
   const bool v8 = ew_v8_ok(n, a, b, out);
   auto k = CudaContext::Global().registerCudaKernel(
     ELTWISE_SRC, v8 ? "add_fp16_v8" : "add_fp16");
@@ -566,6 +589,43 @@ bool cuda_add_fp16(const unsigned short *a, const unsigned short *b,
   k->SetKernelArguments(2, &out, sizeof(out));
   k->SetKernelArguments(3, &ni, sizeof(ni));
   return dispatch1d(k, (unsigned int)ni);
+}
+} // namespace
+
+void cuda_add_flush_pending() {
+  if (!g_pend_add.valid)
+    return;
+  // Clear BEFORE launching: the launch re-enters DispatchCommand, whose
+  // entry hook calls back into this function.
+  PendingAdd p = g_pend_add;
+  g_pend_add.valid = false;
+  if (!add_launch_now(p.a, p.b, p.out, p.n))
+    ml_loge("[CUDA] pending add flush FAILED (out=%p n=%u)", (void *)p.out,
+            p.n);
+}
+
+bool cuda_add_pending_take(const void *out, unsigned long long n,
+                           const unsigned short **a,
+                           const unsigned short **b) {
+  if (!g_pend_add.valid || g_pend_add.out != out ||
+      (unsigned long long)g_pend_add.n != n)
+    return false;
+  *a = g_pend_add.a;
+  *b = g_pend_add.b;
+  g_pend_add.valid = false;
+  return true;
+}
+
+bool cuda_add_fp16(const unsigned short *a, const unsigned short *b,
+                   unsigned short *out, unsigned int n) {
+  if (n == 0)
+    return true;
+  cuda_add_flush_pending(); // never stack two records
+  if (add_fuse_on() && ew_v8_ok(n, a, b, out)) {
+    g_pend_add = {a, b, out, n, true};
+    return true;
+  }
+  return add_launch_now(a, b, out, n);
 }
 
 bool cuda_mul_fp16(const unsigned short *a, const unsigned short *b,

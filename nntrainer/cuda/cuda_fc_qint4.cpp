@@ -17,6 +17,7 @@
 #include <cuda_blas_manager.h>
 #include <cuda_context.h>
 #include <cuda_context_manager.h>
+#include <cuda_elementwise.h> // cuda_add_pending_take / cuda_add_fp16
 #include <cuda_stream_manager.h>
 
 #include <nntrainer_log.h>
@@ -500,6 +501,189 @@ __global__ void rmsnorm_quant_i8_h_v4p(const unsigned short *x,
     int q1 = max(-128, min(127, (int)rintf(r.y * scale_q) + zp));
     int q2 = max(-128, min(127, (int)rintf(r.z * scale_q) + zp));
     int q3 = max(-128, min(127, (int)rintf(r.w * scale_q) + zp));
+    q32[i] = (q0 & 0xFF) | ((q1 & 0xFF) << 8) | ((q2 & 0xFF) << 16) |
+             ((q3 & 0xFF) << 24);
+  }
+}
+
+// Residual add fused into the norm+quant pair (the graph's add->norm pairs:
+// decoder_add->ffn_norm and decoder_output->next attention_norm). Pass 1
+// performs the add with cuda_add_fp16's exact arithmetic -- r = f2h(h2f(a)+
+// h2f(b)) -- writes the residual plane R (its later consumers read it
+// unchanged), and accumulates the sum of squares over the ROUNDED r, which
+// is byte-for-byte what the split flow's norm reads back from R. Passes 2/3
+// are rmsnorm_quant_i8_h_v4p's, re-reading the L1-hot R instead of a cold
+// DRAM plane. BIT-IDENTICAL to add_fp16_v8 + rmsnorm_quant_i8_h_v4p.
+__global__ void add_rmsnorm_quant_i8_h_v4p(
+  const unsigned short *xa, const unsigned short *xb,
+  const unsigned short *gamma, unsigned short *r, unsigned short *y,
+  signed char *q8, float *ascale, int *azp, int M, int K, float eps,
+  int has_gamma) {
+  int m = blockIdx.x;
+  if (m >= M)
+    return;
+  const uint2 *av = (const uint2 *)(xa + (long)m * K);
+  const uint2 *bv = (const uint2 *)(xb + (long)m * K);
+  const uint2 *gv = (const uint2 *)gamma;
+  uint2 *rv = (uint2 *)(r + (long)m * K);
+  uint2 *yv = (uint2 *)(y + (long)m * K);
+  int *q32 = (int *)(q8 + (long)m * K);
+  const int nv = K >> 2;
+  __shared__ float ssq[32];
+  __shared__ float smn[32];
+  __shared__ float smx[32];
+  float p = 0.f;
+  for (int i = threadIdx.x; i < nv; i += blockDim.x) {
+    const uint2 ra = av[i];
+    const uint2 rb = bv[i];
+    const unsigned short h0 =
+      vq_f2h(vq_h2f((unsigned short)(ra.x & 0xFFFFu)) +
+             vq_h2f((unsigned short)(rb.x & 0xFFFFu)));
+    const unsigned short h1 = vq_f2h(vq_h2f((unsigned short)(ra.x >> 16)) +
+                                     vq_h2f((unsigned short)(rb.x >> 16)));
+    const unsigned short h2 =
+      vq_f2h(vq_h2f((unsigned short)(ra.y & 0xFFFFu)) +
+             vq_h2f((unsigned short)(rb.y & 0xFFFFu)));
+    const unsigned short h3 = vq_f2h(vq_h2f((unsigned short)(ra.y >> 16)) +
+                                     vq_h2f((unsigned short)(rb.y >> 16)));
+    uint2 o;
+    o.x = (unsigned int)h0 | ((unsigned int)h1 << 16);
+    o.y = (unsigned int)h2 | ((unsigned int)h3 << 16);
+    rv[i] = o;
+    const float f0 = vq_h2f(h0), f1 = vq_h2f(h1);
+    const float f2 = vq_h2f(h2), f3 = vq_h2f(h3);
+    p += f0 * f0 + f1 * f1 + f2 * f2 + f3 * f3;
+  }
+  VQ_REDUCE(ssq, p, vq_add, 0.f);
+  const float inv = rsqrtf(ssq[0] / (float)K + eps);
+
+  float lmn = 0.f, lmx = 0.f;
+  for (int i = threadIdx.x; i < nv; i += blockDim.x) {
+    float4 f = vq_load4(rv[i]);
+    float4 g = make_float4(1.f, 1.f, 1.f, 1.f);
+    if (has_gamma == 1)
+      g = vq_load4(gv[i]);
+    else if (has_gamma == 2)
+      g = vq_gather4(gamma + 4 * i);
+    unsigned short h0 = vq_f2h(f.x * inv * g.x), h1 = vq_f2h(f.y * inv * g.y);
+    unsigned short h2 = vq_f2h(f.z * inv * g.z), h3 = vq_f2h(f.w * inv * g.w);
+    uint2 o;
+    o.x = (unsigned int)h0 | ((unsigned int)h1 << 16);
+    o.y = (unsigned int)h2 | ((unsigned int)h3 << 16);
+    yv[i] = o;
+    float4 rr = make_float4(vq_h2f(h0), vq_h2f(h1), vq_h2f(h2), vq_h2f(h3));
+    lmn = fminf(lmn, fminf(fminf(rr.x, rr.y), fminf(rr.z, rr.w)));
+    lmx = fmaxf(lmx, fmaxf(fmaxf(rr.x, rr.y), fmaxf(rr.z, rr.w)));
+  }
+  VQ_REDUCE(smn, lmn, fminf, VQ_POSINF);
+  VQ_REDUCE(smx, lmx, fmaxf, VQ_NEGINF);
+  float scale_q, recip;
+  int zp;
+  asym_qparams(smn[0], smx[0], scale_q, recip, zp);
+  if (threadIdx.x == 0) {
+    ascale[m] = recip;
+    azp[m] = zp;
+  }
+  for (int i = threadIdx.x; i < nv; i += blockDim.x) {
+    float4 rr = vq_load4(yv[i]);
+    int q0 = max(-128, min(127, (int)rintf(rr.x * scale_q) + zp));
+    int q1 = max(-128, min(127, (int)rintf(rr.y * scale_q) + zp));
+    int q2 = max(-128, min(127, (int)rintf(rr.z * scale_q) + zp));
+    int q3 = max(-128, min(127, (int)rintf(rr.w * scale_q) + zp));
+    q32[i] = (q0 & 0xFF) | ((q1 & 0xFF) << 8) | ((q2 & 0xFF) << 16) |
+             ((q3 & 0xFF) << 24);
+  }
+}
+
+// Decode-shaped fused twin (the rows<=32 v4 form with the register carry;
+// merges the decode add+norm+quant three-launch chain into one launch).
+// BIT-IDENTICAL to add_fp16_v8 + rmsnorm_quant_i8_h_v4 for the same reasons
+// as the v4p form above.
+__global__ void add_rmsnorm_quant_i8_h_v4(
+  const unsigned short *xa, const unsigned short *xb,
+  const unsigned short *gamma, unsigned short *r, unsigned short *y,
+  signed char *q8, float *ascale, int *azp, int M, int K, float eps,
+  int has_gamma) {
+  int m = blockIdx.x;
+  if (m >= M)
+    return;
+  const uint2 *av = (const uint2 *)(xa + (long)m * K);
+  const uint2 *bv = (const uint2 *)(xb + (long)m * K);
+  const uint2 *gv = (const uint2 *)gamma;
+  uint2 *rv = (uint2 *)(r + (long)m * K);
+  uint2 *yv = (uint2 *)(y + (long)m * K);
+  int *q32 = (int *)(q8 + (long)m * K);
+  const int nv = K >> 2;
+  __shared__ float ssq[32];
+  __shared__ float smn[32];
+  __shared__ float smx[32];
+  float4 carry[VQ_NCARRY];
+  int nc = 0;
+  float p = 0.f;
+  for (int i = threadIdx.x; i < nv; i += blockDim.x) {
+    const uint2 ra = av[i];
+    const uint2 rb = bv[i];
+    const unsigned short h0 =
+      vq_f2h(vq_h2f((unsigned short)(ra.x & 0xFFFFu)) +
+             vq_h2f((unsigned short)(rb.x & 0xFFFFu)));
+    const unsigned short h1 = vq_f2h(vq_h2f((unsigned short)(ra.x >> 16)) +
+                                     vq_h2f((unsigned short)(rb.x >> 16)));
+    const unsigned short h2 =
+      vq_f2h(vq_h2f((unsigned short)(ra.y & 0xFFFFu)) +
+             vq_h2f((unsigned short)(rb.y & 0xFFFFu)));
+    const unsigned short h3 = vq_f2h(vq_h2f((unsigned short)(ra.y >> 16)) +
+                                     vq_h2f((unsigned short)(rb.y >> 16)));
+    uint2 o;
+    o.x = (unsigned int)h0 | ((unsigned int)h1 << 16);
+    o.y = (unsigned int)h2 | ((unsigned int)h3 << 16);
+    rv[i] = o;
+    const float4 f =
+      make_float4(vq_h2f(h0), vq_h2f(h1), vq_h2f(h2), vq_h2f(h3));
+    if (nc < VQ_NCARRY)
+      carry[nc++] = f;
+    p += f.x * f.x + f.y * f.y + f.z * f.z + f.w * f.w;
+  }
+  VQ_REDUCE(ssq, p, vq_add, 0.f);
+  const float inv = rsqrtf(ssq[0] / (float)K + eps);
+
+  float lmn = 0.f, lmx = 0.f;
+  nc = 0;
+  for (int i = threadIdx.x; i < nv; i += blockDim.x) {
+    const int slot = (nc < VQ_NCARRY) ? nc++ : -1;
+    float4 f = (slot >= 0) ? carry[slot] : vq_load4(rv[i]);
+    float4 g = make_float4(1.f, 1.f, 1.f, 1.f);
+    if (has_gamma == 1)
+      g = vq_load4(gv[i]);
+    else if (has_gamma == 2)
+      g = vq_gather4(gamma + 4 * i);
+    unsigned short h0 = vq_f2h(f.x * inv * g.x), h1 = vq_f2h(f.y * inv * g.y);
+    unsigned short h2 = vq_f2h(f.z * inv * g.z), h3 = vq_f2h(f.w * inv * g.w);
+    uint2 o;
+    o.x = (unsigned int)h0 | ((unsigned int)h1 << 16);
+    o.y = (unsigned int)h2 | ((unsigned int)h3 << 16);
+    yv[i] = o;
+    float4 rr = make_float4(vq_h2f(h0), vq_h2f(h1), vq_h2f(h2), vq_h2f(h3));
+    if (slot >= 0)
+      carry[slot] = rr;
+    lmn = fminf(lmn, fminf(fminf(rr.x, rr.y), fminf(rr.z, rr.w)));
+    lmx = fmaxf(lmx, fmaxf(fmaxf(rr.x, rr.y), fmaxf(rr.z, rr.w)));
+  }
+  VQ_REDUCE(smn, lmn, fminf, VQ_POSINF);
+  VQ_REDUCE(smx, lmx, fmaxf, VQ_NEGINF);
+  float scale_q, recip;
+  int zp;
+  asym_qparams(smn[0], smx[0], scale_q, recip, zp);
+  if (threadIdx.x == 0) {
+    ascale[m] = recip;
+    azp[m] = zp;
+  }
+  nc = 0;
+  for (int i = threadIdx.x; i < nv; i += blockDim.x) {
+    float4 rr = (nc < VQ_NCARRY) ? carry[nc++] : vq_load4(yv[i]);
+    int q0 = max(-128, min(127, (int)rintf(rr.x * scale_q) + zp));
+    int q1 = max(-128, min(127, (int)rintf(rr.y * scale_q) + zp));
+    int q2 = max(-128, min(127, (int)rintf(rr.z * scale_q) + zp));
+    int q3 = max(-128, min(127, (int)rintf(rr.w * scale_q) + zp));
     q32[i] = (q0 & 0xFF) | ((q1 & 0xFF) << 8) | ((q2 & 0xFF) << 16) |
              ((q3 & 0xFF) << 24);
   }
@@ -4718,12 +4902,6 @@ bool cuda_fc_qs4cx_rmsnorm_prequant_fp16(const unsigned short *x,
   const bool okv = cuda_vec4_rows_ok(width, x, y);
   const bool vec4 = okv && cuda_vec4_rows_small(rows);
   const bool v4p = okv && !vec4 && norm_v4p_on();
-  auto k = CudaContext::Global().registerCudaKernel(
-    FC_QINT4_DP4A_SRC, vec4  ? "rmsnorm_quant_i8_h_v4"
-                       : v4p ? "rmsnorm_quant_i8_h_v4p"
-                             : "rmsnorm_quant_i8_h");
-  if (!k)
-    return false;
   std::lock_guard<std::mutex> lk(g_dp4a_mtx);
   // Sizing the quant scratch is a cudaMalloc, which is illegal mid-capture --
   // ensure_buf refuses there and we hand the row back to the plain norm. In
@@ -4732,20 +4910,53 @@ bool cuda_fc_qs4cx_rmsnorm_prequant_fp16(const unsigned short *x,
   // the steady state.
   if (!dp4a_stage_scratch(rows, width))
     return false;
+  // Pending residual-add fusion: if the plane we are about to norm is a
+  // deferred add's output, pass 1 performs the add itself (bit-identical --
+  // see add_rmsnorm_quant_i8_h_v4p). Taken only AFTER the early-return
+  // guards above so a false return cannot orphan the record. On any
+  // non-eligible corner the add is simply re-deferred: the dispatch below
+  // flushes it ahead of the norm kernel, restoring the split flow.
+  const unsigned short *fa = nullptr, *fb = nullptr;
+  bool fuse =
+    (vec4 || v4p) &&
+    cuda_add_pending_take(x, (unsigned long long)rows * width, &fa, &fb);
+  if (fuse && !cuda_vec4_rows_ok(width, fa, fb)) {
+    cuda_add_fp16(fa, fb, const_cast<unsigned short *>(x), rows * width);
+    fuse = false;
+  }
+  auto k = CudaContext::Global().registerCudaKernel(
+    FC_QINT4_DP4A_SRC, fuse   ? (vec4 ? "add_rmsnorm_quant_i8_h_v4"
+                                      : "add_rmsnorm_quant_i8_h_v4p")
+                       : vec4 ? "rmsnorm_quant_i8_h_v4"
+                       : v4p  ? "rmsnorm_quant_i8_h_v4p"
+                              : "rmsnorm_quant_i8_h");
+  if (!k) {
+    if (fuse)
+      cuda_add_fp16(fa, fb, const_cast<unsigned short *>(x), rows * width);
+    return false;
+  }
   int m = (int)rows, kk = (int)width;
   int has_gamma = (gamma == nullptr) ? 0
                   : (!(vec4 || v4p) || cuda_vec4_rows_ok(4, gamma)) ? 1
                                                                     : 2;
-  k->SetKernelArguments(0, &x, sizeof(x));
-  k->SetKernelArguments(1, &gamma, sizeof(gamma));
-  k->SetKernelArguments(2, &y, sizeof(y));
-  k->SetKernelArguments(3, &g_dp4a_q8, sizeof(g_dp4a_q8));
-  k->SetKernelArguments(4, &g_dp4a_ascale, sizeof(g_dp4a_ascale));
-  k->SetKernelArguments(5, &g_dp4a_azp, sizeof(g_dp4a_azp));
-  k->SetKernelArguments(6, &m, sizeof(m));
-  k->SetKernelArguments(7, &kk, sizeof(kk));
-  k->SetKernelArguments(8, &eps, sizeof(eps));
-  k->SetKernelArguments(9, &has_gamma, sizeof(has_gamma));
+  int ai = 0;
+  if (fuse) {
+    k->SetKernelArguments(ai++, &fa, sizeof(fa));
+    k->SetKernelArguments(ai++, &fb, sizeof(fb));
+    k->SetKernelArguments(ai++, &gamma, sizeof(gamma));
+    k->SetKernelArguments(ai++, &x, sizeof(x)); // r: the residual plane
+  } else {
+    k->SetKernelArguments(ai++, &x, sizeof(x));
+    k->SetKernelArguments(ai++, &gamma, sizeof(gamma));
+  }
+  k->SetKernelArguments(ai++, &y, sizeof(y));
+  k->SetKernelArguments(ai++, &g_dp4a_q8, sizeof(g_dp4a_q8));
+  k->SetKernelArguments(ai++, &g_dp4a_ascale, sizeof(g_dp4a_ascale));
+  k->SetKernelArguments(ai++, &g_dp4a_azp, sizeof(g_dp4a_azp));
+  k->SetKernelArguments(ai++, &m, sizeof(m));
+  k->SetKernelArguments(ai++, &kk, sizeof(kk));
+  k->SetKernelArguments(ai++, &eps, sizeof(eps));
+  k->SetKernelArguments(ai++, &has_gamma, sizeof(has_gamma));
   const int block[3] = {vec4 ? 512 : 256, 1, 1};
   const int grid[3] = {(int)rows, 1, 1};
   if (!StreamManager::Global().DispatchCommand(*k, grid, block))

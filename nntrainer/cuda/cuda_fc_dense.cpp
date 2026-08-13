@@ -28,6 +28,9 @@
 
 namespace nntrainer::cuda {
 
+// From cuda_elementwise.cpp: resolve any deferred residual add first.
+void cuda_add_flush_pending();
+
 namespace {
 
 /** NNTR_FC_CUDA_DENSE=0 opts the whole dense device arm out (the caller then
@@ -105,6 +108,7 @@ bool gemm_ex(int M, int N, int K, const void *A, cudaDataType a_type,
   const size_t c_elem = (c_type == CUDA_R_16F) ? 2u : 4u;
   // kprof bracket covers the whole M-chunk loop = one logical GEMM (the
   // failure return precedes a dead context; its dropped pair is irrelevant).
+  cuda_add_flush_pending(); // cuBLAS bypasses DispatchCommand's hook
   void *kp = kprof_begin();
   for (int m0 = 0; m0 < M; m0 += mchunk) {
     const int mc = (M - m0 < mchunk) ? (M - m0) : mchunk;
