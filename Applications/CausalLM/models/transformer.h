@@ -302,6 +302,15 @@ protected:
   virtual unsigned int getLayerSlidingWindow(int layer_id) const;
 
   /**
+   * @brief Whether decoder block layer_id has an attention KV cache at all.
+   *        Layers that never create KV placeholders (e.g. GDN
+   *        linear-attention blocks) should return false so
+   *        allocateAndBindKVCache can size them as a 1-row stub instead of
+   *        max_seq_len rows; the bind loop already skips them.
+   */
+  virtual bool layerHasKVCache(int) const { return true; }
+
+  /**
    * @brief Per-layer physical KV row capacity for
    *        KVCacheManager::setLayerCaps(). caps[i] = Wcap for a ringed sliding
    *        layer, 0 for "keep the full max_seq". Emits a one-time

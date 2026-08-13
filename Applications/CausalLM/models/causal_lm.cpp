@@ -317,6 +317,14 @@ void CausalLM::allocateAndBindKVCache() {
     // getLayerSlidingWindow() hook that shapes the KV placeholders in
     // createKVCachePlaceholders(), so the bind below cannot mismatch.
     kv_ring_caps_ = computeKVRingCaps(max_timestep);
+    // Layers with no attention KV at all (layerHasKVCache false; the GDN
+    // linear-attention blocks here) never create placeholders and never
+    // bind, so give them a 1-row stub instead of a max_seq_len-row cache.
+    if (kv_ring_caps_.size() < (size_t)NUM_LAYERS)
+      kv_ring_caps_.resize((size_t)NUM_LAYERS, 0);
+    for (unsigned int i = 0; i < (unsigned int)NUM_LAYERS; ++i)
+      if (!layerHasKVCache((int)i))
+        kv_ring_caps_[i] = 1;
     kv_cache.setLayerCaps(kv_ring_caps_);
 
     kv_cache.allocate(static_cast<unsigned int>(NUM_LAYERS), BATCH_SIZE,
@@ -1080,6 +1088,14 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     std::vector<std::pair<std::string, float *>> cache_inputs;
     cache_inputs.reserve(static_cast<size_t>(NUM_LAYERS) * 2);
     for (int i = 0; i < NUM_LAYERS; ++i) {
+      // Layers without KV placeholders (layerHasKVCache false, e.g. GDN
+      // blocks) declare no cache_k/v_l<i> graph inputs; their caches are
+      // 1-row stubs whose dims would fail validateInput if fed here. The
+      // feed below is positional against getInputDimension(), which only
+      // ever worked because every entry had identical dims -- the real
+      // per-name binding is setExternalTensors in allocateAndBindKVCache.
+      if (!layerHasKVCache(i))
+        continue;
       cache_inputs.emplace_back(
         "cache_k_l" + std::to_string(i),
         reinterpret_cast<float *>(kv_cache.getKeyCache(i).getData()));

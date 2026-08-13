@@ -64,6 +64,15 @@ public:
    */
   unsigned int getLayerSlidingWindow(int) const override { return UINT_MAX; }
 
+  /** Only the full_attention layers (10 of 40 here) ever create and bind KV
+   *  placeholders; the 30 GDN layers were still allocating max_seq_len-row
+   *  caches (1.41 GiB device) that nothing ever bound or touched. */
+  bool layerHasKVCache(int layer_id) const override {
+    if (layer_id < 0 || (size_t)layer_id >= LAYER_TYPES.size())
+      return true;
+    return LAYER_TYPES[layer_id] == "full_attention";
+  }
+
 private:
   std::vector<std::string> LAYER_TYPES; /**< per-layer "linear_attention"/"full_attention" */
   unsigned int N_EXPERTS;
