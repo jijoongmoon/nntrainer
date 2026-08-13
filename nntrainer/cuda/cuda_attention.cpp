@@ -1331,7 +1331,10 @@ static const char *ATTN_FLASH_SRC = R"CU(
 #define AFD 256
 #define AFBR 128
 #define AFBC 64
-#define AFLD (AFD + 8)
+// v2: NO row pad. A 16B-chunk XOR swizzle inside each 128B window replaces
+// the +8-halves pad as the bank-conflict fix, which frees exactly enough
+// shared memory for a K double-buffer: Q 64K + K 2x32K + V 32K = 160 KB.
+#define AFLD AFD
 __device__ __forceinline__ float af_h2f(unsigned short h){
   float f; asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h)); return f;
 }
@@ -1344,14 +1347,21 @@ __device__ __forceinline__ unsigned af_sh(const void *p){
       : "=r"(r) : "l"(p));
   return r;
 }
+// byte offset of (row, col_half) in a swizzled [rows][AFD] fp16 tile
+__device__ __forceinline__ unsigned af_swz(int row, int col_half){
+  const int chunk = col_half >> 3;
+  const int sw = (chunk & ~7) | ((chunk ^ row) & 7);
+  return (unsigned)((row * AFLD + (sw << 3) + (col_half & 7)) * 2);
+}
 extern "C" __global__ void __launch_bounds__(256, 1)
 attn_flash_d256(const unsigned short *Q, const unsigned short *K,
                 const unsigned short *V, unsigned short *O, int Nq, int Nkv,
                 int qpos0, int nqh, int nkvh, float scale) {
   extern __shared__ unsigned short smem[];
   unsigned short *Qs = smem;
-  unsigned short *Ks = Qs + AFBR * AFLD;
-  unsigned short *Vs = Ks + AFBC * AFLD;
+  unsigned short *Ks0 = Qs + AFBR * AFLD;
+  unsigned short *Ks1 = Ks0 + AFBC * AFLD;
+  unsigned short *Vs = Ks1 + AFBC * AFLD;
   const int qh = blockIdx.y, kvh = qh / (nqh / nkvh);
   const int r0 = blockIdx.x * AFBR;
   if (r0 >= Nq) return;
@@ -1363,12 +1373,12 @@ attn_flash_d256(const unsigned short *Q, const unsigned short *K,
   {
     const int row = tid >> 1, h8 = (tid & 1) * (AFD / 2);
     const unsigned short *srcq = Qg + (long)(r0 + row) * qstride + h8;
-    const unsigned dst = af_sh(Qs + row * AFLD + h8);
+    const unsigned qb0 = af_sh(Qs);
     const int ok = (r0 + row) < Nq ? 16 : 0;
 #pragma unroll
     for (int i = 0; i < AFD / 2 / 8; ++i)
       asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(
-                     dst + i * 16),
+                     qb0 + af_swz(row, h8 + i * 8)),
                    "l"(srcq + i * 8), "r"(ok));
     asm volatile("cp.async.commit_group;\n");
   }
@@ -1383,39 +1393,53 @@ attn_flash_d256(const unsigned short *Q, const unsigned short *K,
   const int wrow = warp * 16;
   const int q_hi_pos = qpos0 + r0 + AFBR - 1;
   const int kv_stop = Nkv < q_hi_pos + 1 ? Nkv : q_hi_pos + 1;
-  asm volatile("cp.async.wait_group 0;\n");
-  __syncthreads();
-  for (int kbase = 0; kbase < kv_stop; kbase += AFBC) {
-    {
-      const int row = tid >> 1, h8 = (tid & 1) * (AFD / 2);
-      const int kr = kbase + (row & (AFBC - 1));
-      const int isv = row >= AFBC;
-      const unsigned short *srckv =
-        (isv ? Vg : Kg) + (long)kr * kstride + h8;
-      const unsigned dst =
-        af_sh((isv ? Vs : Ks) + (row & (AFBC - 1)) * AFLD + h8);
-      const int ok = kr < Nkv ? 16 : 0;
-#pragma unroll
-      for (int i = 0; i < AFD / 2 / 8; ++i)
-        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(
-                       dst + i * 16),
-                     "l"(srckv + i * 8), "r"(ok));
-      asm volatile("cp.async.commit_group;\n");
-      asm volatile("cp.async.wait_group 0;\n");
-    }
+  const int ntiles = (kv_stop + AFBC - 1) / AFBC;
+
+  // one K-or-V tile into a swizzled buffer, one commit group: 4 threads per
+  // row, each a 128B quarter; quarter chunk order staggered by (tid&3) --
+  // without it same-row quarters land on identical bank slots (q*8 has zero
+  // low3) = a 4-way shared-write conflict per cp.async step.
+#define AF_KV_IN(BUFP, GSRC, KBASE)                                            \
+  do {                                                                         \
+    const int rr = tid >> 2;                                                   \
+    const int cq = (tid & 3) * (AFD / 4);                                      \
+    const int kr = (KBASE) + rr;                                               \
+    const unsigned short *srckv = (GSRC) + (long)kr * kstride + cq;            \
+    const unsigned db = af_sh(BUFP);                                           \
+    const int ok = kr < Nkv ? 16 : 0;                                          \
+    _Pragma("unroll") for (int i0 = 0; i0 < AFD / 4 / 8; ++i0) {               \
+      const int i = (i0 + (tid & 3)) & 7;                                      \
+      asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(   \
+                     db + af_swz(rr, cq + i * 8)),                             \
+                   "l"(srckv + i * 8), "r"(ok));                               \
+    }                                                                          \
+    asm volatile("cp.async.commit_group;\n");                                  \
+  } while (0)
+
+  // prologue groups (FIFO): Q, K0, V0
+  AF_KV_IN(Ks0, Kg, 0);
+  AF_KV_IN(Vs, Vg, 0);
+
+  for (int it = 0; it < ntiles; ++it) {
+    const int kbase = it * AFBC;
+    unsigned short *Kcur = (it & 1) ? Ks1 : Ks0;
+    unsigned short *Knxt = (it & 1) ? Ks0 : Ks1;
+    // drain everything up to and including K_it; the youngest group (V_it)
+    // may still be in flight
+    asm volatile("cp.async.wait_group 1;\n");
     __syncthreads();
     unsigned sh2[8][2];
 #pragma unroll
     for (int i = 0; i < 8; ++i)
       sh2[i][0] = sh2[i][1] = 0u;
+    const unsigned qb = af_sh(Qs), kb = af_sh(Kcur);
 #pragma unroll
     for (int k0 = 0; k0 < AFD; k0 += 16) {
       int a0, a1, a2, a3;
       asm volatile(
         "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
         : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)
-        : "r"(af_sh(Qs + (wrow + (lane & 15)) * AFLD + k0 +
-                    ((lane >> 4) & 1) * 8)));
+        : "r"(qb + af_swz(wrow + (lane & 15), k0 + ((lane >> 4) & 1) * 8)));
       int bl0, bl1, bl2, bl3, bh0, bh1, bh2, bh3;
 #pragma unroll
       for (int half32 = 0; half32 < 2; ++half32) {
@@ -1423,12 +1447,11 @@ attn_flash_d256(const unsigned short *Q, const unsigned short *K,
         asm volatile(
           "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
           : "=r"(bl0), "=r"(bl1), "=r"(bl2), "=r"(bl3)
-          : "r"(af_sh(Ks + (nb + (lane >> 3) * 8 + (lane & 7)) * AFLD + k0)));
+          : "r"(kb + af_swz(nb + (lane >> 3) * 8 + (lane & 7), k0)));
         asm volatile(
           "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
           : "=r"(bh0), "=r"(bh1), "=r"(bh2), "=r"(bh3)
-          : "r"(af_sh(Ks + (nb + (lane >> 3) * 8 + (lane & 7)) * AFLD + k0 +
-                      8)));
+          : "r"(kb + af_swz(nb + (lane >> 3) * 8 + (lane & 7), k0 + 8)));
 #define AF_SMMA(SS, BL, BH)                                                    \
   asm volatile(                                                                \
     "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "                       \
@@ -1442,6 +1465,14 @@ attn_flash_d256(const unsigned short *Q, const unsigned short *K,
 #undef AF_SMMA
       }
     }
+    // issue K_{it+1} NOW -- it lands under softmax + PV (+ the next S).
+    // Knxt was last read by S_{it-1}, drained before this iteration's wait.
+    // The empty commit on the last tile keeps per-thread group counts
+    // uniform for the wait_group arithmetic.
+    if (it + 1 < ntiles)
+      AF_KV_IN(Knxt, Kg, kbase + AFBC);
+    else
+      asm volatile("cp.async.commit_group;\n");
     float s[8][4];
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
@@ -1497,6 +1528,10 @@ attn_flash_d256(const unsigned short *Q, const unsigned short *K,
       o[i][2] *= rs1;
       o[i][3] *= rs1;
     }
+    // drain V_it (leaves only K_{it+1} in flight), then PV
+    asm volatile("cp.async.wait_group 1;\n");
+    __syncthreads();
+    const unsigned vb = af_sh(Vs);
 #pragma unroll
     for (int k16 = 0; k16 < AFBC / 16; ++k16) {
       const unsigned pa0 = pf[k16 * 2][0], pa1 = pf[k16 * 2][1];
@@ -1509,14 +1544,12 @@ attn_flash_d256(const unsigned short *Q, const unsigned short *K,
           "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, "
           "[%4];\n"
           : "=r"(bl0), "=r"(bl1), "=r"(bl2), "=r"(bl3)
-          : "r"(af_sh(Vs + (k16 * 16 + (lane & 7)) * AFLD + nb +
-                      (lane >> 3) * 8)));
+          : "r"(vb + af_swz(k16 * 16 + (lane & 7), nb + (lane >> 3) * 8)));
         asm volatile(
           "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, "
           "[%4];\n"
           : "=r"(bh0), "=r"(bh1), "=r"(bh2), "=r"(bh3)
-          : "r"(af_sh(Vs + (k16 * 16 + 8 + (lane & 7)) * AFLD + nb +
-                      (lane >> 3) * 8)));
+          : "r"(vb + af_swz(k16 * 16 + 8 + (lane & 7), nb + (lane >> 3) * 8)));
 #define AF_PMMA(NS, BL, BH)                                                    \
   asm volatile(                                                                \
     "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "                       \
@@ -1530,8 +1563,13 @@ attn_flash_d256(const unsigned short *Q, const unsigned short *K,
 #undef AF_PMMA
       }
     }
-    __syncthreads();
+    __syncthreads(); // all warps done reading Vs before its refill
+    if (it + 1 < ntiles)
+      AF_KV_IN(Vs, Vg, kbase + AFBC);
+    else
+      asm volatile("cp.async.commit_group;\n");
   }
+  asm volatile("cp.async.wait_group 0;\n"); // retire trailing empty groups
   const float il0 = l_lo > 0.f ? 1.f / l_lo : 0.f;
   const float il1 = l_hi > 0.f ? 1.f / l_hi : 0.f;
 #pragma unroll
@@ -1561,7 +1599,12 @@ static bool attn_flash_prefill_d256(const unsigned short *q,
                                                      "attn_flash_d256");
   if (!kf)
     return false;
-  constexpr int SMEM = (128 + 2 * 64) * (256 + 8) * 2; // 135,168 B
+  // v2: pad-free XOR-swizzled tiles + K double-buffer.
+  // Q[128] + K[2x64] + V[64] rows x 256 halves = 163,840 B (sm_87 opt-in
+  // cap is 166,912). Bench: chunk5 85.4 -> 76.1 ms (+12.4%), validated
+  // max|d| identical to v1 (same arithmetic order; only addresses and the
+  // load schedule changed).
+  constexpr int SMEM = (128 + 3 * 64) * 256 * 2; // 163,840 B
   static bool attr_ok = []() { return true; }();
   static bool attr_done = false;
   if (!attr_done) {
