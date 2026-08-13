@@ -865,9 +865,14 @@ __global__ void moe_swiglu_actq_wl(const unsigned short *gate,
 __global__ void moe_swiglu_actq_w32(const unsigned short *gate,
                                     const unsigned short *up, signed char *q8,
                                     float *ascale, int *azp, const int *wl_e,
-                                    int K){
+                                    const int *wl_n, int K){
   if (wl_e[blockIdx.y] < 0) return;
   const int wid = threadIdx.x >> 5;
+  // Padding rows are dead outputs: their q8/scale feed only the down GEMM's
+  // pad output rows, which the combine's slots never reference. Skipping is
+  // therefore output-identical (real pad share ~25% of Wcap*64 rows;
+  // decode windows are live=1 -> 7 of 8 warps exit).
+  if (blockIdx.x*8 + wid >= wl_n[blockIdx.y]) return;
   const int lane = threadIdx.x & 31;
   const int m = blockIdx.y*64 + blockIdx.x*8 + wid; // gathered row
   const unsigned short *gr = gate + (long)m*K;
@@ -909,9 +914,11 @@ __global__ void moe_swiglu_actq_w32(const unsigned short *gate,
 __global__ void moe_swiglu_actq_w32_v4(const unsigned short *gate,
                                        const unsigned short *up,
                                        signed char *q8, float *ascale,
-                                       int *azp, const int *wl_e, int K){
+                                       int *azp, const int *wl_e,
+                                       const int *wl_n, int K){
   if (wl_e[blockIdx.y] < 0) return;
   const int wid = threadIdx.x >> 5;
+  if (blockIdx.x*8 + wid >= wl_n[blockIdx.y]) return; // dead pad row
   const int lane = threadIdx.x & 31;
   const int m = blockIdx.y*64 + blockIdx.x*8 + wid; // gathered row
   const uint2 *gv = (const uint2 *)(gate + (long)m*K);
@@ -2001,7 +2008,12 @@ bool cuda_moe_grouped_ffn_imma(const unsigned short *input,
     k->SetKernelArguments(3, &g_sb, PS);
     k->SetKernelArguments(4, &g_zb, PS);
     k->SetKernelArguments(5, &p.wl_e, PS);
-    k->SetKernelArguments(6, &iI, sizeof(int));
+    if (w32) { // both w32 arms take wl_n for the dead-pad-row skip
+      k->SetKernelArguments(6, &p.wl_n, PS);
+      k->SetKernelArguments(7, &iI, sizeof(int));
+    } else {
+      k->SetKernelArguments(6, &iI, sizeof(int));
+    }
     const int g[3] = {w32 ? 8 : 64, (int)Wcap, 1}, b[3] = {256, 1, 1};
     if (!sm.DispatchCommand(*k, g, b))
       return false;
