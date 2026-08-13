@@ -1277,6 +1277,60 @@ __global__ void gdn_conv_prefill_h(const float *qkv, const float *wconv,
   unsigned short hh; asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hh) : "f"(sv));
   conv[idx] = hh;
 }
+// Halo-tiled conv twin (phase B). The per-element kernel above re-reads each
+// qkv row KS times, and p_qkv is a PINNED pool plane on Tegra (no GPU L2), so
+// the taps cost ~4x DRAM. This one stages a (GCTT+3)-row x 512-channel fp32
+// tile ONCE in shared memory (float2 per thread = conflict-free) and taps
+// from there: read amplification drops to (GCTT+3)/GCTT. Same j-ascending
+// accumulate, same silu, same cvt -- bit-identical to the twin above.
+// Eligibility (launcher-checked): CONV % 512 == 0 and KS == 4.
+#define GCTT 13
+__global__ __launch_bounds__(256) void gdn_conv_prefill_h2(
+    const float *qkv, const float *wconv, const float *ring,
+    unsigned short *conv, int T, int CONV, int KS, int has_ring){
+  __shared__ __align__(16) float2 xs[(GCTT + 3) * 256];
+  const int c0 = blockIdx.x * 512;
+  const int t0 = blockIdx.y * GCTT;
+  const int tid = threadIdx.x;
+  const int c = c0 + 2*tid;
+  for (int r = 0; r < GCTT + 3; ++r) {
+    const int ti = t0 - 3 + r;
+    float2 v;
+    if (ti >= 0 && ti < T) {
+      v = *(const float2 *)&qkv[(long)ti*CONV + c];
+    } else if (ti < 0 && has_ring) {
+      v.x = ring[(long)c*(KS-1) + (KS-1+ti)];
+      v.y = ring[(long)(c+1)*(KS-1) + (KS-1+ti)];
+    } else {
+      v.x = 0.0f; v.y = 0.0f;
+    }
+    xs[r*256 + tid] = v;
+  }
+  __syncthreads();
+  float w0[4], w1[4];
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    w0[j] = wconv[c*KS + j];
+    w1[j] = wconv[(c+1)*KS + j];
+  }
+#pragma unroll
+  for (int i = 0; i < GCTT; ++i) {
+    const int t = t0 + i;
+    if (t >= T) break;
+    float a0 = 0.0f, a1 = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const float2 xv = xs[(i + j)*256 + tid];
+      a0 += w0[j]*xv.x;
+      a1 += w1[j]*xv.y;
+    }
+    const float s0 = gdn_silu(a0), s1 = gdn_silu(a1);
+    unsigned short h0, h1;
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h0) : "f"(s0));
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h1) : "f"(s1));
+    *(unsigned *)&conv[(long)t*CONV + c] = (unsigned)h0 | ((unsigned)h1 << 16);
+  }
+}
 __global__ void gdn_l2norm_prefill_h(unsigned short *conv, int CONV, int KEY,
                                      int NKH, int HKD, float eps){
   const int kh = blockIdx.x % NKH, t = blockIdx.x / NKH;
@@ -1648,8 +1702,17 @@ bool cuda_gdn_prefill_chunked_fp16(
     const char *e = std::getenv("NNTR_GDN_CK_TC");
     return e == nullptr || e[0] != '0'; // default ON; =0 restores fp32 SIMT
   }();
+  // Phase B: halo-tiled conv (single qkv read; the pinned plane has no GPU
+  // L2, so the naive kernel's KS-tap re-read is 4x DRAM). Bit-identical to
+  // _h; NNTR_GDN_CONV2=0 restores the per-element twin for bisects.
+  static const bool g_conv2 = []() {
+    const char *e = std::getenv("NNTR_GDN_CONV2");
+    return e == nullptr || e[0] != '0';
+  }();
+  const bool conv2 = g_ck_tc && g_conv2 && (CONV % 512 == 0) && KS == 4;
   auto kcv = ctx.registerCudaKernel(
-    GDN_SRC, g_ck_tc ? "gdn_conv_prefill_h" : "gdn_conv_prefill");
+    GDN_SRC, conv2 ? "gdn_conv_prefill_h2"
+                   : (g_ck_tc ? "gdn_conv_prefill_h" : "gdn_conv_prefill"));
   auto kln = ctx.registerCudaKernel(
     GDN_SRC, g_ck_tc ? "gdn_l2norm_prefill_h" : "gdn_l2norm_prefill");
   auto kgc = ctx.registerCudaKernel(GDN_SRC, "gdn_ck_gcum");
@@ -1721,7 +1784,10 @@ bool cuda_gdn_prefill_chunked_fp16(
     kcv->SetKernelArguments(6, &iKS, sizeof(iKS));
     kcv->SetKernelArguments(7, &has_ring, sizeof(has_ring));
     const long total = (long)T * CONV;
-    const int g[3] = {(int)((total + 255) / 256), 1, 1}, b3[3] = {256, 1, 1};
+    // GCTT=13 t-rows per CTA in the h2 kernel (keep in sync with GDN_SRC)
+    const int g[3] = {conv2 ? CONV / 512 : (int)((total + 255) / 256),
+                      conv2 ? (T + 12) / 13 : 1, 1};
+    const int b3[3] = {256, 1, 1};
     if (!sm.DispatchCommand(*kcv, g, b3))
       return false;
   }
