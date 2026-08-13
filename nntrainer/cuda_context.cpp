@@ -122,7 +122,13 @@ void CudaContext::initialize() noexcept {
     setenv("NNTR_CUDA_GEGLU", "1", 0);
     setenv("NNTR_CUDA_ELTWISE", "1", 0);
     setenv("NNTR_CUDA_QKNORM", "1", 0);
-    setenv("NNTR_CUDA_FLASH_DECODE", "64", 0);
+    // 256-key decode chunks (was 64): quarters the split-KV scratch
+    // round-trip (10.5 -> 2.6 MB/call at 20K keys) and the reduce's merge
+    // width. attn_partial 704 -> 632 us/call + attn_reduce 52 -> 18
+    // measured; still 80+ live chunks at 20K = full grid. Chunk partials
+    // merge in chunk order, so the partition is numerics-visible (ulp
+    // class) -- gated with the 2026-08-14 decode batch.
+    setenv("NNTR_CUDA_FLASH_DECODE", "256", 0);
     setenv("NNTR_CUDA_BLOCKQ", "1", 0);
     setenv("NNTR_FC_CUDA_CUBLAS", "1", 0);
     setenv("NNTR_CUDA_PREWARM", "1", 0);

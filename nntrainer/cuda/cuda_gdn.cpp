@@ -147,6 +147,120 @@ __global__ void gdn_gemv_f_h4(const float *x, const unsigned short *W,
   }
   out[n0]=f2h(a0); out[n0+1]=f2h(a1); out[n0+2]=f2h(a2); out[n0+3]=f2h(a3);
 }
+// ---- [gdn-i8w] int8-weight decode GEMV family --------------------------
+// The fp16 decode weight streams pin at ~46 GB/s in EVERY kernel form and
+// EVERY memory kind (see the 2026-08-14 residency verdict); dp4a_gemv_raw
+// proves the warp-per-row n-major stream form reaches ~115 GB/s on the same
+// pinned pool. So the decode z/out projections move to ONE-TIME int8
+// per-output-channel planes ([N,K] n-major + scale + rowsum) and a dp4a
+// warp-per-row GEMV with the standard asym-activation correction:
+//   y_n = (acc - azp * rowsum_n) * ascale * wscale_n
+// w8a8 accuracy class (16x finer weight steps than the shipped w4a8 qkv).
+
+// One-time transpose+quantize of a k-major fp16 plane. One block per output
+// channel n: pass 1 absmax over k, pass 2 quantize + integer rowsum.
+__global__ void gdn_wq_i8t(const unsigned short *Wkn, signed char *W8,
+                           float *wscl, int *wrs, int K, int N){
+  const int n = blockIdx.x;
+  if (n >= N) return;
+  __shared__ float red[256];
+  __shared__ int redi[256];
+  float amax = 0.0f;
+  for (int k = threadIdx.x; k < K; k += blockDim.x)
+    amax = fmaxf(amax, fabsf(h2f(Wkn[(long)k*N + n])));
+  red[threadIdx.x] = amax;
+  __syncthreads();
+  for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+    if (threadIdx.x < s)
+      red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s]);
+    __syncthreads();
+  }
+  const float sc = red[0] > 0.0f ? red[0] / 127.0f : 1.0f;
+  const float inv = red[0] > 0.0f ? 127.0f / red[0] : 0.0f;
+  int rs = 0;
+  for (int k = threadIdx.x; k < K; k += blockDim.x) {
+    int q = (int)rintf(h2f(Wkn[(long)k*N + n]) * inv);
+    q = max(-127, min(127, q));
+    W8[(long)n*K + k] = (signed char)q;
+    rs += q;
+  }
+  redi[threadIdx.x] = rs;
+  __syncthreads();
+  for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+    if (threadIdx.x < s)
+      redi[threadIdx.x] += redi[threadIdx.x + s];
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) { wscl[n] = sc; wrs[n] = redi[0]; }
+}
+// M=1 asym int8 row quant, fp16 or fp32 input (in_fp16 selects). Same
+// range convention as the dp4a-family asym quant (255-step, clamped zp).
+__global__ void gdn_actq_i8(const void *x, signed char *q8, float *ascale,
+                            int *azp, int K, int in_fp16){
+  __shared__ float red[256];
+  __shared__ float red2[256];
+  float lmn = 0.0f, lmx = 0.0f;
+  for (int k = threadIdx.x; k < K; k += blockDim.x) {
+    const float v = in_fp16 ? h2f(((const unsigned short *)x)[k])
+                            : ((const float *)x)[k];
+    lmn = fminf(lmn, v); lmx = fmaxf(lmx, v);
+  }
+  red[threadIdx.x] = lmn; red2[threadIdx.x] = lmx;
+  __syncthreads();
+  for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+    if (threadIdx.x < s) {
+      red[threadIdx.x] = fminf(red[threadIdx.x], red[threadIdx.x + s]);
+      red2[threadIdx.x] = fmaxf(red2[threadIdx.x], red2[threadIdx.x + s]);
+    }
+    __syncthreads();
+  }
+  const float rmin = fminf(0.0f, red[0]), rmax = fmaxf(0.0f, red2[0]);
+  const float range = rmax - rmin;
+  const float scale_q = range > 0.0f ? 255.0f / range : 1.0f;
+  const float recip = range > 0.0f ? range / 255.0f : 1.0f;
+  float zp_f;
+  {
+    const float dmin = rmin*scale_q, dmax = rmax*scale_q;
+    const float zp_lo = -128.0f - dmin, zp_hi = 127.0f - dmax;
+    zp_f = ((-128.0f + dmin) + (127.0f + dmax) > 0.0f) ? zp_lo : zp_hi;
+    zp_f = fmaxf(-128.0f, fminf(127.0f, zp_f));
+  }
+  const int zp = (int)rintf(zp_f);
+  if (threadIdx.x == 0) { ascale[0] = recip; azp[0] = zp; }
+  for (int k = threadIdx.x; k < K; k += blockDim.x) {
+    const float v = in_fp16 ? h2f(((const unsigned short *)x)[k])
+                            : ((const float *)x)[k];
+    int q = (int)rintf(v * scale_q) + zp;
+    q8[k] = (signed char)max(-128, min(127, q));
+  }
+}
+// Warp-per-output-row w8a8 GEMV (the dp4a_gemv_raw stream form minus the
+// nibble unpack): lanes stride k in 4-byte int8 quads, dp4a accumulate,
+// shfl reduce, asym-corrected fp32 (or fp16) store.
+__global__ void gdn_gemv_i8w(const signed char *q8, const signed char *W8,
+                             const float *wscl, const int *wrs,
+                             const float *ascale, const int *azp, void *Y,
+                             int K, int N, int out_fp16){
+  const int n = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  if (n >= N) return;
+  const int lane = threadIdx.x & 31;
+  const signed char *wrow = W8 + (long)n*K;
+  int acc = 0;
+  for (int k = lane * 4; k < K; k += 128) {
+    const int a = *(const int *)(q8 + k);
+    const int w = *(const int *)(wrow + k);
+    acc = __dp4a(a, w, acc);
+  }
+  for (int o = 16; o > 0; o >>= 1)
+    acc += __shfl_down_sync(0xffffffffu, acc, o);
+  if (lane == 0) {
+    const float r = (float)(acc - azp[0] * wrs[n]) * ascale[0] * wscl[n];
+    if (out_fp16)
+      ((unsigned short *)Y)[n] = f2h(r);
+    else
+      ((float *)Y)[n] = r;
+  }
+}
 // causal depthwise conv1d (persistent ring) + SiLU; advances the ring.
 __global__ void gdn_conv_ring(const float *qkv, const float *wconv,
                               float *ring, float *conv, int CONV, int KS){
@@ -2596,6 +2710,91 @@ bool cuda_gdn_decode_fp16(const unsigned short *x, const unsigned short *wqkv,
     const char *e = std::getenv("NNTR_GDN_GEMVN");
     return !(e != nullptr && e[0] == '0');
   }();
+  // [gdn-i8w] one-time int8 planes for the decode z/out weights + per-call
+  // activation quant (see the kernel-family comment). NNTR_GDN_I8W=0
+  // restores the fp16 GEMVs.
+  static const bool i8w_on = []() {
+    const char *e = std::getenv("NNTR_GDN_I8W");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  struct I8Plane { signed char *w8; float *scl; int *rs; };
+  static std::map<const void *, I8Plane> g_i8w;
+  static signed char *g_q8x = nullptr; // K-row act quant scratch (z), 4 KB cap
+  static signed char *g_q8o = nullptr; // VAL-row act quant scratch (out)
+  static float *g_as2 = nullptr;       // 2 ascale slots (z, out)
+  static int *g_az2 = nullptr;         // 2 azp slots
+  auto kwq = i8w_on ? ctx.registerCudaKernel(GDN_SRC, "gdn_wq_i8t")
+                    : decltype(kg){};
+  auto kaq = i8w_on ? ctx.registerCudaKernel(GDN_SRC, "gdn_actq_i8")
+                    : decltype(kg){};
+  auto kg8 = i8w_on ? ctx.registerCudaKernel(GDN_SRC, "gdn_gemv_i8w")
+                    : decltype(kg){};
+  auto i8plane = [&](const unsigned short *w, int K, int N) -> const I8Plane * {
+    if (!i8w_on || !kwq || sm.isCapturing())
+      return nullptr;
+    auto it = g_i8w.find(w);
+    if (it == g_i8w.end()) {
+      I8Plane p{nullptr, nullptr, nullptr};
+      if (cudaMalloc(&p.w8, (size_t)N * K) == cudaSuccess &&
+          cudaMalloc(&p.scl, (size_t)N * 4) == cudaSuccess &&
+          cudaMalloc(&p.rs, (size_t)N * 4) == cudaSuccess) {
+        kwq->SetKernelArguments(0, &w, sizeof(w));
+        kwq->SetKernelArguments(1, &p.w8, sizeof(p.w8));
+        kwq->SetKernelArguments(2, &p.scl, sizeof(p.scl));
+        kwq->SetKernelArguments(3, &p.rs, sizeof(p.rs));
+        kwq->SetKernelArguments(4, &K, sizeof(K));
+        kwq->SetKernelArguments(5, &N, sizeof(N));
+        const int gq[3] = {N, 1, 1}, bq[3] = {256, 1, 1};
+        if (!sm.DispatchCommand(*kwq, gq, bq)) {
+          cudaFree(p.w8); cudaFree(p.scl); cudaFree(p.rs);
+          p = {nullptr, nullptr, nullptr};
+        }
+      } else {
+        cudaGetLastError();
+        if (p.w8) cudaFree(p.w8);
+        if (p.scl) cudaFree(p.scl);
+        p = {nullptr, nullptr, nullptr}; // negative-cache
+      }
+      it = g_i8w.emplace(w, p).first;
+    }
+    return it->second.w8 != nullptr ? &it->second : nullptr;
+  };
+  auto gemv_i8 = [&](const I8Plane *p, const void *xin, int in_fp16,
+                     signed char *q8s, int slot, void *dst, int out_fp16,
+                     int K, int N) {
+    float *as = g_as2 + slot;
+    int *az = g_az2 + slot;
+    kaq->SetKernelArguments(0, &xin, sizeof(xin));
+    kaq->SetKernelArguments(1, &q8s, sizeof(q8s));
+    kaq->SetKernelArguments(2, &as, sizeof(as));
+    kaq->SetKernelArguments(3, &az, sizeof(az));
+    kaq->SetKernelArguments(4, &K, sizeof(K));
+    kaq->SetKernelArguments(5, &in_fp16, sizeof(in_fp16));
+    const int ga[3] = {1, 1, 1}, ba[3] = {256, 1, 1};
+    if (!sm.DispatchCommand(*kaq, ga, ba))
+      return false;
+    kg8->SetKernelArguments(0, &q8s, sizeof(q8s));
+    kg8->SetKernelArguments(1, &p->w8, sizeof(p->w8));
+    kg8->SetKernelArguments(2, &p->scl, sizeof(p->scl));
+    kg8->SetKernelArguments(3, &p->rs, sizeof(p->rs));
+    kg8->SetKernelArguments(4, &as, sizeof(as));
+    kg8->SetKernelArguments(5, &az, sizeof(az));
+    kg8->SetKernelArguments(6, &dst, sizeof(dst));
+    kg8->SetKernelArguments(7, &K, sizeof(K));
+    kg8->SetKernelArguments(8, &N, sizeof(N));
+    kg8->SetKernelArguments(9, &out_fp16, sizeof(out_fp16));
+    const int gg[3] = {(N + 7) / 8, 1, 1}, bg[3] = {256, 1, 1};
+    return sm.DispatchCommand(*kg8, gg, bg);
+  };
+  if (i8w_on && kaq && kg8 &&
+      (g_q8x != nullptr || cudaMalloc(&g_q8x, 4096) == cudaSuccess) &&
+      (g_q8o != nullptr || cudaMalloc(&g_q8o, 4096) == cudaSuccess) &&
+      (g_as2 != nullptr || cudaMalloc(&g_as2, 8) == cudaSuccess) &&
+      (g_az2 != nullptr || cudaMalloc(&g_az2, 8) == cudaSuccess)) {
+    // allocations verified; arms selected per-projection below
+  } else {
+    cudaGetLastError();
+  }
   auto kgn = gemvn_on ? ctx.registerCudaKernel(GDN_SRC, "gdn_gemv_h_f4n")
                       : decltype(kg){};
   auto gemv_h = [&](const unsigned short *W, float *dst, int K, int N) {
@@ -2625,8 +2824,14 @@ bool cuda_gdn_decode_fp16(const unsigned short *x, const unsigned short *wqkv,
   // the w4a8 int4 GEMV outside this entry, into qkv_pre) -- then wqkv is
   // unused and the fp16 qkv GEMV is skipped.
   const float *qkv_vec = qkv_pre != nullptr ? qkv_pre : g_qkv;
+  const I8Plane *pz = ((int)H % 4 == 0 && H <= 4096 && g_q8x != nullptr)
+                        ? i8plane(wz, (int)H, (int)VAL)
+                        : nullptr;
+  const bool z_ok = pz != nullptr
+                      ? gemv_i8(pz, x, 1, g_q8x, 0, g_z, 0, (int)H, (int)VAL)
+                      : gemv_h(wz, g_z, (int)H, (int)VAL);
   if ((qkv_pre == nullptr && !gemv_h(wqkv, g_qkv, (int)H, (int)CONV)) ||
-      !gemv_h(wz, g_z, (int)H, (int)VAL) ||
+      !z_ok ||
       !gemv_h(wb, g_pb, (int)H, (int)NVH) ||
       !gemv_h(wa, g_pa, (int)H, (int)NVH)) {
     fprintf(stderr, "[cuda_gdn] gemv dispatch FAILED: %s\n",
@@ -2682,17 +2887,28 @@ bool cuda_gdn_decode_fp16(const unsigned short *x, const unsigned short *wqkv,
   // device-mirrored weight the trade may reverse; re-measure then.)
   {
     int K = (int)VAL, N = (int)H;
-    auto &kk = *ko;
-    kk.SetKernelArguments(0, &g_normed, sizeof(g_normed));
-    kk.SetKernelArguments(1, &wout, sizeof(wout));
-    kk.SetKernelArguments(2, &out, sizeof(out));
-    kk.SetKernelArguments(3, &K, sizeof(K));
-    kk.SetKernelArguments(4, &N, sizeof(N));
-    const int g[3] = {((int)H + B - 1) / B, 1, 1}, b[3] = {B, 1, 1};
-    if (!sm.DispatchCommand(kk, g, b)) {
-      fprintf(stderr, "[cuda_gdn] out_proj dispatch FAILED: %s\n",
-              cudaGetErrorString(cudaGetLastError()));
-      return false;
+    const I8Plane *po = (K % 4 == 0 && K <= 4096 && g_q8o != nullptr)
+                          ? i8plane(wout, K, N)
+                          : nullptr;
+    if (po != nullptr) {
+      if (!gemv_i8(po, g_normed, 0, g_q8o, 1, out, 1, K, N)) {
+        fprintf(stderr, "[cuda_gdn] out_proj i8 dispatch FAILED: %s\n",
+                cudaGetErrorString(cudaGetLastError()));
+        return false;
+      }
+    } else {
+      auto &kk = *ko;
+      kk.SetKernelArguments(0, &g_normed, sizeof(g_normed));
+      kk.SetKernelArguments(1, &wout, sizeof(wout));
+      kk.SetKernelArguments(2, &out, sizeof(out));
+      kk.SetKernelArguments(3, &K, sizeof(K));
+      kk.SetKernelArguments(4, &N, sizeof(N));
+      const int g[3] = {((int)H + B - 1) / B, 1, 1}, b[3] = {B, 1, 1};
+      if (!sm.DispatchCommand(kk, g, b)) {
+        fprintf(stderr, "[cuda_gdn] out_proj dispatch FAILED: %s\n",
+                cudaGetErrorString(cudaGetLastError()));
+        return false;
+      }
     }
   }
   // single drain for the whole GDN step (host reads the fp16 output next)
