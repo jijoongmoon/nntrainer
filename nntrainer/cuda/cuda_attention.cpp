@@ -1348,6 +1348,14 @@ __device__ __forceinline__ float af_h2f(unsigned short h){
 __device__ __forceinline__ unsigned short af_f2h(float f){
   unsigned short h; asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(f)); return h;
 }
+// Bare MUFU.EX2 (the exp2-fold runs the whole softmax state in the log2
+// domain, so the exponential IS exp2). Explicit PTX so the instruction count
+// matches the validated bench arm regardless of NVRTC math-mode defaults;
+// ~2-ulp exp accuracy, the class FlashInfer runs and the bench validated at
+// max|d| 1.2e-4 vs an fp64 natural-exp reference.
+__device__ __forceinline__ float af_ex2(float x){
+  float r; asm("ex2.approx.f32 %0, %1;" : "=f"(r) : "f"(x)); return r;
+}
 __device__ __forceinline__ unsigned af_sh(const void *p){
   unsigned r;
   asm("{ .reg .u64 t; cvta.to.shared.u64 t, %1; cvt.u32.u64 %0, t; }"
@@ -1398,6 +1406,7 @@ attn_flash_d256(const unsigned short *Q, const unsigned short *K,
   float m_lo = -1e30f, m_hi = -1e30f, l_lo = 0.f, l_hi = 0.f;
   const int g = lane >> 2, t = lane & 3;
   const int wrow = warp * 16;
+  const float scl2 = scale * 1.44269504088896340736f; // R3: log2 domain
   const int q_hi_pos = qpos0 + r0 + AFBR - 1;
   const int kv_stop = Nkv < q_hi_pos + 1 ? Nkv : q_hi_pos + 1;
   const int ntiles = (kv_stop + AFBC - 1) / AFBC;
@@ -1495,14 +1504,29 @@ attn_flash_d256(const unsigned short *Q, const unsigned short *K,
       s[i][2] = af_h2f((unsigned short)(sh2[i][1] & 0xFFFFu));
       s[i][3] = af_h2f((unsigned short)(sh2[i][1] >> 16));
     }
-    const int qlo = qpos0 + r0 + wrow + g, qhi = qlo + 8;
+    // R2: a tile whose LAST column is causally visible to the warp's FIRST
+    // row (and inside Nkv) needs no per-value masks -- every ternary below
+    // would take its true arm, so the fast path is value-identical. Warp-
+    // uniform operands (kbase/r0/wrow), no divergence. ~95% of chunk-5
+    // tiles are full.
+    if (kbase + AFBC - 1 <= qpos0 + r0 + wrow && kbase + AFBC <= Nkv) {
 #pragma unroll
-    for (int n8 = 0; n8 < 8; ++n8) {
-      const int c = kbase + n8 * 8 + 2 * t;
-      s[n8][0] = (c <= qlo && c < Nkv) ? s[n8][0] * scale : -1e30f;
-      s[n8][1] = (c + 1 <= qlo && c + 1 < Nkv) ? s[n8][1] * scale : -1e30f;
-      s[n8][2] = (c <= qhi && c < Nkv) ? s[n8][2] * scale : -1e30f;
-      s[n8][3] = (c + 1 <= qhi && c + 1 < Nkv) ? s[n8][3] * scale : -1e30f;
+      for (int n8 = 0; n8 < 8; ++n8) {
+        s[n8][0] *= scl2;
+        s[n8][1] *= scl2;
+        s[n8][2] *= scl2;
+        s[n8][3] *= scl2;
+      }
+    } else {
+      const int qlo = qpos0 + r0 + wrow + g, qhi = qlo + 8;
+#pragma unroll
+      for (int n8 = 0; n8 < 8; ++n8) {
+        const int c = kbase + n8 * 8 + 2 * t;
+        s[n8][0] = (c <= qlo && c < Nkv) ? s[n8][0] * scl2 : -1e30f;
+        s[n8][1] = (c + 1 <= qlo && c + 1 < Nkv) ? s[n8][1] * scl2 : -1e30f;
+        s[n8][2] = (c <= qhi && c < Nkv) ? s[n8][2] * scl2 : -1e30f;
+        s[n8][3] = (c + 1 <= qhi && c + 1 < Nkv) ? s[n8][3] * scl2 : -1e30f;
+      }
     }
     float tm0 = -1e30f, tm1 = -1e30f;
 #pragma unroll
@@ -1515,13 +1539,16 @@ attn_flash_d256(const unsigned short *Q, const unsigned short *K,
     tm1 = fmaxf(tm1, __shfl_xor_sync(0xffffffffu, tm1, 1));
     tm1 = fmaxf(tm1, __shfl_xor_sync(0xffffffffu, tm1, 2));
     const float mn0 = fmaxf(m_lo, tm0), mn1 = fmaxf(m_hi, tm1);
-    const float rs0 = expf(m_lo - mn0), rs1 = expf(m_hi - mn1);
+    // R3: s/m carry log2e*scale, so the exponential is a bare EX2. p/l/o
+    // stay in linear (probability) space; the common 2^-m cancels in o/l,
+    // so the epilogue needs no correction.
+    const float rs0 = af_ex2(m_lo - mn0), rs1 = af_ex2(m_hi - mn1);
     unsigned pf[8][2];
     float tl0 = 0.f, tl1 = 0.f;
 #pragma unroll
     for (int n8 = 0; n8 < 8; ++n8) {
-      const float p00 = expf(s[n8][0] - mn0), p01 = expf(s[n8][1] - mn0);
-      const float p10 = expf(s[n8][2] - mn1), p11 = expf(s[n8][3] - mn1);
+      const float p00 = af_ex2(s[n8][0] - mn0), p01 = af_ex2(s[n8][1] - mn0);
+      const float p10 = af_ex2(s[n8][2] - mn1), p11 = af_ex2(s[n8][3] - mn1);
       tl0 += p00 + p01;
       tl1 += p10 + p11;
       pf[n8][0] = (unsigned)af_f2h(p00) | ((unsigned)af_f2h(p01) << 16);
