@@ -98,6 +98,63 @@ __global__ void moe_actq_h(const unsigned short *Xh, signed char *q8,
     q8[(long)m*K + k] = (signed char)q;
   }
 }
+// Vectorized twin of moe_actq_h (uint2 loads, warp-shuffle reduction, packed
+// int stores, quant pass re-reads the L1-hot row -- the act_quant_i8_h_v4p
+// recipe). BIT-IDENTICAL: min/max are order-independent, the conversions
+// produce the same values, and the rint/clamp is unchanged. Requires
+// K % 4 == 0 and 8-byte-aligned rows (the launcher checks).
+__global__ void moe_actq_h_v4p(const unsigned short *Xh, signed char *q8,
+                               float *ascale, int *azp, int M, int K){
+  int m = blockIdx.x;
+  if (m >= M) return;
+  const uint2 *xv = (const uint2 *)(Xh + (long)m*K);
+  int *q32 = (int *)(q8 + (long)m*K);
+  const int nv = K >> 2;
+  __shared__ float smn[32];
+  __shared__ float smx[32];
+  float lmn = 0.f, lmx = 0.f;
+  for (int i = threadIdx.x; i < nv; i += blockDim.x) {
+    const uint2 r = xv[i];
+    const float f0 = moe_h2f((unsigned short)(r.x & 0xFFFFu));
+    const float f1 = moe_h2f((unsigned short)(r.x >> 16));
+    const float f2 = moe_h2f((unsigned short)(r.y & 0xFFFFu));
+    const float f3 = moe_h2f((unsigned short)(r.y >> 16));
+    lmn = fminf(lmn, fminf(fminf(f0, f1), fminf(f2, f3)));
+    lmx = fmaxf(lmx, fmaxf(fmaxf(f0, f1), fmaxf(f2, f3)));
+  }
+  for (int o = 16; o > 0; o >>= 1) {
+    lmn = fminf(lmn, __shfl_down_sync(0xffffffffu, lmn, o));
+    lmx = fmaxf(lmx, __shfl_down_sync(0xffffffffu, lmx, o));
+  }
+  if ((threadIdx.x & 31) == 0) {
+    smn[threadIdx.x >> 5] = lmn;
+    smx[threadIdx.x >> 5] = lmx;
+  }
+  __syncthreads();
+  if (threadIdx.x < 32) {
+    const int nw = blockDim.x >> 5;
+    float a = (threadIdx.x < nw) ? smn[threadIdx.x] : __int_as_float(0x7F800000);
+    float b = (threadIdx.x < nw) ? smx[threadIdx.x] : __int_as_float((int)0xFF800000);
+    for (int o = 16; o > 0; o >>= 1) {
+      a = fminf(a, __shfl_down_sync(0xffffffffu, a, o));
+      b = fmaxf(b, __shfl_down_sync(0xffffffffu, b, o));
+    }
+    if (threadIdx.x == 0) { smn[0] = a; smx[0] = b; }
+  }
+  __syncthreads();
+  float scale_q, recip; int zp;
+  moe_asym(smn[0], smx[0], scale_q, recip, zp);
+  if (threadIdx.x == 0) { ascale[m] = recip; azp[m] = zp; }
+  for (int i = threadIdx.x; i < nv; i += blockDim.x) {
+    const uint2 r = xv[i];
+    const int q0 = max(-128, min(127, (int)rintf(moe_h2f((unsigned short)(r.x & 0xFFFFu)) * scale_q) + zp));
+    const int q1 = max(-128, min(127, (int)rintf(moe_h2f((unsigned short)(r.x >> 16)) * scale_q) + zp));
+    const int q2 = max(-128, min(127, (int)rintf(moe_h2f((unsigned short)(r.y & 0xFFFFu)) * scale_q) + zp));
+    const int q3 = max(-128, min(127, (int)rintf(moe_h2f((unsigned short)(r.y >> 16)) * scale_q) + zp));
+    q32[i] = (q0 & 0xFF) | ((q1 & 0xFF) << 8) | ((q2 & 0xFF) << 16) |
+             ((q3 & 0xFF) << 24);
+  }
+}
 
 // GROUPED dp4a GEMM. Same 64x64 register-blocked tile as dp4a_gemm_reg -- that
 // shape is already right, and was measured 1.4x FASTER than a 16x16 tile with
@@ -676,6 +733,69 @@ __global__ void moe_swiglu_actq_w32(const unsigned short *gate,
     q8[(long)m*K + k] = (signed char)q;
   }
 }
+// Vectorized twin of moe_swiglu_actq_w32: uint2 gate/up loads, the fp16
+// SwiGLU carried in registers as uint2 (same v[16] register budget), packed
+// int q8 stores. BIT-IDENTICAL: only the lane->element assignment changes
+// (vector-of-4 instead of stride-32); per-element arithmetic is unchanged
+// and the min/max reduction is order-independent. Requires K % 128 == 0
+// (so nv = K/4 splits evenly across 32 lanes) and 8-byte-aligned rows; the
+// launcher checks both and falls back to the scalar form.
+__global__ void moe_swiglu_actq_w32_v4(const unsigned short *gate,
+                                       const unsigned short *up,
+                                       signed char *q8, float *ascale,
+                                       int *azp, const int *wl_e, int K){
+  if (wl_e[blockIdx.y] < 0) return;
+  const int wid = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int m = blockIdx.y*64 + blockIdx.x*8 + wid; // gathered row
+  const uint2 *gv = (const uint2 *)(gate + (long)m*K);
+  const uint2 *uv = (const uint2 *)(up + (long)m*K);
+  int *q32 = (int *)(q8 + (long)m*K);
+  const int nv = K >> 2;
+  uint2 v[4]; // fp16 SwiGLU carry, 4 halves per slot (K<=512 at 32 lanes)
+  float lmn = 0.f, lmx = 0.f;
+  int c = 0;
+  for (int i = lane; i < nv; i += 32, ++c) {
+    const uint2 gr = gv[i];
+    const uint2 ur = uv[i];
+    const float g0 = moe_h2f((unsigned short)(gr.x & 0xFFFFu));
+    const float g1 = moe_h2f((unsigned short)(gr.x >> 16));
+    const float g2 = moe_h2f((unsigned short)(gr.y & 0xFFFFu));
+    const float g3 = moe_h2f((unsigned short)(gr.y >> 16));
+    const unsigned short h0 = moe_f2h((g0 / (1.0f + expf(-g0))) *
+                                      moe_h2f((unsigned short)(ur.x & 0xFFFFu)));
+    const unsigned short h1 = moe_f2h((g1 / (1.0f + expf(-g1))) *
+                                      moe_h2f((unsigned short)(ur.x >> 16)));
+    const unsigned short h2 = moe_f2h((g2 / (1.0f + expf(-g2))) *
+                                      moe_h2f((unsigned short)(ur.y & 0xFFFFu)));
+    const unsigned short h3 = moe_f2h((g3 / (1.0f + expf(-g3))) *
+                                      moe_h2f((unsigned short)(ur.y >> 16)));
+    v[c].x = (unsigned int)h0 | ((unsigned int)h1 << 16);
+    v[c].y = (unsigned int)h2 | ((unsigned int)h3 << 16);
+    const float f0 = moe_h2f(h0), f1 = moe_h2f(h1);
+    const float f2 = moe_h2f(h2), f3 = moe_h2f(h3);
+    lmn = fminf(lmn, fminf(fminf(f0, f1), fminf(f2, f3)));
+    lmx = fmaxf(lmx, fmaxf(fmaxf(f0, f1), fmaxf(f2, f3)));
+  }
+  for (int o = 16; o > 0; o >>= 1) {
+    lmn = fminf(lmn, __shfl_down_sync(0xffffffffu, lmn, o));
+    lmx = fmaxf(lmx, __shfl_down_sync(0xffffffffu, lmx, o));
+  }
+  lmn = __shfl_sync(0xffffffffu, lmn, 0);
+  lmx = __shfl_sync(0xffffffffu, lmx, 0);
+  float scale_q, recip; int zp;
+  moe_asym(lmn, lmx, scale_q, recip, zp);
+  if (lane == 0) { ascale[m] = recip; azp[m] = zp; }
+  c = 0;
+  for (int i = lane; i < nv; i += 32, ++c) {
+    const int q0 = max(-128, min(127, (int)rintf(moe_h2f((unsigned short)(v[c].x & 0xFFFFu)) * scale_q) + zp));
+    const int q1 = max(-128, min(127, (int)rintf(moe_h2f((unsigned short)(v[c].x >> 16)) * scale_q) + zp));
+    const int q2 = max(-128, min(127, (int)rintf(moe_h2f((unsigned short)(v[c].y & 0xFFFFu)) * scale_q) + zp));
+    const int q3 = max(-128, min(127, (int)rintf(moe_h2f((unsigned short)(v[c].y >> 16)) * scale_q) + zp));
+    q32[i] = (q0 & 0xFF) | ((q1 & 0xFF) << 8) | ((q2 & 0xFF) << 16) |
+             ((q3 & 0xFF) << 24);
+  }
+}
 
 // Sequential-rounding combine: bit-identical to the per-expert path's
 // moe_scatter_add_h sequence (one fp16 round after EVERY expert, dst starting
@@ -697,6 +817,41 @@ __global__ void moe_combine_seq_h(const unsigned short *Y, unsigned short *out,
       acc = moe_f2h(moe_h2f(acc) + moe_h2f(Y[(long)a * width + w]) * wts[a]);
   }
   out[(long)t * width + w] = acc;
+}
+// uint4 (8-half) form of the sequential-rounding combine. BIT-IDENTICAL to
+// moe_combine_seq_h: the rounding chain runs along k per (t,w) element, and
+// that chain is untouched -- only the w axis is vectorized, so each element
+// sees the identical operation sequence. The 8x wider thread also gives the
+// 8 dependent k-gathers of the scalar form 8 independent FMA chains of ILP.
+// Requires width % 8 == 0 and 16-byte-aligned Y/out (the launcher checks).
+__global__ void moe_combine_seq_h_v8(const unsigned short *Y,
+                                     unsigned short *out, const int *slots,
+                                     const float *wts, int T, int topk,
+                                     int width){
+  const int wv8 = width >> 3;
+  const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= (long)T * wv8) return;
+  const int t = (int)(idx / wv8);
+  const int v = (int)(idx - (long)t * wv8);
+  const uint4 *Yv = (const uint4 *)Y;
+  uint4 *ov = (uint4 *)out;
+  unsigned short acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  for (int k = 0; k < topk; ++k) {
+    const int a = slots[(long)t * topk + k];
+    if (a < 0) continue;
+    const float wt = wts[a];
+    const uint4 y = Yv[(long)a * wv8 + v];
+    const unsigned short *yh = (const unsigned short *)&y;
+    #pragma unroll
+    for (int j = 0; j < 8; ++j)
+      acc[j] = moe_f2h(moe_h2f(acc[j]) + moe_h2f(yh[j]) * wt);
+  }
+  uint4 o;
+  unsigned short *oh = (unsigned short *)&o;
+  #pragma unroll
+  for (int j = 0; j < 8; ++j)
+    oh[j] = acc[j];
+  ov[(long)t * wv8 + v] = o;
 }
 } // extern "C"
 )CU";
@@ -1488,8 +1643,12 @@ bool cuda_moe_grouped_ffn_imma(const unsigned short *input,
   };
   stamp(0);
 
-  { // quantize the LAYER input once (shared by gate and up, all experts)
-    auto k = ctx.registerCudaKernel(MOE_SRC, "moe_actq_h");
+  { // quantize the LAYER input once (shared by gate and up, all experts).
+    // v4p = bit-identical vectorized twin (min/max order-independent).
+    const bool aq4 = (H % 4u) == 0u &&
+                     ((((uintptr_t)input) | ((uintptr_t)g_qa)) & 7u) == 0u;
+    auto k =
+      ctx.registerCudaKernel(MOE_SRC, aq4 ? "moe_actq_h_v4p" : "moe_actq_h");
     if (!k)
       return false;
     k->SetKernelArguments(0, &input, PS);
@@ -1587,8 +1746,14 @@ bool cuda_moe_grouped_ffn_imma(const unsigned short *input,
   if (glue) { // fused silu(gate)*up + re-quant; warp-per-row when it fits
     // (dbg labels unchanged: the fused time prints as "swiglu", "actq2"~0)
     const bool w32 = I <= 512u;
-    auto k = ctx.registerCudaKernel(MOE_SRC, w32 ? "moe_swiglu_actq_w32"
-                                                 : "moe_swiglu_actq_wl");
+    // _v4 = bit-identical uint2 twin; its 4-slot register carry only covers
+    // K <= 512 at 32 lanes, and K % 128 keeps the vec split lane-even.
+    const bool w32v4 =
+      w32 && (I % 128u) == 0u &&
+      ((((uintptr_t)g_G) | ((uintptr_t)g_U) | ((uintptr_t)g_qb)) & 7u) == 0u;
+    auto k = ctx.registerCudaKernel(MOE_SRC, w32v4 ? "moe_swiglu_actq_w32_v4"
+                                             : w32 ? "moe_swiglu_actq_w32"
+                                                   : "moe_swiglu_actq_wl");
     if (!k)
       return false;
     k->SetKernelArguments(0, &g_G, PS);
@@ -1659,13 +1824,18 @@ bool cuda_moe_grouped_ffn_imma(const unsigned short *input,
                                              g_zb, g_Y, Wcap, H, I, 1))
     return false;
   stamp(6);
-  { // sequential-rounding combine: bit-identical to the per-expert scatter
+  { // sequential-rounding combine: bit-identical to the per-expert scatter.
+    // v8 = the same chain 8 halves per thread (bit-identical, see kernel);
+    // scalar stays as the odd-width / misaligned fallback.
+    const bool v8 = (H % 8u) == 0u &&
+                    ((((uintptr_t)g_Y) | ((uintptr_t)output)) & 15u) == 0u;
     void *a[] = {(void *)&g_Y, (void *)&output, (void *)&p.slots,
                  (void *)&p.wts, &iT,           &ik,
                  &iH};
     const size_t s[] = {PS,          PS,          PS,         PS,
                         sizeof(int), sizeof(int), sizeof(int)};
-    if (!dispatch1d("moe_combine_seq_h", a, s, 7, (long)T * H, 256))
+    if (!dispatch1d(v8 ? "moe_combine_seq_h_v8" : "moe_combine_seq_h", a, s, 7,
+                    v8 ? (long)T * (H / 8) : (long)T * H, 256))
       return false;
   }
   stamp(7);
