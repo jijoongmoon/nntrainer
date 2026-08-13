@@ -511,6 +511,72 @@ __global__ void moe_route_topk(const float *logits, int *tk_idx, float *tk_wt,
     }
   }
 }
+// Warp-per-token routing (E==256, K<=8): one warp owns a token -- 8 experts
+// per lane as float4 pairs, shuffle-only reductions, no shared memory and no
+// block barriers (the block form pays 6 __syncthreads rounds per token).
+// SELECTION IS IDENTICAL to moe_route_topk: the row max is order-independent
+// (same m), exp inputs are per-element identical, comparisons scan lane-local
+// experts in ascending order with strict > and the shuffle merge keeps the
+// lower lane on ties -- the global winner is the lowest maximal expert,
+// exactly the serial tie-break. Only the softmax DENOMINATOR's reduction
+// order changes, so tk_wt can move by an ulp while tk_idx and counts (and
+// therefore the whole routing/work-list build) are bit-identical.
+__global__ void moe_route_topk_w(const float *logits, int *tk_idx,
+                                 float *tk_wt, int *counts, int T, int E,
+                                 int K){
+  const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int t = blockIdx.x * (blockDim.x >> 5) + w;
+  if (t >= T) return;
+  const float4 *rv = (const float4 *)(logits + (long)t * E);
+  float p[8];
+  {
+    const float4 a = rv[lane * 2];
+    const float4 b = rv[lane * 2 + 1];
+    p[0] = a.x; p[1] = a.y; p[2] = a.z; p[3] = a.w;
+    p[4] = b.x; p[5] = b.y; p[6] = b.z; p[7] = b.w;
+  }
+  float m = p[0];
+  #pragma unroll
+  for (int j = 1; j < 8; ++j) m = fmaxf(m, p[j]);
+  for (int o = 16; o > 0; o >>= 1)
+    m = fmaxf(m, __shfl_down_sync(0xffffffffu, m, o));
+  m = __shfl_sync(0xffffffffu, m, 0);
+  float s = 0.f;
+  #pragma unroll
+  for (int j = 0; j < 8; ++j) { p[j] = __expf(p[j] - m); s += p[j]; }
+  for (int o = 16; o > 0; o >>= 1)
+    s += __shfl_down_sync(0xffffffffu, s, o);
+  s = __shfl_sync(0xffffffffu, s, 0);
+  const float inv = 1.0f / s;
+  float wsum = 0.f;
+  for (int j = 0; j < K; ++j) {
+    float bv = -1.f; int bi = -1;
+    #pragma unroll
+    for (int q = 0; q < 8; ++q)
+      if (p[q] > bv) { bv = p[q]; bi = (lane << 3) + q; }
+    for (int o = 16; o > 0; o >>= 1) {
+      const float ov = __shfl_down_sync(0xffffffffu, bv, o);
+      const int oi = __shfl_down_sync(0xffffffffu, bi, o);
+      if (ov > bv) { bv = ov; bi = oi; }
+    }
+    bv = __shfl_sync(0xffffffffu, bv, 0);
+    bi = __shfl_sync(0xffffffffu, bi, 0);
+    if ((bi >> 3) == lane) p[bi & 7] = -1.f; // winner self-masks
+    if (lane == 0) {
+      const float nw = bv * inv;
+      tk_idx[(long)t * K + j] = bi;
+      tk_wt[(long)t * K + j] = nw;
+      wsum += nw;
+    }
+  }
+  if (lane == 0) {
+    const float n = (wsum > 0.f) ? (1.0f / wsum) : 1.0f;
+    for (int j = 0; j < K; ++j) {
+      tk_wt[(long)t * K + j] *= n;
+      atomicAdd(&counts[tk_idx[(long)t * K + j]], 1);
+    }
+  }
+}
 
 // exclusive scan of counts[E] -> offs[E], and seed the scatter cursors.
 // One block; E is 256, so a serial scan in thread 0 is a few hundred ns.
@@ -1533,8 +1599,17 @@ bool cuda_moe_route_grouped_fp32(const float *logits, int *rows, float *wts,
     return false;
   const size_t PS = sizeof(void *);
   int iT = (int)T, iE = (int)E, iK = (int)K, iBM = (int)BM, iW = (int)Wcap;
-  { // softmax + top-k + normalize (bit-identical to the per-expert path)
-    auto k = ctx.registerCudaKernel(MOE_SRC, "moe_route_topk");
+  { // softmax + top-k + normalize. _w = warp-per-token form: identical
+    // selection/counts, tk_wt can move an ulp (denominator reduce order) --
+    // NNTR_MOE_TOPK_W=0 restores the block form.
+    static const bool tkw_on = []() {
+      const char *e = std::getenv("NNTR_MOE_TOPK_W");
+      return !(e != nullptr && e[0] == '0');
+    }();
+    const bool tkw = tkw_on && E == 256u && K <= 8u &&
+                     (((uintptr_t)logits) & 15u) == 0u;
+    auto k = ctx.registerCudaKernel(MOE_SRC,
+                                    tkw ? "moe_route_topk_w" : "moe_route_topk");
     if (!k)
       return false;
     k->SetKernelArguments(0, &logits, PS);
@@ -1544,8 +1619,9 @@ bool cuda_moe_route_grouped_fp32(const float *logits, int *rows, float *wts,
     k->SetKernelArguments(4, &iT, sizeof(int));
     k->SetKernelArguments(5, &iE, sizeof(int));
     k->SetKernelArguments(6, &iK, sizeof(int));
-    const int g[3] = {iT, 1, 1}, b[3] = {256, 1, 1};
-    if (!sm.DispatchCommand(*k, g, b, (unsigned int)(E * sizeof(float))))
+    const int g[3] = {tkw ? (int)((T + 7) / 8) : iT, 1, 1}, b[3] = {256, 1, 1};
+    if (!sm.DispatchCommand(*k, g, b,
+                            tkw ? 0u : (unsigned int)(E * sizeof(float))))
       return false;
   }
   rstamp(1);
