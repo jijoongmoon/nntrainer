@@ -158,6 +158,7 @@ private:
   bool ensureMoeG3Tables(nntrainer::RunLayerContext &context,
                          unsigned int hidden_size, unsigned int I);
   bool moe_g3_ok = false;        /**< payloads ARE fragment-order repacked */
+  bool moe_m4_ok = false;        /**< gate/up payloads are in m4 order */
   bool moe_tbl_built = false;
   // false when any expert payload fails the imma tile's 8-byte alignment
   // check at table-build time; the grouped-imma path then declines for good.

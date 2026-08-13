@@ -1525,18 +1525,34 @@ bool cuda_moe_grouped_ffn_imma(const unsigned short *input,
   if (g3) {
     // packed fragment-order tile; wide/_g2 arms stand aside (they read the
     // raw nibble order, which no longer exists once the repack ran)
-    if (!cuda_fc_qs4cx_moe_grouped_gemm_g3(g_qa, p.rows, wp64 + p.off_gate,
-                                           ws64 + p.off_gate,
-                                           wr64 + p.off_gate, p.wl_e, g_sa,
-                                           g_za, g_G, Wcap, I, H, 1, p.wl_n))
-      return false;
-    stamp(2);
-    if (!cuda_fc_qs4cx_moe_grouped_gemm_g3(g_qa, p.rows, wp64 + p.off_up,
-                                           ws64 + p.off_up, wr64 + p.off_up,
-                                           p.wl_e, g_sa, g_za, g_U, Wcap, I, H,
-                                           1, p.wl_n))
-      return false;
-    stamp(3);
+    if (p.m4_gateup) {
+      // gate/up payloads are in m4 fragment-chunk order: _g4 only
+      if (!cuda_fc_qs4cx_moe_grouped_gemm_g4(g_qa, p.rows, wp64 + p.off_gate,
+                                             ws64 + p.off_gate,
+                                             wr64 + p.off_gate, p.wl_e, g_sa,
+                                             g_za, g_G, Wcap, I, H, 1, p.wl_n))
+        return false;
+      stamp(2);
+      if (!cuda_fc_qs4cx_moe_grouped_gemm_g4(g_qa, p.rows, wp64 + p.off_up,
+                                             ws64 + p.off_up, wr64 + p.off_up,
+                                             p.wl_e, g_sa, g_za, g_U, Wcap, I,
+                                             H, 1, p.wl_n))
+        return false;
+      stamp(3);
+    } else {
+      if (!cuda_fc_qs4cx_moe_grouped_gemm_g3(g_qa, p.rows, wp64 + p.off_gate,
+                                             ws64 + p.off_gate,
+                                             wr64 + p.off_gate, p.wl_e, g_sa,
+                                             g_za, g_G, Wcap, I, H, 1, p.wl_n))
+        return false;
+      stamp(2);
+      if (!cuda_fc_qs4cx_moe_grouped_gemm_g3(g_qa, p.rows, wp64 + p.off_up,
+                                             ws64 + p.off_up, wr64 + p.off_up,
+                                             p.wl_e, g_sa, g_za, g_U, Wcap, I,
+                                             H, 1, p.wl_n))
+        return false;
+      stamp(3);
+    }
   } else if (g_wt) {
     if (!cuda_fc_qs4cx_moe_grouped_gemm_w(g_qa, p.rows, wp64 + p.off_gate,
                                           ws64 + p.off_gate, p.wl_e, g_sa,

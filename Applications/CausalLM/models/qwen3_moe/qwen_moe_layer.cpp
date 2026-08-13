@@ -688,6 +688,7 @@ bool MoELayer::ensureMoeG3Tables(nntrainer::RunLayerContext &context,
       const char *e = std::getenv("NNTR_MOE_WDEV");
       return e == nullptr || e[0] != '0';
     }();
+    bool slab0 = false, slab1 = false, slab2 = false;
     if (ok && wdev) {
       auto to_dev = [&](unsigned int base, unsigned int Nn,
                         unsigned int Kk) -> bool {
@@ -709,36 +710,79 @@ bool MoELayer::ensureMoeG3Tables(nntrainer::RunLayerContext &context,
           moe_wptr[base + e] = slab + (size_t)e * sz;
         return true;
       };
-      const bool m0 = to_dev(0, I, hidden_size);
-      const bool m1 = to_dev(E, I, hidden_size);
-      const bool m2 = to_dev(2 * E, hidden_size, I);
-      if (!(m0 && m1 && m2))
+      slab0 = to_dev(0, I, hidden_size);
+      slab1 = to_dev(E, I, hidden_size);
+      slab2 = to_dev(2 * E, hidden_size, I);
+      if (!(slab0 && slab1 && slab2))
         ml_logw("[MoE][G3] device payload slab partial (%d/%d/%d) -- "
                 "unmoved projections stream from the pinned arena",
-                (int)m0, (int)m1, (int)m2);
+                (int)slab0, (int)slab1, (int)slab2);
     }
     if (ok) {
-      auto rp = [&](unsigned int base, int *rs, unsigned int Nn,
-                    unsigned int Kk) -> bool {
+      // NNTR_MOE_M4=1: gate/up move to imma_moe_g4's fragment-chunk order
+      // (slab-to-slab global permutation; needs the device slabs). Both or
+      // neither: a mixed gate/up order would run a wrong kernel on one of
+      // them, so a partial success is fatal. Down stays g3/g3d order; the
+      // rowsum is permutation-invariant and runs unchanged on either.
+      // DEFAULT ON (NNTR_MOE_M4=0 restores g3 order): gate 3.28 -> 2.6,
+      // up 3.28 -> 2.6 ms/layer-chunk, text byte-identical, decode rides.
+      static const bool m4req = []() {
+        const char *e = std::getenv("NNTR_MOE_M4");
+        return !(e && e[0] == '0');
+      }();
+      auto rowsum = [&](unsigned int base, int *rs, unsigned int Nn,
+                        unsigned int Kk) -> bool {
         const auto *tab =
           reinterpret_cast<const unsigned long long *>(moe_wptr + base);
-        if (!nntrainer::cuda::cuda_fc_qs4cx_moe_repack_g3(tab, E, Nn, Kk) ||
-            !nntrainer::cuda::cuda_fc_qs4cx_moe_rowsum_g3(tab, E, Nn, Kk, rs))
+        if (!nntrainer::cuda::cuda_fc_qs4cx_moe_rowsum_g3(tab, E, Nn, Kk, rs))
           return false;
         for (unsigned int e = 0; e < E; ++e)
           moe_wrs[base + e] = rs + (size_t)e * Nn;
         return true;
       };
+      bool m4ok = false;
+      if (m4req && slab0 && slab1) {
+        // rowsum FIRST, on the raw slab: the m4 repack scatters nibbles
+        // ACROSS rows (fragment-chunk order), so the per-row sum is only
+        // computable before it. (g3's repack is row-local, which is why the
+        // g3 flow can sum after -- that invariance does NOT carry over.)
+        const bool u4 =
+          rowsum(0, rs_up, I, hidden_size) &&
+          nntrainer::cuda::cuda_fc_qs4cx_moe_repack_m4(
+            reinterpret_cast<unsigned long long *>(moe_wptr + 0), E, I,
+            hidden_size);
+        const bool g4 =
+          u4 && rowsum(E, rs_gate, I, hidden_size) &&
+          nntrainer::cuda::cuda_fc_qs4cx_moe_repack_m4(
+            reinterpret_cast<unsigned long long *>(moe_wptr + E), E, I,
+            hidden_size);
+        if (u4 && !g4) {
+          ml_loge("[MoE][M4] gate/up repack order MIXED; no arm can run "
+                  "both. Aborting.");
+          std::abort();
+        }
+        m4ok = u4 && g4;
+        if (!m4ok)
+          ml_logw("[MoE][M4] m4 repack unavailable; staying on g3 order");
+      }
+      auto rp = [&](unsigned int base, int *rs, unsigned int Nn,
+                    unsigned int Kk) -> bool {
+        const auto *tab =
+          reinterpret_cast<const unsigned long long *>(moe_wptr + base);
+        return nntrainer::cuda::cuda_fc_qs4cx_moe_repack_g3(tab, E, Nn, Kk) &&
+               rowsum(base, rs, Nn, Kk);
+      };
       // A mid-run launch failure would leave payloads HALF-repacked -- every
       // arm is then wrong. Loud and fatal is the only honest handling.
-      if (!rp(0, rs_up, I, hidden_size) ||
-          !rp(E, rs_gate, I, hidden_size) ||
+      if ((!m4ok && (!rp(0, rs_up, I, hidden_size) ||
+                     !rp(E, rs_gate, I, hidden_size))) ||
           !rp(2 * E, rs_down, hidden_size, I)) {
         ml_loge("[MoE][G3] batched repack/rowsum FAILED: expert payloads may "
                 "be in a mixed byte order; no arm can run. Aborting.");
         std::abort();
       }
       moe_g3_ok = true;
+      moe_m4_ok = m4ok;
     }
     if (!ok)
       ml_logw("[MoE][G3] preflight failed (alignment/alloc); staying on the "
@@ -814,6 +858,7 @@ bool MoELayer::runGroupedMoEImma(nntrainer::RunLayerContext &context,
   plan.wptr = moe_wptr;
   plan.wsc = moe_wsc;
   plan.wrs = moe_g3_ok ? moe_wrs : nullptr;
+  plan.m4_gateup = moe_m4_ok;
   plan.off_up = 0;
   plan.off_gate = E;
   plan.off_down = 2 * E;

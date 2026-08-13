@@ -131,6 +131,9 @@ struct MoePlan {
   unsigned int off_up;        /**< start of the `up` block (= 0) */
   unsigned int off_gate;      /**< start of the `gate` block (= E) */
   unsigned int off_down;      /**< start of the `down` block (= 2E) */
+  /** gate/up payloads are in imma_moe_g4's m4 fragment-chunk order (the
+   *  driver must launch _g4, not _g3, on them); down stays g3 order. */
+  bool m4_gateup = false;
 };
 
 /**

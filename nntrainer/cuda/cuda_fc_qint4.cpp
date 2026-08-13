@@ -3148,6 +3148,274 @@ void imma_gemm_m4(const signed char *q8, const unsigned char *wm,
     __syncthreads();
   }
 }
+// Slab-to-slab m4-order repack for a MoE projection: every expert's payload
+// moves from QS4CX row-major byte order into imma_moe_g4's fragment-chunk
+// order (same 4096-B chunk layout as repack_marlin_m4, per expert). Global
+// permutation -- needs distinct src/dst (the g3 repack is 16B-slot-local and
+// runs in place; this one is not). Raw nibble VALUES are preserved
+// (cx stays with the consumer, as for g3).
+__global__ void moe_repack_m4(const unsigned char *src, unsigned char *dst,
+                              int E, int N, int K) {
+  // grid: (N/128, K/64, E); 256 threads = one 16-B slot each
+  const int bn = blockIdx.x, ks = blockIdx.y, e = blockIdx.z;
+  const int nsteps = K >> 6;
+  const int t = threadIdx.x;
+  const int nw = t >> 6, kw = (t >> 5) & 1, lane = t & 31;
+  const int Kh = K >> 1;
+  const size_t esz = (size_t)N * Kh;
+  const unsigned char *s = src + (size_t)e * esz;
+  unsigned char *d = dst + (size_t)e * esz;
+  unsigned char out[16];
+#pragma unroll
+  for (int j = 0; j < 16; ++j) {
+    unsigned nib[2];
+#pragma unroll
+    for (int jj = 0; jj < 2; ++jj) {
+      const int i = 2 * j + jj;
+      const int f = i >> 3, w = (i >> 2) & 1, m = i & 3;
+      const int row = bn * 128 + nw * 32 + f * 8 + (lane >> 2);
+      const int k = ks * 64 + kw * 32 + w * 16 + 4 * (lane & 3) + m;
+      const unsigned char b = s[(long)row * Kh + (k >> 1)];
+      nib[jj] = (k & 1) ? (b >> 4) : (b & 0xFu);
+    }
+    out[j] = (unsigned char)(nib[0] | (nib[1] << 4));
+  }
+  long off = (((long)bn * nsteps + ks) * 256 + t) * 16;
+#pragma unroll
+  for (int j = 0; j < 16; ++j)
+    d[off + j] = out[j];
+}
+
+// MoE grouped gate/up on the m4 geometry: imma_gemm_m4's warp form (warp
+// owns all 64 window rows, 4 n-warps x 2 k-warps, one ld.shared.v4 of
+// fragment-order packed W per lane per k-step feeding 16 mma) driven by the
+// g3 steering (block_expert window table, tokid gather with src-size-0
+// zero-fill for padding rows, per-expert scale/rowsum tables, wl_n live
+// counts). The g3 dead-SUBTILE skip becomes a dead-M-BLOCK skip: every warp
+// guards each 16-row m-block on (mb*16 < live) uniformly, so a decode
+// window (live=1) skips 3/4 of its mma on all 8 warps. Epilogue = the m4
+// cross-k-warp int32 reduction with g3's per-token azp/ascale and
+// per-expert rowsum/scale -- same integers, same arithmetic, bit-identical
+// to g3 (dead m-blocks store nothing, exactly like g3's mdead warps).
+// Requires K % 256 == 0 and N % 128 == 0 (the launcher gates).
+__global__ __launch_bounds__(256, 2)
+void imma_moe_g4(const signed char *q8, const int *tokid,
+                 const unsigned long long *wp_tab,
+                 const unsigned long long *ws_tab,
+                 const unsigned long long *wr_tab, const int *block_expert,
+                 const float *ascale, const int *azp, float *Y, int N, int K,
+                 int out_fp16, const int *wl_n) {
+  const int e = block_expert[blockIdx.y];
+  if (e < 0)
+    return;
+  const unsigned char *plain =
+    (const unsigned char *)(unsigned long long)wp_tab[e];
+  const unsigned short *wscale =
+    (const unsigned short *)(unsigned long long)ws_tab[e];
+  const int *wrsum = (const int *)(unsigned long long)wr_tab[e];
+  __shared__ IPv16 A4sv[4][64 * IP_LD / 16];
+  __shared__ IPv16 W4sv[4][256];
+  __shared__ int toks[64];
+  const int tid = threadIdx.x;
+  const int lane = tid & 31, warp = tid >> 5;
+  const int nw = warp & 3, kw = warp >> 2;
+  const int blockM = blockIdx.y * 64, blockN = blockIdx.x * 128;
+  if (tid < 64)
+    toks[tid] = tokid ? tokid[blockM + tid] : (blockM + tid);
+  __syncthreads();
+  const int live = wl_n ? wl_n[blockIdx.y] : 64;
+
+  const int srow = tid >> 2, ssub = tid & 3;
+  const int atok = toks[srow];
+  const signed char *aptr = q8 + (long)atok * K + (ssub << 4);
+  const int a_src_sz = atok >= 0 ? 16 : 0; // padding rows zero-fill
+  const int sdst = srow * IP_LD + (ssub << 4);
+  const int nsteps = K >> 6;
+  const unsigned char *wsrc =
+    plain + (long)blockIdx.x * nsteps * 4096 + tid * 16;
+  unsigned adst[4], wdst[4];
+#pragma unroll
+  for (int b = 0; b < 4; ++b) {
+    adst[b] = ip_sh((signed char *)A4sv[b] + sdst);
+    wdst[b] = ip_sh((signed char *)W4sv[b] + tid * 16);
+  }
+
+  int acc[4][4][4];
+#pragma unroll
+  for (int mb = 0; mb < 4; ++mb)
+#pragma unroll
+    for (int f = 0; f < 4; ++f)
+#pragma unroll
+      for (int r = 0; r < 4; ++r)
+        acc[mb][f][r] = 0;
+
+#define G4_CPAW(BUF, KS)                                                       \
+  do {                                                                         \
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(     \
+                   adst[BUF]),                                                 \
+                 "l"(aptr + (KS)*64), "r"(a_src_sz));                          \
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(         \
+                   wdst[BUF]),                                                 \
+                 "l"(wsrc + (long)(KS)*4096));                                 \
+  } while (0)
+#define G4_CPC() asm volatile("cp.async.commit_group;\n" ::)
+#define G4_CPW1() asm volatile("cp.async.wait_group 1;\n" ::)
+
+  G4_CPAW(0, 0);
+  G4_CPC();
+  G4_CPAW(1, 1);
+  G4_CPC();
+  G4_CPAW(2, 2);
+  G4_CPC();
+  G4_CPW1();
+  __syncthreads();
+
+  const int lrow_a = (lane & 7) + ((lane & 8) ? 8 : 0);
+  const int lkb_a = kw * 32 + ((lane & 16) ? 16 : 0);
+  unsigned pa_buf[4], pw_buf[4];
+#pragma unroll
+  for (int b = 0; b < 4; ++b) {
+    pa_buf[b] = ip_sh((const signed char *)A4sv[b] + lrow_a * IP_LD + lkb_a);
+    pw_buf[b] =
+      ip_sh((const signed char *)W4sv[b] + ((nw * 2 + kw) * 32 + lane) * 16);
+  }
+  const bool ml0 = 0 < live, ml1 = 16 < live, ml2 = 32 < live, ml3 = 48 < live;
+
+  for (int kb = 0; kb < nsteps; kb += 4) {
+#pragma unroll
+    for (int u = 0; u < 4; ++u) {
+      const int k = kb + u;
+      const int u2 = (u + 2) & 3;
+      if (k > 0) {
+        if (k + 2 < nsteps)
+          G4_CPAW(u2, k + 2);
+        G4_CPC();
+        G4_CPW1();
+        __syncthreads();
+      }
+      const unsigned pa = pa_buf[u], pw = pw_buf[u];
+      unsigned p0, p1, p2, p3;
+      asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];\n"
+                   : "=r"(p0), "=r"(p1), "=r"(p2), "=r"(p3) : "r"(pw));
+      int a0[4], a1[4], a2[4], a3[4];
+      if (ml0)
+        M4_LDM(a0, pa);
+      if (ml1)
+        M4_LDM(a1, pa + 16 * IP_LD);
+      if (ml2)
+        M4_LDM(a2, pa + 32 * IP_LD);
+      if (ml3)
+        M4_LDM(a3, pa + 48 * IP_LD);
+      int c0, c1, c2, c3, c4, c5, c6, c7;
+      M4_EXPAND(c0, c1, c2, c3, p0, p1);
+      M4_EXPAND(c4, c5, c6, c7, p2, p3);
+      if (ml0) {
+        M4_MMA(acc[0][0], a0, c0, c1);
+        M4_MMA(acc[0][1], a0, c2, c3);
+        M4_MMA(acc[0][2], a0, c4, c5);
+        M4_MMA(acc[0][3], a0, c6, c7);
+      }
+      if (ml1) {
+        M4_MMA(acc[1][0], a1, c0, c1);
+        M4_MMA(acc[1][1], a1, c2, c3);
+        M4_MMA(acc[1][2], a1, c4, c5);
+        M4_MMA(acc[1][3], a1, c6, c7);
+      }
+      if (ml2) {
+        M4_MMA(acc[2][0], a2, c0, c1);
+        M4_MMA(acc[2][1], a2, c2, c3);
+        M4_MMA(acc[2][2], a2, c4, c5);
+        M4_MMA(acc[2][3], a2, c6, c7);
+      }
+      if (ml3) {
+        M4_MMA(acc[3][0], a3, c0, c1);
+        M4_MMA(acc[3][1], a3, c2, c3);
+        M4_MMA(acc[3][2], a3, c4, c5);
+        M4_MMA(acc[3][3], a3, c6, c7);
+      }
+    }
+  }
+#undef G4_CPAW
+#undef G4_CPC
+#undef G4_CPW1
+
+  __syncthreads();
+  int *scr = (int *)A4sv;
+  const int g = lane >> 2, t2 = lane & 3;
+#pragma unroll
+  for (int half = 0; half < 2; ++half) {
+    if (kw == 0) {
+#pragma unroll
+      for (int mb = 0; mb < 4; ++mb) {
+        if (mb * 16 >= live)
+          continue;
+#pragma unroll
+        for (int ff = 0; ff < 2; ++ff)
+#pragma unroll
+          for (int r = 0; r < 4; ++r) {
+            const int f = half * 2 + ff;
+            const int row = mb * 16 + g + ((r >> 1) ? 8 : 0);
+            const int cidx = nw * 16 + ff * 8 + 2 * t2 + (r & 1);
+            scr[row * 64 + cidx] = acc[mb][f][r];
+          }
+      }
+    }
+    __syncthreads();
+    if (kw == 1) {
+#pragma unroll
+      for (int mb = 0; mb < 4; ++mb) {
+        if (mb * 16 >= live)
+          continue; // dead m-block: store nothing (g3 mdead parity)
+        const int lr0 = mb * 16 + g, lr1 = lr0 + 8;
+        const int tk0 = toks[lr0], tk1 = toks[lr1];
+        const int az0 = tk0 >= 0 ? azp[tk0] : 0;
+        const int az1 = tk1 >= 0 ? azp[tk1] : 0;
+        const float as0 = tk0 >= 0 ? ascale[tk0] : 0.0f;
+        const float as1 = tk1 >= 0 ? ascale[tk1] : 0.0f;
+#pragma unroll
+        for (int ff = 0; ff < 2; ++ff) {
+          const int f = half * 2 + ff;
+          const int c0 = blockN + nw * 32 + f * 8 + 2 * t2;
+          const int i0 = lr0 * 64 + nw * 16 + ff * 8 + 2 * t2;
+          const int rs0 = wrsum[c0], rs1 = wrsum[c0 + 1];
+          const float ws0 = hw_h2f(wscale[c0]), ws1 = hw_h2f(wscale[c0 + 1]);
+          const float v00 =
+            tk0 >= 0 ? (float)(scr[i0] + acc[mb][f][0] - az0 * rs0) * as0 * ws0
+                     : 0.0f;
+          const float v01 = tk0 >= 0
+                              ? (float)(scr[i0 + 1] + acc[mb][f][1] - az0 * rs1)
+                                  * as0 * ws1
+                              : 0.0f;
+          const float v10 = tk1 >= 0
+                              ? (float)(scr[i0 + 512] + acc[mb][f][2]
+                                        - az1 * rs0) * as1 * ws0
+                              : 0.0f;
+          const float v11 = tk1 >= 0
+                              ? (float)(scr[i0 + 513] + acc[mb][f][3]
+                                        - az1 * rs1) * as1 * ws1
+                              : 0.0f;
+          if (out_fp16) {
+            *(unsigned int *)((unsigned short *)Y + (long)(blockM + lr0) * N +
+                              c0) =
+              (unsigned int)hw_f2h(v00) | ((unsigned int)hw_f2h(v01) << 16);
+            *(unsigned int *)((unsigned short *)Y + (long)(blockM + lr1) * N +
+                              c0) =
+              (unsigned int)hw_f2h(v10) | ((unsigned int)hw_f2h(v11) << 16);
+          } else {
+            IPf2 lo, hi;
+            lo.x = v00;
+            lo.y = v01;
+            hi.x = v10;
+            hi.y = v11;
+            *(IPf2 *)(Y + (long)(blockM + lr0) * N + c0) = lo;
+            *(IPf2 *)(Y + (long)(blockM + lr1) * N + c0) = hi;
+          }
+        }
+      }
+    }
+    __syncthreads();
+  }
+}
 #undef M4_EXPAND
 #undef M4_MMA
 #undef M4_LDM
@@ -4043,6 +4311,98 @@ bool cuda_fc_qs4cx_moe_grouped_gemm_g3d(
   kg->SetKernelArguments(11, &wl_n, sizeof(wl_n));
   const int ib[3] = {256, 1, 1};
   const int ig[3] = {1, (int)n_mblocks, 1};
+  return StreamManager::Global().DispatchCommand(*kg, ig, ib);
+}
+
+// m4-order slab-to-slab repack (see header note). The permutation is global,
+// so it bounces through a fresh slab; the old slab is freed on success.
+bool cuda_fc_qs4cx_moe_repack_m4(unsigned long long *wp_tab, unsigned int E,
+                                 unsigned int N, unsigned int K) {
+  const size_t esz = (size_t)N * (K >> 1);
+  if (wp_tab == nullptr || E == 0 || (N & 127u) != 0u || (K & 255u) != 0u ||
+      esz == 0)
+    return false;
+  // contiguity invariant: the slab builder laid experts out at stride esz
+  unsigned char *src = (unsigned char *)(unsigned long long)wp_tab[0];
+  for (unsigned int e = 0; e < E; ++e)
+    if ((unsigned char *)(unsigned long long)wp_tab[e] != src + (size_t)e * esz)
+      return false;
+  auto kr = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
+                                                     "moe_repack_m4");
+  if (!kr)
+    return false;
+  unsigned char *dst = nullptr;
+  if (cudaMalloc(&dst, esz * E) != cudaSuccess) {
+    cudaGetLastError();
+    return false;
+  }
+  const int e_ = (int)E, n = (int)N, k = (int)K;
+  kr->SetKernelArguments(0, &src, sizeof(src));
+  kr->SetKernelArguments(1, &dst, sizeof(dst));
+  kr->SetKernelArguments(2, &e_, sizeof(e_));
+  kr->SetKernelArguments(3, &n, sizeof(n));
+  kr->SetKernelArguments(4, &k, sizeof(k));
+  const int b[3] = {256, 1, 1};
+  const int g[3] = {(int)(N / 128u), (int)(K / 64u), (int)E};
+  if (!StreamManager::Global().DispatchCommand(*kr, g, b)) {
+    cudaFree(dst);
+    return false;
+  }
+  // The repack must complete before the source slab is freed and before any
+  // caller-side rowsum reads the new order through the repointed table.
+  if (cudaDeviceSynchronize() != cudaSuccess) {
+    cudaFree(dst);
+    return false;
+  }
+  for (unsigned int e = 0; e < E; ++e)
+    wp_tab[e] = (unsigned long long)(dst + (size_t)e * esz);
+  cudaFree(src);
+  return true;
+}
+
+// m4 grouped gate/up launcher: g3's contract on the m4-order payload.
+bool cuda_fc_qs4cx_moe_grouped_gemm_g4(
+  const signed char *q8, const int *tokid, const unsigned long long *wp_tab,
+  const unsigned long long *ws_tab, const unsigned long long *wr_tab,
+  const int *block_expert, const float *ascale, const int *azp, void *Y,
+  unsigned int n_mblocks, unsigned int N, unsigned int K, int out_fp16,
+  const int *wl_n) {
+  if (q8 == nullptr || wp_tab == nullptr || ws_tab == nullptr ||
+      wr_tab == nullptr || block_expert == nullptr || Y == nullptr ||
+      n_mblocks == 0 || (N & 127u) != 0u || (K & 255u) != 0u)
+    return false;
+  auto kg = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
+                                                     "imma_moe_g4");
+  if (!kg)
+    return false;
+  static bool attr_once = []() {
+    const char *e = std::getenv("NNTR_MOE_G_DBG");
+    return e != nullptr && e[0] != '0';
+  }();
+  if (attr_once) {
+    attr_once = false;
+    int nregs = 0, lmem = 0;
+    cuFuncGetAttribute(&nregs, CU_FUNC_ATTRIBUTE_NUM_REGS, kg->GetFunction());
+    cuFuncGetAttribute(&lmem, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,
+                       kg->GetFunction());
+    fprintf(stderr, "[g4_attr] regs=%d local=%dB\n", nregs, lmem);
+  }
+  const int n = (int)N, k = (int)K;
+  kg->SetKernelArguments(0, &q8, sizeof(q8));
+  kg->SetKernelArguments(1, &tokid, sizeof(tokid));
+  kg->SetKernelArguments(2, &wp_tab, sizeof(wp_tab));
+  kg->SetKernelArguments(3, &ws_tab, sizeof(ws_tab));
+  kg->SetKernelArguments(4, &wr_tab, sizeof(wr_tab));
+  kg->SetKernelArguments(5, &block_expert, sizeof(block_expert));
+  kg->SetKernelArguments(6, &ascale, sizeof(ascale));
+  kg->SetKernelArguments(7, &azp, sizeof(azp));
+  kg->SetKernelArguments(8, &Y, sizeof(Y));
+  kg->SetKernelArguments(9, &n, sizeof(n));
+  kg->SetKernelArguments(10, &k, sizeof(k));
+  kg->SetKernelArguments(11, &out_fp16, sizeof(out_fp16));
+  kg->SetKernelArguments(12, &wl_n, sizeof(wl_n));
+  const int ib[3] = {256, 1, 1};
+  const int ig[3] = {(int)(N / 128u), (int)n_mblocks, 1};
   return StreamManager::Global().DispatchCommand(*kg, ig, ib);
 }
 

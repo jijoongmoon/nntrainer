@@ -124,6 +124,29 @@ bool cuda_fc_qs4cx_moe_grouped_gemm_g3d(
                                         const int *wl_n = nullptr);
 
 /** @brief In-place fragment repack of ALL E payloads via the pointer table. */
+/**
+ * @brief Slab-to-slab m4-order repack of ALL E expert payloads of one
+ * projection (imma_moe_g4's fragment-chunk order). Requires the payloads to
+ * be ONE contiguous device slab (stride N*K/2, wp_tab[0] = base). On success
+ * the table entries are repointed to the new slab and the old slab is freed;
+ * on failure the payloads are untouched (caller may fall back to the g3
+ * repack). N % 128 == 0, K % 256 == 0.
+ */
+bool cuda_fc_qs4cx_moe_repack_m4(unsigned long long *wp_tab, unsigned int E,
+                                 unsigned int N, unsigned int K);
+
+/**
+ * @brief Grouped gate/up GEMM on m4-order payloads (imma_moe_g4): same
+ * steering and epilogue semantics as _g3, BN=128 grid. Payloads must have
+ * been through cuda_fc_qs4cx_moe_repack_m4.
+ */
+bool cuda_fc_qs4cx_moe_grouped_gemm_g4(
+  const signed char *q8, const int *tokid, const unsigned long long *wp_tab,
+  const unsigned long long *ws_tab, const unsigned long long *wr_tab,
+  const int *block_expert, const float *ascale, const int *azp, void *Y,
+  unsigned int n_mblocks, unsigned int N, unsigned int K, int out_fp16,
+  const int *wl_n);
+
 bool cuda_fc_qs4cx_moe_repack_g3(const unsigned long long *wp_tab,
                                  unsigned int E, unsigned int N,
                                  unsigned int K);
