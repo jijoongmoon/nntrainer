@@ -1384,6 +1384,7 @@ void gdn_ck_state_tc2(const unsigned short *conv, const unsigned short *w,
   unsigned short *Wb = (unsigned short *)(sb2 + 18432);  // w tile [64][136]
   unsigned short *Kb = (unsigned short *)(sb2 + 35840);  // k tile [64][136]
   unsigned short *Db = (unsigned short *)(sb2 + 53248);  // dv [64][72]
+  unsigned short *Ub = (unsigned short *)(sb2 + 62464);  // u tile [64][72]
 
   // one w-or-k tile via cp.async, one commit group; 4 thr/row x 64 B; rows
   // past cn zero-fill through the src-size predicate.
@@ -1408,6 +1409,22 @@ void gdn_ck_state_tc2(const unsigned short *conv, const unsigned short *w,
 #define ST2_K_IN(CK, CNV)                                                      \
   ST2_TILE_IN(Kb, conv + ((long)(CK)*64 + (tid >> 2))*CONV + KEY + kh*HKD,     \
               CK, CNV)
+  // u tile: 64 rows x 64 halves (this CTA's b-half), 4 thr/row x 32 B
+#define ST2_U_IN(CK, CNV)                                                      \
+  do {                                                                         \
+    const int rr = tid >> 2;                                                   \
+    const int cq = (tid & 3) * 16;                                             \
+    const unsigned short *src =                                                \
+      u + (((long)(CK)*64 + rr)*NVH + vh)*HVD + bh*64 + cq;                    \
+    const unsigned db_ =                                                       \
+      (unsigned)__cvta_generic_to_shared(&Ub[rr*72 + cq]);                     \
+    const int ok = (rr < (CNV)) ? 16 : 0;                                      \
+    _Pragma("unroll") for (int i = 0; i < 2; ++i)                              \
+      asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(   \
+                     db_ + i * 16),                                            \
+                   "l"(src + i * 8), "r"(ok));                                 \
+    asm volatile("cp.async.commit_group;\n");                                  \
+  } while (0)
 
   // S frags: warp j-tile 16 x the CTA's 64 b columns
   float S[8][4];
@@ -1421,10 +1438,11 @@ void gdn_ck_state_tc2(const unsigned short *conv, const unsigned short *w,
         ? state[((long)vh*HKD + j)*HVD + bh*64 + b] : 0.0f;
     }
 
-  { // prologue: w_0 then k_0 in flight (groups FIFO: w before k)
+  { // prologue: w_0, k_0, u_0 in flight (groups FIFO in that order)
     const int cn0 = (T < 64) ? T : 64;
     ST2_W_IN(0, cn0);
     ST2_K_IN(0, cn0);
+    ST2_U_IN(0, cn0);
   }
   for (int c = 0; c < NCH; ++c) {
     const int cn = (T - c*64 < 64) ? (T - c*64) : 64;
@@ -1444,8 +1462,8 @@ void gdn_ck_state_tc2(const unsigned short *conv, const unsigned short *w,
         *(unsigned *)&Sh[j*SLD2 + b] = pv;
         *(unsigned *)&h[((long)c*NVH + vh)*16384 + j*128 + bh*64 + b] = pv;
       }
-    // 2) drain w_c (leaves k_c in flight; groups are FIFO)
-    asm volatile("cp.async.wait_group 1;\n");
+    // 2) drain w_c (leaves k_c, u_c in flight; groups are FIFO)
+    asm volatile("cp.async.wait_group 2;\n");
     __syncthreads();
     // 3) vp = w @ S : c64 x b64, K=j128; warp = (c-tile 16, b-tile 32)
     float vp[4][4];
@@ -1494,6 +1512,10 @@ void gdn_ck_state_tc2(const unsigned short *conv, const unsigned short *w,
       ST2_W_IN(c + 1, cnn);
     else
       asm volatile("cp.async.commit_group;\n");
+    // drain k_c AND u_c (FIFO: u is younger; leaves w_{c+1}) -- k just
+    // parks in Kb until step 6; u is consumed from smem right below.
+    asm volatile("cp.async.wait_group 1;\n");
+    __syncthreads();
     // 4) vn = u - vp; dv -> Db; vnew pair store. Warp covers its (c,b) tile.
 #pragma unroll
     for (int s = 0; s < 4; ++s)
@@ -1504,8 +1526,7 @@ void gdn_ck_state_tc2(const unsigned short *conv, const unsigned short *w,
         float dv0 = 0.0f, dv1 = 0.0f;
         if (cc < cn) {
           const long t = (long)c*64 + cc;
-          const unsigned up =
-            *(const unsigned *)&u[(t*NVH + vh)*HVD + bh*64 + bl];
+          const unsigned up = *(const unsigned *)&Ub[cc*72 + bl];
           float u0, u1;
           asm("cvt.f32.f16 %0, %1;" : "=f"(u0)
               : "h"((unsigned short)(up & 0xFFFFu)));
@@ -1527,8 +1548,7 @@ void gdn_ck_state_tc2(const unsigned short *conv, const unsigned short *w,
         asm("cvt.rn.f16.f32 %0, %1;" : "=h"(d1) : "f"(dv1));
         *(unsigned *)&Db[cc*SLD2 + bl] = (unsigned)d0 | ((unsigned)d1 << 16);
       }
-    // 5) drain k_c (leaves w_{c+1} in flight)
-    asm volatile("cp.async.wait_group 1;\n");
+    // 5) Db visibility (k_c already drained by the pre-4 wait)
     __syncthreads();
     // 6) S = S*e^{gl_c} + k^T @ dv : j128 x b64, K=c64
 #pragma unroll
@@ -1563,12 +1583,16 @@ void gdn_ck_state_tc2(const unsigned short *conv, const unsigned short *w,
       }
     }
 #undef ST2MMA
-    __syncthreads(); // all warps done reading Kb/Db before refill
-    // 6b) prefetch k_{c+1}: lands under the next chunk's S dump + vp
-    if (c + 1 < NCH)
+    __syncthreads(); // all warps done reading Kb/Db/Ub before refills
+    // 6b) prefetch k_{c+1} and u_{c+1}: land under the next chunk's
+    // S dump + vp (u also has the pre-4 wait as its deadline)
+    if (c + 1 < NCH) {
       ST2_K_IN(c + 1, cnn);
-    else
+      ST2_U_IN(c + 1, cnn);
+    } else {
       asm volatile("cp.async.commit_group;\n");
+      asm volatile("cp.async.commit_group;\n");
+    }
   }
   asm volatile("cp.async.wait_group 0;\n"); // retire trailing groups
   if (save_state) {
@@ -2314,11 +2338,11 @@ bool cuda_gdn_prefill_chunked_fp16(
     kst->SetKernelArguments(16, &i_save, sizeof(i_save));
     const int g[3] = {iNVH, state2 ? 2 : 1, 1};
     const int b3[3] = {state2 ? 256 : 512, 1, 1};
-    // D2: 62,464 B dynamic smem (Sh 18,432 + Wb/Kb 17,408 each + Db 9,216)
-    // exceeds the 48 KB default -> one-time opt-in, flash-kernel precedent.
+    // D2+u: 71,680 B dynamic smem (Sh 18,432 + Wb/Kb 17,408 each + Db
+    // 9,216 + Ub 9,216) -- one-time >48K opt-in, flash-kernel precedent.
     unsigned int st_smem = 0;
     if (state2) {
-      st_smem = 62464u;
+      st_smem = 71680u;
       static bool st2_attr_done = false;
       if (!st2_attr_done) {
         st2_attr_done = true;
