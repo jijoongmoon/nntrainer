@@ -49,6 +49,7 @@ namespace {
 
 struct KpAcc {
   double ms = 0.0;
+  double gap_ms = 0.0; // GPU idle BEFORE this kernel (host-path attribution)
   unsigned long long calls = 0;
 };
 
@@ -63,6 +64,10 @@ struct KpState {
   std::deque<KpPending> pending;
   std::string key; // reused per launch to avoid churn
   unsigned long long launches = 0;
+  // The previous drained pair's END event, held back one drain so the
+  // inter-launch gap elapsed(prev_end, cur_start) can be measured. Events on
+  // one stream are ordered, so this gap IS the GPU idle between launches.
+  cudaEvent_t prev_end = nullptr;
 };
 
 KpState &kp_state() {
@@ -95,9 +100,40 @@ bool kp_drain_one(KpState &st) {
     return false;
   p.acc->ms += (double)f;
   p.acc->calls += 1;
+  if (st.prev_end != nullptr) {
+    float g = 0.f;
+    if (cudaEventElapsedTime(&g, st.prev_end, p.s) == cudaSuccess && g > 0.f)
+      p.acc->gap_ms += (double)g;
+    st.free_ev.push_back(st.prev_end);
+  }
+  st.prev_end = p.e; // held back until the NEXT drain reads the gap
   st.free_ev.push_back(p.s);
-  st.free_ev.push_back(p.e);
   return true;
+}
+
+void kp_print(KpState &st, const char *label) {
+  std::vector<std::pair<std::string, KpAcc>> rows(st.table.begin(),
+                                                  st.table.end());
+  std::sort(rows.begin(), rows.end(), [](const auto &a, const auto &b) {
+    return a.second.ms > b.second.ms;
+  });
+  double total = 0.0, tgap = 0.0;
+  unsigned long long calls = 0;
+  for (const auto &r : rows) {
+    total += r.second.ms;
+    tgap += r.second.gap_ms;
+    calls += r.second.calls;
+  }
+  std::fprintf(stderr,
+               "[kern_prof:%s] ==== GPU %.1f ms + host-gap %.1f ms, "
+               "%llu launches, %zu keys (unresolved pending=%zu) ====\n",
+               label, total, tgap, calls, rows.size(), st.pending.size());
+  for (const auto &r : rows)
+    std::fprintf(
+      stderr, "[kern_prof:%s] %10.1f ms %9.1f gap %7llu calls %9.1f us/call  %s\n",
+      label, r.second.ms, r.second.gap_ms, r.second.calls,
+      r.second.calls ? 1000.0 * r.second.ms / (double)r.second.calls : 0.0,
+      r.first.c_str());
 }
 
 } // namespace
@@ -170,27 +206,23 @@ void kprof_dump() {
   while (!st.pending.empty())
     if (!kp_drain_one(st))
       break; // context already gone: report what resolved
-  std::vector<std::pair<std::string, KpAcc>> rows(st.table.begin(),
-                                                  st.table.end());
-  std::sort(rows.begin(), rows.end(), [](const auto &a, const auto &b) {
-    return a.second.ms > b.second.ms;
-  });
-  double total = 0.0;
-  unsigned long long calls = 0;
-  for (const auto &r : rows) {
-    total += r.second.ms;
-    calls += r.second.calls;
+  kp_print(st, "exit");
+}
+
+void kprof_window(const char *label) {
+  if (!kprof_enabled())
+    return;
+  KpState &st = kp_state();
+  while (!st.pending.empty())
+    if (!kp_drain_one(st))
+      break;
+  if (st.prev_end != nullptr) { // no gap carried across windows
+    st.free_ev.push_back(st.prev_end);
+    st.prev_end = nullptr;
   }
-  std::fprintf(stderr,
-               "[kern_prof] ==== GPU ms by kernel|role: %.1f ms total, "
-               "%llu launches, %zu keys (unresolved pending=%zu) ====\n",
-               total, calls, rows.size(), st.pending.size());
-  for (const auto &r : rows)
-    std::fprintf(stderr, "[kern_prof] %10.1f ms %7llu calls %9.1f us/call  %s\n",
-                 r.second.ms, r.second.calls,
-                 r.second.calls ? 1000.0 * r.second.ms / (double)r.second.calls
-                                : 0.0,
-                 r.first.c_str());
+  kp_print(st, label);
+  st.table.clear();
+  st.launches = 0;
 }
 // ---------------------------------------------------------------------------
 

@@ -255,6 +255,12 @@ void *kprof_begin();
 void kprof_end(void *start_ev, const char *kern, const char *tag);
 /** @brief Drain pending pairs and print the table (idempotent; also atexit). */
 void kprof_dump();
+/** @brief Drain, print the table under a window label, then RESET it.
+ *  Bracketing a region (e.g. the prefill) scopes the histogram -- and its
+ *  host-gap column -- to that region alone. The gap column attributes the
+ *  GPU-idle time BEFORE each kernel to that kernel's row, pointing at the
+ *  host code path that ran between the previous launch and this one. */
+void kprof_window(const char *label);
 
 /**
  * @brief Process-lifetime device int[2] holding the per-token DECODE position:

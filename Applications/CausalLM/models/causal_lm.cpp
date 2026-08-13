@@ -1304,6 +1304,10 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
 #endif
 
   auto start_prefill = std::chrono::high_resolution_clock::now();
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // Scope the kern_prof histogram (and its host-gap column) to the prefill.
+  nntrainer::cuda::kprof_window("load+warmup");
+#endif
 
   std::vector<float *> output;
 
@@ -1488,6 +1492,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       std::cout << "prefill warmup (once per process): " << warmup_ms << " ms"
                 << std::endl;
       start_prefill = std::chrono::high_resolution_clock::now();
+      nntrainer::cuda::kprof_window("load+warmup");
     }
   }
 #endif
@@ -1524,6 +1529,9 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   }
 
   auto finish_prefill = std::chrono::high_resolution_clock::now();
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  nntrainer::cuda::kprof_window("PREFILL");
+#endif
   auto prefill_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
     finish_prefill - start_prefill);
 
