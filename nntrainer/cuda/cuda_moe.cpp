@@ -326,6 +326,66 @@ __global__ void moe_rsplit(const float *w, unsigned short *hi,
   hi[i] = h;
   lo[i] = l;
 }
+// Transposed split for the decode GEMV: w is [H,E] h-major (the dense-gemm
+// B layout); hiT/loT come out [E,H] e-major so a warp streams its expert's
+// row with coalesced vec4 loads. Same split arithmetic as moe_rsplit.
+__global__ void moe_rsplit_t(const float *w, unsigned short *hiT,
+                             unsigned short *loT, int H, int E) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= H * E) return;
+  const int h = i / E, e = i - h * E;
+  float f = w[i];
+  unsigned short hh;
+  float fh;
+  asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hh) : "f"(f));
+  asm("cvt.f32.f16 %0, %1;" : "=f"(fh) : "h"(hh));
+  unsigned short ll;
+  float r = f - fh;
+  asm("cvt.rn.f16.f32 %0, %1;" : "=h"(ll) : "f"(r));
+  hiT[(long)e * H + h] = hh;
+  loT[(long)e * H + h] = ll;
+}
+// M=1 decode router on the transposed split planes: warp per expert, BOTH
+// planes in one pass (one launch, ~2 MB device reads), each plane dot
+// accumulated in its own fp32 register then summed once at the end -- the
+// dual-pass hi+lo structure. Replaces the fp32 SIMT tile whose 64x64 M-tile
+// is 63/64 idle at M=1 (measured 240 us/call on decode).
+__global__ void moe_router_gemv_h2(const unsigned short *X,
+                                   const unsigned short *hiT,
+                                   const unsigned short *loT, float *L,
+                                   int H, int E) {
+  const int e = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  if (e >= E) return;
+  const int lane = threadIdx.x & 31;
+  const uint2 *xv = (const uint2 *)X;
+  const uint2 *hv = (const uint2 *)(hiT + (long)e * H);
+  const uint2 *lv = (const uint2 *)(loT + (long)e * H);
+  const int nv = H >> 2;
+  float ah = 0.f, al = 0.f;
+  for (int i = lane; i < nv; i += 32) {
+    const uint2 xr = xv[i];
+    const uint2 hr = hv[i];
+    const uint2 lr = lv[i];
+    const float x0 = moe_h2f((unsigned short)(xr.x & 0xFFFFu));
+    const float x1 = moe_h2f((unsigned short)(xr.x >> 16));
+    const float x2 = moe_h2f((unsigned short)(xr.y & 0xFFFFu));
+    const float x3 = moe_h2f((unsigned short)(xr.y >> 16));
+    ah += x0 * moe_h2f((unsigned short)(hr.x & 0xFFFFu)) +
+          x1 * moe_h2f((unsigned short)(hr.x >> 16)) +
+          x2 * moe_h2f((unsigned short)(hr.y & 0xFFFFu)) +
+          x3 * moe_h2f((unsigned short)(hr.y >> 16));
+    al += x0 * moe_h2f((unsigned short)(lr.x & 0xFFFFu)) +
+          x1 * moe_h2f((unsigned short)(lr.x >> 16)) +
+          x2 * moe_h2f((unsigned short)(lr.y & 0xFFFFu)) +
+          x3 * moe_h2f((unsigned short)(lr.y >> 16));
+  }
+  for (int o = 16; o > 0; o >>= 1) {
+    ah += __shfl_down_sync(0xffffffffu, ah, o);
+    al += __shfl_down_sync(0xffffffffu, al, o);
+  }
+  if (lane == 0)
+    L[e] = ah + al;
+}
 __global__ void moe_router_gemm(const unsigned short *X, const float *Wg,
                                 float *L, int T, int H, int E){
   // 68-float row stride: 16B-aligned rows so the inner-loop fragment loads
@@ -1179,6 +1239,65 @@ bool cuda_moe_router_gemm_fp16(const unsigned short *X, const float *Wg,
           }
         }
         return true;
+      }
+    }
+  }
+  // [rgemv-h2] Decode arm of the split-fp16 router: the fp32 SIMT tile's
+  // 64x64 M-tile is 63/64 idle at M=1 and measured 240 us/call; a warp-per-
+  // expert GEMV over TRANSPOSED hi/lo planes (one-time moe_rsplit_t, cached
+  // per Wg) reads ~2 MB device-resident fp16 in one launch. Same numeric
+  // class as the prefill dual-pass (split-fp16, fp32 accumulate); the tile
+  // stays the fallback and the NNTR_MOE_RGEMV_H2=0 opt-out.
+  static const bool rgemv_on = []() {
+    const char *e = std::getenv("NNTR_MOE_RGEMV_H2");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  if (h2_on && rgemv_on && T == 1 && (H % 4u) == 0u) {
+    static std::map<const float *, std::pair<unsigned short *, unsigned short *>>
+      g_rsplit_t;
+    auto it = g_rsplit_t.find(Wg);
+    if (it == g_rsplit_t.end() && !StreamManager::Global().isCapturing()) {
+      auto ks =
+        CudaContext::Global().registerCudaKernel(MOE_SRC, "moe_rsplit_t");
+      unsigned short *hiT = nullptr, *loT = nullptr;
+      const size_t n = (size_t)H * E;
+      bool built = false;
+      if (ks && cudaMalloc(&hiT, n * 2) == cudaSuccess &&
+          cudaMalloc(&loT, n * 2) == cudaSuccess) {
+        int hh = (int)H, ee = (int)E;
+        ks->SetKernelArguments(0, &Wg, sizeof(Wg));
+        ks->SetKernelArguments(1, &hiT, sizeof(hiT));
+        ks->SetKernelArguments(2, &loT, sizeof(loT));
+        ks->SetKernelArguments(3, &hh, sizeof(hh));
+        ks->SetKernelArguments(4, &ee, sizeof(ee));
+        const int gs[3] = {(int)((n + 255) / 256), 1, 1}, bs[3] = {256, 1, 1};
+        built = StreamManager::Global().DispatchCommand(*ks, gs, bs);
+      }
+      if (!built) {
+        if (hiT)
+          cudaFree(hiT);
+        if (loT)
+          cudaFree(loT);
+        hiT = loT = nullptr; // negative-cache: do not retry every call
+      }
+      it = g_rsplit_t.emplace(Wg, std::make_pair(hiT, loT)).first;
+    }
+    if (it != g_rsplit_t.end() && it->second.first != nullptr) {
+      auto kg =
+        CudaContext::Global().registerCudaKernel(MOE_SRC, "moe_router_gemv_h2");
+      if (kg) {
+        int hh = (int)H, ee = (int)E;
+        kg->SetKernelArguments(0, &X, sizeof(X));
+        kg->SetKernelArguments(1, &it->second.first, sizeof(void *));
+        kg->SetKernelArguments(2, &it->second.second, sizeof(void *));
+        kg->SetKernelArguments(3, &L, sizeof(L));
+        kg->SetKernelArguments(4, &hh, sizeof(hh));
+        kg->SetKernelArguments(5, &ee, sizeof(ee));
+        const int gg[3] = {(int)((E + 7) / 8), 1, 1}, bb[3] = {256, 1, 1};
+        if (StreamManager::Global().DispatchCommand(*kg, gg, bb)) {
+          StreamManager::Global().maybeFinish();
+          return true;
+        }
       }
     }
   }
