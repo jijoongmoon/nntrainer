@@ -39,7 +39,7 @@ namespace nntrainer::cuda {
  * site (and the stage lapses conservatively).
  */
 void quant_stage_survive(const void *w0, const void *w1 = nullptr,
-                         const void *w2 = nullptr);
+                         const void *w2 = nullptr, const void *w3 = nullptr);
 
 /**
  * @brief check a CUDA Runtime API return, logging on failure

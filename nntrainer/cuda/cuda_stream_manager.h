@@ -221,9 +221,9 @@ public:
    */
   void enableLaunchTrace() { launch_trace_ = true; }
   const char *lastLaunch(unsigned back) const {
-    if (!launch_trace_ || back >= 8 || back >= launch_ring_n_)
+    if (!launch_trace_ || back >= 16 || back >= launch_ring_n_)
       return "?";
-    return launch_ring_[(launch_ring_pos_ + 8 - 1 - back) & 7];
+    return launch_ring_[(launch_ring_pos_ + 16 - 1 - back) & 15];
   }
 
   /**
@@ -245,7 +245,7 @@ private:
   char dispatch_tag_[96]{};
   unsigned long long dispatch_seq_{0};
   bool launch_trace_{false};
-  char launch_ring_[8][96]{};
+  char launch_ring_[16][96]{};
   unsigned launch_ring_pos_{0};
   unsigned launch_ring_n_{0};
 };

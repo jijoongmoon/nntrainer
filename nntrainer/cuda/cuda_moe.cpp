@@ -5,6 +5,7 @@
  */
 #include "cuda_moe.h"
 
+#include <cuda_common.h> // quant_stage_survive
 #include <cuda_context.h>
 #include <cuda_context_manager.h>
 #include <cuda_fc_dense.h>  // cuda_fc_dense_gemm_fp16_f32out_acc (router h2)
@@ -1181,6 +1182,9 @@ bool cuda_moe_router_gemm_fp16(const unsigned short *X, const float *Wg,
         ks->SetKernelArguments(3, &ni, sizeof(ni));
         const int gs[3] = {(int)((n + 255) / 256), 1, 1}, bs[3] = {256, 1, 1};
         built = StreamManager::Global().DispatchCommand(*ks, gs, bs);
+        if (built)
+          quant_stage_survive(hi, lo); // one-time plane build: writes only
+                                       // the freshly cudaMalloc'd hi/lo
       }
       if (!built) {
         if (hi)
@@ -1279,6 +1283,9 @@ bool cuda_moe_router_gemm_fp16(const unsigned short *X, const float *Wg,
         ks->SetKernelArguments(4, &ee, sizeof(ee));
         const int gs[3] = {(int)((n + 255) / 256), 1, 1}, bs[3] = {256, 1, 1};
         built = StreamManager::Global().DispatchCommand(*ks, gs, bs);
+        if (built)
+          quant_stage_survive(hiT, loT); // one-time plane build: writes only
+                                         // the freshly cudaMalloc'd planes
       }
       if (!built) {
         if (hiT)
@@ -1749,6 +1756,7 @@ bool cuda_moe_route_grouped_fp32(const float *logits, int *rows, float *wts,
     if (!sm.DispatchCommand(*k, g, b,
                             tkw ? 0u : (unsigned int)(E * sizeof(float))))
       return false;
+    quant_stage_survive(d_idx, d_wt, counts); // routing scratch only
   }
   rstamp(1);
   { // e-ascending sort of each token's pairs (order only, values untouched)
@@ -1756,6 +1764,7 @@ bool cuda_moe_route_grouped_fp32(const float *logits, int *rows, float *wts,
     const size_t s[] = {PS, PS, sizeof(int), sizeof(int)};
     if (!dispatch1d("moe_tk_esort", a, s, 4, (long)T, 256))
       return false;
+    quant_stage_survive(d_idx, d_wt); // in-place pair reorder
   }
   rstamp(2);
   { // padded offsets + block work list, single-threaded over E like the scan
@@ -1775,6 +1784,7 @@ bool cuda_moe_route_grouped_fp32(const float *logits, int *rows, float *wts,
     const int g[3] = {1, 1, 1}, b[3] = {par ? 256 : 32, 1, 1};
     if (!sm.DispatchCommand(*k, g, b, par ? (E + 1) * 4 : 0))
       return false;
+    quant_stage_survive(d_cur, wl_e, wl_n); // routing scratch only
   }
   rstamp(3);
   { // bucket into padded slots + reverse map
@@ -1783,6 +1793,7 @@ bool cuda_moe_route_grouped_fp32(const float *logits, int *rows, float *wts,
     const size_t s[] = {PS, PS, PS, PS, PS, PS, sizeof(int), sizeof(int)};
     if (!dispatch1d("moe_route_bucket_rev", a, s, 8, (long)T * K, 256))
       return false;
+    quant_stage_survive(rows, wts, slots, d_cur); // routing planes only
   }
   rstamp(4);
   if (rdbg_this) {
@@ -1906,6 +1917,8 @@ bool cuda_moe_grouped_ffn_imma(const unsigned short *input,
     const int g[3] = {iT, 1, 1}, b[3] = {256, 1, 1};
     if (!sm.DispatchCommand(*k, g, b))
       return false;
+    quant_stage_survive(g_qa, g_sa, g_za); // MoE's OWN quant planes, not
+                                           // the FC staging scratch
   }
   stamp(1);
   const auto *wp64 = reinterpret_cast<const unsigned long long *>(p.wptr);
@@ -2017,6 +2030,7 @@ bool cuda_moe_grouped_ffn_imma(const unsigned short *input,
     const int g[3] = {w32 ? 8 : 64, (int)Wcap, 1}, b[3] = {256, 1, 1};
     if (!sm.DispatchCommand(*k, g, b))
       return false;
+    quant_stage_survive(g_qb, g_sb, g_zb);
     stamp(4);
     stamp(5);
   } else {
@@ -2032,6 +2046,7 @@ bool cuda_moe_grouped_ffn_imma(const unsigned short *input,
     const int g[3] = {32, (int)Wcap, 1}, b[3] = {256, 1, 1};
     if (!sm.DispatchCommand(*k, g, b))
       return false;
+    quant_stage_survive(g_S);
   }
   stamp(4);
   { // re-quantize the SwiGLU output, work-list-indexed
@@ -2047,6 +2062,7 @@ bool cuda_moe_grouped_ffn_imma(const unsigned short *input,
     const int g[3] = {64, (int)Wcap, 1}, b[3] = {256, 1, 1};
     if (!sm.DispatchCommand(*k, g, b))
       return false;
+    quant_stage_survive(g_qb, g_sb, g_zb);
   }
   stamp(5);
   }
@@ -2088,6 +2104,7 @@ bool cuda_moe_grouped_ffn_imma(const unsigned short *input,
     if (!dispatch1d(v8 ? "moe_combine_seq_h_v8" : "moe_combine_seq_h", a, s, 7,
                     v8 ? (long)T * (H / 8) : (long)T * H, 256))
       return false;
+    quant_stage_survive(output); // the ffn output tensor; never the staged X
   }
   stamp(7);
   if (dbg_this) {

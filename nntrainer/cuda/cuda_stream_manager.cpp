@@ -277,10 +277,10 @@ bool StreamManager::DispatchCommand(Kernel &kernel, const int (&grid)[3],
   // own dispatches sees a value no other dispatch can reproduce.
   ++dispatch_seq_;
   if (launch_trace_) {
-    snprintf(launch_ring_[launch_ring_pos_ & 7], sizeof(launch_ring_[0]),
+    snprintf(launch_ring_[launch_ring_pos_ & 15], sizeof(launch_ring_[0]),
              "%s|%s", kernel.name().c_str(), dispatch_tag_);
     ++launch_ring_pos_;
-    if (launch_ring_n_ < 8)
+    if (launch_ring_n_ < 16)
       ++launch_ring_n_;
   }
   auto params = kernel.getKernelParams();

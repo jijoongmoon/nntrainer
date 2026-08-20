@@ -4295,7 +4295,7 @@ bool quant_staged_for(const void *xh, int k) {
     fprintf(stderr, "[qstage] xh=%p k=%d ok=%d ptr=%d kk=%d dseq=%lld\n", xh, k,
             (int)ok, (int)(xh == g_last_quant_xh), (int)(k == g_last_quant_k),
             dseq);
-    for (long long b = 0; !ok && b < dseq && b < 8; ++b)
+    for (long long b = 0; !ok && b < dseq && b < 16; ++b)
       fprintf(stderr, "[qstage]   -%lld: %s\n", b + 1,
               StreamManager::Global().lastLaunch((unsigned)b));
     ++dbg;
@@ -4380,11 +4380,13 @@ static DevWeightI8 *ensure_i8_cache_locked(const unsigned char *plain_w,
 // dispatch is exactly what lapsed it. (Defined OUTSIDE the anonymous
 // namespace: the callers are other translation units; the staging record it
 // reads stays internal.)
-void quant_stage_survive(const void *w0, const void *w1, const void *w2) {
+void quant_stage_survive(const void *w0, const void *w1, const void *w2,
+                         const void *w3) {
   if (!g_last_quant_valid)
     return;
   if (w0 == g_last_quant_xh || (w1 != nullptr && w1 == g_last_quant_xh) ||
-      (w2 != nullptr && w2 == g_last_quant_xh))
+      (w2 != nullptr && w2 == g_last_quant_xh) ||
+      (w3 != nullptr && w3 == g_last_quant_xh))
     return;
   if (StreamManager::Global().dispatchSeq() == g_last_quant_seq + 1)
     g_last_quant_seq = StreamManager::Global().dispatchSeq();
@@ -4472,7 +4474,10 @@ bool cuda_fc_qs4cx_moe_grouped_gemm(
   kg->SetKernelArguments(10, &out_fp16, sizeof(out_fp16));
   const int ib[3] = {256, 1, 1};
   const int ig[3] = {(int)(N / 64u), (int)n_mblocks, 1};
-  return StreamManager::Global().DispatchCommand(*kg, ig, ib);
+  if (!StreamManager::Global().DispatchCommand(*kg, ig, ib))
+    return false;
+  quant_stage_survive(Y); // grouped GEMM writes only its C plane(s)
+  return true;
 }
 
 bool cuda_fc_qs4cx_moe_grouped_gemm2(
@@ -4507,7 +4512,10 @@ bool cuda_fc_qs4cx_moe_grouped_gemm2(
   kg->SetKernelArguments(13, &out_fp16, sizeof(out_fp16));
   const int ib[3] = {256, 1, 1};
   const int ig[3] = {(int)(N / 64u), (int)n_mblocks, 1};
-  return StreamManager::Global().DispatchCommand(*kg, ig, ib);
+  if (!StreamManager::Global().DispatchCommand(*kg, ig, ib))
+    return false;
+  quant_stage_survive(Yg, Yu); // grouped GEMM writes only its C plane(s)
+  return true;
 }
 
 bool cuda_fc_qs4cx_moe_grouped_gemm_w(
@@ -4537,7 +4545,10 @@ bool cuda_fc_qs4cx_moe_grouped_gemm_w(
   kg->SetKernelArguments(10, &out_fp16, sizeof(out_fp16));
   const int ib[3] = {256, 1, 1};
   const int ig[3] = {(int)(N / 128u), (int)n_mblocks, 1};
-  return StreamManager::Global().DispatchCommand(*kg, ig, ib);
+  if (!StreamManager::Global().DispatchCommand(*kg, ig, ib))
+    return false;
+  quant_stage_survive(Y); // grouped GEMM writes only its C plane(s)
+  return true;
 }
 
 // NNTR_MOE_G3 launcher: same shape/steering as the _gemm entry plus the
@@ -4592,7 +4603,10 @@ bool cuda_fc_qs4cx_moe_grouped_gemm_g3(
   kg->SetKernelArguments(12, &wl_n, sizeof(wl_n));
   const int ib[3] = {256, 1, 1};
   const int ig[3] = {(int)(N / 64u), (int)n_mblocks, 1};
-  return StreamManager::Global().DispatchCommand(*kg, ig, ib);
+  if (!StreamManager::Global().DispatchCommand(*kg, ig, ib))
+    return false;
+  quant_stage_survive(Y); // grouped GEMM writes only its C plane(s)
+  return true;
 }
 
 // down (K <= 512) persistent-N launcher: grid (1, W) -- see the kernel note.
@@ -4626,7 +4640,10 @@ bool cuda_fc_qs4cx_moe_grouped_gemm_g3d(
   kg->SetKernelArguments(11, &wl_n, sizeof(wl_n));
   const int ib[3] = {256, 1, 1};
   const int ig[3] = {1, (int)n_mblocks, 1};
-  return StreamManager::Global().DispatchCommand(*kg, ig, ib);
+  if (!StreamManager::Global().DispatchCommand(*kg, ig, ib))
+    return false;
+  quant_stage_survive(Y); // grouped GEMM writes only its C plane(s)
+  return true;
 }
 
 // m4-order slab-to-slab repack (see header note). The permutation is global,
@@ -4718,7 +4735,10 @@ bool cuda_fc_qs4cx_moe_grouped_gemm_g4(
   kg->SetKernelArguments(12, &wl_n, sizeof(wl_n));
   const int ib[3] = {256, 1, 1};
   const int ig[3] = {(int)(N / 128u), (int)n_mblocks, 1};
-  return StreamManager::Global().DispatchCommand(*kg, ig, ib);
+  if (!StreamManager::Global().DispatchCommand(*kg, ig, ib))
+    return false;
+  quant_stage_survive(Y); // grouped GEMM writes only its C plane(s)
+  return true;
 }
 
 // One launch per projection: in-place fragment repack of ALL E expert
