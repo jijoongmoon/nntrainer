@@ -61,6 +61,12 @@ bool cuda_add_pending_take(const void *out, unsigned long long n,
                            const unsigned short **a, const unsigned short **b);
 void cuda_add_flush_pending();
 
+/**
+ * @brief Launch a deferred in-place sigmoid (the attn-gate fusion's flush
+ * half; see cuda_act_sigmoid_fp16 / cuda_mul_fp16).
+ */
+void cuda_sigmoid_flush_pending();
+
 /** @brief out[i] = a[i] * b[i] (same-shape eltwise multiply; bit-identical
  *  to the host loop -- fp16 products are exact in fp32) */
 bool cuda_mul_fp16(const unsigned short *a, const unsigned short *b,

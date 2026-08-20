@@ -105,6 +105,31 @@ __global__ void act_sigmoid_fp16(unsigned short *x, int n) {
   if (i >= n) return;
   x[i] = ew_f2h(1.0f / (1.0f + expf(-ew_h2f(x[i]))));
 }
+// sigmoid+mul fused (the attention output gate): reproduces the SPLIT
+// pair's arithmetic exactly -- s = rn_f16(sigmoid(g)) is written back to g
+// (the in-place activation's contract, kept for any later reader of the
+// gate) and the product rounds from the ROUNDED s, so output bytes match
+// act_sigmoid_fp16_v8 followed by mul_fp16_v8 exactly.
+__global__ void sigmoid_mul_fp16_v8(unsigned short *g, const unsigned short *b,
+                                    unsigned short *out, int n8) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n8) return;
+  uint4 gv = ((uint4 *)g)[i];
+  const uint4 bv = ((const uint4 *)b)[i];
+  uint4 ov;
+  unsigned short *gh = (unsigned short *)&gv;
+  const unsigned short *bh = (const unsigned short *)&bv;
+  unsigned short *oh = (unsigned short *)&ov;
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    const float s = 1.0f / (1.0f + expf(-ew_h2f(gh[j])));
+    const unsigned short s16 = ew_f2h(s);
+    gh[j] = s16;
+    oh[j] = ew_f2h(ew_h2f(s16) * ew_h2f(bh[j]));
+  }
+  ((uint4 *)g)[i] = gv;
+  ((uint4 *)out)[i] = ov;
+}
 __global__ void act_sigmoid_fp32(float *x, int n) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
@@ -483,9 +508,42 @@ bool cuda_swiglu_fp16(const unsigned short *gate, const unsigned short *up,
   return dispatch1d(k, (unsigned int)ni);
 }
 
-bool cuda_act_sigmoid_fp16(unsigned short *x, unsigned int n) {
-  if (n == 0)
-    return true;
+// The one-deep pending-SIGMOID record (attn output gate): created at
+// cuda_act_sigmoid_fp16, consumed by the next cuda_mul_fp16 on the same
+// tensor (fused sigmoid_mul), flushed by every backend entry otherwise --
+// the same discipline as PendingAdd above. The two records never coexist:
+// each defer entry flushes the other type first, so hook flush order can
+// never invert graph order.
+namespace {
+struct PendingSig {
+  unsigned short *x = nullptr;
+  unsigned int n = 0;
+  bool valid = false;
+};
+PendingSig g_pend_sig;
+
+// EXPERIMENTAL, DEFAULT OFF — a real deferred sigmoid corrupts the output
+// ("ou ou ou" garbage from token 0) even though the defer/flush machinery is
+// proven sound: level 3 (defer + immediate flush, identical stream position)
+// is text-exact, level 2 (real defer, flush at the consumer's first
+// dispatch) is garbage, and the [sigp] trace shows every flush landing at
+// the consumer's own tag. Conclusion: something between the sigmoid node
+// and the consumer's first dispatch reads the gate WITHOUT entering any
+// backend hook (a raw cudaMemcpyAsync tensor copy or a mapped-memory host
+// read) and captures pre-sigmoid bytes. Until that reader is named, the
+// defer must not ship. 0 = off (DEFAULT), 1 = full fusion, 2 = defer-only
+// bisect arm, 3 = zero-length-defer machinery check.
+int sig_fuse_lvl() {
+  static const int v = []() {
+    const char *e = std::getenv("NNTR_SIG_FUSE");
+    if (e == nullptr) return 0;
+    return (int)(e[0] - '0');
+  }();
+  return v;
+}
+bool sig_fuse_on() { return sig_fuse_lvl() != 0; }
+
+bool sig_launch_now(unsigned short *x, unsigned int n) {
   const bool v8 = ew_v8_ok(n, x, nullptr, nullptr);
   auto k = CudaContext::Global().registerCudaKernel(
     ELTWISE_SRC, v8 ? "act_sigmoid_fp16_v8" : "act_sigmoid_fp16");
@@ -497,6 +555,50 @@ bool cuda_act_sigmoid_fp16(unsigned short *x, unsigned int n) {
   k->SetKernelArguments(0, &x, sizeof(x));
   k->SetKernelArguments(1, &ni, sizeof(ni));
   return dispatch1d(k, (unsigned int)ni);
+}
+} // namespace
+
+namespace {
+int sig_dbg_budget() {
+  static int b = []() {
+    const char *e = std::getenv("NNTR_SIG_DBG");
+    return (e != nullptr && e[0] == '1') ? 60 : 0;
+  }();
+  return b;
+}
+int g_sig_dbg_n = 0;
+} // namespace
+
+void cuda_sigmoid_flush_pending() {
+  if (!g_pend_sig.valid)
+    return;
+  PendingSig p = g_pend_sig; // clear BEFORE launching (re-entrant hook)
+  g_pend_sig.valid = false;
+  if (g_sig_dbg_n < sig_dbg_budget())
+    fprintf(stderr, "[sigp] FLUSH x=%p n=%u at tag=%s (#%d)\n", (void *)p.x,
+            p.n, StreamManager::Global().dispatchTag(), g_sig_dbg_n++);
+  if (!sig_launch_now(p.x, p.n))
+    ml_loge("[CUDA] pending sigmoid flush FAILED (x=%p n=%u)", (void *)p.x,
+            p.n);
+}
+
+bool cuda_act_sigmoid_fp16(unsigned short *x, unsigned int n) {
+  if (n == 0)
+    return true;
+  cuda_add_flush_pending();     // one live pending across both types
+  cuda_sigmoid_flush_pending(); // never stack two sigmoid records
+  if (sig_fuse_on() && ew_v8_ok(n, x, nullptr, nullptr)) {
+    g_pend_sig = {x, n, true};
+    if (sig_fuse_lvl() == 3) { // zero-length defer: machinery bisect arm
+      cuda_sigmoid_flush_pending();
+      return true;
+    }
+    if (g_sig_dbg_n < sig_dbg_budget())
+      fprintf(stderr, "[sigp] DEFER x=%p n=%u at tag=%s (#%d)\n", (void *)x, n,
+              StreamManager::Global().dispatchTag(), g_sig_dbg_n++);
+    return true;
+  }
+  return sig_launch_now(x, n);
 }
 
 bool cuda_act_sigmoid_fp32(float *x, unsigned int n) {
@@ -621,6 +723,7 @@ bool cuda_add_fp16(const unsigned short *a, const unsigned short *b,
                    unsigned short *out, unsigned int n) {
   if (n == 0)
     return true;
+  cuda_sigmoid_flush_pending(); // one live pending across both types
   cuda_add_flush_pending(); // never stack two records
   if (add_fuse_on() && ew_v8_ok(n, a, b, out)) {
     g_pend_add = {a, b, out, n, true};
@@ -633,6 +736,25 @@ bool cuda_mul_fp16(const unsigned short *a, const unsigned short *b,
                    unsigned short *out, unsigned int n) {
   if (n == 0)
     return true;
+  if (g_pend_sig.valid && g_pend_sig.n == n && sig_fuse_lvl() == 1) {
+    unsigned short *gx = g_pend_sig.x;
+    const unsigned short *other =
+      (gx == a) ? b : (gx == b) ? a : (const unsigned short *)nullptr;
+    if (other != nullptr && ew_v8_ok(n, gx, other, out)) {
+      auto kf = CudaContext::Global().registerCudaKernel(
+        ELTWISE_SRC, "sigmoid_mul_fp16_v8");
+      if (kf) {
+        g_pend_sig.valid = false;
+        int n8 = (int)(n / 8);
+        kf->SetKernelArguments(0, &gx, sizeof(gx));
+        kf->SetKernelArguments(1, &other, sizeof(other));
+        kf->SetKernelArguments(2, &out, sizeof(out));
+        kf->SetKernelArguments(3, &n8, sizeof(n8));
+        return dispatch1d(kf, (unsigned int)n8);
+      }
+    }
+    // non-matching or ineligible: the dispatch below flushes it in order
+  }
   const bool v8 = ew_v8_ok(n, a, b, out);
   auto k = CudaContext::Global().registerCudaKernel(
     ELTWISE_SRC, v8 ? "mul_fp16_v8" : "mul_fp16");

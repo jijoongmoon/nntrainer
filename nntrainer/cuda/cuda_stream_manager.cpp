@@ -31,6 +31,7 @@ namespace nntrainer::cuda {
 // From cuda_elementwise.cpp (declared in cuda_elementwise.h; kept as a local
 // declaration to avoid pulling the eltwise header into the stream manager).
 void cuda_add_flush_pending();
+void cuda_sigmoid_flush_pending();
 
 // [CAP-AUDIT] prints are opt-in diagnostics (NNTR_CUDA_CAP_AUDIT=1): with the
 // M2-B decode graph default-ON they fire on every capture (one per shared-
@@ -239,7 +240,8 @@ void StreamManager::initialize() noexcept {
 
 bool StreamManager::EnqueueWriteBuffer(void *dst_dev, size_t size,
                                        const void *src_host, bool async) {
-  cuda_add_flush_pending(); // raw stream op bypasses DispatchCommand's hook
+  cuda_add_flush_pending();
+  cuda_sigmoid_flush_pending(); // raw stream op bypasses DispatchCommand's hook
   if (!cudaCheck(cudaMemcpyAsync(dst_dev, src_host, size,
                                  cudaMemcpyHostToDevice, stream_),
                  "cudaMemcpyAsync H2D"))
@@ -251,7 +253,8 @@ bool StreamManager::EnqueueWriteBuffer(void *dst_dev, size_t size,
 
 bool StreamManager::EnqueueReadBuffer(const void *src_dev, size_t size,
                                       void *dst_host, bool async) {
-  cuda_add_flush_pending(); // raw stream op bypasses DispatchCommand's hook
+  cuda_add_flush_pending();
+  cuda_sigmoid_flush_pending(); // raw stream op bypasses DispatchCommand's hook
   if (!cudaCheck(cudaMemcpyAsync(dst_host, src_dev, size,
                                  cudaMemcpyDeviceToHost, stream_),
                  "cudaMemcpyAsync D2H"))
@@ -268,6 +271,7 @@ bool StreamManager::DispatchCommand(Kernel &kernel, const int (&grid)[3],
   // stream: stream order stays exactly what the graph produced. Re-entrancy
   // safe (the flush clears its record before launching through here).
   cuda_add_flush_pending();
+  cuda_sigmoid_flush_pending();
   if (!kernel.valid()) {
     ml_loge("[CUDA] DispatchCommand: invalid kernel");
     return false;
@@ -313,7 +317,8 @@ bool StreamManager::DispatchCommand(Kernel &kernel, const int (&grid)[3],
 }
 
 void StreamManager::finish() {
-  cuda_add_flush_pending(); // a host read may follow; materialize the residual
+  cuda_add_flush_pending();
+  cuda_sigmoid_flush_pending(); // a host read may follow; materialize the residual
   if (capturing_) { // an in-capture cudaStreamSynchronize is illegal; the drain
     // is deferred to after the graph replay (endCapture caller). A host read
     // that depended on this drain now consumes stale bytes -- audit-log the

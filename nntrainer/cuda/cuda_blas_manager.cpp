@@ -23,6 +23,7 @@ namespace nntrainer::cuda {
 
 // From cuda_elementwise.cpp: resolve any deferred residual add first.
 void cuda_add_flush_pending();
+void cuda_sigmoid_flush_pending();
 
 namespace {
 // Contiguous repack scratch for the int8 GEMM K-chunking (igemmRowMajor).
@@ -147,7 +148,8 @@ bool BlasManager::igemmRowMajor(int M, int N, int K, const signed char *A,
   // kprof bracket covers the whole chunk loop = one logical GEMM. The failure
   // returns below skip kprof_end: they precede a dead context, so the dropped
   // pair is irrelevant.
-  cuda_add_flush_pending(); // cuBLAS bypasses DispatchCommand's hook
+  cuda_add_flush_pending();
+  cuda_sigmoid_flush_pending(); // cuBLAS bypasses DispatchCommand's hook
   void *kp = kprof_begin();
   for (int m0 = 0; m0 < M; m0 += mchunk) {
     const int mc = (M - m0 < mchunk) ? (M - m0) : mchunk;

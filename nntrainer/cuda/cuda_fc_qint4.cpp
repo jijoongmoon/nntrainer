@@ -5841,6 +5841,19 @@ bool cuda_fc_qs4cx_prewarm(const unsigned char *plain_w, unsigned int N,
               N, K, ((size_t)N * K + FC_I8_TAIL_PAD) >> 20);
     }
   }
+  // m4 prewarm: the marlin-form fragment repack was the last lazy
+  // first-touch left inside the timed prefill window (repack_marlin_m4
+  // rows + their gaps, ~15 ms across the dense roles on chunk 0). Build it
+  // here with EXACTLY the runtime's key and arguments (DevWeightQ plain,
+  // cxnib=8, rowsum reused) so the in-path ensure hits its cache.
+  // Ineligible shapes fall through untouched; a failed build just leaves
+  // the lazy path in place.
+  if (marlin_on() && (N % 128u) == 0u && (K % 256u) == 0u) {
+    auto itq = g_dp4a_plain_cache.find(plain_w);
+    if (itq != g_dp4a_plain_cache.end())
+      (void)ensure_m4_cache_locked(itq->second.plain, N, K, 8,
+                                   itq->second.rowsum);
+  }
   return true;
 }
 
