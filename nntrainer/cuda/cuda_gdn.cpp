@@ -129,6 +129,42 @@ __global__ void gdn_gemv_h_f4n(const unsigned short *x,
   if (s == 0)
     out[c] = red[c];
 }
+// Wide-load twin of gdn_gemv_h_f4n for N=32 (the b/a shape). The narrow
+// kernel's 2-BYTE loads from ONE block were the "~190us / 128KB pinned
+// floor": ~2 KB in flight against pinned's full-fabric latency = ~0.7 GB/s.
+// This is MLP starvation, not a memory law — thread t loads a uint4
+// (8 halves = its column octet q=t&3 of k-row t>>2), putting 16 KB in
+// flight: measured 182.8 -> 15.5 us on the exact shape (baprobe, 8.4 GB/s).
+// Accumulation is per-column over 64 k-slices tree-summed — ANOTHER reorder
+// vs f4n (same ulp class, NLL-gated batch); NNTR_GDN_GEMVW=0 restores f4n.
+__global__ void gdn_gemv_h_f4nw(const unsigned short *x,
+                                const unsigned short *W, float *out, int K,
+                                int N){
+  __shared__ float xs[4096];
+  for (int i = threadIdx.x; i < K; i += blockDim.x) xs[i] = h2f(x[i]);
+  __syncthreads();
+  const int q = threadIdx.x & 3, r0 = threadIdx.x >> 2; // 64 rows per sweep
+  float a[8] = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+  for (int k = r0; k < K; k += 64) {
+    const uint4 w = *(const uint4 *)(W + (long)k*N + q*8);
+    const float xv = xs[k];
+    const unsigned short *hw = (const unsigned short *)&w;
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) a[j] += xv*h2f(hw[j]);
+  }
+  __shared__ float red[64][32];
+  #pragma unroll
+  for (int j = 0; j < 8; ++j) red[r0][q*8 + j] = a[j];
+  __syncthreads();
+  for (int st = 32; st > 0; st >>= 1) {
+    for (int i = threadIdx.x; i < st*32; i += blockDim.x) {
+      const int s = i >> 5, c = i & 31;
+      red[s][c] += red[s + st][c];
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x < 32) out[threadIdx.x] = red[0][threadIdx.x];
+}
 __global__ void gdn_gemv_f_h4(const float *x, const unsigned short *W,
                               unsigned short *out, int K, int N){
   __shared__ float xs[4096];
@@ -2841,7 +2877,33 @@ bool cuda_gdn_decode_fp16(const unsigned short *x, const unsigned short *wqkv,
   }
   auto kgn = gemvn_on ? ctx.registerCudaKernel(GDN_SRC, "gdn_gemv_h_f4n")
                       : decltype(kg){};
+  // Wide-load narrow twin (the 190us pinned-floor fix): OPT-IN via
+  // NNTR_GDN_GEMVW=1. The row win is 10x (185 -> 18.4 us measured in-tree)
+  // but decode wall is FLAT today — the freed GPU time was covering host
+  // work (exit host-gap grew 393->473 ms), so the -10 ms/token pays out
+  // only together with the decode host-gap levers (graph capture). Gates
+  // run 2026-08-20: floor 8/10 both arms (identical miss), judge_nll on
+  // 0.2527 vs off 0.2435 (in-band, ON slightly worse) — default stays OFF
+  // until the win is wall-visible; flip with the decode batch's gate cycle.
+  // Map assumes N==32 / 256 threads / 16B-aligned W / K<=4096.
+  static const bool gemvw_on = []() {
+    const char *e = std::getenv("NNTR_GDN_GEMVW");
+    return e != nullptr && e[0] == '1';
+  }();
+  auto kgnw = (gemvn_on && gemvw_on)
+                ? ctx.registerCudaKernel(GDN_SRC, "gdn_gemv_h_f4nw")
+                : decltype(kg){};
   auto gemv_h = [&](const unsigned short *W, float *dst, int K, int N) {
+    if (kgnw && N == 32 && (K % 64) == 0 && K <= 4096 &&
+        ((uintptr_t)W & 15u) == 0u) {
+      kgnw->SetKernelArguments(0, &x, sizeof(x));
+      kgnw->SetKernelArguments(1, &W, sizeof(W));
+      kgnw->SetKernelArguments(2, &dst, sizeof(dst));
+      kgnw->SetKernelArguments(3, &K, sizeof(K));
+      kgnw->SetKernelArguments(4, &N, sizeof(N));
+      const int g[3] = {1, 1, 1}, b[3] = {256, 1, 1};
+      return sm.DispatchCommand(*kgnw, g, b);
+    }
     // Narrow rows (b/a: N=32) take the cooperative block kernel -- the
     // 4-wide form would launch N/4 threads total.
     if (gemvn_on && kgn && N <= 64 && (B % N) == 0) {
