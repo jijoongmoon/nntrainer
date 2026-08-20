@@ -12,6 +12,7 @@
 
 #include "cuda_rope.h"
 
+#include <cuda_common.h>
 #include <cuda_context.h>
 #include <cuda_stream_manager.h>
 
@@ -125,6 +126,7 @@ bool cuda_rope_fp16(const unsigned short *in, unsigned short *out,
   const int grid[3] = {num_rows, num_heads, 1};
   if (!StreamManager::Global().DispatchCommand(*kernel, grid, block))
     return false;
+  quant_stage_survive(out); // rope writes only `out`
   StreamManager::Global().maybeFinish();
   return true;
 }
@@ -158,6 +160,7 @@ bool cuda_rope_fp16_dpos(const unsigned short *in, unsigned short *out,
   const int grid[3] = {num_rows, num_heads, 1};
   if (!StreamManager::Global().DispatchCommand(*kernel, grid, block))
     return false;
+  quant_stage_survive(out); // rope writes only `out`
   StreamManager::Global().maybeFinish();
   return true;
 }

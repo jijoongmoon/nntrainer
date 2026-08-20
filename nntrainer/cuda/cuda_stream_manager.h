@@ -213,6 +213,20 @@ public:
   unsigned long long dispatchSeq() const { return dispatch_seq_; }
 
   /**
+   * @brief Debug ring of the last dispatched kernel names (NNTR_QUANT_DBG).
+   *
+   * Off by default (zero hot-path cost); a staging-miss probe turns it on to
+   * NAME the launches that invalidated a staged activation quant instead of
+   * guessing them from histograms. back=0 is the most recent launch.
+   */
+  void enableLaunchTrace() { launch_trace_ = true; }
+  const char *lastLaunch(unsigned back) const {
+    if (!launch_trace_ || back >= 8 || back >= launch_ring_n_)
+      return "?";
+    return launch_ring_[(launch_ring_pos_ + 8 - 1 - back) & 7];
+  }
+
+  /**
    * @brief Destroy the stream
    */
   ~StreamManager() override;
@@ -230,6 +244,10 @@ private:
   bool capture_doomed_{false};
   char dispatch_tag_[96]{};
   unsigned long long dispatch_seq_{0};
+  bool launch_trace_{false};
+  char launch_ring_[8][96]{};
+  unsigned launch_ring_pos_{0};
+  unsigned launch_ring_n_{0};
 };
 
 /**

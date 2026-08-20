@@ -24,6 +24,24 @@
 namespace nntrainer::cuda {
 
 /**
+ * @brief Extend a live staged activation quant across one benign dispatch.
+ *
+ * The FC act-quant staging (cuda_fc_qint4.cpp) is guarded by "not one kernel
+ * dispatched since" so a pool-recycled pointer can never impersonate the
+ * staged activation. That proxy is stricter than the hazard: a kernel whose
+ * global writes are all NAMED and none of them is the staged activation
+ * plane leaves the staged bytes untouched. Such a dispatch site may call
+ * this immediately after its (successful) DispatchCommand, passing every
+ * buffer its kernel writes; if none matches the staged pointer, the staging
+ * survives the dispatch. A stage that is already stale stays stale — the
+ * ABA/recycling hazard needs a WRITE to the staged buffer, and that writer
+ * either names the pointer here (and fails the match) or is not a survive
+ * site (and the stage lapses conservatively).
+ */
+void quant_stage_survive(const void *w0, const void *w1 = nullptr,
+                         const void *w2 = nullptr);
+
+/**
  * @brief check a CUDA Runtime API return, logging on failure
  * @return true on cudaSuccess
  */

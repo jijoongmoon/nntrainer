@@ -276,6 +276,13 @@ bool StreamManager::DispatchCommand(Kernel &kernel, const int (&grid)[3],
   // Counted before the launch so a caller that stamps dispatchSeq() AFTER its
   // own dispatches sees a value no other dispatch can reproduce.
   ++dispatch_seq_;
+  if (launch_trace_) {
+    snprintf(launch_ring_[launch_ring_pos_ & 7], sizeof(launch_ring_[0]),
+             "%s|%s", kernel.name().c_str(), dispatch_tag_);
+    ++launch_ring_pos_;
+    if (launch_ring_n_ < 8)
+      ++launch_ring_n_;
+  }
   auto params = kernel.getKernelParams();
   void *kp = kprof_begin();
   CUresult r = cuLaunchKernel(

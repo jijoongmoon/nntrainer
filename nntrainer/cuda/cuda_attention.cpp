@@ -12,6 +12,7 @@
 
 #include "cuda_attention.h"
 
+#include <cuda_common.h>
 #include <cuda_blas_manager.h>
 #include <cuda_context.h>
 #include <cuda_context_manager.h>
@@ -1705,14 +1706,20 @@ static bool attn_flash_prefill_d256(const unsigned short *q,
   kf->SetKernelArguments(8, &HKV, sizeof(HKV));
   kf->SetKernelArguments(9, &scale, sizeof(scale));
   const int g[3] = {(N_q + 127) / 128, HQ, 1}, b[3] = {256, 1, 1};
-  if (!time_this)
-    return StreamManager::Global().DispatchCommand(*kf, g, b, (unsigned)SMEM);
+  if (!time_this) {
+    if (!StreamManager::Global().DispatchCommand(*kf, g, b, (unsigned)SMEM))
+      return false;
+    quant_stage_survive(o); // flash writes only `o`
+    return true;
+  }
   auto &sm = StreamManager::Global();
   cudaEvent_t e0, e1;
   cudaEventCreate(&e0);
   cudaEventCreate(&e1);
   cudaEventRecord(e0, sm.GetStream());
   const bool ok = sm.DispatchCommand(*kf, g, b, (unsigned)SMEM);
+  if (ok)
+    quant_stage_survive(o);
   cudaEventRecord(e1, sm.GetStream());
   cudaEventSynchronize(e1);
   float ms = 0.f;

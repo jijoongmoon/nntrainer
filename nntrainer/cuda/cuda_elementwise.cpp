@@ -12,6 +12,7 @@
 
 #include "cuda_elementwise.h"
 
+#include <cuda_common.h>
 #include <cuda_context.h>
 #include <cuda_stream_manager.h>
 
@@ -699,7 +700,10 @@ bool cuda_scalar_mul_fp16(const unsigned short *in, unsigned short *out,
   k->SetKernelArguments(1, &out, sizeof(out));
   k->SetKernelArguments(2, &ni, sizeof(ni));
   k->SetKernelArguments(3, &scalar, sizeof(scalar));
-  return dispatch1d(k, n);
+  if (!dispatch1d(k, n))
+    return false;
+  quant_stage_survive(out); // writes only `out` (the mha V-cache copy path)
+  return true;
 }
 
 bool cuda_scalar_mul_fp16_slot(const unsigned short *in,

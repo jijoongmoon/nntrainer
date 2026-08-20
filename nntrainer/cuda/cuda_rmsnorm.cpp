@@ -317,6 +317,10 @@ bool cuda_rmsnorm_fp16(const unsigned short *in, const unsigned short *gamma,
   const int grid[3] = {w4p ? (int)((rows + 7u) / 8u) : (int)rows, 1, 1};
   if (!StreamManager::Global().DispatchCommand(*kernel, grid, block))
     return false;
+  // This norm's only global write is `out` (a distinct pooled tensor): a
+  // sibling FC's staged activation quant survives it (q/k norms run BETWEEN
+  // the wq/wk/wv/w_gate projections that share one input).
+  quant_stage_survive(out);
   rms_maybe_finish(out);
   return true;
 }

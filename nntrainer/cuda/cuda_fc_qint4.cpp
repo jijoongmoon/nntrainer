@@ -4173,13 +4173,21 @@ bool dp4a_repack_and_gemm(const unsigned char *plain_w,
   return StreamManager::Global().DispatchCommand(*kg, gg, gb);
 }
 
+extern bool g_last_quant_valid; // defined below with the staging record
+
 static bool dp4a_stage_scratch(unsigned int M, unsigned int K) {
-  return ensure_buf((void **)&g_dp4a_q8, &g_dp4a_q8_cap,
-                    (size_t)M * K + FC_I8_TAIL_PAD) &&
-         ensure_buf((void **)&g_dp4a_ascale, &g_dp4a_ascale_cap,
-                    sizeof(float) * (size_t)M) &&
-         ensure_buf((void **)&g_dp4a_azp, &g_dp4a_azp_cap,
-                    sizeof(int) * (size_t)M);
+  const size_t cap0 = g_dp4a_q8_cap;
+  const bool ok = ensure_buf((void **)&g_dp4a_q8, &g_dp4a_q8_cap,
+                             (size_t)M * K + FC_I8_TAIL_PAD) &&
+                  ensure_buf((void **)&g_dp4a_ascale, &g_dp4a_ascale_cap,
+                             sizeof(float) * (size_t)M) &&
+                  ensure_buf((void **)&g_dp4a_azp, &g_dp4a_azp_cap,
+                             sizeof(int) * (size_t)M);
+  // A grow reallocates g_dp4a_q8 — any staged quant died with the old buffer,
+  // and a pointer+seq match must not be allowed to resurrect it.
+  if (g_dp4a_q8_cap != cap0)
+    g_last_quant_valid = false;
+  return ok;
 }
 
 
@@ -4269,8 +4277,30 @@ void mark_quant_staged(const void *xh, int k) {
 
 // True when g_dp4a_q8 already holds the int8 quant of (xh, k).
 bool quant_staged_for(const void *xh, int k) {
-  return g_last_quant_valid && xh == g_last_quant_xh && k == g_last_quant_k &&
-         StreamManager::Global().dispatchSeq() == g_last_quant_seq;
+  const bool ok = g_last_quant_valid && xh == g_last_quant_xh &&
+                  k == g_last_quant_k &&
+                  StreamManager::Global().dispatchSeq() == g_last_quant_seq;
+  // NNTR_QUANT_DBG=1: print the first probes with the failing term (pointer
+  // vs K vs sequence drift) so a staging miss can be attributed, not guessed.
+  static int dbg = -1;
+  if (dbg < 0) {
+    const char *e = std::getenv("NNTR_QUANT_DBG");
+    dbg = (e != nullptr && e[0] == '1') ? 0 : 1 << 30;
+    if (dbg == 0)
+      StreamManager::Global().enableLaunchTrace();
+  }
+  if (dbg < 48) {
+    const long long dseq = (long long)(StreamManager::Global().dispatchSeq() -
+                                       g_last_quant_seq);
+    fprintf(stderr, "[qstage] xh=%p k=%d ok=%d ptr=%d kk=%d dseq=%lld\n", xh, k,
+            (int)ok, (int)(xh == g_last_quant_xh), (int)(k == g_last_quant_k),
+            dseq);
+    for (long long b = 0; !ok && b < dseq && b < 8; ++b)
+      fprintf(stderr, "[qstage]   -%lld: %s\n", b + 1,
+              StreamManager::Global().lastLaunch((unsigned)b));
+    ++dbg;
+  }
+  return ok;
 }
 
 /**
@@ -4342,6 +4372,23 @@ static DevWeightI8 *ensure_i8_cache_locked(const unsigned char *plain_w,
 }
 
 } // namespace
+
+// See cuda_common.h. Extends only a stage that was valid up to EXACTLY this
+// one dispatch (seq == staged+1): a chain of benign dispatches each extends
+// by one, while a stage that already lapsed stays lapsed — reviving it would
+// reopen the recycled-pointer hazard, because the re-purposing writer's own
+// dispatch is exactly what lapsed it. (Defined OUTSIDE the anonymous
+// namespace: the callers are other translation units; the staging record it
+// reads stays internal.)
+void quant_stage_survive(const void *w0, const void *w1, const void *w2) {
+  if (!g_last_quant_valid)
+    return;
+  if (w0 == g_last_quant_xh || (w1 != nullptr && w1 == g_last_quant_xh) ||
+      (w2 != nullptr && w2 == g_last_quant_xh))
+    return;
+  if (StreamManager::Global().dispatchSeq() == g_last_quant_seq + 1)
+    g_last_quant_seq = StreamManager::Global().dispatchSeq();
+}
 
 // One grouped-MoE GEMM launch: every expert's rows in one grid (see the
 // kernel comment). All buffers are caller-owned (cuda_moe.cpp) -- this
