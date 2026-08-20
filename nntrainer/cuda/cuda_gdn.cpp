@@ -1070,19 +1070,26 @@ void gdn_ck_out_tc(const unsigned short *conv, const float *gc,
   float *gcs = (float *)(sb + 62464); // 64 floats; total 62,720 B
   const int LD = 136, LDC = 72;
 
-// one 64-row x 128-half fp16 tile via cp.async, one commit group
-#define OUT_TILE_IN(BUFP, ROWPTR_EXPR, CNV)                                    \
+// one 64-row x 128-half fp16 tile via cp.async, one commit group.
+// COALESCED MAP (sector-request finding 2026-08-20, same fix as the flash
+// loader a6c7199d8): one warp sweeps 2 rows per wave with lanes covering 16
+// CONSECUTIVE 16B chunks of one row, so every warp-wide wave fills whole
+// 128B sectors. The old 4-thr/row x 64B-quarter map touched 16 sectors per
+// wave at 32B use each = 4x the sector requests for the same bytes.
+#define OUT_TILE_IN(BUFP, BASE, RSTRIDE, CNV)                                  \
   do {                                                                         \
-    const int rr = tid >> 2;                                                   \
-    const int cq = (tid & 3) * 32;                                             \
-    const unsigned short *src = (ROWPTR_EXPR) + cq;                            \
-    const unsigned db_ =                                                       \
-      (unsigned)__cvta_generic_to_shared(&(BUFP)[rr*LD + cq]);                 \
-    const int ok = (rr < (CNV)) ? 16 : 0;                                      \
-    _Pragma("unroll") for (int i = 0; i < 4; ++i)                              \
+    const int w8_ = tid >> 5, ln_ = tid & 31;                                  \
+    _Pragma("unroll") for (int i = 0; i < 4; ++i) {                            \
+      const int rr = i*16 + w8_*2 + (ln_ >> 4);                                \
+      const unsigned short *src =                                              \
+        (BASE) + (long)rr*(RSTRIDE) + (ln_ & 15)*8;                            \
+      const unsigned db_ =                                                     \
+        (unsigned)__cvta_generic_to_shared(&(BUFP)[rr*LD + (ln_ & 15)*8]);     \
+      const int ok = (rr < (CNV)) ? 16 : 0;                                    \
       asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(   \
-                     db_ + i * 16),                                            \
-                   "l"(src + i * 8), "r"(ok));                                 \
+                     db_),                                                     \
+                   "l"(src), "r"(ok));                                         \
+    }                                                                          \
     asm volatile("cp.async.commit_group;\n");                                  \
   } while (0)
 
@@ -1091,9 +1098,9 @@ void gdn_ck_out_tc(const unsigned short *conv, const float *gc,
   if (tid < 64)
     gcs[tid] = (tid < cn) ? gc[((long)ck*64 + tid)*NVH + vh] : 0.0f;
   const unsigned short *hb0 = h + ((long)ck*NVH + vh)*16384;
-  OUT_TILE_IN(qs, conv + (long)(ck*64 + (tid >> 2))*CONV + kh*HKD, cn);
-  OUT_TILE_IN(kx, conv + (long)(ck*64 + (tid >> 2))*CONV + KEY + kh*HKD, cn);
-  OUT_TILE_IN(kx2, hb0 + (tid >> 2)*128, 64);
+  OUT_TILE_IN(qs, conv + (long)ck*64*CONV + kh*HKD, CONV, cn);
+  OUT_TILE_IN(kx, conv + (long)ck*64*CONV + KEY + kh*HKD, CONV, cn);
+  OUT_TILE_IN(kx2, hb0, 128, 64);
   asm volatile("cp.async.wait_group 1;\n"); // q,k landed; h0 in flight
   __syncthreads();
 
@@ -1163,7 +1170,7 @@ void gdn_ck_out_tc(const unsigned short *conv, const float *gc,
   const int a_row = wm*16 + (lane & 15);
   const int a_kh8 = (lane >> 4) & 1;
   // commit h1 -> kx (the post-coef sync above fenced phase A's kx reads)
-  OUT_TILE_IN(kx, hb0 + 64*128 + (tid >> 2)*128, 64);
+  OUT_TILE_IN(kx, hb0 + 64*128, 128, 64);
 #define OUT_T1_HALF(BUF, EH)                                                   \
   do {                                                                         \
     _Pragma("unroll") for (int k0 = 0; k0 < 64; k0 += 16) {                    \
@@ -1196,7 +1203,7 @@ void gdn_ck_out_tc(const unsigned short *conv, const float *gc,
   __syncthreads();
   OUT_T1_HALF(kx2, 0);
   __syncthreads(); // kx2 free for vn
-  OUT_TILE_IN(kx2, vnew + (((long)ck*64 + (tid >> 2))*NVH + vh)*HVD, cn);
+  OUT_TILE_IN(kx2, vnew + ((long)ck*64*NVH + vh)*HVD, (long)NVH*HVD, cn);
   // half 1 on kx: drain h1 (leaves vn in flight)
   asm volatile("cp.async.wait_group 1;\n");
   __syncthreads();
@@ -1531,43 +1538,49 @@ void gdn_ck_state_tc2(const unsigned short *conv, const unsigned short *w,
   unsigned short *Db = (unsigned short *)(sb2 + 53248);  // dv [64][72]
   unsigned short *Ub = (unsigned short *)(sb2 + 62464);  // u tile [64][72]
 
-  // one w-or-k tile via cp.async, one commit group; 4 thr/row x 64 B; rows
-  // past cn zero-fill through the src-size predicate.
-#define ST2_TILE_IN(BUFP, ROWPTR_EXPR, CK, CNV)                                \
+  // one w-or-k tile via cp.async, one commit group; rows past cn zero-fill
+  // through the src-size predicate. COALESCED MAP (sector-request finding
+  // 2026-08-20, same fix as the flash loader a6c7199d8): one warp sweeps 2
+  // rows per wave, lanes cover 16 CONSECUTIVE 16B chunks — whole 128B
+  // sectors per wave. The old 4-thr/row x 64B-quarter map touched 16
+  // sectors per wave at 32B use each (4x the sector requests, same bytes).
+#define ST2_TILE_IN(BUFP, BASE, RSTRIDE, CNV)                                  \
   do {                                                                         \
-    const int rr = tid >> 2;                                                   \
-    const int cq = (tid & 3) * 32;                                             \
-    const long tk = (long)(CK)*64 + rr;                                        \
-    const unsigned short *src = (ROWPTR_EXPR) + cq;                            \
-    const unsigned db_ =                                                       \
-      (unsigned)__cvta_generic_to_shared(&(BUFP)[rr*136 + cq]);                \
-    const int ok = (rr < (CNV)) ? 16 : 0;                                      \
-    (void)tk;                                                                  \
-    _Pragma("unroll") for (int i = 0; i < 4; ++i)                              \
+    const int w8_ = tid >> 5, ln_ = tid & 31;                                  \
+    _Pragma("unroll") for (int i = 0; i < 4; ++i) {                            \
+      const int rr = i*16 + w8_*2 + (ln_ >> 4);                                \
+      const unsigned short *src =                                              \
+        (BASE) + (long)rr*(RSTRIDE) + (ln_ & 15)*8;                            \
+      const unsigned db_ =                                                     \
+        (unsigned)__cvta_generic_to_shared(&(BUFP)[rr*136 + (ln_ & 15)*8]);    \
+      const int ok = (rr < (CNV)) ? 16 : 0;                                    \
       asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(   \
-                     db_ + i * 16),                                            \
-                   "l"(src + i * 8), "r"(ok));                                 \
+                     db_),                                                     \
+                   "l"(src), "r"(ok));                                         \
+    }                                                                          \
     asm volatile("cp.async.commit_group;\n");                                  \
   } while (0)
 #define ST2_W_IN(CK, CNV)                                                      \
-  ST2_TILE_IN(Wb, w + (((long)(CK)*64 + (tid >> 2))*NVH + vh)*HKD, CK, CNV)
+  ST2_TILE_IN(Wb, w + ((long)(CK)*64*NVH + vh)*HKD, (long)NVH*HKD, CNV)
 #define ST2_K_IN(CK, CNV)                                                      \
-  ST2_TILE_IN(Kb, conv + ((long)(CK)*64 + (tid >> 2))*CONV + KEY + kh*HKD,     \
-              CK, CNV)
-  // u tile: 64 rows x 64 halves (this CTA's b-half), 4 thr/row x 32 B
+  ST2_TILE_IN(Kb, conv + (long)(CK)*64*CONV + KEY + kh*HKD, CONV, CNV)
+  // u tile: 64 rows x 64 halves (this CTA's b-half) = 128B rows, exactly one
+  // sector each: one warp sweeps 4 rows per wave, lanes cover 8 consecutive
+  // 16B chunks (was 4-thr/row x 32B = 2x sector requests).
 #define ST2_U_IN(CK, CNV)                                                      \
   do {                                                                         \
-    const int rr = tid >> 2;                                                   \
-    const int cq = (tid & 3) * 16;                                             \
-    const unsigned short *src =                                                \
-      u + (((long)(CK)*64 + rr)*NVH + vh)*HVD + bh*64 + cq;                    \
-    const unsigned db_ =                                                       \
-      (unsigned)__cvta_generic_to_shared(&Ub[rr*72 + cq]);                     \
-    const int ok = (rr < (CNV)) ? 16 : 0;                                      \
-    _Pragma("unroll") for (int i = 0; i < 2; ++i)                              \
+    const int w8_ = tid >> 5, ln_ = tid & 31;                                  \
+    _Pragma("unroll") for (int i = 0; i < 2; ++i) {                            \
+      const int rr = i*32 + w8_*4 + (ln_ >> 3);                                \
+      const unsigned short *src =                                              \
+        u + (((long)(CK)*64 + rr)*NVH + vh)*HVD + bh*64 + (ln_ & 7)*8;         \
+      const unsigned db_ =                                                     \
+        (unsigned)__cvta_generic_to_shared(&Ub[rr*72 + (ln_ & 7)*8]);          \
+      const int ok = (rr < (CNV)) ? 16 : 0;                                    \
       asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(   \
-                     db_ + i * 16),                                            \
-                   "l"(src + i * 8), "r"(ok));                                 \
+                     db_),                                                     \
+                   "l"(src), "r"(ok));                                         \
+    }                                                                          \
     asm volatile("cp.async.commit_group;\n");                                  \
   } while (0)
 
