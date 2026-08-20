@@ -1959,6 +1959,15 @@ __global__ void gdn_save_ring(const float *qkv, float *ring, int T, int CONV,
     ring[(long)c*(KS-1) + j] = v;
   }
 }
+
+// Pinned->device plane copy at kernel rate. cudaMemcpyAsync H2D on this Tegra
+// runs at DMA-engine rate for the 16.78 MB x plane while a plain uint4 copy
+// kernel streams pinned at DRAM rate (measured: the memcpy cost ~94 ms/prefill
+// and kern_prof mis-billed it as host gap before the qkv GEMM).
+__global__ void gdn_copy_u4(const uint4 *src, uint4 *dst, unsigned int n16){
+  const unsigned int i = blockIdx.x*blockDim.x + threadIdx.x;
+  if (i < n16) dst[i] = src[i];
+}
 } // extern "C"
 )CU";
 
@@ -2072,8 +2081,30 @@ bool cuda_gdn_proj_dev(unsigned int T, unsigned int VAL, unsigned int NVH,
       !grow((void **)&g_pf_a, &g_pf_a_cap, (size_t)T * NVH * 4) ||
       !grow((void **)&g_pf_x, &g_pf_x_cap, (size_t)T * H * 2))
     return false;
-  if (cudaMemcpyAsync(g_pf_x, x_pinned16, (size_t)T * H * 2,
-                      cudaMemcpyDefault,
+  // The x mirror used to be a cudaMemcpyAsync: on Tegra that runs at
+  // DMA-engine rate (~94 ms/prefill across 150 calls, mis-billed by
+  // kern_prof as host gap before the qkv GEMM). The copy kernel streams
+  // the same bytes at DRAM rate. NNTR_GDN_XCOPYK=0 restores the memcpy.
+  const size_t xbytes = (size_t)T * H * 2;
+  static const bool copyk = []() {
+    const char *e = std::getenv("NNTR_GDN_XCOPYK");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  bool copied = false;
+  if (copyk &&
+      ((((uintptr_t)x_pinned16 | (uintptr_t)g_pf_x | xbytes) & 15) == 0)) {
+    auto kcp = CudaContext::Global().registerCudaKernel(GDN_SRC, "gdn_copy_u4");
+    if (kcp) {
+      unsigned int n16 = (unsigned int)(xbytes >> 4);
+      kcp->SetKernelArguments(0, &x_pinned16, sizeof(x_pinned16));
+      kcp->SetKernelArguments(1, &g_pf_x, sizeof(g_pf_x));
+      kcp->SetKernelArguments(2, &n16, sizeof(n16));
+      const int g[3] = {(int)((n16 + 255u) / 256u), 1, 1}, b[3] = {256, 1, 1};
+      copied = StreamManager::Global().DispatchCommand(*kcp, g, b);
+    }
+  }
+  if (!copied &&
+      cudaMemcpyAsync(g_pf_x, x_pinned16, xbytes, cudaMemcpyDefault,
                       StreamManager::Global().GetStream()) != cudaSuccess)
     return false;
   *x_dev16 = g_pf_x;
