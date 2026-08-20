@@ -159,6 +159,16 @@ void CudaContext::initialize() noexcept {
       // Measured on Orin/gemma4-e2b QS4CX, 1004-token prefill:
       // [CAP-AUDIT] lines 32 -> 0, prefill 3498 -> 3560 TPS.
       setenv("NNTR_CUDA_VCOPY_PREFILL", "1", 0);
+      // NNTR_CUDA_M2B on integrated too (2026-08-21, e4d203516's fixes):
+      // the 35B corruption was capture-on-first-token + host-fallback muls,
+      // both fixed; with the default warmup (NNTR_CUDA_M2B_WARM=2) the
+      // graph is byte-identical to eager on the 20K gate and 64 EOS-banned
+      // tokens, deterministic across runs, and the graph's short-prompt
+      // ulp drift GATE-PASSED: floor 8/10 (same miss as both eager arms),
+      // judge_nll 0.2356 = the best score in the project record (eager
+      // anchors 0.2435/0.2527). Decode 11.67 -> 13.9, and 16.05 with the
+      // wide b/a GEMV riding the graph. Value-checked: =0 opts out.
+      setenv("NNTR_CUDA_M2B", "1", 0);
     }
     if (!caps_.integrated && context_inst_.concurrentManagedAccess()) {
       // Discrete (RTX/dGPU) residency + decode-CUDA-graph add-ons: device-only

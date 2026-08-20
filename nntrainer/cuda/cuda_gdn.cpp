@@ -2877,18 +2877,17 @@ bool cuda_gdn_decode_fp16(const unsigned short *x, const unsigned short *wqkv,
   }
   auto kgn = gemvn_on ? ctx.registerCudaKernel(GDN_SRC, "gdn_gemv_h_f4n")
                       : decltype(kg){};
-  // Wide-load narrow twin (the 190us pinned-floor fix): OPT-IN via
-  // NNTR_GDN_GEMVW=1. The row win is 10x (185 -> 18.4 us measured in-tree)
-  // but decode wall is FLAT today — the freed GPU time was covering host
-  // work (exit host-gap grew 393->473 ms), so the -10 ms/token pays out
-  // only together with the decode host-gap levers (graph capture). Gates
-  // run 2026-08-20: floor 8/10 both arms (identical miss), judge_nll on
-  // 0.2527 vs off 0.2435 (in-band, ON slightly worse) — default stays OFF
-  // until the win is wall-visible; flip with the decode batch's gate cycle.
+  // Wide-load narrow twin (the 190us pinned-floor fix): DEFAULT ON since
+  // the M2B decode graph landed (2026-08-21) — the 10x row win (185 ->
+  // 18.4 us measured in-tree) pays on the wall exactly when the graph
+  // removes the host cover: decode 13.9 -> 16.05 TPS riding the replay.
+  // Gates: floor 8/10 (identical miss across all arms), judge_nll 0.2356
+  // with the graph (best in the project record; eager anchors
+  // 0.2435/0.2527). NNTR_GDN_GEMVW=0 restores the f4n narrow kernel.
   // Map assumes N==32 / 256 threads / 16B-aligned W / K<=4096.
   static const bool gemvw_on = []() {
     const char *e = std::getenv("NNTR_GDN_GEMVW");
-    return e != nullptr && e[0] == '1';
+    return !(e != nullptr && e[0] == '0');
   }();
   auto kgnw = (gemvn_on && gemvw_on)
                 ? ctx.registerCudaKernel(GDN_SRC, "gdn_gemv_h_f4nw")
