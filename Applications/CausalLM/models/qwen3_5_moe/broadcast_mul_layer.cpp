@@ -62,7 +62,12 @@ static void bcast_mul_dispatch(nntrainer::Tensor &a, nntrainer::Tensor &g,
     const char *e = std::getenv("NNTR_EW_DEV");
     return e == nullptr || e[0] != '0';
   }();
-  if (g_ew_dev && (size_t)rows * a.width() >= 32768 &&
+  // Capture override: see multiply_layer.cpp — a host fallback inside a
+  // CUDA-graph capture reads un-executed producers and drops this node from
+  // the graph (the 35B M2B decode corruption, 2026-08-21).
+  const bool in_capture =
+    nntrainer::cuda::StreamManager::Global().isCapturing();
+  if (g_ew_dev && ((size_t)rows * a.width() >= 32768 || in_capture) &&
       a.getDataType() == ml::train::TensorDim::DataType::FP16 &&
       a.batch() == 1 && a.channel() == 1) {
     const auto *ap =

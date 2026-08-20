@@ -1253,6 +1253,24 @@ void MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                           hidden_size)) {
       route_dev = true;
     }
+    // capture-time bisect probe (temporary): name the failing leg
+    if (!route_dev && nntrainer::cuda::StreamManager::Global().isCapturing()) {
+      static int cap_dbg = 0;
+      if (cap_dbg < 4) {
+        ++cap_dbg;
+        fprintf(stderr,
+                "[M2B-MOE] grouped path REJECTED under capture: router_dev=%d "
+                "env=%d tok=%u g3=%d dtin=%d dtout=%d accin=%d accout=%d\n",
+                (int)router_dev, grouped2_env, total_tokens,
+                (int)nntrainer::cuda::moe_g3_enabled(),
+                (int)(input.getDataType() ==
+                      ml::train::TensorDim::DataType::FP16),
+                (int)(output.getDataType() ==
+                      ml::train::TensorDim::DataType::FP16),
+                (int)nntrainer::cuda::dev_accessible(input.getData<_FP16>()),
+                (int)nntrainer::cuda::dev_accessible(output.getData<_FP16>()));
+      }
+    }
     // NNTR_MOE_ROUTE_DEV=0 keeps the host path as the A/B reference.
     static const bool route_dev_on = []() {
       const char *e = std::getenv("NNTR_MOE_ROUTE_DEV");

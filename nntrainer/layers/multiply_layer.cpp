@@ -22,6 +22,9 @@
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
 #include <cuda_context_manager.h>
 #include <cuda_elementwise.h>
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_stream_manager.h>
+#endif
 #endif
 
 namespace nntrainer {
@@ -47,7 +50,16 @@ void MultiplyLayer::forwarding_operation(const Tensor &input0,
     const char *e = std::getenv("NNTR_EW_DEV");
     return e == nullptr || e[0] != '0';
   }();
-  if (g_ew_dev && input0.size() >= 32768 &&
+  // Under CUDA-graph capture the size gate must yield: the host loop below
+  // reads producer outputs that have NOT run (capture records, not executes)
+  // and leaves this node OUT of the graph entirely — the replayed forward
+  // then reuses the capture-time garbage every token (the 35B M2B decode
+  // corruption, 2026-08-21). A ~4K-element kernel is ~10 us; correctness of
+  // the capture beats the eager-decode micro-cost, and eager decode still
+  // takes the host loop as before.
+  const bool in_capture =
+    nntrainer::cuda::StreamManager::Global().isCapturing();
+  if (g_ew_dev && (input0.size() >= 32768 || in_capture) &&
       input0.getDataType() == ml::train::TensorDim::DataType::FP16 &&
       input1.getDataType() == ml::train::TensorDim::DataType::FP16 &&
       hidden.getDataType() == ml::train::TensorDim::DataType::FP16 &&

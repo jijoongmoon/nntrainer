@@ -540,7 +540,27 @@ sharedConstTensors CudaContext::runDecode(NeuralNetwork &nn, unsigned int from,
     _cg_cached_exec = nullptr;
     _cg_cached_out = {};
   }
-  if (cuda_m2b && from != 0 && (to - from) == 1) {
+  // M2B WARMUP (the 35B fix, 2026-08-21): capturing the FIRST decode token
+  // bakes a broken graph on any model with lazy decode-side setup — the GDN
+  // decode scratch grow_dev refuses its cudaMalloc under capture ("scratch
+  // alloc FAILED"), so all 30 GDN layers record NOTHING and the replayed
+  // graph computes a forward with no GDN in it; the one-time weight
+  // transforms (gdn_wq_i8t, moe_rsplit_t) either get baked into every replay
+  // or get isCapturing-skipped into their slow fallback arms. Run the first
+  // N decode tokens EAGERLY so every lazy allocation and one-time build has
+  // happened, then capture. NNTR_CUDA_M2B_WARM overrides (default 2).
+  static const int m2b_warm_tokens = []() {
+    const char *e = std::getenv("NNTR_CUDA_M2B_WARM");
+    const int v = e ? atoi(e) : 2;
+    return v >= 0 ? v : 2;
+  }();
+  static int m2b_warm_left = m2b_warm_tokens;
+  if (cuda_m2b && (from == 0 || (to - from) > 1))
+    m2b_warm_left = m2b_warm_tokens; // new sequence: warm up again
+  if (cuda_m2b && from != 0 && (to - from) == 1 &&
+      _cg_cached_exec == nullptr && m2b_warm_left > 0) {
+    --m2b_warm_left; // eager token; fall through to the normal path below
+  } else if (cuda_m2b && from != 0 && (to - from) == 1) {
     auto &sm = nntrainer::cuda::StreamManager::Global();
     if (_cg_cached_exec != nullptr) {
       // subsequent token: embed-only feed (refresh emb_stage) -> set pos ->

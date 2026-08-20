@@ -324,9 +324,11 @@ void StreamManager::finish() {
     // that depended on this drain now consumes stale bytes -- audit-log the
     // skip so capture-time host fallbacks are visible.
     static int audit_n = 0;
-    if (++audit_n <= 32 && cap_audit_on())
-      std::fprintf(
-        stderr, "[CAP-AUDIT] finish() skipped during capture (#%d)\n", audit_n);
+    if (++audit_n <= 80 && cap_audit_on())
+      std::fprintf(stderr,
+                   "[CAP-AUDIT] finish() skipped during capture (#%d) at "
+                   "tag=%s\n",
+                   audit_n, dispatch_tag_);
     return;
   }
   if (stream_) {
@@ -415,8 +417,8 @@ void StreamManager::finishIfAsync() {
     static int audit_n = 0;
     if (++audit_n <= 32 && cap_audit_on())
       std::fprintf(stderr,
-                   "[CAP-AUDIT] finishIfAsync() skipped during capture (#%d)\n",
-                   audit_n);
+                   "[CAP-AUDIT] finishIfAsync() skipped during capture (#%d) at tag=%s\n",
+                   audit_n, dispatch_tag_);
     return;
   }
   // Inside a deferred-drain region the per-op maybeFinish() that normally
