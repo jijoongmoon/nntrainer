@@ -1412,24 +1412,28 @@ attn_flash_d256(const unsigned short *Q, const unsigned short *K,
   const int kv_stop = Nkv < q_hi_pos + 1 ? Nkv : q_hi_pos + 1;
   const int ntiles = (kv_stop + AFBC - 1) / AFBC;
 
-  // one K-or-V tile into the PADDED-LINEAR buffer, one commit group: 4
-  // threads per row, each a 128B quarter. The +16B pad de-conflicts the
-  // writes, so the old chunk stagger is gone and every address is
-  // [reg + immediate]; the L2::128B hint requests full-sector fills.
+  // one K-or-V tile into the PADDED-LINEAR buffer, one commit group.
+  // COALESCED MAP (the 50-vs-71 finding, 2026-08-20): one warp per 8-row
+  // sweep with lanes covering 32 CONSECUTIVE 16B chunks of one row, so every
+  // warp-wide cp.async wave fills whole 128B sectors. The previous
+  // 4-threads-per-row/128B-quarter map put every lane in a DIFFERENT sector
+  // (32 sectors touched per wave, 16B used each): same bytes, same
+  // instruction count, 8x the sector requests — a per-SM LSU-queue wall that
+  // static SASS counting cannot see. Bench: chunk5 71.4 -> 55.3 ms,
+  // bit-identical output (same smem bytes, different writer lanes).
 #define AF_KV_IN(BUFP, GSRC, KBASE)                                            \
   do {                                                                         \
-    const int rr = tid >> 2;                                                   \
-    const int kr = (KBASE) + rr;                                               \
-    const unsigned short *srckv =                                              \
-      (GSRC) + (long)kr * kstride + (tid & 3) * (AFD / 4);                     \
-    const unsigned db =                                                        \
-      af_sh(BUFP) + (unsigned)(rr * (AFLDKV * 2) + (tid & 3) * 128);           \
-    const int ok = kr < Nkv ? 16 : 0;                                          \
-    _Pragma("unroll") for (int i = 0; i < AFD / 4 / 8; ++i) {                  \
+    const int w8 = tid >> 5;                                                   \
+    const int ln = tid & 31;                                                   \
+    _Pragma("unroll") for (int i = 0; i < AFBC / 8; ++i) {                     \
+      const int kr = (KBASE) + i * 8 + w8;                                     \
+      const unsigned short *srckv = (GSRC) + (long)kr * kstride + ln * 8;      \
+      const unsigned db =                                                      \
+        af_sh(BUFP) + (unsigned)((i * 8 + w8) * (AFLDKV * 2) + ln * 16);       \
+      const int ok = kr < Nkv ? 16 : 0;                                        \
       asm volatile(                                                            \
-        "cp.async.cg.shared.global.L2::128B [%0], [%1], 16, %2;\n" ::"r"(     \
-          db + i * 16),                                                        \
-        "l"(srckv + i * 8), "r"(ok));                                          \
+        "cp.async.cg.shared.global.L2::128B [%0], [%1], 16, %2;\n" ::"r"(db), \
+        "l"(srckv), "r"(ok));                                                  \
     }                                                                          \
     asm volatile("cp.async.commit_group;\n");                                  \
   } while (0)
