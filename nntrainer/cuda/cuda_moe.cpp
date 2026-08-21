@@ -1027,6 +1027,175 @@ __global__ void moe_combine_seq_h_v8(const unsigned short *Y,
     oh[j] = acc[j];
   ov[(long)t * wv8 + v] = o;
 }
+
+// ---- [moe-dec] M=1 decode GEMV arms (NNTR_MOE_DEC) -------------------------
+// At decode (T=1, live=1 per window) the grouped IMMA tiles run 64-row
+// geometry for ONE gathered row: g4 wastes 3 of 4 m-blocks + tile machinery
+// (55.9 us/call x2), g3d loops 32 n-tiles at 12.5% warp occupancy
+// (143 us/call). These two dp4a GEMV kernels read the SAME repacked slabs
+// (m4 fragment-chunk order for gate/up, g3 slot order for down) with
+// exact-integer nibble expansion and the verbatim dequant expression, so the
+// int32 accumulators -- and therefore every output byte -- match the IMMA
+// path (integer accumulation is order-free).
+//
+// m4 chunk order (moe_repack_m4): 16-B slot t of chunk (bn,ks) holds 4 output
+// rows r = bn*128 + (t>>6)*32 + ((t&31)>>2) + {0,8,16,24} (one per 4-byte
+// word), each word's bytes pairing k = ks*64 + ((t>>5)&1)*32 + 4*(t&3) +
+// {0,1|2,3} (lo half) and +16..19 (hi half) in plain QS4CX lo/hi nibble
+// order. Nibbles are RAW offset-binary: ^0x8 per nibble then the signed-4bit
+// shift decode reproduces (nib-8) exactly (the dp4a_gemm raw-arm decode).
+__global__ void moe_dec_gu_m4(const signed char *q8, const int *rows,
+                              const unsigned long long *wpg,
+                              const unsigned long long *wsg,
+                              const unsigned long long *wrg,
+                              const unsigned long long *wpu,
+                              const unsigned long long *wsu,
+                              const unsigned long long *wru,
+                              const int *wl_e, const int *wl_n,
+                              const float *ascale, const int *azp,
+                              unsigned short *G, unsigned short *U, int I,
+                              int K) {
+  const int win = blockIdx.y;
+  const int e = wl_e[win];
+  if (e < 0 || wl_n[win] <= 0)
+    return;
+  const int tok = rows[win * 64];
+  if (tok < 0)
+    return;
+  const int proj = blockIdx.z; // 0 = gate, 1 = up
+  const signed char *plain =
+    (const signed char *)(proj ? wpu[e] : wpg[e]);
+  const unsigned short *wsc =
+    (const unsigned short *)(proj ? wsu[e] : wsg[e]);
+  const int *wrs = (const int *)(proj ? wru[e] : wrg[e]);
+  unsigned short *Y = proj ? U : G;
+  extern __shared__ signed char smem[];
+  int *q8s = (int *)smem;                       // K bytes of activation
+  int *sacc = (int *)(smem + K);                // 128 int partials
+  {
+    const uint2 *src = (const uint2 *)(q8 + (long)tok * K);
+    uint2 *dst = (uint2 *)q8s;
+    for (int i = threadIdx.x; i < (K >> 3); i += blockDim.x)
+      dst[i] = src[i];
+    if (threadIdx.x < 128)
+      sacc[threadIdx.x] = 0;
+  }
+  __syncthreads();
+  const int t = threadIdx.x;
+  const int lane = t & 31;
+  const int nsteps = K >> 6;
+  const int kbase0 = ((t >> 5) & 1) * 32 + 4 * (lane & 3);
+  const int lr0 = ((t >> 6) << 5) + (lane >> 2); // local row of word .x
+  const uint4 *slab =
+    (const uint4 *)(plain + ((long)blockIdx.x * nsteps) * 4096) + t;
+  int acc0 = 0, acc1 = 0, acc2 = 0, acc3 = 0;
+  for (int ks = 0; ks < nsteps; ++ks) {
+    const uint4 w = slab[ks * 256];
+    const int a_lo = q8s[(ks * 64 + kbase0) >> 2];
+    const int a_hi = q8s[(ks * 64 + kbase0 + 16) >> 2];
+#define MOE_DEC_W(uw, accv)                                                    \
+  {                                                                            \
+    const unsigned int u = (uw) ^ 0x88888888u;                                 \
+    {                                                                          \
+      const int b0 = u & 0xFF, b1 = (u >> 8) & 0xFF;                           \
+      const int w0 = ((int)(signed char)(b0 << 4)) >> 4;                       \
+      const int w1 = ((int)(signed char)b0) >> 4;                              \
+      const int w2 = ((int)(signed char)(b1 << 4)) >> 4;                       \
+      const int w3 = ((int)(signed char)b1) >> 4;                              \
+      accv = __dp4a(a_lo,                                                      \
+                    (w0 & 0xFF) | ((w1 & 0xFF) << 8) | ((w2 & 0xFF) << 16) |   \
+                      ((w3 & 0xFF) << 24),                                     \
+                    accv);                                                     \
+    }                                                                          \
+    {                                                                          \
+      const int b0 = (u >> 16) & 0xFF, b1 = (u >> 24) & 0xFF;                  \
+      const int w0 = ((int)(signed char)(b0 << 4)) >> 4;                       \
+      const int w1 = ((int)(signed char)b0) >> 4;                              \
+      const int w2 = ((int)(signed char)(b1 << 4)) >> 4;                       \
+      const int w3 = ((int)(signed char)b1) >> 4;                              \
+      accv = __dp4a(a_hi,                                                      \
+                    (w0 & 0xFF) | ((w1 & 0xFF) << 8) | ((w2 & 0xFF) << 16) |   \
+                      ((w3 & 0xFF) << 24),                                     \
+                    accv);                                                     \
+    }                                                                          \
+  }
+    MOE_DEC_W(w.x, acc0)
+    MOE_DEC_W(w.y, acc1)
+    MOE_DEC_W(w.z, acc2)
+    MOE_DEC_W(w.w, acc3)
+#undef MOE_DEC_W
+  }
+  atomicAdd(&sacc[lr0], acc0);
+  atomicAdd(&sacc[lr0 + 8], acc1);
+  atomicAdd(&sacc[lr0 + 16], acc2);
+  atomicAdd(&sacc[lr0 + 24], acc3);
+  __syncthreads();
+  if (threadIdx.x < 128) {
+    const int n = blockIdx.x * 128 + threadIdx.x;
+    if (n < I) {
+      const float v = (float)(sacc[threadIdx.x] - azp[tok] * wrs[n]) *
+                      ascale[tok] * moe_h2f(wsc[n]);
+      Y[(long)win * 64 * I + n] = moe_f2h(v);
+    }
+  }
+}
+
+// g3 slot order (moe_repack_frag_g3, row-linear at n*Kh): the u32 at byte
+// offset n*Kh + 16*s + 4*q carries lo nibbles k = 32s+4q+{0..3} and hi
+// nibbles k = 32s+16+4q+{0..3}; per-byte (nib-8) via the masked expansion
+// (same values as ip_nib2i8 on the FC side).
+__global__ void moe_dec_down_g3(const signed char *q8, // g_qb gathered rows
+                                const unsigned long long *wpd,
+                                const unsigned long long *wsd,
+                                const unsigned long long *wrd,
+                                const int *wl_e, const int *wl_n,
+                                const float *bscale, const int *bzp,
+                                unsigned short *Yg, int N, int K) {
+  const int win = blockIdx.y;
+  const int e = wl_e[win];
+  if (e < 0 || wl_n[win] <= 0)
+    return;
+  const int grow = win * 64; // the single live gathered row of this window
+  const signed char *plain = (const signed char *)wpd[e];
+  const unsigned short *wsc = (const unsigned short *)wsd[e];
+  const int *wrs = (const int *)wrd[e];
+  extern __shared__ signed char smem[];
+  int *q8s = (int *)smem; // K bytes
+  {
+    const uint2 *src = (const uint2 *)(q8 + (long)grow * K);
+    uint2 *dst = (uint2 *)q8s;
+    for (int i = threadIdx.x; i < (K >> 3); i += blockDim.x)
+      dst[i] = src[i];
+  }
+  __syncthreads();
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int n = blockIdx.x * (blockDim.x >> 5) + warp;
+  if (n >= N)
+    return;
+  const int Kh = K >> 1;
+  const unsigned int *wrow = (const unsigned int *)(plain + (long)n * Kh);
+  const int nu = Kh >> 2; // u32s per row
+  int acc = 0;
+  for (int i = lane; i < nu; i += 32) {
+    const unsigned int u = wrow[i];
+    const int s = i >> 2, q = i & 3;
+    const int klo = 32 * s + 4 * q;
+    unsigned int lo = u & 0x0F0F0F0Fu;
+    lo = ((lo | 0x80808080u) - 0x08080808u) ^ 0x80808080u;
+    unsigned int hi = (u >> 4) & 0x0F0F0F0Fu;
+    hi = ((hi | 0x80808080u) - 0x08080808u) ^ 0x80808080u;
+    acc = __dp4a(q8s[klo >> 2], (int)lo, acc);
+    acc = __dp4a(q8s[(klo + 16) >> 2], (int)hi, acc);
+  }
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1)
+    acc += __shfl_down_sync(0xffffffffu, acc, o);
+  if (lane == 0) {
+    const float v = (float)(acc - bzp[grow] * wrs[n]) * bscale[grow] *
+                    moe_h2f(wsc[n]);
+    Yg[(long)grow * N + n] = moe_f2h(v);
+  }
+}
 } // extern "C"
 )CU";
 
@@ -1940,10 +2109,59 @@ bool cuda_moe_grouped_ffn_imma(const unsigned short *input,
   }();
   const auto *wr64 = reinterpret_cast<const unsigned long long *>(p.wrs);
   const bool g3 = moe_g3_enabled() && p.wrs != nullptr;
+  // [moe-dec] M=1 decode GEMV arms (NNTR_MOE_DEC): at T=1 every live window
+  // carries exactly ONE gathered row, so the 64-row IMMA tiles run at 1/4
+  // (g4) and 1/8 (g3d) utilization plus tile machinery. The dp4a GEMV twins
+  // read the SAME repacked slabs with exact-integer expansion and the
+  // verbatim dequant, so outputs are byte-identical (integer accumulation is
+  // order-free). Live windows at T=1 are 0..wtot-1 <= A, so the grids cover
+  // A windows and rely on the standard wl_e<0 self-discard.
+  static const bool g_dec = []() {
+    const char *e = std::getenv("NNTR_MOE_DEC");
+    if (e && e[0])
+      return e[0] != '0';
+    // Default ON on integrated: byte-identical to the IMMA path (verified
+    // 256-token 20K-prompt decode), decode 17.86 -> 19.1/19.4 TPS on the
+    // 35B. Discrete defaults off (dp4a decode-form economics unmeasured
+    // there; the IMMA tiles are not the bottleneck on discrete decode).
+    return ContextManager::Global().isIntegrated();
+  }();
+  const int A = (int)(T * topk);
+  const bool dec_gu = g_dec && T == 1u && g3 && p.m4_gateup &&
+                      p.rows != nullptr && p.wl_n != nullptr &&
+                      (I % 128u) == 0u && (H % 64u) == 0u && (H % 8u) == 0u;
   if (g3) {
     // packed fragment-order tile; wide/_g2 arms stand aside (they read the
     // raw nibble order, which no longer exists once the repack ran)
-    if (p.m4_gateup) {
+    if (dec_gu) {
+      auto k = ctx.registerCudaKernel(MOE_SRC, "moe_dec_gu_m4");
+      if (!k)
+        return false;
+      const auto *wpg = wp64 + p.off_gate, *wsg = ws64 + p.off_gate,
+                 *wrg = wr64 + p.off_gate, *wpu = wp64 + p.off_up,
+                 *wsu = ws64 + p.off_up, *wru = wr64 + p.off_up;
+      k->SetKernelArguments(0, &g_qa, PS);
+      k->SetKernelArguments(1, &p.rows, PS);
+      k->SetKernelArguments(2, &wpg, PS);
+      k->SetKernelArguments(3, &wsg, PS);
+      k->SetKernelArguments(4, &wrg, PS);
+      k->SetKernelArguments(5, &wpu, PS);
+      k->SetKernelArguments(6, &wsu, PS);
+      k->SetKernelArguments(7, &wru, PS);
+      k->SetKernelArguments(8, &p.wl_e, PS);
+      k->SetKernelArguments(9, &p.wl_n, PS);
+      k->SetKernelArguments(10, &g_sa, PS);
+      k->SetKernelArguments(11, &g_za, PS);
+      k->SetKernelArguments(12, &g_G, PS);
+      k->SetKernelArguments(13, &g_U, PS);
+      k->SetKernelArguments(14, &iI, sizeof(int));
+      k->SetKernelArguments(15, &iH, sizeof(int));
+      const int g[3] = {(int)(I / 128u), A, 2}, b[3] = {256, 1, 1};
+      if (!sm.DispatchCommand(*k, g, b, (unsigned int)(H + 512u)))
+        return false;
+      stamp(2);
+      stamp(3);
+    } else if (p.m4_gateup) {
       // gate/up payloads are in m4 fragment-chunk order: _g4 only
       if (!cuda_fc_qs4cx_moe_grouped_gemm_g4(g_qa, p.rows, wp64 + p.off_gate,
                                              ws64 + p.off_gate,
@@ -2069,7 +2287,29 @@ bool cuda_moe_grouped_ffn_imma(const unsigned short *input,
   // down stays on the 64x64 tile: with K=512 (8 k-steps) the wide tile's
   // doubled W staging outweighs its fragment savings -- measured 8.7 -> 9.5
   // ms. The wide tile pays only on the K=2048 gate/up shapes (-5% each).
-  if (g3 && I <= 512u) {
+  const bool dec_dn = g_dec && T == 1u && g3 && p.wl_n != nullptr &&
+                      (I % 32u) == 0u && (I % 8u) == 0u;
+  if (dec_dn) {
+    auto k = ctx.registerCudaKernel(MOE_SRC, "moe_dec_down_g3");
+    if (!k)
+      return false;
+    const auto *wpd = wp64 + p.off_down, *wsd = ws64 + p.off_down,
+               *wrd = wr64 + p.off_down;
+    k->SetKernelArguments(0, &g_qb, PS);
+    k->SetKernelArguments(1, &wpd, PS);
+    k->SetKernelArguments(2, &wsd, PS);
+    k->SetKernelArguments(3, &wrd, PS);
+    k->SetKernelArguments(4, &p.wl_e, PS);
+    k->SetKernelArguments(5, &p.wl_n, PS);
+    k->SetKernelArguments(6, &g_sb, PS);
+    k->SetKernelArguments(7, &g_zb, PS);
+    k->SetKernelArguments(8, &g_Y, PS);
+    k->SetKernelArguments(9, &iH, sizeof(int));
+    k->SetKernelArguments(10, &iI, sizeof(int));
+    const int g[3] = {(int)((H + 7u) / 8u), A, 1}, b[3] = {256, 1, 1};
+    if (!sm.DispatchCommand(*k, g, b, (unsigned int)I))
+      return false;
+  } else if (g3 && I <= 512u) {
     // persistent-N down: A loads once, W ring never drains between n-tiles
     if (!cuda_fc_qs4cx_moe_grouped_gemm_g3d(g_qb, wp64 + p.off_down,
                                             ws64 + p.off_down,
