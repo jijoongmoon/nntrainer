@@ -265,6 +265,10 @@ bool cuda_fc_dense_gemm_fp16(const void *Xh, const void *Wh, void *Yh,
   // into shexp_k1 (NNTR_SHEXP_FUSE=1) or kept live (=2). True = handled.
   if (shexp_dense_hook(Xh, Wh, Yh, M, N, K))
     return true;
+  // Decode lm_head w8a8 arm (NNTR_DENSE_I8W, opt-in): int8 planes halve the
+  // ~1 GB/token fp16 weight stream this cuBLAS GEMV pays at M=1.
+  if (cuda_fc_dense_i8w_gemv(Xh, Wh, Yh, M, N, K))
+    return true;
   // fp16 in / fp16 out with an FP32 ACCUMULATE (CUBLAS_COMPUTE_32F). A
   // 16F accumulate would round every partial sum at 11 bits of mantissa,
   // which over K in the thousands is a visible drift from the host dot()

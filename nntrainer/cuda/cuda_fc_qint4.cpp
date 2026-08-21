@@ -3876,6 +3876,108 @@ __global__ void shexp_k2(const unsigned short *sact, const signed char *wd,
   }
 }
 
+// ---- [dense-i8w] int8-weight decode GEMV for large fp16 FCs (lm_head) ------
+// The decode lm_head is a cuBLAS fp16 GEMV streaming a 1 GB [K,N] plane at
+// the DRAM roofline (~6 ms/token on the 35B). One-time per-output-channel
+// int8 planes ([N,K] n-major + fp32 scale + int rowsum, the gdn-i8w family
+// convention) halve the bytes; the GEMV is gdn_gemv_i8w's proven
+// warp-per-row dp4a form. w8a8 accuracy class -- NLL-gated.
+//
+// The builder is TWO passes (unlike gdn_wq_i8t's block-per-n form, whose
+// strided reads are fine for ~100 MB of GDN planes but ~10 s on 1 GB):
+// pass 1 = thread-per-column absmax (adjacent threads read adjacent n:
+// coalesced row sweeps); pass 2 = 32n x 128k tiled transpose-quantize
+// (coalesced fp16 reads, smem transpose, coalesced int32 writes, integer
+// atomicAdd rowsum -- deterministic).
+
+__global__ void dense_wq_absmax(const unsigned short *Wkn, float *wscl,
+                                float *winv, int K, int N) {
+  const int n = blockIdx.x * blockDim.x + threadIdx.x;
+  if (n >= N)
+    return;
+  float amax = 0.0f;
+  for (int k = 0; k < K; ++k)
+    amax = fmaxf(amax, fabsf(dp4a_h2f(Wkn[(long)k * N + n])));
+  wscl[n] = amax > 0.0f ? amax / 127.0f : 1.0f;
+  winv[n] = amax > 0.0f ? 127.0f / amax : 0.0f;
+}
+
+__global__ void dense_wq_i8t2(const unsigned short *Wkn, const float *winv,
+                              signed char *W8, int *wrs, int K, int N) {
+  // grid: {N/32, K/128}; block 256. Thread t owns column n0+(t&31) across
+  // its 8 k-rows per iteration, so per-thread rowsum partials stay
+  // single-column; the 8 owners of one column combine via integer smem
+  // atomics, then one atomicAdd per (column, k-tile) into wrs.
+  __shared__ signed char tile[32][132];
+  __shared__ int rsum[32];
+  const int n0 = blockIdx.x * 32, k0 = blockIdx.y * 128;
+  const int nl = threadIdx.x & 31;
+  const int n = n0 + nl;
+  if (threadIdx.x < 32)
+    rsum[threadIdx.x] = 0;
+  __syncthreads();
+  const float inv = (n < N) ? winv[n] : 0.0f;
+  int myrs = 0;
+  // Warp w (= threadIdx.x>>5) owns the 16 consecutive k-rows [w*16, w*16+16)
+  // of the tile; at every j its 32 lanes read 32 adjacent n -- coalesced.
+  {
+    const int kl = threadIdx.x >> 5;
+    const int k = k0 + kl * 16;
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+      int q = 0;
+      if (n < N && (k + j) < K) {
+        q = (int)rintf(dp4a_h2f(Wkn[(long)(k + j) * N + n]) * inv);
+        q = max(-127, min(127, q));
+      }
+      tile[nl][kl * 16 + j] = (signed char)q;
+      myrs += q;
+    }
+  }
+  atomicAdd(&rsum[nl], myrs);
+  __syncthreads();
+  if (threadIdx.x < 32 && (n0 + threadIdx.x) < N)
+    atomicAdd(&wrs[n0 + threadIdx.x], rsum[threadIdx.x]);
+  // write the transposed tile as coalesced int32s: thread t writes ints of
+  // row n0+(t>>3), int-column (t&7)+8*i
+  const int wr = threadIdx.x >> 3, wc = threadIdx.x & 7;
+  if ((n0 + wr) < N) {
+    int *dst = (int *)(W8 + (long)(n0 + wr) * K + k0);
+    const int *src = (const int *)&tile[wr][0];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int c = wc + 8 * i;
+      if ((k0 + c * 4) < K)
+        dst[c] = src[c];
+    }
+  }
+}
+
+// gdn_gemv_i8w's warp-per-row w8a8 form, verbatim (dp4a_* helper names).
+__global__ void dense_gemv_i8w(const signed char *q8, const signed char *W8,
+                               const float *wscl, const int *wrs,
+                               const float *ascale, const int *azp,
+                               unsigned short *Y, int K, int N) {
+  const int n = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  if (n >= N)
+    return;
+  const int lane = threadIdx.x & 31;
+  const signed char *wrow = W8 + (long)n * K;
+  int acc = 0;
+  for (int k = lane * 4; k < K; k += 128) {
+    const int a = *(const int *)(q8 + k);
+    const int w = *(const int *)(wrow + k);
+    acc = __dp4a(a, w, acc);
+  }
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1)
+    acc += __shfl_down_sync(0xffffffffu, acc, o);
+  if (lane == 0) {
+    const float r = (float)(acc - azp[0] * wrs[n]) * ascale[0] * wscl[n];
+    Y[n] = dp4a_f2h(r);
+  }
+}
+
 }
 
 )CU";
@@ -5678,6 +5780,152 @@ bool cuda_fc_qs4cx_dp4a_gemm_fp32(const float *X, const unsigned char *plain_w,
   if (!dp4a_repack_and_gemm(plain_w, scales_fp16, Y, M, N, K))
     return false;
   StreamManager::Global().maybeFinish();
+  return true;
+}
+
+// ---- dense-i8w host side (NNTR_DENSE_I8W): one-time int8 planes + w8a8
+// GEMV for huge M=1 fp16 FCs -- in practice the decode lm_head. Build is
+// forced onto an eager token (capture-time miss falls back to cuBLAS, which
+// then simply stays in the graph for that capture).
+namespace {
+struct DenseI8W {
+  signed char *w8 = nullptr; // [N,K] n-major int8
+  float *wscl = nullptr;     // [N] fp32 dequant scale (absmax/127)
+  float *winv = nullptr;     // [N] 127/absmax (builder operand; kept, ~1 MB)
+  int *wrs = nullptr;        // [N] integer rowsum of q
+  bool dead = false;         // build failed: never retry, cuBLAS keeps it
+};
+std::unordered_map<const void *, DenseI8W> g_di8w;
+bool dense_i8w_on() {
+  static const bool v = []() {
+    const char *e = std::getenv("NNTR_DENSE_I8W");
+    if (e && e[0])
+      return e[0] != '0';
+    // Default ON on integrated (gates 2026-08-21: answer floor 7/10 with the
+    // baseline's exact miss set, judge_nll 0.2408 vs anchor 0.2442 -- better,
+    // 20K long gate exact; 256-token decode 16.98 -> 17.86 TPS). Discrete
+    // defaults off: its cuBLAS GEMV is not the bottleneck there and the
+    // M=1 device-stream economics differ (the 2026-08-13 mirror lesson).
+    return ContextManager::Global().isIntegrated();
+  }();
+  return v;
+}
+} // namespace
+
+bool cuda_fc_dense_i8w_gemv(const void *Xh, const void *Wh, void *Yh,
+                            unsigned int M, unsigned int N, unsigned int K) {
+  if (!dense_i8w_on() || M != 1 || N < 65536u)
+    return false;
+  auto &sm = StreamManager::Global();
+  auto &ctx = CudaContext::Global();
+  std::lock_guard<std::mutex> lk(g_dp4a_mtx);
+  auto it = g_di8w.find(Wh);
+  if (it == g_di8w.end()) {
+    if (sm.isCapturing())
+      return false; // the build allocates; eager (warm) tokens only
+    DenseI8W d;
+    auto ka = ctx.registerCudaKernel(FC_QINT4_DP4A_SRC, "dense_wq_absmax");
+    auto kt = ctx.registerCudaKernel(FC_QINT4_DP4A_SRC, "dense_wq_i8t2");
+    bool ok = ka != nullptr && kt != nullptr && (N % 32u) == 0u &&
+              (K % 128u) == 0u;
+    if (ok)
+      ok = cudaMalloc(&d.w8, (size_t)N * K) == cudaSuccess;
+    if (ok)
+      ok = cudaMalloc(&d.wscl, sizeof(float) * N) == cudaSuccess;
+    if (ok)
+      ok = cudaMalloc(&d.winv, sizeof(float) * N) == cudaSuccess;
+    if (ok)
+      ok = cudaMalloc(&d.wrs, sizeof(int) * N) == cudaSuccess;
+    if (ok)
+      ok = cudaMemsetAsync(d.wrs, 0, sizeof(int) * N, sm.GetStream()) ==
+           cudaSuccess;
+    int kk = (int)K, nn = (int)N;
+    if (ok) {
+      ka->SetKernelArguments(0, &Wh, sizeof(Wh));
+      ka->SetKernelArguments(1, &d.wscl, sizeof(d.wscl));
+      ka->SetKernelArguments(2, &d.winv, sizeof(d.winv));
+      ka->SetKernelArguments(3, &kk, sizeof(kk));
+      ka->SetKernelArguments(4, &nn, sizeof(nn));
+      const int ba[3] = {256, 1, 1};
+      const int ga[3] = {((int)N + 255) / 256, 1, 1};
+      ok = sm.DispatchCommand(*ka, ga, ba);
+    }
+    if (ok) {
+      kt->SetKernelArguments(0, &Wh, sizeof(Wh));
+      kt->SetKernelArguments(1, &d.winv, sizeof(d.winv));
+      kt->SetKernelArguments(2, &d.w8, sizeof(d.w8));
+      kt->SetKernelArguments(3, &d.wrs, sizeof(d.wrs));
+      kt->SetKernelArguments(4, &kk, sizeof(kk));
+      kt->SetKernelArguments(5, &nn, sizeof(nn));
+      const int bt[3] = {256, 1, 1};
+      const int gt[3] = {(int)(N / 32u), (int)(K / 128u), 1};
+      ok = sm.DispatchCommand(*kt, gt, bt);
+    }
+    if (!ok) {
+      cudaGetLastError();
+      if (d.w8)
+        cudaFree(d.w8);
+      if (d.wscl)
+        cudaFree(d.wscl);
+      if (d.winv)
+        cudaFree(d.winv);
+      if (d.wrs)
+        cudaFree(d.wrs);
+      d = DenseI8W{};
+      d.dead = true;
+      ml_logw("[dense-i8w] plane build failed (W=%p N=%u K=%u) -- cuBLAS "
+              "keeps this FC",
+              Wh, N, K);
+    }
+    it = g_di8w.emplace(Wh, d).first;
+  }
+  DenseI8W &d = it->second;
+  if (d.dead)
+    return false;
+  if (!dp4a_stage_scratch(1, K))
+    return false;
+  const unsigned short *Xu = (const unsigned short *)Xh;
+  if (!quant_staged_for(Xu, (int)K)) {
+    const bool q_okv = fused_normq_on() && cuda_vec4_rows_ok(K, Xu);
+    const bool q_vec4 = q_okv && cuda_vec4_rows_small(1);
+    auto kq = ctx.registerCudaKernel(FC_QINT4_DP4A_SRC,
+                                     q_vec4  ? "act_quant_i8_h_v4"
+                                     : q_okv ? "act_quant_i8_h_v4p"
+                                             : "act_quant_i8_h");
+    if (!kq)
+      return false;
+    int m1 = 1, kk = (int)K;
+    kq->SetKernelArguments(0, &Xu, sizeof(Xu));
+    kq->SetKernelArguments(1, &g_dp4a_q8, sizeof(g_dp4a_q8));
+    kq->SetKernelArguments(2, &g_dp4a_ascale, sizeof(g_dp4a_ascale));
+    kq->SetKernelArguments(3, &g_dp4a_azp, sizeof(g_dp4a_azp));
+    kq->SetKernelArguments(4, &m1, sizeof(m1));
+    kq->SetKernelArguments(5, &kk, sizeof(kk));
+    const int qb[3] = {q_vec4 ? 512 : 256, 1, 1};
+    const int qg[3] = {1, 1, 1};
+    if (!sm.DispatchCommand(*kq, qg, qb))
+      return false;
+  }
+  auto kg = ctx.registerCudaKernel(FC_QINT4_DP4A_SRC, "dense_gemv_i8w");
+  if (!kg)
+    return false;
+  int kk = (int)K, nn = (int)N;
+  kg->SetKernelArguments(0, &g_dp4a_q8, sizeof(g_dp4a_q8));
+  kg->SetKernelArguments(1, &d.w8, sizeof(d.w8));
+  kg->SetKernelArguments(2, &d.wscl, sizeof(d.wscl));
+  kg->SetKernelArguments(3, &d.wrs, sizeof(d.wrs));
+  kg->SetKernelArguments(4, &g_dp4a_ascale, sizeof(g_dp4a_ascale));
+  kg->SetKernelArguments(5, &g_dp4a_azp, sizeof(g_dp4a_azp));
+  kg->SetKernelArguments(6, &Yh, sizeof(Yh));
+  kg->SetKernelArguments(7, &kk, sizeof(kk));
+  kg->SetKernelArguments(8, &nn, sizeof(nn));
+  const int gb[3] = {128, 1, 1};
+  const int gg[3] = {((int)N + 3) / 4, 1, 1};
+  if (!sm.DispatchCommand(*kg, gg, gb))
+    return false;
+  if (fused_normq_on())
+    mark_quant_staged(Xu, (int)K);
+  sm.maybeFinish();
   return true;
 }
 

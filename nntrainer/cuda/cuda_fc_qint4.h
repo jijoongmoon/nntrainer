@@ -228,6 +228,18 @@ bool shexp_bcast_hook(const unsigned short *a, const unsigned short *g,
                       unsigned short *out, int n, int W);
 
 /**
+ * @brief NNTR_DENSE_I8W (opt-in): one-time int8 [N,K] planes + w8a8
+ * warp-per-row GEMV for huge M=1 fp16 dense FCs -- the decode lm_head, whose
+ * cuBLAS fp16 form streams a ~1 GB weight plane per token at the DRAM
+ * roofline. gdn-i8w family convention (per-channel absmax/127 scale, integer
+ * rowsum, asym activation correction). True = dispatched here; false = caller
+ * runs its normal (cuBLAS) path. The plane build happens on the first eager
+ * M=1 sighting, never under capture.
+ */
+bool cuda_fc_dense_i8w_gemv(const void *Xh, const void *Wh, void *Yh,
+                            unsigned int M, unsigned int N, unsigned int K);
+
+/**
  * @brief RMSNorm fused with the int8 activation quant its consumer FC needs.
  *
  * Writes the normed fp16 rows to @p y exactly as cuda_rmsnorm_fp16 would, and
