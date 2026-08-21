@@ -13,6 +13,7 @@
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
 #include <cuda_context_manager.h>
 #include <cuda_elementwise.h>
+#include <cuda_fc_qint4.h> // shexp_bcast_hook
 #include <cuda_stream_manager.h>
 #endif
 
@@ -54,6 +55,24 @@ static void bcast_mul_dispatch(nntrainer::Tensor &a, nntrainer::Tensor &g,
                                nntrainer::Tensor &out, unsigned int rows) {
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
 #ifdef ENABLE_FP16
+  // Shared-expert decode-chain fusion (NNTR_SHEXP_FUSE): at M=1 this node is
+  // the chain's tail -- the hook records/verifies it, and once fused it
+  // launches the down-projection + gate-scale kernel directly into `out`
+  // (the split down FC and this multiply were both skipped upstream).
+  if (rows == 1 &&
+      a.getDataType() == ml::train::TensorDim::DataType::FP16 &&
+      a.batch() == 1 && a.channel() == 1) {
+    const auto *ap =
+      reinterpret_cast<const unsigned short *>(a.getData<_FP16>());
+    const auto *gp =
+      reinterpret_cast<const unsigned short *>(g.getData<_FP16>());
+    auto *op = reinterpret_cast<unsigned short *>(out.getData<_FP16>());
+    if (nntrainer::cuda::dev_accessible(gp) &&
+        nntrainer::cuda::dev_accessible(op) &&
+        nntrainer::cuda::shexp_bcast_hook(ap, gp, op, (int)(rows * a.width()),
+                                          (int)a.width()))
+      return;
+  }
   // Device path: one stream-ordered kernel. The host loop below needs a full
   // stream drain in front of it (40 nodes/chunk = 200 drains per 20K prefill)
   // and then multiplies the whole chunk on one core; both go away here.

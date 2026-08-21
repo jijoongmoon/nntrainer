@@ -14,6 +14,7 @@
 
 #include <cuda_common.h>
 #include <cuda_context.h>
+#include <cuda_fc_qint4.h> // shexp_swiglu_hook / shexp_sigmoid_hook
 #include <cuda_stream_manager.h>
 
 #include <nntrainer_log.h>
@@ -493,6 +494,10 @@ bool cuda_swiglu_fp16(const unsigned short *gate, const unsigned short *up,
                       unsigned short *out, unsigned int n) {
   if (n == 0)
     return true;
+  // Shared-expert chain fusion: the decode-time shared_swiglu is computed
+  // inside shexp_k1 (see cuda_fc_qint4.h). True = handled/skip.
+  if (shexp_swiglu_hook(gate, up, out, n))
+    return true;
   const bool v8 = ew_v8_ok(n, gate, up, out);
   auto k = CudaContext::Global().registerCudaKernel(
     ELTWISE_SRC, v8 ? "swiglu_fp16_v8" : "swiglu_fp16");
@@ -587,6 +592,10 @@ bool cuda_act_sigmoid_fp16(unsigned short *x, unsigned int n) {
     return true;
   cuda_add_flush_pending();     // one live pending across both types
   cuda_sigmoid_flush_pending(); // never stack two sigmoid records
+  // Shared-expert chain fusion: the decode-time shared_gate_sig is computed
+  // inside shexp_k1 (NNTR_SHEXP_FUSE=1). True = handled/skip.
+  if (shexp_sigmoid_hook(x, n))
+    return true;
   if (sig_fuse_on() && ew_v8_ok(n, x, nullptr, nullptr)) {
     g_pend_sig = {x, n, true};
     if (sig_fuse_lvl() == 3) { // zero-length defer: machinery bisect arm

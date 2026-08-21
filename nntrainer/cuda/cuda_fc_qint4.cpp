@@ -31,6 +31,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <mutex>
 #include <string>
@@ -3675,6 +3676,206 @@ void imma_moe_g4(const signed char *q8, const int *tokid,
 #undef M4_MMA
 #undef M4_LDM
 
+// ---- shared-expert decode-chain fusion (NNTR_SHEXP_FUSE) -------------------
+// The 35B MoE block's always-on shared expert is 9 device launches per layer
+// per decode token (actq, gate gemv, up gemv, swiglu, actq, down gemv, cuBLAS
+// N=1 gate_lin, sigmoid, bcast_mul) totalling ~130 us/layer for 1.5 MB of int4
+// weight -- launch/epilogue floors, not bandwidth. These two kernels replay
+// the SAME arithmetic fused: k1 = actq + gate/up GEMV pair + swiglu
+// (+ gate_lin dot + sigmoid when do_lin), k2 = actq + down GEMV + gate scale.
+//
+// Bit-identity argument vs the split kernels it replaces:
+//  * act quant: min/max are order-independent (any reduction shape gives the
+//    same values), asym_qparams and the rint/clamp are copied verbatim -> the
+//    int8 vector, recip and zp are IDENTICAL to act_quant_i8_h_v4's.
+//  * gemv: __dp4a int32 accumulation is integer-associative; the dequant
+//    expression matches dp4a_gemv character for character.
+//  * swiglu / sigmoid / broadcast mul: same fp32 math, same single fp16
+//    rounding points as swiglu_fp16(_v8) / act_sigmoid_fp16 / bcast_mul_fp16.
+//  * The ONLY numeric change is gate_lin under do_lin=1: a fixed block-reduce
+//    fp32 dot replaces cuBLAS's internal (unknown) fp32 accumulation order.
+//    do_lin=0 keeps cuBLAS+sigmoid live and reads their result -> that mode is
+//    byte-identical end to end.
+
+// k1: grid {SI/8 (+1 when do_lin), 1, 1}, block {256,1,1}, dynamic smem = K
+// bytes (the quantized activation row). Warp w of compute CTA b owns row
+// r = b*8+w of BOTH the gate and up projections and applies SiLU*up into
+// sact[r]. The extra trailing CTA (do_lin) computes sigmoid(x . wl) -> gsig.
+__global__ void shexp_k1(const unsigned short *Xh, const signed char *wg,
+                         const int *wg_rs, const unsigned short *wg_sc,
+                         const signed char *wu, const int *wu_rs,
+                         const unsigned short *wu_sc, const unsigned short *wl,
+                         unsigned short *sact, unsigned short *gsig, int K,
+                         int SI, int do_lin) {
+  const int ncta = SI >> 3;
+  if ((int)blockIdx.x == ncta) { // gate_lin CTA (launched only when do_lin)
+    __shared__ float red[32];
+    float acc = 0.f;
+    for (int i = threadIdx.x; i < K; i += blockDim.x)
+      acc += dp4a_h2f(Xh[i]) * dp4a_h2f(wl[i]);
+    VQ_REDUCE(red, acc, vq_add, 0.f);
+    if (threadIdx.x == 0) {
+      // round the dot to fp16 first (the cuBLAS arm wrote fp16 gl), then the
+      // sigmoid reads the rounded value -- same two-step form as the split
+      // cublas_dense + act_sigmoid_fp16 pair.
+      const unsigned short glh = dp4a_f2h(red[0]);
+      gsig[0] = dp4a_f2h(1.0f / (1.0f + expf(-dp4a_h2f(glh))));
+    }
+    return;
+  }
+  // Per-CTA redundant act quant of the K-wide fp16 row into shared memory.
+  // Reproduces act_quant_i8_h_v4 exactly (see bit-identity note above); the
+  // redundancy across CTAs is ~4 KB of L2-hot reads per CTA, cheaper than a
+  // separate kernel + global staging round-trip.
+  extern __shared__ signed char q8s[];
+  __shared__ float smn[32];
+  __shared__ float smx[32];
+  const uint2 *xv = (const uint2 *)Xh;
+  const int nv = K >> 2;
+  float lmn = 0.f, lmx = 0.f;
+  for (int i = threadIdx.x; i < nv; i += blockDim.x) {
+    float4 f = vq_load4(xv[i]);
+    lmn = fminf(lmn, fminf(fminf(f.x, f.y), fminf(f.z, f.w)));
+    lmx = fmaxf(lmx, fmaxf(fmaxf(f.x, f.y), fmaxf(f.z, f.w)));
+  }
+  VQ_REDUCE(smn, lmn, fminf, VQ_POSINF);
+  VQ_REDUCE(smx, lmx, fmaxf, VQ_NEGINF);
+  float scale_q, recip;
+  int zp;
+  asym_qparams(smn[0], smx[0], scale_q, recip, zp);
+  int *q32 = (int *)q8s;
+  for (int i = threadIdx.x; i < nv; i += blockDim.x) {
+    float4 f = vq_load4(xv[i]);
+    int q0 = max(-128, min(127, (int)rintf(f.x * scale_q) + zp));
+    int q1 = max(-128, min(127, (int)rintf(f.y * scale_q) + zp));
+    int q2 = max(-128, min(127, (int)rintf(f.z * scale_q) + zp));
+    int q3 = max(-128, min(127, (int)rintf(f.w * scale_q) + zp));
+    q32[i] = (q0 & 0xFF) | ((q1 & 0xFF) << 8) | ((q2 & 0xFF) << 16) |
+             ((q3 & 0xFF) << 24);
+  }
+  __syncthreads();
+  const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int r = (int)blockIdx.x * 8 + w;
+  if (r >= SI)
+    return;
+  const int Kh = K >> 1;
+  const signed char *wgr = wg + (long)r * Kh;
+  const signed char *wur = wu + (long)r * Kh;
+  int accg = 0, accu = 0;
+  for (int k = lane * 4; k < K; k += 128) {
+    const int a = *(const int *)(q8s + k);
+    const int kb = k >> 1;
+    {
+      const unsigned int w16 = *(const unsigned short *)(wgr + kb);
+      const int b0 = w16 & 0xFF, b1 = (w16 >> 8) & 0xFF;
+      const int w0 = ((int)(signed char)(b0 << 4)) >> 4;
+      const int w1 = ((int)(signed char)b0) >> 4;
+      const int w2 = ((int)(signed char)(b1 << 4)) >> 4;
+      const int w3 = ((int)(signed char)b1) >> 4;
+      accg = __dp4a(a,
+                    (w0 & 0xFF) | ((w1 & 0xFF) << 8) | ((w2 & 0xFF) << 16) |
+                      ((w3 & 0xFF) << 24),
+                    accg);
+    }
+    {
+      const unsigned int w16 = *(const unsigned short *)(wur + kb);
+      const int b0 = w16 & 0xFF, b1 = (w16 >> 8) & 0xFF;
+      const int w0 = ((int)(signed char)(b0 << 4)) >> 4;
+      const int w1 = ((int)(signed char)b0) >> 4;
+      const int w2 = ((int)(signed char)(b1 << 4)) >> 4;
+      const int w3 = ((int)(signed char)b1) >> 4;
+      accu = __dp4a(a,
+                    (w0 & 0xFF) | ((w1 & 0xFF) << 8) | ((w2 & 0xFF) << 16) |
+                      ((w3 & 0xFF) << 24),
+                    accu);
+    }
+  }
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) {
+    accg += __shfl_down_sync(0xffffffffu, accg, o);
+    accu += __shfl_down_sync(0xffffffffu, accu, o);
+  }
+  if (lane == 0) {
+    const float rg =
+      (float)(accg - zp * wg_rs[r]) * recip * dp4a_h2f(wg_sc[r]);
+    const unsigned short gh = dp4a_f2h(rg);
+    const float ru =
+      (float)(accu - zp * wu_rs[r]) * recip * dp4a_h2f(wu_sc[r]);
+    const unsigned short uh = dp4a_f2h(ru);
+    const float x = dp4a_h2f(gh);
+    const float s = x / (1.0f + expf(-x));
+    sact[r] = dp4a_f2h(s * dp4a_h2f(uh));
+  }
+}
+
+// k2: grid {64,1,1}, block {256,1,1}, dynamic smem = K bytes. Per-CTA
+// redundant quant of sact (K=SI elements), then 8 warps x N/(64*8) rows of
+// the down projection; the epilogue folds the shared-expert sigmoid gate
+// (bcast_mul) into the store.
+__global__ void shexp_k2(const unsigned short *sact, const signed char *wd,
+                         const int *wd_rs, const unsigned short *wd_sc,
+                         const unsigned short *gsig, unsigned short *out,
+                         int K, int N) {
+  extern __shared__ signed char q8s[];
+  __shared__ float smn[32];
+  __shared__ float smx[32];
+  const uint2 *xv = (const uint2 *)sact;
+  const int nv = K >> 2;
+  float lmn = 0.f, lmx = 0.f;
+  for (int i = threadIdx.x; i < nv; i += blockDim.x) {
+    float4 f = vq_load4(xv[i]);
+    lmn = fminf(lmn, fminf(fminf(f.x, f.y), fminf(f.z, f.w)));
+    lmx = fmaxf(lmx, fmaxf(fmaxf(f.x, f.y), fmaxf(f.z, f.w)));
+  }
+  VQ_REDUCE(smn, lmn, fminf, VQ_POSINF);
+  VQ_REDUCE(smx, lmx, fmaxf, VQ_NEGINF);
+  float scale_q, recip;
+  int zp;
+  asym_qparams(smn[0], smx[0], scale_q, recip, zp);
+  int *q32 = (int *)q8s;
+  for (int i = threadIdx.x; i < nv; i += blockDim.x) {
+    float4 f = vq_load4(xv[i]);
+    int q0 = max(-128, min(127, (int)rintf(f.x * scale_q) + zp));
+    int q1 = max(-128, min(127, (int)rintf(f.y * scale_q) + zp));
+    int q2 = max(-128, min(127, (int)rintf(f.z * scale_q) + zp));
+    int q3 = max(-128, min(127, (int)rintf(f.w * scale_q) + zp));
+    q32[i] = (q0 & 0xFF) | ((q1 & 0xFF) << 8) | ((q2 & 0xFF) << 16) |
+             ((q3 & 0xFF) << 24);
+  }
+  __syncthreads();
+  const float gv = dp4a_h2f(gsig[0]);
+  const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int Kh = K >> 1;
+  const int rows_per_warp = N / ((int)gridDim.x * 8);
+  const int r0 = ((int)blockIdx.x * 8 + w) * rows_per_warp;
+  for (int r = r0; r < r0 + rows_per_warp; ++r) {
+    const signed char *wr = wd + (long)r * Kh;
+    int acc = 0;
+    for (int k = lane * 4; k < K; k += 128) {
+      const int a = *(const int *)(q8s + k);
+      const unsigned int w16 = *(const unsigned short *)(wr + (k >> 1));
+      const int b0 = w16 & 0xFF, b1 = (w16 >> 8) & 0xFF;
+      const int w0 = ((int)(signed char)(b0 << 4)) >> 4;
+      const int w1 = ((int)(signed char)b0) >> 4;
+      const int w2 = ((int)(signed char)(b1 << 4)) >> 4;
+      const int w3 = ((int)(signed char)b1) >> 4;
+      acc = __dp4a(a,
+                   (w0 & 0xFF) | ((w1 & 0xFF) << 8) | ((w2 & 0xFF) << 16) |
+                     ((w3 & 0xFF) << 24),
+                   acc);
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+      acc += __shfl_down_sync(0xffffffffu, acc, o);
+    if (lane == 0) {
+      const float rr =
+        (float)(acc - zp * wd_rs[r]) * recip * dp4a_h2f(wd_sc[r]);
+      const unsigned short sdh = dp4a_f2h(rr);
+      out[r] = dp4a_f2h(dp4a_h2f(sdh) * gv);
+    }
+  }
+}
+
 }
 
 )CU";
@@ -4172,6 +4373,421 @@ bool dp4a_repack_and_gemm(const unsigned char *plain_w,
   const int gg[3] = {((int)N + tile - 1) / tile, ((int)M + tile - 1) / tile, 1};
   return StreamManager::Global().DispatchCommand(*kg, gg, gb);
 }
+
+// ---- shared-expert decode-chain fusion: host side (NNTR_SHEXP_FUSE) --------
+// The qwen3_5_moe shared expert is 8 separate graph nodes (gate/up/down FCs,
+// swiglu, gate_lin FC, sigmoid, broadcast_mul; plus the ffn add). Graph-node
+// fusion is forbidden (the weight loader aborts on any re-enumeration), so
+// this fuses at the backend: during the first two M=1 decode tokens each
+// chain dispatch RECORDS its operand pointers and every producer->consumer
+// edge is VERIFIED (mismatch permanently disables fusion for that layer with
+// a warning); from the third token the shared_gate dispatch launches shexp_k1,
+// the shared_mul dispatch launches shexp_k2, and the seven dispatches in
+// between are skipped. Weight planes are immutable and the decode CUDA graph
+// (M2B) already depends on activation-pointer stability across tokens, so the
+// two recorded eager tokens (== NNTR_CUDA_M2B_WARM's default) validate
+// exactly the invariant the fused launches rely on. K2 always writes the LIVE
+// output pointer handed to the broadcast_mul hook.
+//
+// NNTR_SHEXP_FUSE: 0/unset = off, 1 = full fusion (gate_lin dot moves into
+// shexp_k1 -- semantic, ulp-class change on the sigmoid gate scalar),
+// 2 = bit-identical mode (cuBLAS gate_lin + sigmoid stay live; shexp_k2 reads
+// the sigmoid's own output buffer).
+} // namespace
+
+namespace {
+enum : unsigned {
+  SHX_GATE = 1u,
+  SHX_UP = 2u,
+  SHX_SWIGLU = 4u,
+  SHX_DOWN = 8u,
+  SHX_LIN = 16u,
+  SHX_SIG = 32u,
+  SHX_MUL = 64u,
+  SHX_ALL = 127u
+};
+struct ShexpRec {
+  // immutable weight planes (dp4a DevWeightQ cache + fp16 scale/lin planes)
+  const signed char *wg = nullptr;
+  const int *wg_rs = nullptr;
+  const unsigned short *wg_sc = nullptr;
+  const signed char *wu = nullptr;
+  const int *wu_rs = nullptr;
+  const unsigned short *wu_sc = nullptr;
+  const signed char *wd = nullptr;
+  const int *wd_rs = nullptr;
+  const unsigned short *wd_sc = nullptr;
+  const unsigned short *wl = nullptr; // gate_lin fp16 weight [K]
+  // recorded activation edges (verified during the record tokens)
+  const unsigned short *x = nullptr; // ffn_norm out: gate/up/lin input
+  unsigned short *sg = nullptr;      // shared_gate out
+  unsigned short *su = nullptr;      // shared_up out
+  const unsigned short *sw = nullptr; // shared_swiglu out
+  unsigned short *sd = nullptr;       // shared_down out
+  unsigned short *gl = nullptr;       // gate_lin out (sigmoid runs in-place)
+  int K = 0, SI = 0, N = 0;
+  unsigned mask = 0; // roles seen in the current (record-mode) token
+  int tokens = 0;    // completed, consistent record tokens
+  bool dead = false;
+  bool fused_tok = false; // k1 launched this token; k2 pending at the mul
+};
+constexpr int SHX_MAX_LAYERS = 96;
+ShexpRec g_shx[SHX_MAX_LAYERS];
+std::mutex g_shx_mtx;
+unsigned short *g_shx_sact = nullptr; // [SI] swiglu output scratch
+unsigned short *g_shx_gsig = nullptr; // [8] sigmoid gate scalar (padded)
+bool g_shx_scratch_fail = false;
+
+int shx_mode() {
+  static const int v = []() {
+    const char *e = std::getenv("NNTR_SHEXP_FUSE");
+    if (e && e[0])
+      return std::atoi(e);
+    // Default: the BIT-IDENTICAL mode (2) on integrated -- removes ~26% of
+    // the M2B decode graph's nodes (1,534 -> 1,134 on the 35B) with zero
+    // numeric change (256-token 20K-prompt decode byte-identical). Full
+    // fusion (1) folds the cuBLAS gate_lin dot in too and is NLL-gated,
+    // opt-in until its gate cycle. Discrete stays off: the FUSED_DECQ RTX
+    // lesson (fused-quant block barriers serialize the weight streaming
+    // that split kernels pipeline naturally there).
+    return ContextManager::Global().isIntegrated() ? 2 : 0;
+  }();
+  return v;
+}
+
+// "layer<id>_<role>" -> role suffix (or nullptr when the tag is not that
+// shape). Same prefix strip as kern_prof's role aggregation.
+const char *shx_role(const char *tag, int *lid) {
+  if (tag == nullptr || std::strncmp(tag, "layer", 5) != 0)
+    return nullptr;
+  const char *p = tag + 5;
+  int id = 0;
+  bool any = false;
+  while (*p >= '0' && *p <= '9') {
+    id = id * 10 + (*p - '0');
+    ++p;
+    any = true;
+  }
+  if (!any || *p != '_' || id >= SHX_MAX_LAYERS)
+    return nullptr;
+  *lid = id;
+  return p + 1;
+}
+
+void shx_kill(ShexpRec &r, int lid, const char *why) {
+  if (!r.dead)
+    ml_logw("[shexp] layer %d: %s -- fusion disabled for this layer", lid,
+            why);
+  r.dead = true;
+  r.fused_tok = false;
+}
+
+// Role sighting on the record path; a token completes when all 7 roles have
+// been seen once. Re-entry inside an incomplete token means the chain shape
+// is not what this fusion assumes -> kill.
+void shx_saw(ShexpRec &r, int lid, unsigned bit) {
+  if (r.mask & bit) {
+    shx_kill(r, lid, "role re-entered before the chain completed");
+    r.mask = 0;
+    return;
+  }
+  r.mask |= bit;
+  if (r.mask == SHX_ALL) {
+    r.mask = 0;
+    ++r.tokens;
+  }
+}
+
+bool shx_scratch_ready(int SI) {
+  if (g_shx_sact != nullptr && g_shx_gsig != nullptr)
+    return true;
+  // Never allocate under capture (the GDN scratch lesson: cudaMalloc inside a
+  // capture is refused and the graph silently loses the kernel).
+  if (g_shx_scratch_fail || StreamManager::Global().isCapturing())
+    return false;
+  if (cudaMalloc(&g_shx_sact, sizeof(unsigned short) * (size_t)SI) !=
+        cudaSuccess ||
+      cudaMalloc(&g_shx_gsig, sizeof(unsigned short) * 8) != cudaSuccess) {
+    cudaGetLastError();
+    g_shx_scratch_fail = true;
+    ml_logw("[shexp] scratch alloc failed -- fusion stays off");
+    return false;
+  }
+  return true;
+}
+} // namespace
+
+bool shexp_fc_qs4cx_hook(const unsigned short *Xh, const unsigned char *plain_w,
+                         const unsigned short *scales_fp16, unsigned short *Yh,
+                         unsigned int M, unsigned int N, unsigned int K) {
+  if (shx_mode() == 0 || M != 1)
+    return false;
+  int lid = -1;
+  const char *role = shx_role(StreamManager::Global().dispatchTag(), &lid);
+  if (role == nullptr)
+    return false;
+  const bool is_g = std::strcmp(role, "shared_gate") == 0;
+  const bool is_u = !is_g && std::strcmp(role, "shared_up") == 0;
+  const bool is_d = !is_g && !is_u && std::strcmp(role, "shared_down") == 0;
+  if (!is_g && !is_u && !is_d)
+    return false;
+  std::lock_guard<std::mutex> lk(g_shx_mtx);
+  ShexpRec &r = g_shx[lid];
+  if (r.dead)
+    return false;
+  if (is_g) {
+    if (r.tokens >= 2 && r.mask == 0 && Xh == r.x && (int)N == r.SI &&
+        (int)K == r.K && r.wu != nullptr && r.wd != nullptr &&
+        (shx_mode() != 1 || r.wl != nullptr) && shx_scratch_ready(r.SI)) {
+      auto k1 = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
+                                                         "shexp_k1");
+      auto k2 = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
+                                                         "shexp_k2");
+      if (!k1 || !k2) {
+        shx_kill(r, lid, "shexp kernel registration failed");
+        return false;
+      }
+      const int do_lin = (shx_mode() == 1) ? 1 : 0;
+      int kk = r.K, si = r.SI;
+      k1->SetKernelArguments(0, &Xh, sizeof(Xh));
+      k1->SetKernelArguments(1, &r.wg, sizeof(r.wg));
+      k1->SetKernelArguments(2, &r.wg_rs, sizeof(r.wg_rs));
+      k1->SetKernelArguments(3, &r.wg_sc, sizeof(r.wg_sc));
+      k1->SetKernelArguments(4, &r.wu, sizeof(r.wu));
+      k1->SetKernelArguments(5, &r.wu_rs, sizeof(r.wu_rs));
+      k1->SetKernelArguments(6, &r.wu_sc, sizeof(r.wu_sc));
+      k1->SetKernelArguments(7, &r.wl, sizeof(r.wl));
+      k1->SetKernelArguments(8, &g_shx_sact, sizeof(g_shx_sact));
+      k1->SetKernelArguments(9, &g_shx_gsig, sizeof(g_shx_gsig));
+      k1->SetKernelArguments(10, &kk, sizeof(kk));
+      k1->SetKernelArguments(11, &si, sizeof(si));
+      k1->SetKernelArguments(12, &do_lin, sizeof(do_lin));
+      const int blk[3] = {256, 1, 1};
+      const int grd[3] = {(r.SI >> 3) + do_lin, 1, 1};
+      if (!StreamManager::Global().DispatchCommand(*k1, grd, blk,
+                                                   (unsigned int)r.K)) {
+        shx_kill(r, lid, "shexp_k1 dispatch failed");
+        return false;
+      }
+      r.fused_tok = true;
+      StreamManager::Global().maybeFinish();
+      return true;
+    }
+    DevWeightQ *dw = ensure_dp4a_cache_locked(plain_w, N, K);
+    if (!dw) {
+      shx_kill(r, lid, "no dp4a weight cache for shared_gate");
+      return false;
+    }
+    // Geometry the fused kernels assume: warp-per-row-pair in k1 (SI % 8),
+    // int-vector activation loads (K % 4), and k2's fixed 64x8-warp grid
+    // covering N in whole rows-per-warp strides (N checked at the down FC).
+    if ((N & 7u) != 0u || (K & 3u) != 0u) {
+      shx_kill(r, lid, "shared_gate geometry unsupported by shexp kernels");
+      return false;
+    }
+    if (r.x != nullptr &&
+        (r.x != Xh || r.SI != (int)N || r.K != (int)K || r.wg != dw->plain)) {
+      shx_kill(r, lid, "shared_gate operands changed between tokens");
+      return false;
+    }
+    // Do the one-time work NOW, on an eager record token: the activation
+    // check runs again at the capture token, where a cudaMalloc would be
+    // refused (the GDN lesson) and an NVRTC first-compile is unwanted.
+    if (!shx_scratch_ready((int)N)) {
+      shx_kill(r, lid, "shexp scratch unavailable");
+      return false;
+    }
+    if (!CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
+                                                  "shexp_k1") ||
+        !CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
+                                                  "shexp_k2")) {
+      shx_kill(r, lid, "shexp kernel registration failed");
+      return false;
+    }
+    r.x = Xh;
+    r.SI = (int)N;
+    r.K = (int)K;
+    r.wg = dw->plain;
+    r.wg_rs = dw->rowsum;
+    r.wg_sc = scales_fp16;
+    r.sg = Yh;
+    shx_saw(r, lid, SHX_GATE);
+    return false;
+  }
+  if (is_u) {
+    if (r.fused_tok)
+      return true; // computed by shexp_k1
+    DevWeightQ *dw = ensure_dp4a_cache_locked(plain_w, N, K);
+    if (!dw) {
+      shx_kill(r, lid, "no dp4a weight cache for shared_up");
+      return false;
+    }
+    if (Xh != r.x || (int)N != r.SI || (int)K != r.K ||
+        (r.wu != nullptr && r.wu != dw->plain)) {
+      shx_kill(r, lid, "shared_up operands do not match the gate's");
+      return false;
+    }
+    r.wu = dw->plain;
+    r.wu_rs = dw->rowsum;
+    r.wu_sc = scales_fp16;
+    r.su = Yh;
+    shx_saw(r, lid, SHX_UP);
+    return false;
+  }
+  // shared_down
+  if (r.fused_tok)
+    return true; // computed by shexp_k2 at the broadcast-mul hook
+  DevWeightQ *dw = ensure_dp4a_cache_locked(plain_w, N, K);
+  if (!dw) {
+    shx_kill(r, lid, "no dp4a weight cache for shared_down");
+    return false;
+  }
+  if ((int)K != r.SI || r.SI == 0 || Xh != r.sw ||
+      (r.wd != nullptr && r.wd != dw->plain)) {
+    shx_kill(r, lid, "shared_down input is not the swiglu output");
+    return false;
+  }
+  // shexp_k2's fixed 64-CTA x 8-warp grid walks N in whole rows-per-warp
+  // strides; N must divide evenly or rows would be dropped.
+  if (N % 512u != 0u) {
+    shx_kill(r, lid, "shared_down N unsupported by shexp_k2's grid");
+    return false;
+  }
+  r.wd = dw->plain;
+  r.wd_rs = dw->rowsum;
+  r.wd_sc = scales_fp16;
+  r.sd = Yh;
+  r.N = (int)N;
+  shx_saw(r, lid, SHX_DOWN);
+  return false;
+}
+
+bool shexp_dense_hook(const void *Xh, const void *Wh, void *Yh, unsigned int M,
+                      unsigned int N, unsigned int K) {
+  if (shx_mode() == 0 || M != 1 || N != 1)
+    return false;
+  int lid = -1;
+  const char *role = shx_role(StreamManager::Global().dispatchTag(), &lid);
+  if (role == nullptr || std::strcmp(role, "shared_gate_lin") != 0)
+    return false;
+  std::lock_guard<std::mutex> lk(g_shx_mtx);
+  ShexpRec &r = g_shx[lid];
+  if (r.dead)
+    return false;
+  if (r.fused_tok)
+    return shx_mode() == 1; // mode 2 keeps the cuBLAS dot live
+  if (r.K != 0 && (int)K != r.K) {
+    shx_kill(r, lid, "gate_lin K mismatch");
+    return false;
+  }
+  if (r.x != nullptr && Xh != (const void *)r.x) {
+    shx_kill(r, lid, "gate_lin input is not the ffn_norm output");
+    return false;
+  }
+  r.wl = (const unsigned short *)Wh;
+  r.gl = (unsigned short *)Yh;
+  shx_saw(r, lid, SHX_LIN);
+  return false;
+}
+
+bool shexp_swiglu_hook(const unsigned short *gate, const unsigned short *up,
+                       unsigned short *out, unsigned int n) {
+  if (shx_mode() == 0)
+    return false;
+  int lid = -1;
+  const char *role = shx_role(StreamManager::Global().dispatchTag(), &lid);
+  if (role == nullptr || std::strcmp(role, "shared_swiglu") != 0)
+    return false;
+  std::lock_guard<std::mutex> lk(g_shx_mtx);
+  ShexpRec &r = g_shx[lid];
+  if (r.dead || r.SI == 0 || (int)n != r.SI)
+    return false; // prefill-shaped call (n = rows*SI): not ours
+  if (r.fused_tok)
+    return true; // computed by shexp_k1
+  if (gate != r.sg || up != r.su) {
+    shx_kill(r, lid, "swiglu inputs are not the gate/up outputs");
+    return false;
+  }
+  r.sw = out;
+  shx_saw(r, lid, SHX_SWIGLU);
+  return false;
+}
+
+bool shexp_sigmoid_hook(unsigned short *x, unsigned int n) {
+  if (shx_mode() == 0 || n != 1)
+    return false;
+  int lid = -1;
+  const char *role = shx_role(StreamManager::Global().dispatchTag(), &lid);
+  if (role == nullptr || std::strcmp(role, "shared_gate_sig") != 0)
+    return false;
+  std::lock_guard<std::mutex> lk(g_shx_mtx);
+  ShexpRec &r = g_shx[lid];
+  if (r.dead)
+    return false;
+  if (r.fused_tok)
+    return shx_mode() == 1; // mode 2 keeps the in-place sigmoid live
+  if (r.gl == nullptr || x != r.gl) {
+    shx_kill(r, lid, "sigmoid input is not the gate_lin output");
+    return false;
+  }
+  shx_saw(r, lid, SHX_SIG);
+  return false;
+}
+
+bool shexp_bcast_hook(const unsigned short *a, const unsigned short *g,
+                      unsigned short *out, int n, int W) {
+  if (shx_mode() == 0 || n != W)
+    return false; // rows != 1: prefill-shaped
+  int lid = -1;
+  const char *role = shx_role(StreamManager::Global().dispatchTag(), &lid);
+  if (role == nullptr || std::strcmp(role, "shared_mul") != 0)
+    return false;
+  std::lock_guard<std::mutex> lk(g_shx_mtx);
+  ShexpRec &r = g_shx[lid];
+  if (r.dead)
+    return false;
+  if (r.fused_tok) {
+    auto k2 = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
+                                                       "shexp_k2");
+    if (!k2) { // registration succeeded at k1 time; treat as fatal for fusion
+      shx_kill(r, lid, "shexp_k2 registration failed mid-token");
+      return false;
+    }
+    const unsigned short *gsrc = (shx_mode() == 1) ? g_shx_gsig : g;
+    int kk = r.SI, nn = r.N;
+    k2->SetKernelArguments(0, &g_shx_sact, sizeof(g_shx_sact));
+    k2->SetKernelArguments(1, &r.wd, sizeof(r.wd));
+    k2->SetKernelArguments(2, &r.wd_rs, sizeof(r.wd_rs));
+    k2->SetKernelArguments(3, &r.wd_sc, sizeof(r.wd_sc));
+    k2->SetKernelArguments(4, &gsrc, sizeof(gsrc));
+    k2->SetKernelArguments(5, &out, sizeof(out));
+    k2->SetKernelArguments(6, &kk, sizeof(kk));
+    k2->SetKernelArguments(7, &nn, sizeof(nn));
+    const int blk[3] = {256, 1, 1};
+    const int grd[3] = {64, 1, 1};
+    r.fused_tok = false;
+    if (!StreamManager::Global().DispatchCommand(*k2, grd, blk,
+                                                 (unsigned int)r.SI)) {
+      // k1 already ran and the split chain was skipped -- this token's output
+      // for this layer is unrecoverable. Loud, and never fuse again.
+      ml_loge("[shexp] layer %d: shexp_k2 dispatch FAILED after a fused k1 -- "
+              "this token's shared-expert output is invalid",
+              lid);
+      shx_kill(r, lid, "shexp_k2 dispatch failed");
+      return false;
+    }
+    StreamManager::Global().maybeFinish();
+    return true;
+  }
+  if ((int)W != r.N || r.N == 0 || a != r.sd || g != r.gl) {
+    shx_kill(r, lid, "broadcast_mul inputs are not the down/sigmoid outputs");
+    return false;
+  }
+  shx_saw(r, lid, SHX_MUL);
+  return false;
+}
+
+namespace {
 
 extern bool g_last_quant_valid; // defined below with the staging record
 
@@ -5085,6 +5701,11 @@ bool cuda_fc_qs4cx_dp4a_gemm_fp16(const unsigned short *Xh,
     return false;
   }
   std::lock_guard<std::mutex> lk(g_dp4a_mtx);
+  // Shared-expert decode-chain fusion (NNTR_SHEXP_FUSE): gate/up/down of the
+  // qwen3_5_moe shared expert are recorded, then fused/skipped from the third
+  // M=1 token. A true return means this dispatch is already covered.
+  if (shexp_fc_qs4cx_hook(Xh, plain_w, scales_fp16, Yh, M, N, K))
+    return true;
   // Fused decode (M==1): fold the activation quant into the GEMV kernel
   // (the ML Drift paper's 3.7 decode form). Output verified BIT-IDENTICAL
   // to the two-kernel path (fmin/fmax partition-independence + integer

@@ -200,6 +200,34 @@ bool cuda_fc_qs4cx_dp4a_gemm_fp16in_f32out(const unsigned short *Xh,
 bool cuda_fc_qs4cx_fused_normq_enabled();
 
 /**
+ * @brief Shared-expert decode-chain fusion hooks (NNTR_SHEXP_FUSE; 0/unset =
+ * off, 1 = full fusion, 2 = bit-identical mode that keeps the cuBLAS gate_lin
+ * + sigmoid live). Each backend entry on the qwen3_5_moe shared-expert chain
+ * calls its hook first; a true return means the dispatch was handled (fused
+ * or skipped) and the caller must return success without launching anything.
+ * The first two M=1 sightings of a layer's chain record and verify the
+ * operand pointers; from the third token shared_gate launches the fused
+ * gate/up/swiglu(+gate_lin+sigmoid) kernel and shared_mul launches the fused
+ * down+gate-scale kernel. shexp_fc_qs4cx_hook must be called with the dp4a
+ * cache mutex held (it resolves DevWeightQ planes).
+ */
+bool shexp_fc_qs4cx_hook(const unsigned short *Xh, const unsigned char *plain_w,
+                         const unsigned short *scales_fp16, unsigned short *Yh,
+                         unsigned int M, unsigned int N, unsigned int K);
+/** @brief gate_lin (dense fp16 N=1) hook -- see shexp_fc_qs4cx_hook. */
+bool shexp_dense_hook(const void *Xh, const void *Wh, void *Yh, unsigned int M,
+                      unsigned int N, unsigned int K);
+/** @brief shared_swiglu hook -- see shexp_fc_qs4cx_hook. */
+bool shexp_swiglu_hook(const unsigned short *gate, const unsigned short *up,
+                       unsigned short *out, unsigned int n);
+/** @brief shared_gate_sig (in-place sigmoid, n==1) hook. */
+bool shexp_sigmoid_hook(unsigned short *x, unsigned int n);
+/** @brief shared_mul (row-broadcast multiply) hook; launches the fused down
+ *  projection + gate scale into @p out when the chain is fused. */
+bool shexp_bcast_hook(const unsigned short *a, const unsigned short *g,
+                      unsigned short *out, int n, int W);
+
+/**
  * @brief RMSNorm fused with the int8 activation quant its consumer FC needs.
  *
  * Writes the normed fp16 rows to @p y exactly as cuda_rmsnorm_fp16 would, and
