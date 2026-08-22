@@ -532,6 +532,203 @@ TEST(nntrainer_Tensor, QS4CXTensor_03_p) {
 }
 
 /**
+ * @brief Build an FP32 weight whose output channels have deliberately
+ * different magnitudes, so a single tensor-wide scale could not stand in for
+ * the per-channel ones QS4CX keeps.
+ */
+static nntrainer::Tensor qs4cxSource(unsigned int K, unsigned int N) {
+  nntrainer::Tensor t(1, 1, K, N);
+  for (unsigned int n = 0; n < N; ++n) {
+    const float amp = 0.25f * static_cast<float>(n + 1);
+    for (unsigned int k = 0; k < K; ++k) {
+      // symmetric around zero and touching both ends of the channel's range
+      float v;
+      if (k == 0)
+        v = amp;
+      else if (k == 1)
+        v = -amp;
+      else
+        v =
+          amp * std::sin(1.7f * static_cast<float>(k) + static_cast<float>(n));
+      t.setValue(0, 0, k, n, v);
+    }
+  }
+  return t;
+}
+
+/**
+ * @brief How far a QS4CX reconstruction of channel @a n may sit from the
+ * source: half a step to rounding, plus whatever the top of the channel's
+ * range loses to the +7 clamp. The code carries no zero point, so it reaches
+ * 8 steps below zero but only 7 above.
+ */
+static float qs4cxTolerance(const nntrainer::Tensor &src, unsigned int n,
+                            float step) {
+  float lo = 0.0f;
+  for (unsigned int k = 0; k < src.height(); ++k)
+    lo = std::min(lo, src.getValue(0, 0, k, n));
+  return 0.5f * step + std::max(0.0f, lo + 8.0f * step) + 1e-5f;
+}
+
+/**
+ * @brief QScheme::QS4CX resolves to a quantizer instead of throwing
+ */
+TEST(nntrainer_Tensor, QS4CXQuantizer_01_p) {
+  std::unique_ptr<nntrainer::Quantizer> quantizer;
+  ASSERT_NO_THROW(quantizer = nntrainer::Quantization::createQuantizer(
+                    nntrainer::QScheme::QS4CX));
+  ASSERT_NE(quantizer, nullptr);
+  EXPECT_EQ(quantizer->qscheme(), nntrainer::QScheme::QS4CX);
+  EXPECT_EQ(quantizer->create()->qscheme(), nntrainer::QScheme::QS4CX);
+}
+
+/**
+ * @brief QS4CX quantize / dequantize round trip stays within the per-channel
+ * step size
+ */
+TEST(nntrainer_Tensor, QS4CXQuantizer_02_p) {
+  const unsigned int K = 8;
+  const unsigned int N = 4;
+  nntrainer::Tensor input = qs4cxSource(K, N);
+
+  auto quantizer =
+    nntrainer::Quantization::createQuantizer(nntrainer::QScheme::QS4CX);
+  nntrainer::Tensor q = quantizer->quantize(input, nntrainer::Tdatatype::QS4CX);
+
+  EXPECT_EQ(q.getDataType(), nntrainer::Tdatatype::QS4CX);
+  EXPECT_EQ(q.q_scheme(), nntrainer::QScheme::QS4CX);
+  EXPECT_EQ(q.height(), K);
+  EXPECT_EQ(q.width(), N);
+  EXPECT_EQ(q.size(), N * ((K + 1) / 2) + N * sizeof(float));
+
+  const float *scales = q.getScale<float>();
+  // the scales are per output channel, and this input made them differ
+  EXPECT_NE(scales[0], scales[N - 1]);
+
+  nntrainer::Tensor deq = quantizer->dequantize(q, nntrainer::Tdatatype::FP32);
+  ASSERT_EQ(deq.getDim(), input.getDim());
+
+  for (unsigned int n = 0; n < N; ++n) {
+    // the scale of a channel is its range, zero included, over the 15 steps
+    float lo = 0.0f, hi = 0.0f;
+    for (unsigned int k = 0; k < K; ++k) {
+      lo = std::min(lo, input.getValue(0, 0, k, n));
+      hi = std::max(hi, input.getValue(0, 0, k, n));
+    }
+    ASSERT_NEAR(scales[n], (hi - lo) / 15.0f, 1e-6f) << " at n=" << n;
+
+    const float tol = qs4cxTolerance(input, n, scales[n]);
+    for (unsigned int k = 0; k < K; ++k) {
+      EXPECT_NEAR(deq.getValue(0, 0, k, n), input.getValue(0, 0, k, n), tol)
+        << " at k=" << k << ", n=" << n;
+    }
+  }
+}
+
+/**
+ * @brief a quantized QS4CX weight survives the .bin save / read round trip
+ */
+TEST(nntrainer_Tensor, QS4CXQuantizer_03_p) {
+  // an odd K leaves the last nibble of every channel unused
+  const unsigned int K = 9;
+  const unsigned int N = 4;
+  nntrainer::Tensor input = qs4cxSource(K, N);
+
+  auto quantizer =
+    nntrainer::Quantization::createQuantizer(nntrainer::QScheme::QS4CX);
+  nntrainer::Tensor saved =
+    quantizer->quantize(input, nntrainer::Tdatatype::QS4CX);
+  nntrainer::Tensor before =
+    quantizer->dequantize(saved, nntrainer::Tdatatype::FP32);
+
+  const std::string path = "qs4cx_round_trip.bin";
+  {
+    std::ofstream f(path, std::ios::out | std::ios::binary | std::ios::trunc);
+    ASSERT_TRUE(f.good());
+    saved.save(f);
+  }
+
+  // the record is the nibbles and the scales, with no qparam header of its own
+  {
+    std::ifstream f(path, std::ios::in | std::ios::binary | std::ios::ate);
+    ASSERT_TRUE(f.good());
+    EXPECT_EQ(static_cast<size_t>(f.tellg()), saved.getMemoryBytes());
+  }
+
+  nntrainer::Tensor loaded(
+    {1, 1, K, N, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QS4CX}},
+    true);
+  {
+    std::ifstream f(path, std::ios::in | std::ios::binary);
+    ASSERT_TRUE(f.good());
+    loaded.read(f);
+  }
+  remove(path.c_str());
+
+  EXPECT_EQ(0, memcmp(loaded.getData<uint8_t>(), saved.getData<uint8_t>(),
+                      saved.getMemoryBytes()));
+
+  nntrainer::Tensor after =
+    quantizer->dequantize(loaded, nntrainer::Tdatatype::FP32);
+  EXPECT_EQ(before, after);
+
+  const float *scales = loaded.getScale<float>();
+  for (unsigned int n = 0; n < N; ++n) {
+    const float tol = qs4cxTolerance(input, n, scales[n]);
+    for (unsigned int k = 0; k < K; ++k) {
+      EXPECT_NEAR(after.getValue(0, 0, k, n), input.getValue(0, 0, k, n), tol)
+        << " at k=" << k << ", n=" << n;
+    }
+  }
+}
+
+/**
+ * @brief only an FP32 tensor can be quantized to QS4CX
+ */
+TEST(nntrainer_Tensor, QS4CXQuantizer_01_n) {
+  nntrainer::Tensor input(
+    {1, 1, 8, 4, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QINT8}},
+    true);
+  auto quantizer =
+    nntrainer::Quantization::createQuantizer(nntrainer::QScheme::QS4CX);
+  EXPECT_THROW(quantizer->quantize(input, nntrainer::Tdatatype::QS4CX),
+               std::invalid_argument);
+}
+
+/**
+ * @brief the QS4CX quantizer produces QS4CX and nothing else
+ */
+TEST(nntrainer_Tensor, QS4CXQuantizer_02_n) {
+  nntrainer::Tensor input = qs4cxSource(8, 4);
+  auto quantizer =
+    nntrainer::Quantization::createQuantizer(nntrainer::QScheme::QS4CX);
+  EXPECT_THROW(quantizer->quantize(input, nntrainer::Tdatatype::QINT8),
+               std::invalid_argument);
+}
+
+/**
+ * @brief a QS4CX record dequantizes to FP32 and nothing else
+ */
+TEST(nntrainer_Tensor, QS4CXQuantizer_03_n) {
+  auto quantizer =
+    nntrainer::Quantization::createQuantizer(nntrainer::QScheme::QS4CX);
+  nntrainer::Tensor q =
+    quantizer->quantize(qs4cxSource(8, 4), nntrainer::Tdatatype::QS4CX);
+  EXPECT_THROW(quantizer->dequantize(q, nntrainer::Tdatatype::QINT8),
+               std::invalid_argument);
+}
+
+/**
+ * @brief the QS4CX quantizer only dequantizes QS4CX
+ */
+TEST(nntrainer_Tensor, QS4CXQuantizer_04_n) {
+  nntrainer::Tensor input = qs4cxSource(8, 4);
+  auto quantizer =
+    nntrainer::Quantization::createQuantizer(nntrainer::QScheme::QS4CX);
+  EXPECT_THROW(quantizer->dequantize(input, nntrainer::Tdatatype::FP32),
+               std::invalid_argument);
+}
+/**
  * @brief Per Tensor Quantized Tensor (unsigned 32-bit integer)
  */
 TEST(nntrainer_Tensor, QTensor_05_p) {
