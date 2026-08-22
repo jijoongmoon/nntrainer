@@ -122,7 +122,8 @@ TEST(mixed_precision, model_tensor_type_test) {
     "QINT4-FP16",    "QINT4-FP32",    "QINT8-FP16",   "QINT8-FP32",
     "FP16-FP16",     "FP16-FP32",     "FP32-FP16",    "FP32-FP32",
     "QINT16-QINT16", "UINT16-UINT16", "QINT8-UINT16", "UINT4-UINT8",
-    "UINT4-UINT16",  "UINT8-UINT8",   "UINT8-UINT16"};
+    "UINT4-UINT16",  "UINT8-UINT8",   "UINT8-UINT16", "QS4CX-FP32",
+    "QS4CX-FP16"};
   std::string negative_type_list[] = {"FP16-XXX", "XXX-XXX", "", "ttkt"};
 
   for (auto type_item : positive_type_list) {
