@@ -21,6 +21,8 @@
 #include <fp16.h>
 #include <fstream>
 #include <nntrainer_error.h>
+#include <qs4cx_tensor.h>
+#include <quantizer.h>
 #include <sstream>
 #include <tensor.h>
 #include <tensor_dim.h>
@@ -455,6 +457,78 @@ TEST(nntrainer_Tensor, QTensor_04_n) {
                       {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QINT4},
                       nntrainer::QScheme::PER_CHANNEL_AFFINE),
     std::invalid_argument);
+}
+
+/**
+ * @brief QS4CX_Tensor holds N rows of ceil(K/2) nibble bytes followed by N
+ * float scales, one per output channel
+ */
+TEST(nntrainer_Tensor, QS4CXTensor_01_p) {
+  const unsigned int K = 5;
+  const unsigned int N = 4;
+  nntrainer::Tensor tensor(
+    {1, 1, K, N, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QS4CX}},
+    true);
+
+  const size_t expected = N * ((K + 1) / 2) + N * sizeof(float);
+  EXPECT_EQ(tensor.size(), expected);
+  EXPECT_EQ(tensor.getMemoryBytes(), expected);
+  ASSERT_NE(tensor.getData<uint8_t>(), nullptr);
+  ASSERT_NE(tensor.getScale<float>(), nullptr);
+  EXPECT_EQ(reinterpret_cast<uint8_t *>(tensor.getScale<float>()) -
+              tensor.getData<uint8_t>(),
+            static_cast<ptrdiff_t>(N * ((K + 1) / 2)));
+  EXPECT_EQ(tensor.q_scheme(), nntrainer::QScheme::QS4CX);
+}
+
+/**
+ * @brief QS4CX_Tensor is a 2 dimensional weight type
+ */
+TEST(nntrainer_Tensor, QS4CXTensor_02_n) {
+  EXPECT_THROW(
+    nntrainer::Tensor(
+      {2, 1, 4, 4, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QS4CX}},
+      true),
+    std::invalid_argument);
+}
+
+/**
+ * @brief a QS4CX tensor keeps its type and its record through copy,
+ * assignment, construction from a TensorBase handle, and comparison
+ */
+TEST(nntrainer_Tensor, QS4CXTensor_03_p) {
+  const unsigned int K = 8;
+  const unsigned int N = 4;
+  nntrainer::TensorDim dim(
+    {1, 1, K, N, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QS4CX}});
+
+  nntrainer::Tensor q(dim, true);
+  uint8_t *raw = q.getData<uint8_t>();
+  for (size_t i = 0; i < N * ((K + 1) / 2); ++i)
+    raw[i] = static_cast<uint8_t>(0x3B + i);
+  float *scale = q.getScale<float>();
+  for (unsigned int n = 0; n < N; ++n)
+    scale[n] = 0.125f * static_cast<float>(n + 1);
+
+  nntrainer::Tensor copied(q);
+  EXPECT_EQ(copied.getDataType(), nntrainer::Tdatatype::QS4CX);
+  EXPECT_EQ(copied, q);
+
+  // assignment used to leave itensor_ null, so the next call dereferenced it
+  nntrainer::Tensor assigned;
+  assigned = q;
+  EXPECT_EQ(assigned.getDataType(), nntrainer::Tdatatype::QS4CX);
+  EXPECT_EQ(assigned, q);
+  EXPECT_EQ(assigned.getData<uint8_t>(), q.getData<uint8_t>());
+
+  // construction from a TensorBase handle, as a clone of one would do
+  std::unique_ptr<nntrainer::TensorBase> base =
+    std::make_unique<nntrainer::QS4CX_Tensor>(dim, true);
+  nntrainer::Tensor from_base(base);
+  ASSERT_NE(from_base.getData<uint8_t>(), nullptr);
+  EXPECT_EQ(from_base.getDataType(), nntrainer::Tdatatype::QS4CX);
+  EXPECT_EQ(from_base.size(), q.size());
+  EXPECT_EQ(from_base, q);
 }
 
 /**
