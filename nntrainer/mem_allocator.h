@@ -19,6 +19,8 @@
 
 namespace nntrainer {
 
+class MemoryPool;
+
 /**
  * @brief MemAllocator, Memory allocator class
  *
@@ -111,6 +113,32 @@ public:
    */
   virtual bool needsRegister() const { return false; }
   /** @} */
+
+  /**
+   * @brief True if this allocator can additionally back a device-resident
+   *        pool, the prerequisite for a tensor to live in device memory
+   *        rather than in the shared plane.
+   *
+   * Separate from isSVM() because being addressable by both sides says
+   * nothing about there being a second, device-only plane to place a
+   * tensor in.
+   */
+  virtual bool supportsDevicePool() const { return false; }
+
+  /**
+   * @brief Build the MemoryPool that a TensorPool allocates from.
+   *
+   * The allocator decides which KIND of pool backs it, because the kind
+   * follows from what the allocator can produce. The base returns a plain
+   * MemoryPool; an allocator with a device plane returns the pool that
+   * knows how to hand one out.
+   *
+   * @param self shared_ptr to this allocator; the pool holds it for the
+   *        allocate/free calls it makes.
+   * @return the backing pool
+   */
+  virtual std::shared_ptr<MemoryPool>
+  makePool(const std::shared_ptr<MemAllocator> &self);
 };
 } // namespace nntrainer
 

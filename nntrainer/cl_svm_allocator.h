@@ -76,6 +76,14 @@ public:
   // isSVM() derives true, matching the old getName()=="gpu-svm".
   bool isDeviceVisible() const override { return true; }
 
+  /**
+   * @copydoc MemAllocator::supportsDevicePool
+   *
+   * OpenCL has a second, device-only plane (cl_mem) a tensor can be placed
+   * in, so this allocator can back one.
+   */
+  bool supportsDevicePool() const override { return true; }
+
 private:
   opencl::ContextManager &ctx_;
   // Host-owned set: pointers that came from MemAllocator::alloc
