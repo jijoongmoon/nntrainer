@@ -571,6 +571,11 @@ ComputeOps *get_cpu_ops();
  *  enable-opencl is on, in cl_operations/cl_compute_ops.cpp. */
 ComputeOps *get_cl_ops();
 #endif
+#ifdef ENABLE_CUDA
+/** @brief CUDA accelerator ComputeOps singleton. Defined when enable-cuda is
+ *  on, in cuda/cuda_compute_ops.cpp. */
+ComputeOps *get_cuda_ops();
+#endif
 #ifdef ENABLE_HEXKL
 /** @brief HTP (Hexagon/HMX) accelerator ComputeOps singleton. Defined
  *  when enable-htp is on, in htp_backend/htp_compute_ops.cpp. */
