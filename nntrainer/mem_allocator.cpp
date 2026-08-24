@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mem_allocator.h>
+#include <memory_pool.h>
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 
@@ -67,6 +68,11 @@ void MemAllocator::free(void *ptr) {
 #else
   std::free(ptr);
 #endif
+}
+
+std::shared_ptr<MemoryPool>
+MemAllocator::makePool(const std::shared_ptr<MemAllocator> &self) {
+  return std::make_shared<MemoryPool>(self);
 }
 
 } // namespace nntrainer

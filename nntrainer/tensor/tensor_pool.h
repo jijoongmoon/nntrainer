@@ -68,7 +68,11 @@ public:
       cache_loader = std::make_unique<CacheLoader>(cache_pool);
       mem_pool = cache_pool;
     } else {
-      mem_pool = std::make_shared<MemoryPool>(allocator_);
+      // The allocator decides which KIND of pool backs this one: a plain
+      // offset-planned MemoryPool, or one that can also hand out device
+      // memory. Which it is follows from what the allocator can produce, so
+      // it is not a branch on the allocator's name here.
+      mem_pool = allocator_->makePool(allocator_);
     }
   }
 
@@ -82,7 +86,7 @@ public:
    */
   void reinitialize() {
     name_map.clear();
-    mem_pool = std::make_shared<MemoryPool>(allocator_);
+    mem_pool = allocator_->makePool(allocator_);
   }
 
   /**
@@ -98,7 +102,7 @@ public:
       throw std::runtime_error(
         "[TensorPool] cannot change allocator after allocation");
     allocator_ = std::move(allocator);
-    mem_pool = std::make_shared<MemoryPool>(allocator_);
+    mem_pool = allocator_->makePool(allocator_);
   }
 
   /**
