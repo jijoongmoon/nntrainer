@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #if defined(_WIN32)
 #include <windows.h> // DiscardVirtualMemory
 #else
@@ -92,6 +93,56 @@ bool cuda_fc_qs4cx_scales_to_uvm_fp16(const float *fp32_scales, unsigned int N,
   return true;
 }
 
+// [lm_head fp-act] The same side buffer in fp32. The dp4a family reads the
+// fp16 copy above -- a per-channel scale rounded to 11 significant bits, which
+// is far below its own int8-activation noise and therefore free there. The
+// fp-activation lm_head GEMV exists precisely to take the last argmax noise
+// out of the logits, so it keeps the tensor's fp32 scale instead (the OpenCL
+// lm_head GEMV reads fp32 for the same reason) -- one extra MiB for the one
+// weight that asks for it.
+//
+// @p source_readable is the caller's promise that @p fp32_scales may still be
+// dereferenced. It may NOT be once the caller has released the payload: the
+// fp32 scale tail lives inside the same allocation as the nibbles, so
+// releasing one releases the other and it reads back as zeros -- which would
+// silently produce all-zero logits rather than fail. On a
+// cache HIT nothing is read and the flag is irrelevant; on a miss with the
+// flag false the build is refused and the caller falls back.
+bool cuda_fc_qs4cx_scales_to_uvm_fp32(const float *fp32_scales, unsigned int N,
+                                      const float **out_sc,
+                                      bool source_readable) {
+  static std::map<const void *, float *> cache;
+  static std::mutex mtx;
+  std::lock_guard<std::mutex> lk(mtx);
+  auto it = cache.find(fp32_scales);
+  if (it == cache.end()) {
+    if (!source_readable || fp32_scales == nullptr || N == 0)
+      return false;
+    if (StreamManager::Global().isCapturing())
+      return false;
+    float *usc = nullptr;
+    // Same host-written-once / device-read-every-call pattern as the fp16
+    // buffer, so the same WDDM coherence choice applies.
+    static const bool host_mapped = []() {
+      const char *e = std::getenv("NNTR_CUDA_HOST_MAPPED");
+      if (e != nullptr)
+        return e[0] == '1';
+      return !ContextManager::Global().concurrentManagedAccess();
+    }();
+    if (host_mapped) {
+      if (cudaHostAlloc(&usc, sizeof(float) * (size_t)N,
+                        cudaHostAllocMapped) != cudaSuccess)
+        return false;
+    } else if (cudaMallocManaged(&usc, sizeof(float) * (size_t)N) !=
+               cudaSuccess)
+      return false;
+    std::memcpy(usc, fp32_scales, sizeof(float) * (size_t)N);
+    it = cache.emplace(fp32_scales, usc).first;
+  }
+  *out_sc = it->second;
+  return true;
+}
+
 // Per-op cudaStreamSynchronize is ~90% of inference wall time (nsys): each GPU
 // op drains the stream, fully serializing CPU and GPU. This drain is a sync
 // point hook for the future selective-sync work (sync only before a HOST
@@ -110,7 +161,7 @@ static inline void maybe_finish(const void *out = nullptr) {
   // (it would AV) -- every legal host access goes through a stream-ordered
   // staging copy (copy_any / EnqueueReadBuffer / explicit finish), so the
   // per-op drain is provably unnecessary. Skipping it removes the WDDM
-  // submit+wait round-trip (measured ~0.2-0.6ms/op in the 1K prefill lprof)
+  // submit+wait round-trip (measured at 0.2-0.6 ms per op in a 1K prefill)
   // while ops with host-visible outputs keep their sync-mode drain.
   static const bool skip_dev_drain = []() {
     const char *e = std::getenv("NNTR_CUDA_DRAINSKIP_FC");
@@ -995,6 +1046,74 @@ __global__ void dequant_i32_fp16(const int *C, const float *ascale,
   Y[(long)m * N + n] = dp4a_f2h(r);
 }
 
+)CU"
+  // Third adjacent literal (same MSVC C2026 cap as the split above).
+  R"CU(
+// --- fp-ACTIVATION int4 GEMV (the huge-N untied lm_head decode) -----------
+//
+// Same weight bytes as the dp4a path -- the cached signed packed int4 [N][Kh]
+// -- but the ACTIVATION is read as fp16 and multiplied in float: no per-row
+// int8 activation quant. That quant maps the row onto a 255-level grid over
+// its [min,max], and on this lm_head the resulting per-logit error measured
+// sigma 0.18-0.37 against a top1-top2 argmax margin of ~0.117, i.e. it flips
+// roughly one argmax in twelve, and the flips compound over a long decode.
+// Measured against an fp64 dequant-dot at this shape: this kernel's residual
+// error is the fp16 logit rounding alone (rms 4.4e-4), the dp4a route's is
+// 1.6e-2 -- 37x more. The OpenCL lane routes this exact weight the same way
+// and for the same reason -- lmhead_int4_v8c_gemv in blas_kernels.cpp, "best
+// argmax fidelity; no int8 act quant".
+//
+// The extra cost is only on the activation side (K halves, L2-hot after the
+// first block); the weight is ~201 MB per token at vocab 262144 either way, so
+// this is bandwidth-bound and reads exactly as many weight bytes as dp4a does.
+//
+// One WARP per output row (the dp4a_gemv mapping): 8 input channels per lane
+// per step = one 4-byte weight load (8 nibbles) + one 16-byte activation load,
+// so a warp step consumes 256 channels and reads 128 CONTIGUOUS weight bytes.
+// @p wide is the caller's alignment verdict; the scalar arm keeps odd K and
+// unaligned activation rows correct.
+__global__ void fpact_gemv_i4_h(const unsigned short *Xh,
+                                const signed char *plain, const float *wscale,
+                                unsigned short *Y, int N, int K, int wide) {
+  const int warps_per_block = blockDim.x >> 5;
+  const int n = blockIdx.x * warps_per_block + (threadIdx.x >> 5);
+  if (n >= N)
+    return;
+  const int lane = threadIdx.x & 31;
+  const int Kh = (K + 1) >> 1;
+  const signed char *wrow = plain + (long)n * Kh;
+  float acc = 0.f;
+  if (wide) {
+    for (int k = lane * 8; k < K; k += 32 * 8) {
+      const unsigned int wb = *(const unsigned int *)(wrow + (k >> 1));
+      const uint4 av = *(const uint4 *)(Xh + k);
+      const unsigned int aw[4] = {av.x, av.y, av.z, av.w};
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        // byte j holds channels k+2j (low nibble) and k+2j+1 (high nibble),
+        // which is exactly the half PAIR packed in aw[j].
+        const int b = (int)((wb >> (j * 8)) & 0xFFu);
+        acc += vq_h2f((unsigned short)(aw[j] & 0xFFFFu)) *
+               (float)(((int)(signed char)(b << 4)) >> 4);
+        acc += vq_h2f((unsigned short)(aw[j] >> 16)) *
+               (float)(((int)(signed char)b) >> 4);
+      }
+    }
+  } else {
+    for (int k = lane; k < K; k += 32) {
+      const int b = (unsigned char)wrow[k >> 1];
+      const int wv = (k & 1) ? (((int)(signed char)b) >> 4)
+                             : (((int)(signed char)(b << 4)) >> 4);
+      acc += vq_h2f(Xh[k]) * (float)wv;
+    }
+  }
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1)
+    acc += __shfl_down_sync(0xffffffffu, acc, o);
+  if (lane == 0)
+    Y[n] = vq_f2h(acc * wscale[n]);
+}
+
 }
 )CU";
 
@@ -1673,6 +1792,7 @@ bool cuda_fc_qs4cx_rmsnorm_prequant_fp16(const unsigned short *x,
   const int block[3] = {vec4 ? 512 : 256, 1, 1};
   const int grid[3] = {(int)rows, 1, 1};
   if (!StreamManager::Global().DispatchCommand(*k, grid, block))
+
     return false;
   mark_quant_staged(y, kk);
   maybe_finish(y);
@@ -1771,6 +1891,83 @@ bool cuda_fc_qs4cx_dp4a_gemm_fp16(const unsigned short *Xh,
   // skip its quant.
   if (fused_normq_on())
     mark_quant_staged(Xh, k);
+  maybe_finish(Yh);
+  return true;
+}
+
+// NNTR_CUDA_LMHEAD_FPACT: the fp-activation int4 GEMV for the huge-N decode
+// lm_head. Default ON -- see fpact_gemv_i4_h for why w4a8's activation quant
+// costs argmax fidelity exactly where a 262144-wide output cannot afford it --
+// with an explicit =0 restoring the dp4a route. VALUE-checked, not
+// presence-checked, and read here next to the path it governs so the
+// dispatcher's gate can stay a pure SHAPE test.
+static inline bool lmhead_fpact_on() {
+  static const bool v = []() {
+    const char *e = std::getenv("NNTR_CUDA_LMHEAD_FPACT");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  return v;
+}
+
+bool cuda_fc_qs4cx_fpact_gemv_fp16(const unsigned short *Xh,
+                                   const unsigned char *plain_w,
+                                   const float *scales_fp32, unsigned short *Yh,
+                                   unsigned int N, unsigned int K) {
+  if (!lmhead_fpact_on())
+    return false;
+  if (N == 0 || K == 0 || Xh == nullptr || plain_w == nullptr ||
+      scales_fp32 == nullptr || Yh == nullptr)
+    return false;
+  // Normally built at load time by the prewarm; this is the lazy fallback for
+  // a run that did not prewarm.
+  const float *sc = nullptr;
+  if (!cuda_fc_qs4cx_scales_to_uvm_fp32(scales_fp32, N, &sc, true))
+    return false;
+  auto kg = CudaContext::Global().registerCudaKernel(FC_QS4CX_DP4A_SRC,
+                                                     "fpact_gemv_i4_h");
+  if (!kg) {
+    ml_loge("[CUDA] fc_qs4cx fp-act lm_head GEMV: kernel registration failed");
+    return false;
+  }
+  std::lock_guard<std::mutex> lk(g_dp4a_mtx);
+  // The SAME derived weight cache the dp4a path uses (signed packed int4 +
+  // rowsum; the rowsum is dead here, there is no activation zero-point to
+  // correct). Reusing it is what keeps this route free of extra VRAM -- and
+  // what lets it run at all under NNTR_QS4CX_HEAP_BYPASS + the plain drop,
+  // where the plain payload is neither device-accessible nor still resident.
+  DevWeightQ *dwp = ensure_dp4a_cache_locked(plain_w, N, K);
+  if (!dwp)
+    return false;
+  signed char *plain = dwp->plain;
+  int n = (int)N, k = (int)K;
+  // Wide arm: 8 channels per lane per step needs K a multiple of 8 -- which
+  // also makes Kh a multiple of 4, so every weight ROW base is 4-byte aligned
+  // -- and a 16-byte aligned activation row. Anything else takes the scalar
+  // arm rather than risking a misaligned access (which aborts the launch).
+  const int wide =
+    ((K & 7u) == 0u && (reinterpret_cast<uintptr_t>(Xh) & 15u) == 0u) ? 1 : 0;
+  kg->SetKernelArguments(0, &Xh, sizeof(Xh));
+  kg->SetKernelArguments(1, &plain, sizeof(plain));
+  kg->SetKernelArguments(2, &sc, sizeof(sc));
+  kg->SetKernelArguments(3, &Yh, sizeof(Yh));
+  kg->SetKernelArguments(4, &n, sizeof(n));
+  kg->SetKernelArguments(5, &k, sizeof(k));
+  kg->SetKernelArguments(6, &wide, sizeof(wide));
+  // One warp per output row, 4 warps per block -- the dp4a_gemv launch shape.
+  const int blk[3] = {128, 1, 1};
+  const int grd[3] = {((int)N + 3) / 4, 1, 1};
+  if (!StreamManager::Global().DispatchCommand(*kg, grd, blk))
+    return false;
+  // Which route a decode's logits came from is otherwise invisible: every
+  // refusal above silently falls through to dp4a, and the difference shows up
+  // only as different sampled tokens hundreds of steps later. Say it once.
+  static bool announced = false;
+  if (!announced) {
+    announced = true;
+    ml_logi("[CUDA] lm_head decode on the fp-activation int4 GEMV "
+            "(N=%u K=%u, %s arm); NNTR_CUDA_LMHEAD_FPACT=0 restores w4a8 dp4a",
+            N, K, wide ? "wide" : "scalar");
+  }
   maybe_finish(Yh);
   return true;
 }

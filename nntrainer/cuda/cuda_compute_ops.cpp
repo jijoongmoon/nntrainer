@@ -497,8 +497,21 @@ public:
             const char *e = std::getenv("NNTR_FC_CUBLAS_KMAX");
             return e ? (unsigned)atoi(e) : (1u << 20);
           }();
+          // Decode on a vocab-wide output (the untied int4 lm_head) goes to
+          // the fp-ACTIVATION int4 GEMV ahead of everything else: at
+          // N = 262144 the int8 activation quant's per-logit noise outweighs
+          // the argmax margin and costs sampled tokens (see
+          // cuda_fc_qs4cx_fpact_gemv_fp16). Ordinary projections
+          // (N ~ 1536-12288) stay on dp4a, which is faster and whose noise
+          // they can afford. Like the cuBLAS gate below this is the SHAPE
+          // only: NNTR_CUDA_LMHEAD_FPACT=0 is enforced inside the callee,
+          // which then reports failure and lets the usual route take the call.
+          if (M == 1 && N >= (int)cuda::CUDA_FC_FPACT_MIN_N)
+            ok = cuda::cuda_fc_qs4cx_fpact_gemv_fp16(
+              (const uint16_t *)Xp, W, weight.getScale<float>(),
+              (uint16_t *)Yp, (unsigned)N, (unsigned)K);
           const bool tried_cublas =
-            use_cublas_i8 && use_dp4a && M >= 32 && K <= (int)cublas_kmax;
+            !ok && use_cublas_i8 && use_dp4a && M >= 32 && K <= (int)cublas_kmax;
           if (tried_cublas)
             ok = cuda::cuda_fc_qs4cx_cublas_i8_gemm_fp16(
               (const uint16_t *)Xp, W, S, (uint16_t *)Yp, (unsigned)M,
