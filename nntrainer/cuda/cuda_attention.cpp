@@ -255,12 +255,29 @@ __device__ __forceinline__ unsigned short s_f2h(float f) {
 }
 // One block per (head h, chunk c); query row is 0 (decode M=1). Online softmax
 // over the chunk's keys; writes (m, l, acc[d]) to scratch[h*n_chunks + c].
+// chunk-grid anchor. Without clipping chunk c always covers the
+// absolute keys [c*chunk_kv, ...), so a sliding layer launches a chunk for every
+// key ever cached and all but the last few are empty (29K context, 1K window:
+// 457 chunks, 8 of them live) -- the empty ones still cost a block and, worse,
+// a pass through the reduce loop. Anchoring the grid at the chunk that contains
+// the window's low bound drops them. The anchor stays a multiple of chunk_kv so
+// every surviving chunk covers EXACTLY the key set it covered before: the
+// per-chunk (m, l, acc) triples are unchanged and the dropped ones are the
+// softmax identity (m=-inf, l=0, acc=0), which contributes exactly 0.0f to the
+// merge -- the output is bit-identical.
+__device__ __forceinline__ int sk_jbase(int cf, int window, int chunk_kv,
+                                        int clip) {
+  if (!clip) return 0;
+  int j_lo_g = cf - window + 1; if (j_lo_g < 0) j_lo_g = 0;
+  return (j_lo_g / chunk_kv) * chunk_kv;
+}
 __global__ void attn_partial(const unsigned short *q, const unsigned short *k,
                              const unsigned short *v, float *pm, float *pl,
                              float *pacc, int HQ, int HKV, int N_kv,
                              int cache_from, int d, int window, float softcap,
                              int chunk_kv, int n_chunks,
-                             const int *d_pos, int max_n_chunks) {
+                             const int *d_pos, int max_n_chunks,
+                             int clip) {
   int h = blockIdx.x, c = blockIdx.y;
   // Graph replay: read the live query position / key-count from the device d_pos buffer
   // (mirrors attn_core_il_fp16) so ONE captured graph is valid for every token.
@@ -269,7 +286,13 @@ __global__ void attn_partial(const unsigned short *q, const unsigned short *k,
   // FIXED max_n_chunks so writer and reader always agree.
   int cf = d_pos ? d_pos[0] : cache_from;
   int nkv = d_pos ? d_pos[1] : N_kv;
-  int live_nchunks = (nkv + chunk_kv - 1) / chunk_kv;
+  int i_abs = cf; // i=0
+  int j_lo_g = i_abs - window + 1; if (j_lo_g < 0) j_lo_g = 0;
+  int j_hi_g = i_abs; if (j_hi_g >= nkv) j_hi_g = nkv - 1;
+  int j_base = sk_jbase(cf, window, chunk_kv, clip);
+  int live_nchunks = clip ? ((j_hi_g >= j_base)
+                               ? ((j_hi_g - j_base) / chunk_kv + 1) : 0)
+                          : ((nkv + chunk_kv - 1) / chunk_kv);
   if (c >= live_nchunks) return;
   int gqa = HQ / HKV, hkv = h / gqa;
   int HD_KV = HKV * d;
@@ -280,11 +303,8 @@ __global__ void attn_partial(const unsigned short *q, const unsigned short *k,
   for (int dd = tid; dd < d; dd += B) Qsh[dd] = s_h2f(qrow[dd]);
   __syncthreads();
   float scale = rsqrtf((float)d);
-  int i_abs = cf; // i=0
-  int j_lo_g = i_abs - window + 1; if (j_lo_g < 0) j_lo_g = 0;
-  int j_hi_g = i_abs; if (j_hi_g >= nkv) j_hi_g = nkv - 1;
-  int j_lo = c * chunk_kv; if (j_lo < j_lo_g) j_lo = j_lo_g;
-  int j_hi = (c + 1) * chunk_kv - 1; if (j_hi > j_hi_g) j_hi = j_hi_g;
+  int j_lo = j_base + c * chunk_kv; if (j_lo < j_lo_g) j_lo = j_lo_g;
+  int j_hi = j_base + (c + 1) * chunk_kv - 1; if (j_hi > j_hi_g) j_hi = j_hi_g;
   float acc[4];
 #pragma unroll
   for (int r = 0; r < 4; r++) acc[r] = 0.f;
@@ -310,13 +330,25 @@ __global__ void attn_partial(const unsigned short *q, const unsigned short *k,
 // One block per head; combine the n_chunks partials into the fp16 output row.
 __global__ void attn_reduce(const float *pm, const float *pl, const float *pacc,
                             unsigned short *o, int HQ, int d, int n_chunks,
-                            const int *d_pos, int chunk_kv, int max_n_chunks) {
+                            const int *d_pos, int chunk_kv, int max_n_chunks,
+                            int window, int cache_from, int N_kv, int clip) {
   int h = blockIdx.x;
   int tid = threadIdx.x, B = blockDim.x;
   // Graph replay: live chunk count from d_pos; FIXED max_n_chunks stride to match the
   // partial writer (must be the SAME constant the scratch was sized with).
-  int nkv = d_pos ? d_pos[1] : (n_chunks * chunk_kv);
-  int live_nchunks = d_pos ? (nkv + chunk_kv - 1) / chunk_kv : n_chunks;
+  // When clipping, re-derive the live count from the SAME anchored grid the
+  // partial writer used (identical expression).
+  int cf = d_pos ? d_pos[0] : cache_from;
+  int nkv = d_pos ? d_pos[1] : (clip ? N_kv : (n_chunks * chunk_kv));
+  int live_nchunks;
+  if (clip) {
+    int j_lo_g = cf - window + 1; if (j_lo_g < 0) j_lo_g = 0;
+    int j_hi_g = cf; if (j_hi_g >= nkv) j_hi_g = nkv - 1;
+    int j_base = sk_jbase(cf, window, chunk_kv, clip);
+    live_nchunks = (j_hi_g >= j_base) ? ((j_hi_g - j_base) / chunk_kv + 1) : 0;
+  } else {
+    live_nchunks = d_pos ? (nkv + chunk_kv - 1) / chunk_kv : n_chunks;
+  }
   int base = h * max_n_chunks;
   __shared__ float M, L;
   if (tid == 0) {
@@ -376,6 +408,13 @@ __device__ __forceinline__ float wk_wreduce(float v) {
     v += __shfl_xor_sync(0xffffffffu, v, off);
   return v;
 }
+// Chunk-grid anchor, identical to attn_partial's sk_jbase.
+__device__ __forceinline__ int wk_jbase(int cf, int window, int chunk_kv,
+                                        int clip) {
+  if (!clip) return 0;
+  int j_lo_g = cf - window + 1; if (j_lo_g < 0) j_lo_g = 0;
+  return (j_lo_g / chunk_kv) * chunk_kv;
+}
 // Vectorized fp16 row-slice load: uint2 (8B) for VPL=4, uint4 (16B) above.
 // The host dispatch verifies the base alignment and falls back to attn_partial
 // otherwise.
@@ -403,25 +442,31 @@ splitkv_warp_body(const unsigned short *q, const unsigned short *k,
                   const unsigned short *v, float *pm, float *pl, float *pacc,
                   int HQ, int HKV, int N_kv, int cache_from, int d, int window,
                   float softcap, int chunk_kv, int n_chunks, const int *d_pos,
-                  int max_n_chunks) {
+                  int max_n_chunks, int clip) {
   const int h = blockIdx.x, c = blockIdx.y;
   // Replayed graph: live query position / key count from the device pos buffer; blocks
   // past the live chunk count early-return without writing (identical gate to
   // attn_partial, and the partial->reduce stride stays the FIXED max_n_chunks).
   const int cf = d_pos ? d_pos[0] : cache_from;
   const int nkv = d_pos ? d_pos[1] : N_kv;
-  const int live_nchunks = (nkv + chunk_kv - 1) / chunk_kv;
+  const int i_abs = cf; // i = 0 (decode M=1)
+  int j_lo_g = i_abs - window + 1; if (j_lo_g < 0) j_lo_g = 0;
+  int j_hi_g = i_abs; if (j_hi_g >= nkv) j_hi_g = nkv - 1;
+  // Anchor the chunk grid at the window's chunk-aligned low bound (see
+  // attn_partial): the same key set per surviving chunk, so the merged output
+  // is bit-identical -- only the empty chunks disappear.
+  const int j_base = wk_jbase(cf, window, chunk_kv, clip);
+  const int live_nchunks =
+    clip ? ((j_hi_g >= j_base) ? ((j_hi_g - j_base) / chunk_kv + 1) : 0)
+         : ((nkv + chunk_kv - 1) / chunk_kv);
   if (c >= live_nchunks) return;
   const int gqa = HQ / HKV, hkv = h / gqa;
   const int HD_KV = HKV * d;
   const int tid = threadIdx.x, w = tid >> 5, lane = tid & 31;
   const int lane0 = lane * VPL;
   const float scale = rsqrtf((float)d);
-  const int i_abs = cf; // i = 0 (decode M=1)
-  int j_lo_g = i_abs - window + 1; if (j_lo_g < 0) j_lo_g = 0;
-  int j_hi_g = i_abs; if (j_hi_g >= nkv) j_hi_g = nkv - 1;
-  int j_lo = c * chunk_kv; if (j_lo < j_lo_g) j_lo = j_lo_g;
-  int j_hi = (c + 1) * chunk_kv - 1; if (j_hi > j_hi_g) j_hi = j_hi_g;
+  int j_lo = j_base + c * chunk_kv; if (j_lo < j_lo_g) j_lo = j_lo_g;
+  int j_hi = j_base + (c + 1) * chunk_kv - 1; if (j_hi > j_hi_g) j_hi = j_hi_g;
 
   float q_reg[VPL], acc[VPL];
   {
@@ -484,30 +529,30 @@ attn_partial_w128(const unsigned short *q, const unsigned short *k,
                   const unsigned short *v, float *pm, float *pl, float *pacc,
                   int HQ, int HKV, int N_kv, int cache_from, int d, int window,
                   float softcap, int chunk_kv, int n_chunks, const int *d_pos,
-                  int max_n_chunks) {
+                  int max_n_chunks, int clip) {
   splitkv_warp_body<4, 4>(q, k, v, pm, pl, pacc, HQ, HKV, N_kv, cache_from, d,
                           window, softcap, chunk_kv, n_chunks, d_pos,
-                          max_n_chunks);
+                          max_n_chunks, clip);
 }
 extern "C" __global__ void
 attn_partial_w256(const unsigned short *q, const unsigned short *k,
                   const unsigned short *v, float *pm, float *pl, float *pacc,
                   int HQ, int HKV, int N_kv, int cache_from, int d, int window,
                   float softcap, int chunk_kv, int n_chunks, const int *d_pos,
-                  int max_n_chunks) {
+                  int max_n_chunks, int clip) {
   splitkv_warp_body<8, 4>(q, k, v, pm, pl, pacc, HQ, HKV, N_kv, cache_from, d,
                           window, softcap, chunk_kv, n_chunks, d_pos,
-                          max_n_chunks);
+                          max_n_chunks, clip);
 }
 extern "C" __global__ void
 attn_partial_w512(const unsigned short *q, const unsigned short *k,
                   const unsigned short *v, float *pm, float *pl, float *pacc,
                   int HQ, int HKV, int N_kv, int cache_from, int d, int window,
                   float softcap, int chunk_kv, int n_chunks, const int *d_pos,
-                  int max_n_chunks) {
+                  int max_n_chunks, int clip) {
   splitkv_warp_body<16, 4>(q, k, v, pm, pl, pacc, HQ, HKV, N_kv, cache_from, d,
                            window, softcap, chunk_kv, n_chunks, d_pos,
-                           max_n_chunks);
+                           max_n_chunks, clip);
 }
 )CU";
 
@@ -760,7 +805,30 @@ bool attention_splitkv_decode(const unsigned short *q, const unsigned short *k,
   // bit-identical to the original. Mirrors the dense path's decode-graph gate below.
   static const bool decode_graph = nntr_env_on("NNTR_CUDA_GRAPH");
   const int *dpos = (decode_graph && g_sk_max_nchunks > 0) ? cuda_pos_buffer() : nullptr;
-  const int max_nc = dpos ? g_sk_max_nchunks : n_chunks;
+  int max_nc = dpos ? g_sk_max_nchunks : n_chunks;
+  // On a sliding layer only the keys inside the window are ever
+  // read, so anchoring the chunk grid at the window's chunk-aligned low bound
+  // (see attn_partial) turns the whole-context grid into a window-sized one:
+  // 29K context / 1K window / chunk 64 -> 457 chunks become 8. Bit-neutral,
+  // the dropped chunks are the softmax identity. NNTR_CUDA_SPLITKV_CLIP=0 is
+  // the kill switch (restores the whole-context grid verbatim).
+  //
+  // the replayed decode graph contract: the captured graph freezes the grid and the partial<->reduce
+  // stride, so the clipped stride must be a pure function of the LAYER (window,
+  // chunk) and never of the live key count -- ceil(window/chunk)+1 is the
+  // maximum a window anchored at a chunk boundary can span, for every token.
+  // The scratch is sized by the prewarm at the unclipped maximum, so a smaller
+  // stride is always in bounds.
+  static const bool clip_on = []() {
+    const char *e = std::getenv("NNTR_CUDA_SPLITKV_CLIP");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  const int clip = (clip_on && window > 0 && window < N_kv) ? 1 : 0;
+  if (clip) {
+    const long wc = (long)window / chunk_kv + 2;
+    if (wc < (long)max_nc)
+      max_nc = (int)wc;
+  }
   std::lock_guard<std::mutex> lk(g_sk_mtx);
   if (!ensure_sk((size_t)HQ * max_nc, (size_t)HQ * max_nc * d))
     return false;
@@ -806,6 +874,7 @@ bool attention_splitkv_decode(const unsigned short *q, const unsigned short *k,
   kp->SetKernelArguments(14, &n_chunks, sizeof(n_chunks));
   kp->SetKernelArguments(15, &dpos, sizeof(dpos));
   kp->SetKernelArguments(16, &max_nc, sizeof(max_nc));
+  kp->SetKernelArguments(17, &clip, sizeof(clip));
   const int pg[3] = {HQ, max_nc, 1};
   const int pb[3] = {B, 1, 1};
   // legacy: Q row [d] + reduction scratch [B]; warp: NW acc rows [d] + (m, l).
@@ -824,6 +893,10 @@ bool attention_splitkv_decode(const unsigned short *q, const unsigned short *k,
   kr->SetKernelArguments(7, &dpos, sizeof(dpos));
   kr->SetKernelArguments(8, &chunk_kv, sizeof(chunk_kv));
   kr->SetKernelArguments(9, &max_nc, sizeof(max_nc));
+  kr->SetKernelArguments(10, &window, sizeof(window));
+  kr->SetKernelArguments(11, &cache_from, sizeof(cache_from));
+  kr->SetKernelArguments(12, &N_kv, sizeof(N_kv));
+  kr->SetKernelArguments(13, &clip, sizeof(clip));
   const int rg[3] = {HQ, 1, 1};
   const int rb[3] = {B, 1, 1};
   if (!StreamManager::Global().DispatchCommand(*kr, rg, rb))
