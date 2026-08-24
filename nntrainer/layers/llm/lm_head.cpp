@@ -21,7 +21,7 @@
 #include <tensor_dim.h>
 #include <util_func.h>
 
-namespace causallm {
+namespace nntrainer {
 
 static constexpr size_t SINGLE_INOUT_IDX = 0;
 
@@ -191,24 +191,4 @@ void LmHeadLayer::updateTensorsByInputDimensions(
   context.updateInput(SINGLE_INOUT_IDX, in_dim);
 }
 
-#ifdef PLUGGABLE
-
-nntrainer::Layer *create_tie_word_embedding() {
-  auto layer = new LmHeadLayer();
-  std::cout << "embedding layer created\n";
-  return layer;
-}
-
-void destroy_tie_word_embedding(nntrainer::Layer *layer) {
-  std::cout << "embeddinglayer is deleted\n";
-  delete layer;
-}
-
-extern "C" {
-nntrainer::LayerPluggable ml_train_layer_pluggable{create_tie_word_embedding,
-                                                   destroy_tie_word_embedding};
-}
-
-#endif
-
-} // namespace causallm
+} // namespace nntrainer
