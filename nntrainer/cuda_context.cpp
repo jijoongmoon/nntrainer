@@ -26,6 +26,11 @@
 #include <fc_layer_cl.h>
 #include <geglu_layer.h>
 #include <layer_normalization_layer.h>
+#include <lm_head.h>
+#include <logit_softcapping.h>
+#include <qkv_layer.h>
+#include <scalar_multiply.h>
+#include <tie_word_embedding.h>
 
 // The decode/prefill graph state machine needs the model walk and the CUDA
 // graph API (cuda_context.h already pulls in the stream/context managers).
@@ -396,6 +401,22 @@ void CudaContext::add_default_object() {
   // only in-tree consumer of this type -- cannot be built under engine=cuda at
   // all.
   registerFactory(nntrainer::createLayer<GeGLULayer>, GeGLULayer::type);
+
+  // The promoted LLM layers, again the same core classes. This table has no
+  // whole-op entry for them yet, so they run the inherited host implementation
+  // over the host-coherent managed buffer: unaccelerated, but correct. They
+  // are registered for the same reason as on the OpenCL context -- an
+  // unregistered type makes createLayer() throw, so a model could not build
+  // its graph under engine=cuda even for the layers this backend does
+  // accelerate.
+  registerFactory(nntrainer::createLayer<LmHeadLayer>, LmHeadLayer::type);
+  registerFactory(nntrainer::createLayer<LogitSoftCappingLayer>,
+                  LogitSoftCappingLayer::type);
+  registerFactory(nntrainer::createLayer<QKVLayer>, QKVLayer::type);
+  registerFactory(nntrainer::createLayer<ScalarMultiplyLayer>,
+                  ScalarMultiplyLayer::type);
+  registerFactory(nntrainer::createLayer<TieWordEmbedding>,
+                  TieWordEmbedding::type);
 }
 
 template <typename T>
