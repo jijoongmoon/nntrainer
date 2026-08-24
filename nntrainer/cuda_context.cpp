@@ -86,6 +86,8 @@ void CudaContext::initialize() noexcept {
     // setenv(..., overwrite=0) so an explicit setting from the environment
     // always wins (including "=0", which every consumer treats as off -- see
     // nntr_env_on()).
+    setenv("NNTR_CUDA_GEGLU", "1", 0);
+    setenv("NNTR_CUDA_ELTWISE", "1", 0);
     if (!integrated && context_inst_.concurrentManagedAccess()) {
       // Discrete-GPU profile: let work queue up instead of draining after
       // every op. This is only legal when the driver reports concurrent
