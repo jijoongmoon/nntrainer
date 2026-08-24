@@ -38,6 +38,10 @@ if get_option('enable-opencl')
   nntrainer_base_deps += clblast_dep
 endif
 
+if get_option('enable-cuda')
+  nntrainer_base_deps += cuda_dep
+endif
+
 if get_option('enable-htp')
   nntrainer_base_deps += hexkl_dep
 endif
@@ -69,6 +73,10 @@ if get_option('enable-opencl')
   nntrainer_elements += 'layers/cl_layers'
 
   nntrainer_inc_abs += meson.source_root() / 'subprojects' / 'CLBlast' / 'include'
+endif
+
+if get_option('enable-cuda')
+  nntrainer_elements += 'cuda'
 endif
 
 if get_option('enable-npu')
