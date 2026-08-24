@@ -13,29 +13,19 @@ cuda_sources = [
   'cuda_blas_manager.cpp',
   'cuda_fc_qs4cx.cpp',
   'cuda_rope.cpp',
+  'cuda_attention.cpp',
 ]
 
-cuda_headers = [
-  'cuda_common.h',
-  'cuda_context_manager.h',
-  'cuda_stream_manager.h',
-  'cuda_buffer.h',
-  'cuda_buffer_manager.h',
-  'cuda_module.h',
-  'cuda_kernel.h',
-  'cuda_rmsnorm.h',
-  'cuda_layernorm.h',
-  'cuda_gelu.h',
-  'cuda_elementwise.h',
-  'cuda_blas_manager.h',
-  'cuda_fc_qs4cx.h',
-  'cuda_rope.h',
-]
 
 foreach s : cuda_sources
   nntrainer_sources += meson.current_source_dir() / s
 endforeach
 
-foreach h : cuda_headers
-  nntrainer_headers += meson.current_source_dir() / h
-endforeach
+# No install_headers() here, deliberately. Every header in this directory is
+# an implementation detail of the backend -- device managers, kernel wrappers
+# and the op-table internals -- and nothing outside the library includes one.
+# A header appended to nntrainer_headers is installed into
+# %{_includedir}/nntrainer, and RPM's check-files stage then fails the whole
+# Tizen GBS build (and dh_missing --fail-missing the Debian one) for any
+# installed file no %files section claims. In-tree includes are unaffected:
+# this directory is on nntrainer_inc via nntrainer_elements.
