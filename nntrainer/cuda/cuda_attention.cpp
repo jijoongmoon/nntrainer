@@ -991,15 +991,42 @@ bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
   // cuBLAS/registration failure.
   // head_dim 256/512 are faster on block-Q (warp-shuffle, K/V reuse); GEMM wins
   // for the smaller head dims (128 = qwen3/llama) where block-Q underutilises.
-  static const bool gemm_attn_on = []() {
-    if (std::getenv("NNTR_CUDA_GEMM_ATTN") != nullptr)
-      return true; // explicit opt-in (presence), preserves prior semantics
-    // Caps-derived default (resolver attention cell): integrated GPUs (Orin
-    // sm_87) need the cuBLAS GEMM attention because block-Q runs ~0.2 TFLOP/s
-    // there; discrete (RTX) keeps block-Q. Safe — any cuBLAS/registration
-    // failure falls through to block-Q, never wrong output.
-    return ContextManager::Global().isIntegrated();
+  // NNTR_CUDA_GEMM_ATTN: unset -> caps/shape-derived default (below); =0 ->
+  // kill switch (block-Q everywhere, the pre-lever behaviour byte-for-byte);
+  // =1 -> force ON for every layer and every shape (the historical opt-in);
+  // =N>1 -> default gating with the long-context threshold set to N keys.
+  static const int gemm_attn_mode = []() {
+    const char *e = std::getenv("NNTR_CUDA_GEMM_ATTN");
+    if (e == nullptr || e[0] == '\0')
+      return -1; // default
+    const int v = atoi(e);
+    return (v <= 0) ? 0 : v; // 0 = off, 1 = force, N>1 = threshold
   }();
+  static const bool integrated_gpu = ContextManager::Global().isIntegrated();
+  // window<=0 or window>=N_kv -> no sliding mask (full causal); mha passes
+  // INT_MAX for global layers. Hoisted here because the GEMM default keys off
+  // it; the block-Q path below reuses the same value (identical semantic).
+  const int win_bq = (window <= 0 || window >= N_kv) ? 0 : window;
+  // Default: integrated GPUs (Orin sm_87) need the cuBLAS GEMM attention for
+  // every layer because block-Q runs ~0.2 TFLOP/s there. On discrete GPUs the
+  // long-context FULL-attention layers (win_bq==0) also want it: their key
+  // walk is unbounded, so block-Q's cost grows with N_kv^2 while the cuBLAS
+  // Tensor-Core QK/PV does not. Measured on RTX 5060, 29K prefill: 2742 ->
+  // 6924 TPS. The sliding layers keep block-Q (their walk is already bounded
+  // by the window, and past the ring wrap the guard below excludes them
+  // anyway), and so do short contexts: at N_kv<=1K block-Q wins outright
+  // (1K cell measured 8019 -> 4148 TPS when the GEMM path is taken), so the
+  // path only engages from GEMM_ATTN_MIN_KV keys up. That threshold matches
+  // the block-Q split-prefill engage point, so 1K runs stay byte-identical.
+  // Safe: any cuBLAS/registration failure falls through to block-Q, never
+  // wrong output.
+  constexpr int GEMM_ATTN_MIN_KV = 4096;
+  const int gemm_min_kv =
+    (gemm_attn_mode > 1) ? gemm_attn_mode : GEMM_ATTN_MIN_KV;
+  const bool gemm_attn_on =
+    (gemm_attn_mode == 1) ||
+    (gemm_attn_mode != 0 &&
+     (integrated_gpu || (win_bq == 0 && N_kv >= gemm_min_kv)));
   // head_dim 256/512 (gemma4 sliding/global) were historically excluded because
   // block-Q beat the cuBLAS path on RTX/Adreno. On Orin (sm_87) block-Q runs at
   // only ~0.2 TFLOP/s, so the cuBLAS int8/fp16 Tensor-Core QK/PV is worth trying
@@ -1026,9 +1053,8 @@ bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
                                          : "attn_blockq_d128";
     auto kb = CudaContext::Global().registerCudaKernel(ATTN_BLOCKQ_SRC, fn);
     if (kb) {
-      // window<=0 or window>=N_kv -> disable the sliding mask (full causal);
-      // avoids n+window overflow when mha passes INT_MAX for global layers.
-      int win_bq = (window <= 0 || window >= N_kv) ? 0 : window;
+      // win_bq (sliding mask disabled when window<=0 or window>=N_kv) is
+      // hoisted above the GEMM gate; this path shares the exact same semantic.
       const int TM = 4;
       const int n_row_tiles = (N_q + TM - 1) / TM;
       kb->SetKernelArguments(0, &q_fp16, sizeof(q_fp16));
