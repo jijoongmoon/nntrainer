@@ -28,6 +28,9 @@
 #include <transpose_cl.h>
 
 #include <filesystem>
+#include <mutex>
+#include <system_error>
+#include <unordered_map>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -77,7 +80,22 @@ void ClContext::initialize() noexcept {
       return;
     }
     if (KERNEL_CACHE_ENABLED) {
-      std::filesystem::create_directories(opencl::Program::DEFAULT_KERNEL_PATH);
+      // Best effort: the binary cache is an optimisation. A read-only or
+      // otherwise unwritable working directory must not take the whole
+      // context down with it -- create_directories throws
+      // std::filesystem::filesystem_error, and everything below (the kernel
+      // registration, the memory allocator, the ops table) would then be
+      // skipped by the catch at the end of this function, leaving a context
+      // that registers no layer and hands out no allocator.
+      std::error_code ec;
+      std::filesystem::create_directories(opencl::Program::DEFAULT_KERNEL_PATH,
+                                          ec);
+      if (ec) {
+        ml_logw("Could not create the kernel cache directory %s (%s); "
+                "compiling kernels from source without caching them",
+                opencl::Program::DEFAULT_KERNEL_PATH.c_str(),
+                ec.message().c_str());
+      }
     }
 
     initBlasClKernels();
@@ -245,23 +263,32 @@ void ClContext::initAttentionClKernels() {
 }
 
 const ClContext::SharedPtrClKernel
-ClContext::registerClKernel(std::string kernel_string, std::string kernel_name,
-                            std::string compile_options) {
-  // check if created before
-  if (ocl_kernel_map.find(kernel_name + compile_options) !=
-      ocl_kernel_map.end()) {
-    return ocl_kernel_map[kernel_name + compile_options];
-  }
+ClContext::registerClKernel(const std::string &kernel_string,
+                            const std::string &kernel_name,
+                            const std::string &compile_options) {
+  // check if created before. One key construction, one lookup: the previous
+  // by-value parameters copied the whole kernel source -- tens of KB -- on
+  // every cached lookup, and the attention path takes this route once per
+  // kernel per layer.
+  const std::string key = kernel_name + compile_options;
 
-  // creating shared_ptr for kernel object
+  auto it = ocl_kernel_map.find(key);
+  if (it != ocl_kernel_map.end())
+    return it->second;
+
+  // creating shared_ptr for kernel object. clCreateKernel takes mutable
+  // references, so the cold path makes the copies it needs.
+  std::string source = kernel_string;
+  std::string name = kernel_name;
+  std::string options = compile_options;
   SharedPtrClKernel kernelPtr = std::make_shared<opencl::Kernel>();
-  if (!clCreateKernel(kernel_string, kernel_name, compile_options, kernelPtr)) {
+  if (!clCreateKernel(source, name, options, kernelPtr)) {
     ml_loge("Failed to register kernel %s", kernel_name.c_str());
     return nullptr;
   }
   // add to map
-  ocl_kernel_map.emplace(kernel_name + compile_options, kernelPtr);
-  return ocl_kernel_map[kernel_name + compile_options];
+  ocl_kernel_map.emplace(key, kernelPtr);
+  return ocl_kernel_map[key];
 }
 
 bool ClContext::clCreateKernel(std::string &kernel_string,
@@ -275,20 +302,53 @@ bool ClContext::clCreateKernel(std::string &kernel_string,
 
   opencl::Program program;
 
-  // reading binary
+  // In-memory program cache: kernels that share one source and one option
+  // string share the built cl_program. Without it every kernel of a
+  // multi-kernel source repeats the binary read and the
+  // clCreateProgramWithBinary that goes with it, all of it inside the first
+  // forward pass.
+  static std::unordered_map<std::string, opencl::Program> program_cache;
+  static std::mutex program_cache_mtx;
+  const std::string pc_key =
+    std::to_string(program.GetKernelHash(kernel_string, "")) + "|" +
+    compile_options;
+  {
+    std::lock_guard<std::mutex> lk(program_cache_mtx);
+    auto it = program_cache.find(pc_key);
+    if (it != program_cache.end())
+      return kernel_ptr_->CreateKernelFromProgram(it->second, kernel_name);
+  }
+
+  // On-disk kernel binary cache. The key folds in the per-kernel
+  // compile_options and the device signature (name + driver version): a stored
+  // binary is only valid for the exact source and options it was built from,
+  // and only on the same GPU and driver. Keying on the source alone hands a
+  // binary built for another device to clCreateProgramWithBinary.
+  static const std::string device_sig =
+    opencl::ContextManager::Global().GetDeviceSignature();
   std::string binary_file_path =
     opencl::Program::DEFAULT_KERNEL_PATH + "/" +
-    std::to_string(program.GetKernelHash(kernel_string, "")) + ".cl.bin";
+    std::to_string(program.GetKernelHash(kernel_string,
+                                         compile_options + "|" + device_sig)) +
+    ".cl.bin";
   auto binary_data = KERNEL_CACHE_ENABLED ? readBinaryFile(binary_file_path)
                                           : std::vector<std::byte>();
 
+  bool loaded_from_binary = false;
   if (KERNEL_CACHE_ENABLED && !binary_data.empty()) {
     ml_logi("Using cached version of kernel: %s at path %s",
             kernel_name.c_str(), binary_file_path.c_str());
-    result = program.CreateCLProgramWithBinary(
+    loaded_from_binary = program.CreateCLProgramWithBinary(
       opencl::ContextManager::Global().GetContext(),
       opencl::ContextManager::Global().GetDeviceId(), binary_data,
       binary_file_path, "");
+    if (!loaded_from_binary)
+      ml_logw("Cached kernel binary %s was rejected; recompiling from source",
+              binary_file_path.c_str());
+  }
+
+  if (loaded_from_binary) {
+    result = true;
   } else {
     ml_logi("Binary for kernel %s not found, compiling from source...",
             kernel_name.c_str());
@@ -298,20 +358,28 @@ bool ClContext::clCreateKernel(std::string &kernel_string,
                               kernel_string, compile_options);
 
     if (KERNEL_CACHE_ENABLED && result) {
+      // Best-effort cache write: the freshly compiled program is already
+      // usable, so failing to persist it is a warning, not a build failure.
       auto binary = program.GetProgramBinary(
         opencl::ContextManager::Global().GetDeviceId());
 
       if (binary.empty()) {
-        ml_loge("Failed retrieving binary for kernel %s", kernel_name.c_str());
-        result = false;
-      } else {
-        result &= writeBinaryFile(binary_file_path, binary);
+        ml_logw("Failed retrieving binary for kernel %s; skipping cache write",
+                kernel_name.c_str());
+      } else if (!writeBinaryFile(binary_file_path, binary)) {
+        ml_logw("Failed writing kernel cache %s; continuing",
+                binary_file_path.c_str());
       }
     }
   }
 
   if (!result) {
     return false;
+  }
+
+  {
+    std::lock_guard<std::mutex> lk(program_cache_mtx);
+    program_cache.emplace(pc_key, program);
   }
 
   result = kernel_ptr_->CreateKernelFromProgram(program, kernel_name);
