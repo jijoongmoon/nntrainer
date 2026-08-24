@@ -144,6 +144,31 @@ foreach target: test_target
   )
 endforeach
 
+# CUDA kernel unittests (the CUDA analogue of the OpenCL kernel tests above).
+# Standalone targets: the shared loop cannot add per-target dependencies, and
+# these need cuda_dep (cuda_runtime.h + cudart for the managed buffers they
+# compare against the host reference). They skip themselves at runtime when no
+# CUDA device is present, so the target still builds and runs on a CI machine
+# with the toolkit but no card.
+if get_option('enable-cuda')
+  foreach cuda_kernel_test: ['unittest_cuda_kernels_layernorm',
+                             'unittest_cuda_kernels_gelu']
+    cuda_kernel_test_exe = executable(
+      cuda_kernel_test,
+      cuda_kernel_test + '.cpp',
+      dependencies: unittest_nntrainer_deps + [cuda_dep],
+      install: get_option('enable-test'),
+      install_dir: application_install_dir
+    )
+    test(cuda_kernel_test, cuda_kernel_test_exe,
+      args: ['--gtest_output=xml:@0@/@1@.xml'.format(
+        meson.build_root(), cuda_kernel_test)],
+      timeout: test_timeout,
+      suite: 'unittests'
+    )
+  endforeach
+endif
+
 # DDTree core tests embed the golden vectors (ddtree_golden/build_golden.h), so
 # this target is defined standalone to add that directory to its include path
 # (the shared loop above can't set per-target include dirs). Embedding avoids a
