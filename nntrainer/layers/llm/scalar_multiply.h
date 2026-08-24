@@ -104,6 +104,13 @@ public:
   WIN_EXPORT void calcDerivative(nntrainer::RunLayerContext &context) override;
 
   /**
+   * @brief Resolve the multiplier for one step, memoizing a weight-borne one.
+   * @param context run context holding the (optional) scalar weight
+   * @return the scalar to multiply the input by
+   */
+  WIN_EXPORT float readMultiplier(nntrainer::RunLayerContext &context);
+
+  /**
    * @copydoc bool supportBackwarding() const
    */
   WIN_EXPORT bool supportBackwarding() const override { return false; };
@@ -144,6 +151,11 @@ private:
              nntrainer::props::SkipPrefill>
     scalar_multiply_props;
   bool skip_prefill = false;
+  /**< Memoized weight-borne multiplier, keyed by the weight BUFFER it was read
+       from -- see readMultiplier() for why the read must not repeat per step.
+       A null address means "not read yet"; a different address re-arms it. */
+  const void *memo_weight_addr = nullptr;
+  float memo_multiplier = 0.0f;
 };
 
 } // namespace nntrainer
