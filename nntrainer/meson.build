@@ -117,6 +117,11 @@ if get_option('enable-opencl')
   nntrainer_common_sources += 'cl_svm_allocator.cpp'
 endif
 
+if get_option('enable-cuda')
+  nntrainer_headers += meson.current_source_dir() / 'cuda_mem_allocator.h'
+  nntrainer_common_sources += 'cuda_mem_allocator.cpp'
+endif
+
 if get_option('enable-htp')
   nntrainer_headers += meson.current_source_dir() / 'htp_context.h'
   nntrainer_common_sources += 'htp_context.cpp'
