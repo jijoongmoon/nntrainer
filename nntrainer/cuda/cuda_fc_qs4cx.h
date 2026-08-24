@@ -24,6 +24,63 @@ namespace nntrainer::cuda {
 
 
 /**
+ * @brief Smallest output width N at which a decode (M == 1) QS4CX FC takes the
+ *        fp-ACTIVATION int4 GEMV instead of the w4a8 dp4a route.
+ *
+ * The shape this separates is the untied lm_head (N = vocab, 262144 here) from
+ * every ordinary projection (N ~ 1536-12288, which keeps dp4a). It is a
+ * FIDELITY threshold, not a performance one: only at vocab width does the
+ * int8-activation quant's per-logit noise (sigma 0.18-0.37 measured) exceed the
+ * top1-top2 argmax margin (~0.117) often enough to change which token is
+ * sampled. Mirrors the OpenCL lane, which routes the same weight to its own
+ * fp-activation GEMV once N passes the OpenCL image height cap that makes the
+ * other backends take the same route.
+ */
+constexpr unsigned int CUDA_FC_FPACT_MIN_N = 65536u;
+
+/**
+ * @brief Build (and cache) the N-entry UVM fp32 per-channel scale buffer --
+ *        the fp16 buffer's sibling for the fp-activation lm_head GEMV, which
+ *        keeps the tensor's full-precision scale because its whole purpose is
+ *        argmax fidelity. @p out_sc receives the cached device pointer.
+ * @param source_readable false when @p fp32_scales may no longer be
+ *        dereferenced -- the QS4CX scale tail shares the plain payload's
+ *        allocation, so a caller that releases the payload releases the scale
+ *        with it and the bytes read back as zeros. A cache HIT ignores the
+ *        flag; a MISS with it false is refused, so the caller falls back
+ *        instead of computing against a zero scale. A caller that runs while
+ *        the payload is still live (the load-time prewarm) leaves it at the
+ *        default.
+ * @return false if the buffer neither exists nor could be built.
+ */
+bool cuda_fc_qs4cx_scales_to_uvm_fp32(const float *fp32_scales, unsigned int N,
+                                      const float **out_sc,
+                                      bool source_readable = true);
+
+/**
+ * @brief fp-ACTIVATION int4 GEMV for the huge-N decode lm_head (M == 1).
+ *
+ * Reads the fp16 activation DIRECTLY -- no int8 activation quant -- against the
+ * same derived weight cache the dp4a path builds (signed packed int4), fp32
+ * accumulate, fp16 logits out. w4a8's per-row activation quant injects a
+ * per-logit error (sigma 0.18-0.37 measured on this lm_head) well above the
+ * top1-top2 argmax margin (~0.117), so at vocab width it changes the sampled
+ * token often enough to walk a long greedy decode into a repetition loop; this
+ * route removes that noise at no extra weight traffic. Same design decision the
+ * OpenCL lane already makes for this weight (lmhead_int4_v8c_gemv).
+ *
+ * @param scales_fp32 the tensor's per-channel fp32 scales (dequant
+ *        multipliers); the UVM copy is built/cached internally.
+ * @return false -- and NOTHING dispatched, so the caller must fall through to
+ *         dp4a -- when NNTR_CUDA_LMHEAD_FPACT=0, when the scale buffer is
+ *         unavailable, or on any registration/dispatch failure.
+ */
+bool cuda_fc_qs4cx_fpact_gemv_fp16(const unsigned short *Xh,
+                                   const unsigned char *plain_w,
+                                   const float *scales_fp32, unsigned short *Yh,
+                                   unsigned int N, unsigned int K);
+
+/**
  * @brief Y[M,N] = X[M,K] * dequant(QS4CX W) where W is the PLAIN QS4CX payload
  *        (weight.getData(): row-major [N][(K+1)/2] nibble bytes, even k = low
  *        nibble, stored uint4 = int4+8) -- the same blob the OpenCL v8c kernel
