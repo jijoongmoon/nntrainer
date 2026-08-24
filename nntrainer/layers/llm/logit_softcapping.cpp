@@ -15,7 +15,7 @@
 #include <algorithm>
 #include <stdexcept>
 
-namespace causallm {
+namespace nntrainer {
 
 static constexpr size_t SINGLE_INOUT_IDX = 0;
 
@@ -122,20 +122,4 @@ void LogitSoftCappingLayer::calcDerivative(
   std::throw_with_nested(std::runtime_error("Training is not supported yet."));
 }
 
-#ifdef PLUGGABLE
-
-nntrainer::Layer *create_logit_softcapping_layer() {
-  auto layer = new LogitSoftCappingLayer();
-  return layer;
-}
-
-void destroy_logit_softcapping_layer(nntrainer::Layer *layer) { delete layer; }
-
-extern "C" {
-nntrainer::LayerPluggable ml_train_layer_pluggable{
-  create_logit_softcapping_layer, destroy_logit_softcapping_layer};
-}
-
-#endif
-
-} // namespace causallm
+} // namespace nntrainer

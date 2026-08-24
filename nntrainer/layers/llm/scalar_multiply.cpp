@@ -16,7 +16,7 @@
 
 #include "scalar_multiply.h"
 
-namespace causallm {
+namespace nntrainer {
 
 static constexpr size_t SINGLE_INOUT_IDX = 0;
 
@@ -126,20 +126,4 @@ void ScalarMultiplyLayer::calcDerivative(nntrainer::RunLayerContext &context) {
   std::throw_with_nested(std::runtime_error("Training is not supported yet."));
 }
 
-#ifdef PLUGGABLE
-
-nntrainer::Layer *create_scalar_multiply_layer() {
-  auto layer = new ScalarMultiplyLayer();
-  return layer;
-}
-
-void destroy_scalar_multiply_layer(nntrainer::Layer *layer) { delete layer; }
-
-extern "C" {
-nntrainer::LayerPluggable ml_train_layer_pluggable{
-  create_scalar_multiply_layer, destroy_scalar_multiply_layer};
-}
-
-#endif
-
-} // namespace causallm
+} // namespace nntrainer

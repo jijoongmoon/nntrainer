@@ -5,7 +5,9 @@
 # layer.
 llm_layer_sources = [
   'geglu_layer.cpp',
+  'logit_softcapping.cpp',
   'qkv_layer.cpp',
+  'scalar_multiply.cpp',
   'swiglu_layer.cpp',
 ]
 
