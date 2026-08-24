@@ -84,6 +84,17 @@ public:
    */
   bool supportsDevicePool() const override { return true; }
 
+  /**
+   * @copydoc MemAllocator::makePool
+   *
+   * Returns the pool that can hand out a device buffer for a tensor the
+   * planner placed in device memory. It is not conditional: a pool whose
+   * tensors all stay on the shared plane never asks for one, and none is
+   * created.
+   */
+  std::shared_ptr<MemoryPool>
+  makePool(const std::shared_ptr<MemAllocator> &self) override;
+
 private:
   opencl::ContextManager &ctx_;
   // Host-owned set: pointers that came from MemAllocator::alloc

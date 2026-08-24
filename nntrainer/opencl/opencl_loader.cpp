@@ -201,6 +201,7 @@ void LoadOpenCLFunctions(void *libopencl) {
   LoadFunction(clCreateSubBuffer);
   LoadFunction(clCreateImage);
   LoadFunction(clEnqueueWriteBuffer);
+  LoadFunction(clEnqueueFillBuffer);
   LoadFunction(clEnqueueReadBuffer);
   LoadFunction(clEnqueueMapBuffer);
   LoadFunction(clEnqueueUnmapMemObject);
@@ -240,6 +241,7 @@ PFN_clCreateBuffer clCreateBuffer;
 PFN_clCreateSubBuffer clCreateSubBuffer;
 PFN_clCreateImage clCreateImage;
 PFN_clEnqueueWriteBuffer clEnqueueWriteBuffer;
+PFN_clEnqueueFillBuffer clEnqueueFillBuffer;
 PFN_clEnqueueReadBuffer clEnqueueReadBuffer;
 PFN_clEnqueueMapBuffer clEnqueueMapBuffer;
 PFN_clEnqueueUnmapMemObject clEnqueueUnmapMemObject;
