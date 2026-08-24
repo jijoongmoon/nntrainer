@@ -353,7 +353,12 @@ void unpack_q4_0x8_transpose16(const void *src, unsigned short *__restrict dT,
                                unsigned short *__restrict qsT, int N, int K,
                                int CT) // column tile (in units of 32-cols)
 {
-  assert((K % 256) == 0);
+  // One Q4_0 sub-block spans 32 elements of K and one 8-row group spans 8 rows
+  // of N; the column loop below is tiled with a std::min() bound and the odd
+  // 8-row group has its own tail, so no further alignment is required. These
+  // are the same preconditions the scalar fallback (used by the arm backend)
+  // works under.
+  assert((K % 32) == 0);
   assert((N % 8) == 0);
 
   const auto *__restrict x = static_cast<const block_q4_0x8 *>(src);
