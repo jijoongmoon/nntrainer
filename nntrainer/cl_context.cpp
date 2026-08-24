@@ -30,13 +30,18 @@
 #include <gelu_cl_op.h>
 #include <layer_normalization_layer.h>
 #include <layernorm_cl_op.h>
+#include <lm_head.h>
+#include <logit_softcapping.h>
 #include <opencl_context_manager.h>
 #include <opencl_loader.h>
+#include <qkv_layer.h>
 #include <reshape_cl.h>
 #include <rmsnorm_layer_cl.h>
+#include <scalar_multiply.h>
 #include <string>
 #include <swiglu_cl_op.h>
 #include <swiglu_layer.h>
+#include <tie_word_embedding.h>
 #include <transpose_cl.h>
 
 #include <filesystem>
@@ -270,6 +275,23 @@ void ClContext::add_default_object() {
   // not with its kernel.
   if (!registerGeGLUClKernels(*this))
     ml_logw("failed to register the OpenCL GeGLU kernels");
+
+  // The promoted LLM layers. None of them is an OpenCL fork: each is the core
+  // class, running its maths through this context's ComputeOps table or,
+  // where this table has no entry, through the inherited host path over the
+  // shared-virtual-memory buffer. Registering them is not cosmetic --
+  // createLayer() on a live context THROWS for a type the context does not
+  // know, so without lm_head and tie_word_embeddings here a language model
+  // cannot build its graph under engine=gpu at all, whatever the rest of the
+  // graph can run on the device.
+  registerFactory(nntrainer::createLayer<LmHeadLayer>, LmHeadLayer::type);
+  registerFactory(nntrainer::createLayer<LogitSoftCappingLayer>,
+                  LogitSoftCappingLayer::type);
+  registerFactory(nntrainer::createLayer<QKVLayer>, QKVLayer::type);
+  registerFactory(nntrainer::createLayer<ScalarMultiplyLayer>,
+                  ScalarMultiplyLayer::type);
+  registerFactory(nntrainer::createLayer<TieWordEmbedding>,
+                  TieWordEmbedding::type);
 }
 
 template <typename T>
