@@ -119,9 +119,8 @@ if get_option('enable-opencl')
 endif
 
 if get_option('enable-cuda')
-  nntrainer_headers += meson.current_source_dir() / 'cuda_context.h'
-  nntrainer_headers += meson.current_source_dir() / 'cuda_mem_allocator.h'
-  nntrainer_headers += meson.current_source_dir() / 'layers' / 'cuda_layers' / 'cuda_rmsnorm_layer.h'
+  # Sources only: the CUDA Context, allocator and layer headers stay internal
+  # and are not install_headers()'d -- see the note in cuda/meson.build.
   nntrainer_common_sources += 'cuda_context.cpp'
   nntrainer_common_sources += 'cuda_mem_allocator.cpp'
 endif
