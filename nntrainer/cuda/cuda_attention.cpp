@@ -436,14 +436,35 @@ __device__ __forceinline__ void wk_ldrow(const unsigned short *p,
     }
   }
 }
-template <int VPL, int NW>
+// HPW = query heads handled by ONE warp, KPI = keys staged per loop
+// trip. With grouped-query attention every query head of a group reads the SAME
+// K/V rows, so the HPW=1 grid (one block per query head) fetches each row gqa
+// times: at a 29K context that is 8 x 396 MB/token of L2 traffic for the
+// full layers, and the fp16->fp32 converts are paid gqa times too. Folding HPW
+// heads into one warp loads and converts the row ONCE and runs HPW independent
+// register online-softmaxes over it, so both the re-reads and the converts drop
+// by HPW. KPI stages KPI keys' loads before any of them is consumed, which is
+// what gets the memory pipe and the ALU to overlap (measured: the HPW=1 kernel
+// costs almost exactly stream-time PLUS alu-time, i.e. no overlap at all).
+//
+// Numerics: each (head, key) still runs the same per-lane dot over the same
+// contiguous VPL dims, the same butterfly, the same online-softmax over the
+// same per-warp key subsequence, and the same fixed-warp-order merge. Fusing
+// only changes WHICH warp does the arithmetic, never the arithmetic or its
+// order -- outputs are BIT-IDENTICAL to HPW=1 (verified standalone over the
+// d=512/gqa=8 and d=128/gqa=6 shapes). The host still keeps a
+// kill switch (NNTR_CUDA_ATTN_FUSE=0) that restores the HPW=1 launch.
+//
+// Constraint: the fused heads must share one KV head, so HPW must divide gqa
+// (the host checks this); hkv is then h0/gqa for the whole group.
+template <int VPL, int NW, int HPW, int KPI>
 __device__ __forceinline__ void
 splitkv_warp_body(const unsigned short *q, const unsigned short *k,
                   const unsigned short *v, float *pm, float *pl, float *pacc,
                   int HQ, int HKV, int N_kv, int cache_from, int d, int window,
                   float softcap, int chunk_kv, int n_chunks, const int *d_pos,
                   int max_n_chunks, int clip) {
-  const int h = blockIdx.x, c = blockIdx.y;
+  const int h = blockIdx.x * HPW, c = blockIdx.y;
   // Replayed graph: live query position / key count from the device pos buffer; blocks
   // past the live chunk count early-return without writing (identical gate to
   // attn_partial, and the partial->reduce stride stays the FIXED max_n_chunks).
@@ -468,92 +489,124 @@ splitkv_warp_body(const unsigned short *q, const unsigned short *k,
   int j_lo = j_base + c * chunk_kv; if (j_lo < j_lo_g) j_lo = j_lo_g;
   int j_hi = j_base + (c + 1) * chunk_kv - 1; if (j_hi > j_hi_g) j_hi = j_hi_g;
 
-  float q_reg[VPL], acc[VPL];
-  {
+  float q_reg[HPW][VPL], acc[HPW][VPL], mmax[HPW], l[HPW];
+#pragma unroll
+  for (int e = 0; e < HPW; ++e) {
     unsigned short qh[VPL];
-    wk_ldrow<VPL>(q + (long)h * d + lane0, qh);
+    wk_ldrow<VPL>(q + (long)(h + e) * d + lane0, qh);
 #pragma unroll
-    for (int vv = 0; vv < VPL; vv++) { q_reg[vv] = wk_h2f(qh[vv]); acc[vv] = 0.f; }
+    for (int vv = 0; vv < VPL; vv++) {
+      q_reg[e][vv] = wk_h2f(qh[vv]); acc[e][vv] = 0.f;
+    }
+    mmax[e] = -1e30f; l[e] = 0.f;
   }
-  float mmax = -1e30f, l = 0.f;
-  // warp w walks keys j_lo+w, j_lo+w+NW, ... : NW keys in flight, no barriers
-  for (int j = j_lo + w; j <= j_hi; j += NW) {
-    long base = (long)j * HD_KV + (long)hkv * d + lane0;
-    unsigned short kh[VPL], vh[VPL];
-    wk_ldrow<VPL>(k + base, kh);
-    wk_ldrow<VPL>(v + base, vh);
-    float p = 0.f;
+  // warp w walks keys j_lo+w, j_lo+w+NW, ... : NW*KPI keys in flight, no
+  // barriers. The per-warp key subsequence (and therefore the online-softmax
+  // order) is identical to the KPI=1 form.
+  for (int j = j_lo + w; j <= j_hi; j += NW * KPI) {
+    unsigned short kh[KPI][VPL], vh[KPI][VPL];
+    int nstaged = 0;
 #pragma unroll
-    for (int vv = 0; vv < VPL; vv++) p += q_reg[vv] * wk_h2f(kh[vv]);
-    float score = wk_wreduce(p) * scale;
-    if (softcap > 0.f) score = softcap * tanhf(score / softcap);
-    float mn = fmaxf(mmax, score), corr = __expf(mmax - mn), pp = __expf(score - mn);
-    l = l * corr + pp; mmax = mn;
+    for (int t = 0; t < KPI; ++t) {
+      const int jj = j + t * NW;
+      if (jj <= j_hi) {
+        long base = (long)jj * HD_KV + (long)hkv * d + lane0;
+        wk_ldrow<VPL>(k + base, kh[t]);
+        wk_ldrow<VPL>(v + base, vh[t]);
+        ++nstaged;
+      }
+    }
 #pragma unroll
-    for (int vv = 0; vv < VPL; vv++) acc[vv] = acc[vv] * corr + pp * wk_h2f(vh[vv]);
+    for (int t = 0; t < KPI; ++t) {
+      if (t >= nstaged) break;
+      float kf[VPL], vf[VPL];
+#pragma unroll
+      for (int vv = 0; vv < VPL; vv++) {
+        kf[vv] = wk_h2f(kh[t][vv]); vf[vv] = wk_h2f(vh[t][vv]);
+      }
+#pragma unroll
+      for (int e = 0; e < HPW; ++e) {
+        float p = 0.f;
+#pragma unroll
+        for (int vv = 0; vv < VPL; vv++) p += q_reg[e][vv] * kf[vv];
+        float score = wk_wreduce(p) * scale;
+        if (softcap > 0.f) score = softcap * tanhf(score / softcap);
+        float mn = fmaxf(mmax[e], score), corr = __expf(mmax[e] - mn),
+              pp = __expf(score - mn);
+        l[e] = l[e] * corr + pp; mmax[e] = mn;
+#pragma unroll
+        for (int vv = 0; vv < VPL; vv++)
+          acc[e][vv] = acc[e][vv] * corr + pp * vf[vv];
+      }
+    }
   }
 
   // merge the NW warp partials in FIXED warp order (deterministic). Empty
   // warps carry (-1e30, 0, 0) and weight to exactly zero.
   extern __shared__ float sh[];
-  float *sacc = sh;                    // [NW][d]
-  float *sm = sh + (long)NW * d;       // [NW]
-  float *sl = sm + NW;                 // [NW]
-  if (lane == 0) { sm[w] = mmax; sl[w] = l; }
+  float *sacc = sh;                          // [HPW][NW][d]
+  float *sm = sh + (long)HPW * NW * d;       // [HPW][NW]
+  float *sl = sm + HPW * NW;                 // [HPW][NW]
 #pragma unroll
-  for (int vv = 0; vv < VPL; vv++) sacc[(long)w * d + lane0 + vv] = acc[vv];
+  for (int e = 0; e < HPW; ++e) {
+    if (lane == 0) { sm[e * NW + w] = mmax[e]; sl[e * NW + w] = l[e]; }
+#pragma unroll
+    for (int vv = 0; vv < VPL; vv++)
+      sacc[((long)e * NW + w) * d + lane0 + vv] = acc[e][vv];
+  }
   __syncthreads();
-  float M = -1e30f;
-#pragma unroll
-  for (int t = 0; t < NW; ++t) M = fmaxf(M, sm[t]);
-  float ew[NW];
-#pragma unroll
-  for (int t = 0; t < NW; ++t) ew[t] = __expf(sm[t] - M);
-  const int obase = h * max_n_chunks + c;
-  if (tid == 0) {
-    float L = 0.f;
-#pragma unroll
-    for (int t = 0; t < NW; ++t) L += sl[t] * ew[t];
-    pm[obase] = M; pl[obase] = L;
-  }
   const int B = blockDim.x;
-  for (int dd = tid; dd < d; dd += B) {
-    float a = 0.f;
 #pragma unroll
-    for (int t = 0; t < NW; ++t) a += sacc[(long)t * d + dd] * ew[t];
-    pacc[(long)obase * d + dd] = a;
+  for (int e = 0; e < HPW; ++e) {
+    float M = -1e30f;
+#pragma unroll
+    for (int t = 0; t < NW; ++t) M = fmaxf(M, sm[e * NW + t]);
+    float ew[NW];
+#pragma unroll
+    for (int t = 0; t < NW; ++t) ew[t] = __expf(sm[e * NW + t] - M);
+    const int obase = (h + e) * max_n_chunks + c;
+    if (tid == 0) {
+      float L = 0.f;
+#pragma unroll
+      for (int t = 0; t < NW; ++t) L += sl[e * NW + t] * ew[t];
+      pm[obase] = M; pl[obase] = L;
+    }
+    for (int dd = tid; dd < d; dd += B) {
+      float a = 0.f;
+#pragma unroll
+      for (int t = 0; t < NW; ++t) a += sacc[((long)e * NW + t) * d + dd] * ew[t];
+      pacc[(long)obase * d + dd] = a;
+    }
   }
 }
-extern "C" __global__ void
-attn_partial_w128(const unsigned short *q, const unsigned short *k,
-                  const unsigned short *v, float *pm, float *pl, float *pacc,
-                  int HQ, int HKV, int N_kv, int cache_from, int d, int window,
-                  float softcap, int chunk_kv, int n_chunks, const int *d_pos,
-                  int max_n_chunks, int clip) {
-  splitkv_warp_body<4, 4>(q, k, v, pm, pl, pacc, HQ, HKV, N_kv, cache_from, d,
-                          window, softcap, chunk_kv, n_chunks, d_pos,
-                          max_n_chunks, clip);
-}
-extern "C" __global__ void
-attn_partial_w256(const unsigned short *q, const unsigned short *k,
-                  const unsigned short *v, float *pm, float *pl, float *pacc,
-                  int HQ, int HKV, int N_kv, int cache_from, int d, int window,
-                  float softcap, int chunk_kv, int n_chunks, const int *d_pos,
-                  int max_n_chunks, int clip) {
-  splitkv_warp_body<8, 4>(q, k, v, pm, pl, pacc, HQ, HKV, N_kv, cache_from, d,
-                          window, softcap, chunk_kv, n_chunks, d_pos,
-                          max_n_chunks, clip);
-}
-extern "C" __global__ void
-attn_partial_w512(const unsigned short *q, const unsigned short *k,
-                  const unsigned short *v, float *pm, float *pl, float *pacc,
-                  int HQ, int HKV, int N_kv, int cache_from, int d, int window,
-                  float softcap, int chunk_kv, int n_chunks, const int *d_pos,
-                  int max_n_chunks, int clip) {
-  splitkv_warp_body<16, 4>(q, k, v, pm, pl, pacc, HQ, HKV, N_kv, cache_from, d,
-                           window, softcap, chunk_kv, n_chunks, d_pos,
-                           max_n_chunks, clip);
-}
+#define SPLITKV_WARP_ENTRY(NAME, VPL, HPW, KPI)                                \
+  extern "C" __global__ void NAME(                                             \
+    const unsigned short *q, const unsigned short *k, const unsigned short *v, \
+    float *pm, float *pl, float *pacc, int HQ, int HKV, int N_kv,              \
+    int cache_from, int d, int window, float softcap, int chunk_kv,            \
+    int n_chunks, const int *d_pos, int max_n_chunks, int clip) {              \
+    splitkv_warp_body<VPL, 4, HPW, KPI>(q, k, v, pm, pl, pacc, HQ, HKV, N_kv,  \
+                                        cache_from, d, window, softcap,        \
+                                        chunk_kv, n_chunks, d_pos,             \
+                                        max_n_chunks, clip);                   \
+  }
+// HPW=1: the unfused launch, kept as the kill-switch / narrow-grid path.
+SPLITKV_WARP_ENTRY(attn_partial_w128, 4, 1, 1)
+SPLITKV_WARP_ENTRY(attn_partial_w256, 8, 1, 1)
+SPLITKV_WARP_ENTRY(attn_partial_w512, 16, 1, 1)
+// Fused launches. KPI=4 throughout (measured best, or within noise of best, on
+// every shape); HPW is capped per head_dim by the register budget -- d=512
+// needs VPL=16 registers per head, so HPW>4 there spills.
+SPLITKV_WARP_ENTRY(attn_partial_w128_h2, 4, 2, 4)
+SPLITKV_WARP_ENTRY(attn_partial_w128_h3, 4, 3, 4)
+SPLITKV_WARP_ENTRY(attn_partial_w128_h4, 4, 4, 4)
+SPLITKV_WARP_ENTRY(attn_partial_w128_h6, 4, 6, 4)
+SPLITKV_WARP_ENTRY(attn_partial_w256_h2, 8, 2, 4)
+SPLITKV_WARP_ENTRY(attn_partial_w256_h3, 8, 3, 4)
+SPLITKV_WARP_ENTRY(attn_partial_w256_h4, 8, 4, 4)
+SPLITKV_WARP_ENTRY(attn_partial_w256_h6, 8, 6, 4)
+SPLITKV_WARP_ENTRY(attn_partial_w512_h2, 16, 2, 4)
+SPLITKV_WARP_ENTRY(attn_partial_w512_h4, 16, 4, 4)
 )CU";
 
 // Block-Q multi-row prefill attention (CUDA mirror of the Intel OpenCL
@@ -813,7 +866,7 @@ bool attention_splitkv_decode(const unsigned short *q, const unsigned short *k,
   // the dropped chunks are the softmax identity. NNTR_CUDA_SPLITKV_CLIP=0 is
   // the kill switch (restores the whole-context grid verbatim).
   //
-  // the replayed decode graph contract: the captured graph freezes the grid and the partial<->reduce
+  // Graph-replay contract: the captured graph freezes the grid and the partial<->reduce
   // stride, so the clipped stride must be a pure function of the LAYER (window,
   // chunk) and never of the live key count -- ceil(window/chunk)+1 is the
   // maximum a window anchored at a chunk boundary can span, for every token.
@@ -848,6 +901,51 @@ bool attention_splitkv_decode(const unsigned short *q, const unsigned short *k,
     !attn_legacy && wname != nullptr &&
     (((uintptr_t)q | (uintptr_t)k | (uintptr_t)v) % valign) == 0;
   const int NW = 4; // warps per block in the warp kernel
+  // Fold HPW query heads of one GQA group into a single warp so the
+  // shared K/V row is fetched and converted once instead of gqa times (see
+  // splitkv_warp_body). HPW must divide gqa (the group must sit inside one KV
+  // head) and the resulting grid must still be wide enough to fill the device,
+  // which is why short contexts and window-clipped sliding layers stay at
+  // HPW=1: fusing there would trade re-reads for idle SMs.
+  //
+  // Graph replay: HPW only scales gridDim.x, and it is derived from per-layer
+  // constants plus the chunk count at capture time -- never from the live key
+  // count -- so the captured geometry stays valid for every later token (the
+  // per-token growth is absorbed by the live-chunk gate inside the kernel, as
+  // before). Bit-identical to HPW=1; NNTR_CUDA_ATTN_FUSE=0 is the kill switch.
+  static const bool fuse_on = []() {
+    const char *e = std::getenv("NNTR_CUDA_ATTN_FUSE");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  static const int min_blocks = []() {
+    const char *e = std::getenv("NNTR_CUDA_ATTN_FUSE_MINBLK");
+    int v = e ? atoi(e) : 64;
+    return v > 0 ? v : 64;
+  }();
+  const int gqa_all = (HKV > 0) ? (HQ / HKV) : 1;
+  // work actually launched for this layer: clipped layers already fold their
+  // whole-context grid down to the window, so use the same bound the kernel
+  // does rather than the (max-context) scratch stride.
+  const int eff_nc = clip ? max_nc : ((n_chunks < max_nc) ? n_chunks : max_nc);
+  int hpw = 1;
+  if (fuse_on && warp_ok && gqa_all > 1) {
+    const int hpw_cap = (d == 512) ? 4 : 6; // register budget per head_dim
+    static const int cand[] = {6, 4, 3, 2};
+    for (int i = 0; i < 4; ++i) {
+      const int hp = cand[i];
+      if (hp > hpw_cap || (gqa_all % hp) != 0 || (HQ % hp) != 0)
+        continue;
+      if ((long)(HQ / hp) * eff_nc < (long)min_blocks)
+        continue;
+      hpw = hp;
+      break;
+    }
+  }
+  char fname[40];
+  if (hpw > 1) {
+    snprintf(fname, sizeof(fname), "attn_partial_w%d_h%d", d, hpw);
+    wname = fname;
+  }
   auto kp = warp_ok ? CudaContext::Global().registerCudaKernel(
                         ATTN_SPLITKV_WARP_SRC, wname)
                     : CudaContext::Global().registerCudaKernel(ATTN_SPLITKV_SRC,
@@ -875,12 +973,14 @@ bool attention_splitkv_decode(const unsigned short *q, const unsigned short *k,
   kp->SetKernelArguments(15, &dpos, sizeof(dpos));
   kp->SetKernelArguments(16, &max_nc, sizeof(max_nc));
   kp->SetKernelArguments(17, &clip, sizeof(clip));
-  const int pg[3] = {HQ, max_nc, 1};
+  const int pg[3] = {HQ / hpw, max_nc, 1};
   const int pb[3] = {B, 1, 1};
-  // legacy: Q row [d] + reduction scratch [B]; warp: NW acc rows [d] + (m, l).
+  // legacy: Q row [d] + reduction scratch [B]; warp: HPW*NW acc rows [d] +
+  // (m, l) per (head, warp).
   const unsigned int shmem =
-    (unsigned int)(sizeof(float) * (warp_ok ? ((size_t)NW * d + 2 * NW)
-                                            : ((size_t)d + B)));
+    (unsigned int)(sizeof(float) * (warp_ok
+                                      ? ((size_t)hpw * NW * d + 2 * hpw * NW)
+                                      : ((size_t)d + B)));
   if (!StreamManager::Global().DispatchCommand(*kp, pg, pb, shmem))
     return false;
   kr->SetKernelArguments(0, &g_pm, sizeof(g_pm));
