@@ -47,21 +47,49 @@ void ScalarMultiplyLayer::finalize(nntrainer::InitLayerContext &context) {
   }
 }
 
+/**
+ * @brief Resolve the multiplier for one step, memoizing a weight-borne one.
+ *
+ * `use_weight` puts the multiplier in a one-element static weight, and reading
+ * it is a HOST read. On the GPU lanes the weight pool is unified memory
+ * (cudaMallocManaged / SVM), so that 4-byte host read migrates the whole page
+ * out of device memory -- and the neighbouring norm weights packed into the
+ * same page are faulted straight back device-side by the next block's kernel.
+ * That is one device->host->device page round trip per scalar_multiply per
+ * step, for a value that never changes: measured at 55 4 KiB migrations and
+ * about 0.13 ms per token on a 35-block model.
+ *
+ * So read it once per weight BUFFER and keep it. The key is the weight's data
+ * address rather than a done flag, because deallocateTensors() +
+ * allocateTensors() hands the layer a different buffer and the address
+ * comparison re-arms the read there instead of serving a stale scalar. Taking
+ * the address does not touch the page.
+ *
+ * @param context run context holding the (optional) scalar weight
+ * @return the scalar to multiply the input by
+ */
+float ScalarMultiplyLayer::readMultiplier(nntrainer::RunLayerContext &context) {
+  if (!std::get<props::UseWeight>(scalar_multiply_props).get())
+    return std::get<props::ScalarMultiplier>(scalar_multiply_props).get();
+
+  nntrainer::Tensor &weight = context.getWeight(wt_idx[0]);
+  const void *addr = weight.getData<char>();
+  if (addr != nullptr && addr == memo_weight_addr)
+    return memo_multiplier;
+
+  const float m = weight.getValue<float>(0, 0, 0, 0);
+  memo_weight_addr = addr;
+  memo_multiplier = m;
+  return m;
+}
+
 void ScalarMultiplyLayer::forwarding(nntrainer::RunLayerContext &context,
                                      bool training) {
   // Use incremental_forwarding for actual computation
   auto &in = context.getInput(SINGLE_INOUT_IDX);
   auto &out = context.getOutput(SINGLE_INOUT_IDX);
 
-  bool use_weight = std::get<props::UseWeight>(scalar_multiply_props).get();
-
-  float multiplier;
-  if (use_weight) {
-    nntrainer::Tensor &weight = context.getWeight(wt_idx[0]);
-    multiplier = weight.getValue<float>(0, 0, 0, 0);
-  } else {
-    multiplier = std::get<props::ScalarMultiplier>(scalar_multiply_props).get();
-  }
+  const float multiplier = readMultiplier(context);
 
   in.multiply(multiplier, out);
 }
@@ -73,15 +101,7 @@ void ScalarMultiplyLayer::incremental_forwarding(
   if (skip_prefill && is_prefill)
     return;
 
-  bool use_weight = std::get<props::UseWeight>(scalar_multiply_props).get();
-
-  float multiplier;
-  if (use_weight) {
-    nntrainer::Tensor &weight = context.getWeight(wt_idx[0]);
-    multiplier = weight.getValue<float>(0, 0, 0, 0);
-  } else {
-    multiplier = std::get<props::ScalarMultiplier>(scalar_multiply_props).get();
-  }
+  const float multiplier = readMultiplier(context);
 
   nntrainer::Tensor &in = context.getInput(SINGLE_INOUT_IDX);
   nntrainer::Tensor &out = context.getOutput(SINGLE_INOUT_IDX);
