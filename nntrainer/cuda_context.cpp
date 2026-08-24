@@ -19,6 +19,7 @@
 #include <addition_layer.h>
 #include <compute_ops.h>
 #include <cuda_mem_allocator.h>
+#include <cuda_rmsnorm_layer.h>
 #include <layer_normalization_layer.h>
 
 #include <cstdlib>
@@ -93,6 +94,12 @@ void CudaContext::initialize() noexcept {
       // rather than a race, so an integrated or WDDM device keeps the
       // conservative profile.
       setenv("NNTR_CUDA_ASYNC", "1", 0);
+      // The row cap reads "=all" as RAISE, not disable: the device norm kernel
+      // synchronizes per call, so on a wide (prefill-shaped) row window the
+      // multi-threaded host loop wins and the default caps the device path at
+      // 32 rows. On a discrete part the launch is cheap enough that uncapping
+      // wins everywhere.
+      setenv("NNTR_RMSNORM_CUDA_OFF", "all", 0);
     }
 
     add_default_object();
@@ -122,7 +129,18 @@ void CudaContext::initialize() noexcept {
 }
 
 void CudaContext::add_default_object() {
-  // Every layer registered here is a BACKEND-NEUTRAL core class, registered
+  // RMS normalization is the one CUDA-specific Layer class here, and it exists
+  // for a numerical reason rather than a performance one: the host FP16 path
+  // squares the row in FP16, so a residual element of |x| ~ 1700 -- which real
+  // transformer blocks do produce -- overflows the sum of squares to +Inf and
+  // zeroes the row. This class accumulates in FP32 and hands the row window to
+  // a device kernel. It registers under the same type string as the OpenCL
+  // RMSNormLayerCl, so a graph moves between backends by changing engine= and
+  // nothing else.
+  registerFactory(nntrainer::createLayer<CudaRMSNormLayer>,
+                  CudaRMSNormLayer::type, ml::train::LayerType::LAYER_RMSNORM);
+
+  // Everything below is a BACKEND-NEUTRAL core class, registered
   // unchanged -- literally the same objects the CPU context registers. They
   // reach the device through the CUDA op table (CudaComputeOps), not through a
   // per-backend Layer fork, which is the entire point of the Tensor-level

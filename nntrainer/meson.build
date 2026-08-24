@@ -77,6 +77,7 @@ endif
 
 if get_option('enable-cuda')
   nntrainer_elements += 'cuda'
+  nntrainer_elements += 'layers/cuda_layers'
 endif
 
 if get_option('enable-npu')
@@ -120,6 +121,7 @@ endif
 if get_option('enable-cuda')
   nntrainer_headers += meson.current_source_dir() / 'cuda_context.h'
   nntrainer_headers += meson.current_source_dir() / 'cuda_mem_allocator.h'
+  nntrainer_headers += meson.current_source_dir() / 'layers' / 'cuda_layers' / 'cuda_rmsnorm_layer.h'
   nntrainer_common_sources += 'cuda_context.cpp'
   nntrainer_common_sources += 'cuda_mem_allocator.cpp'
 endif
