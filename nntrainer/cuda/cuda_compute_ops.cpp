@@ -29,11 +29,14 @@
 
 #include <cuda_stream_manager.h>
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_blas_manager.h>
 #include <cuda_context_manager.h>
 #include <cuda_elementwise.h>
+#include <cuda_fc_qs4cx.h>
 #include <cuda_gelu.h>
 #include <cuda_layernorm.h>
 #include <cuda_runtime.h>
+#include <int4_utils.h>
 #include <fp16.h>
 #include <map>
 #include <mutex>
@@ -379,6 +382,194 @@ public:
 
     cuda::StreamManager::Global().finishIfAsync();
     CpuComputeOps::activation(in, out, act_type, active_rows, row_offset);
+  }
+
+  // FC GEMM: output = input * weight. The former CudaFcLayer::cudaFcGemm body
+  // — QS4CX fused dequant-GEMM on device (plain payload consumed in place,
+  // w4a8 dp4a / cuBLAS int8 IMMA) with host-weight/host-input staging, an FP32
+  // cuBLAS path, and a host Tensor::dot fallback (correct on the host-coherent
+  // UVM).
+  void fc(Tensor &input, Tensor &weight, Tensor &output) override {
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+    using DT = ml::train::TensorDim::DataType;
+    Tensor &input_ = input;
+    Tensor &hidden_ = output;
+    const DT wt = weight.getDataType();
+    const DT at = input_.getDataType();
+
+    const auto &id = input_.getDim();
+    const auto &od = hidden_.getDim();
+    const int K = (int)id.width();
+    const int N = (int)od.width();
+    const int M = (int)(id.batch() * id.channel() * id.height());
+
+    static const bool fc_dbg = std::getenv("NNTR_FC_DEBUG") != nullptr;
+    if (fc_dbg) {
+      auto ptype = [](const void *p) {
+        cudaPointerAttributes a{};
+        bool ok = cudaPointerGetAttributes(&a, p) == cudaSuccess;
+        cudaGetLastError();
+        if (!ok)
+          return 'u';
+        switch (a.type) {
+        case cudaMemoryTypeManaged: return 'm';
+        case cudaMemoryTypeDevice: return 'd';
+        case cudaMemoryTypeHost: return 'h';
+        default: return '0';
+        }
+      };
+      fprintf(stderr,
+              "[FCDBG] wt=%d at=%d ot=%d M=%d N=%d K=%d in=%c w=%c out=%c\n",
+              (int)wt, (int)at, (int)hidden_.getDataType(), M, N, K,
+              ptype(input_.getData<float>()), ptype(weight.getData<uint8_t>()),
+              ptype(hidden_.getData<float>()));
+    }
+
+    // QS4CX weight: fused dequant-GEMM on device, consuming the PLAIN nibble
+    // payload in place -- the derived dp4a/cuBLAS device caches are keyed by
+    // its pointer, so the payload is never copied. Default on; the host
+    // Tensor::dot fallback below has no x86 implementation for this dtype.
+    if (wt == DT::QS4CX && (at == DT::FP32 || at == DT::FP16) && M > 0 &&
+        N > 0 && K > 0) {
+      static const bool qs4cx_enabled = []() {
+        const char *e = std::getenv("NNTR_FC_CUDA_QS4CX");
+        return !(e != nullptr && e[0] == '0');
+      }();
+      const uint8_t *W = weight.getData<uint8_t>();
+      // The only per-weight side buffer: the N fp16 per-channel scales the
+      // dequant kernels read every call (cached UVM; built at load by the
+      // prewarm, so this is a pure cache hit -- a miss under graph capture
+      // returns false and the FC falls to the host path).
+      const uint16_t *S = nullptr;
+      if (qs4cx_enabled && (int)weight.getDim().height() == K &&
+          cuda::cuda_fc_qs4cx_scales_to_uvm_fp16(weight.getScale<float>(),
+                                                 (unsigned)N, &S)) {
+        // A prewarmed dp4a cache makes W a pure lookup key -- no kernel
+        // dereferences the payload -- so a host-resident W must NOT be staged
+        // in that case: staging would both miss the prewarmed cache, which is
+        // keyed by the original pointer, and read a payload the caller may no
+        // longer be keeping. Stage only when there is no cache to hit.
+        const bool w_keyed = cuda::cuda_fc_qs4cx_has_cache(W);
+        if (!w_keyed && !nntrainer::cuda::dev_accessible(W)) {
+          const uint8_t *dW = nullptr;
+          const uint16_t *dS = nullptr;
+          if (cuda::cuda_fc_qs4cx_stage_host_weight(W, S, (unsigned)N,
+                                                    (unsigned)K, &dW, &dS)) {
+            W = dW;
+            S = dS;
+          }
+        }
+        const bool fp16 = (at == DT::FP16);
+        const void *Xp = fp16 ? (const void *)input_.getData<uint16_t>()
+                              : (const void *)input_.getData<float>();
+        void *Yp = fp16 ? (void *)hidden_.getData<uint16_t>()
+                        : (void *)hidden_.getData<float>();
+        static const bool use_dp4a = []() {
+          const char *e = std::getenv("NNTR_FC_CUDA_DP4A");
+          return !(e != nullptr && e[0] == '0');
+        }();
+        static const bool use_cublas_i8 = []() {
+          const char *e = std::getenv("NNTR_FC_CUDA_CUBLAS");
+          return e != nullptr && e[0] == '1';
+        }();
+        const bool x_dev = nntrainer::cuda::dev_accessible(Xp);
+        const bool wy_dev = (w_keyed || nntrainer::cuda::dev_accessible(W)) &&
+                            nntrainer::cuda::dev_accessible(Yp);
+        bool all_dev = x_dev && wy_dev;
+        if (!x_dev && wy_dev && fp16) {
+          if (const uint16_t *Xd = cuda::cuda_fc_qs4cx_stage_host_x_fp16(
+                (const uint16_t *)Xp, (unsigned)M, (unsigned)K)) {
+            Xp = (const void *)Xd;
+            all_dev = true;
+          }
+        }
+        if (std::getenv("NNTR_FC_HOSTDBG") && !x_dev) {
+          std::fprintf(stderr,
+                       "[FC-HOSTDBG] host-input M=%u K=%u N=%u wy_dev=%d "
+                       "fp16=%d staged=%d capturing=%d\n",
+                       (unsigned)M, (unsigned)K, (unsigned)N, (int)wy_dev,
+                       (int)fp16, (int)all_dev,
+                       (int)cuda::StreamManager::Global().isCapturing());
+        }
+        bool ok = false;
+        if (all_dev && fp16) {
+          static const unsigned cublas_kmax = []() {
+            const char *e = std::getenv("NNTR_FC_CUBLAS_KMAX");
+            return e ? (unsigned)atoi(e) : (1u << 20);
+          }();
+          const bool tried_cublas =
+            use_cublas_i8 && use_dp4a && M >= 32 && K <= (int)cublas_kmax;
+          if (tried_cublas)
+            ok = cuda::cuda_fc_qs4cx_cublas_i8_gemm_fp16(
+              (const uint16_t *)Xp, W, S, (uint16_t *)Yp, (unsigned)M,
+              (unsigned)N, (unsigned)K);
+          if (tried_cublas && !ok) {
+            // One-time: cuBLAS was attempted (BlasManager initialized OK,
+            // NNTR_FC_CUDA_CUBLAS=1) but this call failed, so every
+            // subsequent qualifying GEMM in this process silently falls back
+            // to dp4a (~10x slower prefill) unless the caller is watching
+            // logs -- surface it once instead of letting it pass unnoticed.
+            static bool warned = false;
+            if (!warned) {
+              warned = true;
+              ml_logw("[CUDA] cuBLAS unavailable, falling back to dp4a GEMM "
+                      "(~10x slower prefill); check that the driver "
+                      "supports CUDA 13.x");
+            }
+          }
+          if (!ok)
+            ok = use_dp4a ? cuda::cuda_fc_qs4cx_dp4a_gemm_fp16(
+                              (const uint16_t *)Xp, W, S, (uint16_t *)Yp,
+                              (unsigned)M, (unsigned)N, (unsigned)K)
+                          : cuda::cuda_fc_qs4cx_gemm_fp16_naive(
+                              (const uint16_t *)Xp, W, S, (uint16_t *)Yp,
+                              (unsigned)M, (unsigned)N, (unsigned)K);
+        } else if (all_dev) {
+          ok = use_dp4a ? cuda::cuda_fc_qs4cx_dp4a_gemm_fp32(
+                            (const float *)Xp, W, S, (float *)Yp, (unsigned)M,
+                            (unsigned)N, (unsigned)K)
+                        : cuda::cuda_fc_qs4cx_gemm_fp32(
+                            (const float *)Xp, W, S, (float *)Yp, (unsigned)M,
+                            (unsigned)N, (unsigned)K);
+        } else if (!fp16) {
+          ok = cuda::cuda_fc_qs4cx_gemm_fp32_resident(
+            (const float *)Xp, W, S, (float *)Yp, (unsigned)M, (unsigned)N,
+            (unsigned)K);
+        }
+        if (std::getenv("NNTR_FC_HOSTDBG") && !ok) {
+          cudaPointerAttributes aw{}, ay{};
+          cudaError_t ew = cudaPointerGetAttributes(&aw, W);
+          cudaError_t ey = cudaPointerGetAttributes(&ay, Yp);
+          cudaGetLastError();
+          std::fprintf(
+            stderr,
+            "[FC-GPUFAIL] ok=0 -> HOST i8mm: M=%u K=%u N=%u x_dev=%d wy_dev=%d "
+            "| W: err=%d type=%d  Y: err=%d type=%d  cap=%d\n",
+            (unsigned)M, (unsigned)K, (unsigned)N, (int)x_dev, (int)wy_dev,
+            (int)ew, (int)aw.type, (int)ey, (int)ay.type,
+            (int)cuda::StreamManager::Global().isCapturing());
+        }
+        if (ok)
+          return;
+      }
+    }
+
+    // FP32 weight: cuBLAS SGEMM on the UVM pointers.
+    if (wt == DT::FP32 && at == DT::FP32 && M > 0 && N > 0 && K > 0 &&
+        nntrainer::cuda::dev_accessible(input_.getData<float>()) &&
+        nntrainer::cuda::dev_accessible(weight.getData<float>()) &&
+        nntrainer::cuda::dev_accessible(hidden_.getData<float>()) &&
+        cuda::BlasManager::Global().sgemmRowMajor(
+          M, N, K, input_.getData<float>(), weight.getData<float>(),
+          hidden_.getData<float>())) {
+      cuda::StreamManager::Global().maybeFinish();
+      return;
+    }
+#endif
+
+    // Host fallback: correct for FP16 / Q4_x / Q6_K / cross-engine host input
+    // (and any GPU-path failure) on the host-coherent UVM tensors.
+    CpuComputeOps::fc(input, weight, output);
   }
 };
 
