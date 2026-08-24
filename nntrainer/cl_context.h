@@ -215,10 +215,13 @@ public:
    * @param kernel_string kernel implementation string
    * @param kernel_name kernel name
    * @return std::shared_ptr<opencl::Kernel>
+   * @note by const reference on purpose: kernel sources are tens of KB and a
+   *       by-value signature copies the whole source on every cached lookup.
    */
-  const SharedPtrClKernel registerClKernel(std::string kernel_string,
-                                           std::string kernel_name,
-                                           std::string compile_options = {});
+  const SharedPtrClKernel
+  registerClKernel(const std::string &kernel_string,
+                   const std::string &kernel_name,
+                   const std::string &compile_options = {});
 
   /**
    * @brief Initialize and register all blas OpenCl kernels
