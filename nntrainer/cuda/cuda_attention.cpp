@@ -571,7 +571,16 @@ blockq_body(const unsigned short *q, const unsigned short *k,
   const int q_pos_off = cache_from;          // absolute query pos = m0+r+cache_from
   int last_row = ((m0 + TM - 1 < N_q) ? (m0 + TM - 1) : (N_q - 1)) + q_pos_off;
   int n_last = (N_kv - 1 < last_row) ? (N_kv - 1) : last_row;   // causal
-  for (int n = 0; n <= n_last; ++n) {
+  // Sliding-window tile-union lower bound. The per-row mask below already
+  // drops every key with n + window <= m; the smallest m in this tile is
+  // row 0's (m grows with r), so any key with n + window <= m0 + q_pos_off is
+  // masked for EVERY row and the tile can start above it -- instead of paying
+  // K-load + dot + warp-reduce + V-load per skipped key. Bit-identical by
+  // construction; without it the sliding layers walk O(M*N_kv) keys where the
+  // window only needs O(M*window).
+  int n_lo = (window > 0) ? (m0 + q_pos_off - window + 1) : 0;
+  if (n_lo < 0) n_lo = 0;
+  for (int n = n_lo; n <= n_last; ++n) {
     long k_base = (long)n * HD_KV + (long)hkv * d;
     float k_reg[VPL];
 #pragma unroll
