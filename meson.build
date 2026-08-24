@@ -293,6 +293,42 @@ if get_option('opencl-kernel-path') != ''
   extra_defines += '-DOPENCL_KERNEL_PATH=@0@'.format(get_option('opencl-kernel-path'))
 endif
 
+# Additive NVIDIA CUDA backend. Mirrors the OpenCL wiring above but is fully
+# independent: when enable-cuda is false this block is skipped and the OpenCL /
+# CPU builds are byte-identical. Kernels are compiled at runtime via NVRTC, so
+# the library build only needs to link cudart/nvrtc/cuBLAS + the driver API --
+# there is no nvcc/device-code compilation step and no arch to pick at build
+# time.
+if get_option('enable-cuda')
+  if get_option('platform') == 'android'
+    error('enable-cuda is only supported on desktop NVIDIA platforms, not android')
+  endif
+
+  extra_defines += '-DENABLE_CUDA=1'
+
+  cuda_path = get_option('cuda-path')
+  cuda_incdir = include_directories(cuda_path / 'include')
+  cuda_libdir = cuda_path / 'lib64'
+
+  cudart_dep   = cxx.find_library('cudart',   dirs: cuda_libdir, required: true)
+  nvrtc_dep    = cxx.find_library('nvrtc',    dirs: cuda_libdir, required: true)
+  cublas_dep   = cxx.find_library('cublas',   dirs: cuda_libdir, required: true)
+  cublaslt_dep = cxx.find_library('cublasLt', dirs: cuda_libdir, required: true)
+  # libcuda (driver API: cuModuleLoad/cuLaunchKernel) ships with the NVIDIA
+  # driver, not the toolkit; fall back to the toolkit stub if the driver lib is
+  # not on the default search path.
+  cudadrv_dep = cxx.find_library('cuda', required: false)
+  if not cudadrv_dep.found()
+    cudadrv_dep = cxx.find_library('cuda', dirs: cuda_libdir / 'stubs', required: true)
+  endif
+
+  cuda_dep = declare_dependency(
+    include_directories: cuda_incdir,
+    dependencies: [cudart_dep, nvrtc_dep, cublas_dep, cublaslt_dep, cudadrv_dep],
+  )
+  message('CUDA backend enabled. Toolkit: ' + cuda_path)
+endif
+
 # HTP (Hexagon/HMX) backend via Qualcomm HexKL CPU Macro API (libsdkl.so).
 # Qualcomm Snapdragon only — libsdkl.so talks to the Hexagon DSP over FastRPC,
 # so it needs a Qualcomm SoC with an HTP/HMX block, not ARM in general, and
