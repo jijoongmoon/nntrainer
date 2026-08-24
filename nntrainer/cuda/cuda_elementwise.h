@@ -59,6 +59,23 @@ bool cuda_slice_copy_fp16(const unsigned short *in, unsigned short *out,
                           unsigned int rows, unsigned int in_width,
                           unsigned int layer_off, unsigned int fs);
 
+/**
+ * @brief On-GPU greedy argmax over device-resident fp32 logits [vocab].
+ * @details Two-pass block reduction entirely on the GPU; only the 4-byte
+ *          winning index is copied to the host (vs the full-vocab D->H pass +
+ *          host std::max_element). Ties resolve to the LOWEST index, matching
+ *          std::max_element. @p logits_dev must be device-accessible (UVM /
+ *          managed or device). Returns false (caller falls back to the host
+ *          path) on a null/zero arg, a non-device pointer, or under graph
+ *          capture before the scratch is allocated.
+ */
+bool cuda_argmax_fp32(const float *logits_dev, unsigned int vocab,
+                      unsigned int *token_out_host);
+
+/** @brief fp16 variant of cuda_argmax_fp32 (logits decoded half->float). */
+bool cuda_argmax_fp16(const unsigned short *logits_dev, unsigned int vocab,
+                      unsigned int *token_out_host);
+
 } // namespace nntrainer::cuda
 
 #endif // __CUDA_ELEMENTWISE_H__
