@@ -22,8 +22,12 @@
 #include <cl_context.h>
 #include <compute_ops.h>
 #include <engine.h>
+#include <layer.h>
 #include <mem_allocator.h>
+#include <model.h>
+#include <nntrainer_error.h>
 #include <optimized_v1_planner.h>
+#include <optimizer.h>
 #include <residency_policy.h>
 #include <tensor_pool.h>
 
@@ -62,6 +66,44 @@ nntrainer::Tensor *planOne(nntrainer::TensorPool &pool, const std::string &name,
                          /*is_weight_grad=*/false, producer);
   pool.view(name + "_view", name, dim, {1}, FWD, 0, consumer);
   return t;
+}
+
+/**
+ * @brief Run input -> fc1 -> fc2 -> add(fc1, fc2) once on the given engine with
+ *        deterministic weights, and return the output.
+ *
+ * TRAIN-mode compile/initialize is used so the weight initialisers actually
+ * run; an optimizer is required to initialize in TRAIN mode but nothing is
+ * trained here.
+ */
+std::vector<float> runModel(const std::string &engine, unsigned int in_w,
+                            unsigned int unit, std::vector<float> &input) {
+  auto model = ml::train::createModel(ml::train::ModelType::NEURAL_NET);
+  model->addLayer(ml::train::createLayer(
+    "input", {"name=input0", "input_shape=1:1:" + std::to_string(in_w)}));
+  model->addLayer(ml::train::createLayer(
+    "fully_connected",
+    {"name=fc1", "unit=" + std::to_string(unit), "weight_initializer=ones",
+     "bias_initializer=zeros", "input_layers=input0", "engine=" + engine}));
+  model->addLayer(ml::train::createLayer(
+    "fully_connected",
+    {"name=fc2", "unit=" + std::to_string(unit), "weight_initializer=ones",
+     "bias_initializer=zeros", "input_layers=fc1", "engine=" + engine}));
+  model->addLayer(ml::train::createLayer(
+    "addition", {"name=add", "input_layers=fc1,fc2", "engine=" + engine}));
+  model->setProperty({"batch_size=1"});
+  model->setOptimizer(ml::train::createOptimizer("sgd", {"learning_rate=0.1"}));
+
+  EXPECT_EQ(model->compile(), ML_ERROR_NONE);
+  EXPECT_EQ(model->initialize(), ML_ERROR_NONE);
+
+  std::vector<float *> in_vec = {input.data()};
+  auto out = model->inference(1, in_vec);
+
+  std::vector<float> result;
+  if (!out.empty() && out[0] != nullptr)
+    result.assign(out[0], out[0] + unit);
+  return result;
 }
 
 } // namespace
@@ -238,6 +280,33 @@ TEST(ClResidency, tensors_sharing_a_planner_offset_share_one_buffer) {
   EXPECT_EQ(first->getClMem(), second->getClMem());
 
   pool.deallocate();
+}
+
+/**
+ * @brief A graph with OpenCL layers allocates its tensors on the OpenCL
+ *        allocator, where the planner can place them, and still computes what
+ *        the same graph on the host computes.
+ *
+ * @note Deliberately the last case in this file. It is the only one that runs
+ *       kernels, and a device placement degrades to the shared plane whenever
+ *       the command queue is in an error state -- by design, so a tensor is
+ *       never left half placed. Running it first would let an unrelated
+ *       driver-side failure in these kernels resurface as a residency failure
+ *       in every case after it, which is a diagnosis this suite must not give.
+ */
+TEST(ClResidency, a_gpu_graph_matches_the_host_graph) {
+  const unsigned int in_w = 8, unit = 4;
+  std::vector<float> input(in_w);
+  for (unsigned int i = 0; i < in_w; ++i)
+    input[i] = static_cast<float>(i + 1) * 0.125f;
+
+  std::vector<float> cpu = runModel("cpu", in_w, unit, input);
+  std::vector<float> gpu = runModel("gpu", in_w, unit, input);
+
+  ASSERT_EQ(cpu.size(), static_cast<size_t>(unit));
+  ASSERT_EQ(gpu.size(), static_cast<size_t>(unit));
+  for (unsigned int i = 0; i < unit; ++i)
+    EXPECT_NEAR(cpu[i], gpu[i], 1e-3f) << "output mismatch at index " << i;
 }
 
 GTEST_API_ int main(int argc, char **argv) {
