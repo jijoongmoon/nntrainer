@@ -5,10 +5,12 @@
 # layer.
 llm_layer_sources = [
   'geglu_layer.cpp',
+  'lm_head.cpp',
   'logit_softcapping.cpp',
   'qkv_layer.cpp',
   'scalar_multiply.cpp',
   'swiglu_layer.cpp',
+  'tie_word_embedding.cpp',
 ]
 
 # NOTE: concrete layer headers are not part of the -devel surface. They stay out

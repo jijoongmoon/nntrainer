@@ -62,6 +62,7 @@
 #include <identity_layer.h>
 #include <input_layer.h>
 #include <layer_normalization_layer.h>
+#include <lm_head.h>
 #include <logit_softcapping.h>
 #include <lr_scheduler_constant.h>
 #include <lr_scheduler_cosine.h>
@@ -99,6 +100,7 @@
 #include <sqrt_layer.h>
 #include <subtract_layer.h>
 #include <tangent_layer.h>
+#include <tie_word_embedding.h>
 #include <time_dist.h>
 #include <upsample2d_layer.h>
 #include <weight_layer.h>
@@ -455,11 +457,14 @@ void AppContext::add_default_object() {
   // the C API and these carry no C-API identity, so an accelerator context
   // can register the very same classes under the very same names.
   registerFactory(nntrainer::createLayer<GeGLULayer>, GeGLULayer::type);
+  registerFactory(nntrainer::createLayer<LmHeadLayer>, LmHeadLayer::type);
   registerFactory(nntrainer::createLayer<LogitSoftCappingLayer>,
                   LogitSoftCappingLayer::type);
   registerFactory(nntrainer::createLayer<QKVLayer>, QKVLayer::type);
   registerFactory(nntrainer::createLayer<ScalarMultiplyLayer>,
                   ScalarMultiplyLayer::type);
+  registerFactory(nntrainer::createLayer<TieWordEmbedding>,
+                  TieWordEmbedding::type);
 
   registerFactory(AppContext::unknownFactory<nntrainer::Layer>, "unknown",
                   LayerType::LAYER_UNKNOWN);
