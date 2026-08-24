@@ -170,11 +170,24 @@ struct Shape {
   unsigned int M, N, K;
 };
 
-// Decode-shaped (M=1), small-batch and prefill-shaped windows. K is a multiple
-// of 4 everywhere here: the int8 routes read the contraction four channels at a
-// time.
+// NOTE: nothing allocated in this file is freed. The FC path caches its derived
+// device copies keyed by the plain payload's ADDRESS -- sound for a model whose
+// weights outlive the run, but a test that frees a weight and allocates another
+// gets the same address back and hits a cache built for the previous shape.
+// Holding every buffer for the life of the test binary keeps the addresses
+// distinct.
+
+// Decode-shaped (M=1), small-batch and prefill-shaped windows, all with K a
+// multiple of 4 -- the shape every real projection width has.
 static const std::vector<Shape> kShapes = {{1, 64, 128}, {4, 96, 256},
                                            {32, 128, 512}};
+
+// Contraction widths that are NOT a multiple of 4, which the int8 routes read
+// four channels at a time. Both parities of (K+1)/2 are covered: an odd
+// half-width also puts every second weight row on an odd address.
+static const std::vector<Shape> kRaggedShapes = {
+  {1, 8, 7},  {1, 8, 19}, {1, 8, 31}, {1, 8, 131},
+  {1, 8, 5},  {1, 8, 17}, {1, 8, 33}, {1, 8, 129}};
 
 } // namespace
 
@@ -214,10 +227,6 @@ TEST(cuda_kernels, fc_qs4cx_dequant_gemm_fp32) {
     // FP32 accumulation in a different order than the host reference.
     EXPECT_LT(rel, 1e-5);
 
-    cudaFree(X);
-    cudaFree(Y);
-    cudaFree(W);
-    cudaFree(S);
   }
 }
 
@@ -264,10 +273,6 @@ TEST(cuda_kernels, fc_qs4cx_dp4a_fp16) {
     // approximation of the reference, not a reassociation of it.
     EXPECT_LT(rel, 3e-2);
 
-    cudaFree(X);
-    cudaFree(Y);
-    cudaFree(W);
-    cudaFree(S);
   }
 }
 
@@ -315,10 +320,64 @@ TEST(cuda_kernels, fc_qs4cx_cublas_i8_fp16) {
   // must land in the same band.
   EXPECT_LT(rel, 3e-2);
 
-  cudaFree(X);
-  cudaFree(Y);
-  cudaFree(W);
-  cudaFree(S);
+}
+
+TEST(cuda_kernels, fc_qs4cx_dp4a_ragged_k) {
+  if (!cudaAvailable())
+    GTEST_SKIP() << "no CUDA device";
+
+  // Every weight stays allocated for the whole test. The derived device caches
+  // are keyed by the plain payload's ADDRESS, which is sound for a model whose
+  // weights outlive the run, but a loop that frees and re-allocates would get
+  // the same address back and hit a cache built for the previous shape.
+  struct Buf {
+    unsigned short *X, *Y, *S;
+    unsigned char *W;
+  };
+  std::vector<Buf> bufs(kRaggedShapes.size());
+  std::vector<std::vector<double>> refs(kRaggedShapes.size());
+
+  for (size_t si = 0; si < kRaggedShapes.size(); ++si) {
+    const Shape &s = kRaggedShapes[si];
+    const TestWeight w = makeWeight(s.N, s.K, 0xC0FFEEu + s.K);
+    const std::vector<float> hx = makeActivation(s.M, s.K, 0xBEEFu + s.K);
+    std::vector<float> hxq(hx.size());
+    for (size_t i = 0; i < hx.size(); ++i)
+      hxq[i] = h2f(f2h(hx[i]));
+    refs[si] = refGemm(hxq, w.dense, s.M, s.N, s.K);
+
+    Buf &b = bufs[si];
+    ASSERT_EQ(cudaMallocManaged(&b.X, hx.size() * sizeof(unsigned short)),
+              cudaSuccess);
+    ASSERT_EQ(cudaMallocManaged(&b.Y, (size_t)s.M * s.N * sizeof(unsigned short)),
+              cudaSuccess);
+    ASSERT_EQ(cudaMallocManaged(&b.W, w.plain.size()), cudaSuccess);
+    ASSERT_EQ(cudaMallocManaged(&b.S, w.scales.size() * sizeof(unsigned short)),
+              cudaSuccess);
+    for (size_t i = 0; i < hx.size(); ++i)
+      b.X[i] = f2h(hx[i]);
+    std::memcpy(b.W, w.plain.data(), w.plain.size());
+    std::memcpy(b.S, w.scales.data(), w.scales.size() * sizeof(unsigned short));
+    std::memset(b.Y, 0, (size_t)s.M * s.N * sizeof(unsigned short));
+  }
+
+  for (size_t si = 0; si < kRaggedShapes.size(); ++si) {
+    const Shape &s = kRaggedShapes[si];
+    Buf &b = bufs[si];
+    ASSERT_TRUE(nntrainer::cuda::cuda_fc_qs4cx_dp4a_gemm_fp16(
+      b.X, b.W, b.S, b.Y, s.M, s.N, s.K));
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+    double maxErr = 0.0;
+    for (size_t i = 0; i < refs[si].size(); ++i)
+      maxErr = std::max(maxErr, std::fabs((double)h2f(b.Y[i]) - refs[si][i]));
+    const double rel = maxErr / refScale(refs[si]);
+    printf("CUDA QS4CX dp4a ragged K %ux%ux%u max rel error : %e\n", s.M, s.N,
+           s.K, rel);
+    // Dropping the tail channels shows up as a gross error, not a small one:
+    // a K=7 contraction that stops at 4 is missing three of seven terms.
+    EXPECT_LT(rel, 3e-2);
+  }
 }
 
 GTEST_API_ int main(int argc, char **argv) {
