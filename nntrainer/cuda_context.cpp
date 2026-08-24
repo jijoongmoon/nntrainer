@@ -22,7 +22,12 @@
 #include <cuda_rmsnorm_layer.h>
 #include <layer_normalization_layer.h>
 
+// The decode/prefill graph state machine needs the model walk and the CUDA
+// graph API (cuda_context.h already pulls in the stream/context managers).
+#include <cstdio>
 #include <cstdlib>
+#include <cuda_runtime.h>
+#include <neuralnet.h>
 
 namespace nntrainer {
 
@@ -91,6 +96,9 @@ void CudaContext::initialize() noexcept {
     setenv("NNTR_CUDA_ROPE", "1", 0);
     setenv("NNTR_FC_CUDA_CUBLAS", "1", 0);
     setenv("NNTR_CUDA_PREWARM", "1", 0);
+    setenv("NNTR_CUDA_ATTN", "1", 0);
+    setenv("NNTR_CUDA_FLASH_DECODE", "64", 0);
+    setenv("NNTR_CUDA_BLOCKQ", "1", 0);
     if (!integrated && context_inst_.concurrentManagedAccess()) {
       // Discrete-GPU profile: let work queue up instead of draining after
       // every op. This is only legal when the driver reports concurrent
@@ -99,6 +107,7 @@ void CudaContext::initialize() noexcept {
       // rather than a race, so an integrated or WDDM device keeps the
       // conservative profile.
       setenv("NNTR_CUDA_ASYNC", "1", 0);
+      setenv("NNTR_CUDA_GRAPH", "1", 0);
       // The row cap reads "=all" as RAISE, not disable: the device norm kernel
       // synchronizes per call, so on a wide (prefill-shaped) row window the
       // multi-threaded host loop wins and the default caps the device path at
@@ -253,5 +262,127 @@ template const int CudaContext::registerFactory<nntrainer::Layer>(
   const FactoryType<nntrainer::Layer> factory, const std::string &key,
   const int int_key);
 
+
+// CUDA override of the decode/prefill step.
+//
+// A single-token decode step issues on the order of a thousand tiny kernels,
+// and the CPU-side launch between them -- not the kernels -- is what limits it:
+// the GPU sits idle for most of the step. Capturing the step into a CUDA graph
+// once and replaying it collapses that launch cost.
+//
+// Two capture points, both off unless asked for:
+//
+//  * the DECODE graph, captured on the first single-token step and replayed for
+//    every later one. Between replays only the nodes the model declared as feed
+//    nodes re-run on the host (to refresh what the graph reads through fixed
+//    device pointers) and the token position is updated in device memory. A
+//    model that declares no feed nodes does not get this path at all, because
+//    replaying without the refresh would silently reuse the previous step's
+//    embedding.
+//  * the PREFILL graph, which is the same machinery applied to the multi-token
+//    step. Default on for an integrated GPU, where the per-op drain the eager
+//    path needs is expensive; a discrete GPU keeps the eager path.
+//
+// The flag is value-checked rather than presence-checked, because the context
+// auto-fills it on hardware where it belongs. A presence check would make "=0"
+// mean "on" here while the attention layer's own value-checked gate turned OFF
+// -- and that split state is not a slowdown, it is corruption: the replay
+// rewrites K/V at the first captured slot every step.
+sharedConstTensors
+CudaContext::runDecode(NeuralNetwork &nn, unsigned int from, unsigned int to,
+                       const sharedConstTensors &input,
+                       const sharedConstTensors &label) {
+  sharedConstTensors out;
+
+  static const bool decode_graph = nntr_env_on("NNTR_CUDA_GRAPH");
+  static const bool prefill_graph = []() {
+    const char *e = std::getenv("NNTR_CUDA_PREFILL_GRAPH");
+    if (e != nullptr)
+      return e[0] != '0';
+    return nntrainer::cuda::ContextManager::Global().isIntegrated();
+  }();
+  static const bool graph_dbg = std::getenv("NNTR_CUDA_GRAPH_DBG") != nullptr;
+
+  static cudaGraphExec_t cached_exec = nullptr;
+  static sharedConstTensors cached_out;
+  bool captured = false;
+
+  const bool feed_declared = !nn.getGraphReplayFeedNodes().empty();
+  const bool single_token = (to - from) == 1 && from != 0;
+
+  if (decode_graph && feed_declared && !single_token && cached_exec != nullptr) {
+    // A new sequence, or a resumed multi-token step, is about to run eagerly.
+    // That forward may free and reallocate the scratch the captured graph holds
+    // pointers into, so the graph has to go now; replaying it afterwards would
+    // launch with dangling device pointers. The next decode step recaptures
+    // against the fresh ones.
+    cudaGraphExecDestroy(cached_exec);
+    cached_exec = nullptr;
+    cached_out = {};
+  }
+
+  if (decode_graph && feed_declared && single_token) {
+    auto &sm = nntrainer::cuda::StreamManager::Global();
+    if (cached_exec != nullptr) {
+      nn.setStepFeedOnly(true);
+      out = nn.incremental_forwarding(from, to, input, label, false);
+      nn.setStepFeedOnly(false);
+      nntrainer::cuda::cuda_set_pos((int)from, (int)from + 1);
+      cudaGraphLaunch(cached_exec, sm.GetStream());
+      cudaStreamSynchronize(sm.GetStream());
+      out = cached_out;
+      captured = true;
+    } else if (sm.beginCapture()) {
+      nntrainer::cuda::cuda_set_pos((int)from, (int)from + 1);
+      out = nn.incremental_forwarding(from, to, input, label, false);
+      cudaGraph_t graph = nullptr;
+      if (sm.endCapture(&graph) && graph != nullptr) {
+        if (graph_dbg) {
+          size_t n_nodes = 0;
+          cudaGraphGetNodes(graph, nullptr, &n_nodes);
+          std::fprintf(stderr, "[CUDA_GRAPH] decode graph: %zu nodes\n",
+                       n_nodes);
+        }
+        if (cudaGraphInstantiate(&cached_exec, graph, 0) == cudaSuccess) {
+          cudaGraphLaunch(cached_exec, sm.GetStream());
+          cudaStreamSynchronize(sm.GetStream());
+          cached_out = out;
+          captured = true;
+        }
+        cudaGraphDestroy(graph);
+      } else {
+        // The capture was invalidated (an allocation inside it, typically).
+        // Clear the sticky error so the eager fallback below is not blamed.
+        cudaGetLastError();
+      }
+    }
+  }
+
+  if (!captured && prefill_graph && !nn.isPrefillCaptureDisabled() &&
+      from == 0 && (to - from) > 1) {
+    auto &sm = nntrainer::cuda::StreamManager::Global();
+    if (sm.beginCapture()) {
+      out = nn.incremental_forwarding(from, to, input, label, false);
+      cudaGraph_t graph = nullptr;
+      if (sm.endCapture(&graph) && graph != nullptr) {
+        cudaGraphExec_t exec = nullptr;
+        if (cudaGraphInstantiate(&exec, graph, 0) == cudaSuccess) {
+          cudaGraphLaunch(exec, sm.GetStream());
+          cudaStreamSynchronize(sm.GetStream());
+          cudaGraphExecDestroy(exec);
+          captured = true;
+        }
+        cudaGraphDestroy(graph);
+      } else {
+        cudaGetLastError();
+      }
+    }
+  }
+
+  if (!captured)
+    out = nn.incremental_forwarding(from, to, input, label, false);
+
+  return out;
+}
 
 } // namespace nntrainer
