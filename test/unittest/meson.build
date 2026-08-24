@@ -152,7 +152,8 @@ endforeach
 # with the toolkit but no card.
 if get_option('enable-cuda')
   foreach cuda_kernel_test: ['unittest_cuda_kernels_layernorm',
-                             'unittest_cuda_kernels_gelu']
+                             'unittest_cuda_kernels_gelu',
+                             'unittest_cuda_kernels_fc_qs4cx']
     cuda_kernel_test_exe = executable(
       cuda_kernel_test,
       cuda_kernel_test + '.cpp',
