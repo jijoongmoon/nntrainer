@@ -30,7 +30,6 @@
 #include <cuda_stream_manager.h>
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
 #include <cuda_context_manager.h>
-#include <cuda_elementwise.h>
 #include <cuda_gelu.h>
 #include <cuda_layernorm.h>
 #include <cuda_runtime.h>
@@ -153,6 +152,132 @@ public:
   }
 #endif
 
+  // ── Whole-op (Tensor-level) ───────────────────────────────────────────────
+  // LayerNorm: out = (x-mean)*rsqrt(var+eps)*gamma + beta per row over width.
+  // Device fp16 kernel for all-FP16 in/gamma/beta/out within the row gate;
+  // everything else (FP32, every mixed activation/weight dtype combo, and
+  // rows > gate) runs the INHERITED host loop CpuComputeOps::layer_norm over
+  // the host-coherent UVM tensors — i.e. UNACCELERATED rather than
+  // "CUDA support". cuda_layernorm_fp32 exists and is
+  // covered by unittest_cuda_kernels_layernorm, but is deliberately not routed
+  // from here yet: it has had no in-graph validation, unlike the fp16 path.
+  //
+  // The row gate is a CUDA-specific PERFORMANCE POLICY and belongs here, in the
+  // op, never in the Layer (a Layer branching on backend behaviour is exactly
+  // the fork smell this collapse removes). Rationale: the kernel syncs per
+  // call, so for a wide prefill norm (rows = seq_len) the multi-threaded host
+  // loop over UVM wins; gating by rows gives the decode speedup with no prefill
+  // regression (same tradeoff as CudaRMSNormLayer). ClComputeOps gets NO
+  // equivalent gate and that is correct, not an oversight — it has no host
+  // fallback to fall back to. Replaces the former forked LayerNorm layer.
+  void layer_norm(const Tensor &in, Tensor &out, const Tensor &gamma,
+                  const Tensor &beta, float epsilon, unsigned int active_rows,
+                  unsigned int row_offset) override {
+    const unsigned int width = in.width();
+    const size_t elem_off = (size_t)row_offset * width;
+
+    if (std::getenv("NNTR_CUDA_DBG")) {
+      static int _n = 0;
+      if (_n++ < 3)
+        std::fprintf(stderr,
+                     "[CUDA-DBG] CudaComputeOps::layer_norm rows=%u width=%u\n",
+                     active_rows, width);
+    }
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+    using DT = ml::train::TensorDim::DataType;
+    // NNTR_LAYERNORM_CUDA_OFF: unset => 32-row decode-only cap, "a"/"all" =>
+    // uncapped, anything else => off. CudaContext::initialize() sets "all" on
+    // discrete GPUs next to the RMSNorm cap raise.
+    static const int gpu_max_rows = []() {
+      const char *e = std::getenv("NNTR_LAYERNORM_CUDA_OFF");
+      if (e && e[0] == 'a')
+        return 1 << 30; // "all"
+      if (e)
+        return 0; // off
+      return 32;  // decode-only default
+    }();
+    if (in.getDataType() == DT::FP16 && gamma.getDataType() == DT::FP16 &&
+        beta.getDataType() == DT::FP16 && out.getDataType() == DT::FP16 &&
+        (int)active_rows <= gpu_max_rows && active_rows > 0) {
+      auto *xi = reinterpret_cast<const unsigned short *>(in.getData<_FP16>() +
+                                                          elem_off);
+      auto *gi =
+        reinterpret_cast<const unsigned short *>(gamma.getData<_FP16>());
+      auto *bi = reinterpret_cast<const unsigned short *>(beta.getData<_FP16>());
+      auto *yi =
+        reinterpret_cast<unsigned short *>(out.getData<_FP16>() + elem_off);
+      if (nntrainer::cuda::dev_accessible(xi) &&
+          nntrainer::cuda::dev_accessible(gi) &&
+          nntrainer::cuda::dev_accessible(bi) &&
+          nntrainer::cuda::dev_accessible(yi) &&
+          cuda::cuda_layernorm_fp16(xi, gi, bi, yi, epsilon, active_rows, width))
+        return;
+    }
+#endif
+    // Host layernorm fallback (UNACCELERATED): sync first so the host read of a
+    // GPU-produced input is coherent under NNTR_CUDA_ASYNC (no-op in sync mode).
+    cuda::StreamManager::Global().finishIfAsync();
+    CpuComputeOps::layer_norm(in, out, gamma, beta, epsilon, active_rows,
+                              row_offset);
+  }
+
+  // Element-wise activation. Device fp16 GELU/tanh-GELU kernel; every other
+  // mode and every other dtype runs the INHERITED host ActiFunc over UVM —
+  // UNACCELERATED, so say so rather than claiming CUDA support.
+  // Note there is NO row gate here and there should not be one: this is a flat
+  // 1-D elementwise map with no host-wins crossover (mirrors the ungated
+  // swiglu/geglu CUDA fast paths). Replaces the former CudaActivationLayer
+  // fork; the ActivationType -> mode mapping (its getGeluMode) lives here now,
+  // because it is a backend concern.
+  void activation(const Tensor &in, Tensor &out, int act_type,
+                  unsigned int active_rows, unsigned int row_offset) override {
+    const auto at = static_cast<ActivationType>(act_type);
+    const unsigned int width = in.width();
+    const size_t elem_off = (size_t)row_offset * width;
+    const size_t n = (size_t)active_rows * width;
+    const bool is_gelu =
+      (at == ActivationType::ACT_GELU || at == ActivationType::ACT_TANH_GELU);
+
+    if (std::getenv("NNTR_CUDA_DBG")) {
+      static int _n = 0;
+      if (_n++ < 3)
+        std::fprintf(stderr,
+                     "[CUDA-DBG] CudaComputeOps::activation n=%zu act=%d\n", n,
+                     act_type);
+    }
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+    using DT = ml::train::TensorDim::DataType;
+    if (is_gelu && n > 0 && in.getDataType() == DT::FP16 &&
+        out.getDataType() == DT::FP16) {
+      const int mode = (at == ActivationType::ACT_TANH_GELU) ? 1 : 0;
+      auto *xi = reinterpret_cast<const unsigned short *>(in.getData<_FP16>() +
+                                                          elem_off);
+      auto *yi =
+        reinterpret_cast<unsigned short *>(out.getData<_FP16>() + elem_off);
+      if (nntrainer::cuda::dev_accessible(xi) &&
+          nntrainer::cuda::dev_accessible(yi) &&
+          cuda::cuda_gelu_fp16(xi, yi, mode, (unsigned int)n))
+        return;
+    }
+#endif
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+    // Under a device-only activation pool (NNTR_CUDA_DEV_ACT) the host loop
+    // below would FAULT on a non-UVM pointer. Fail loudly instead: the caller
+    // must either use an accelerated mode/dtype or turn the pool off.
+    if (n > 0 && (cuda::dev_only(in.getData<uint8_t>()) ||
+                  cuda::dev_only(out.getData<uint8_t>())))
+      throw std::runtime_error(
+        "CudaComputeOps::activation: this activation mode/dtype has no device "
+        "kernel and the tensors are device-only (NNTR_CUDA_DEV_ACT); the host "
+        "path would fault");
+#endif
+
+    cuda::StreamManager::Global().finishIfAsync();
+    CpuComputeOps::activation(in, out, act_type, active_rows, row_offset);
+  }
 };
 
 ComputeOps *get_cuda_ops() {

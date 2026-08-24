@@ -100,6 +100,7 @@ void CudaContext::initialize() noexcept {
       // 32 rows. On a discrete part the launch is cheap enough that uncapping
       // wins everywhere.
       setenv("NNTR_RMSNORM_CUDA_OFF", "all", 0);
+      setenv("NNTR_LAYERNORM_CUDA_OFF", "all", 0);
     }
 
     add_default_object();
@@ -150,9 +151,9 @@ void CudaContext::add_default_object() {
   // its residual_op dispatch is where the residual stream can stay in place.
   registerFactory(nntrainer::createLayer<AdditionLayer>, AdditionLayer::type,
                   ml::train::LayerType::LAYER_ADDITION);
-  // layer normalization / activation: dispatch to CudaComputeOps::layer_norm and
-  // ::activation once those entries exist; until then they run the inherited
-  // host implementation over the managed buffer, which is correct.
+  // layer normalization / activation: dispatch to CudaComputeOps::layer_norm
+  // and ::activation, which run device kernels for the shapes and dtypes they
+  // cover and fall back to the inherited host implementation for the rest.
   registerFactory(nntrainer::createLayer<LayerNormalizationLayer>,
                   LayerNormalizationLayer::type,
                   ml::train::LayerType::LAYER_LAYER_NORMALIZATION);

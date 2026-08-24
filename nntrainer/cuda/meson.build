@@ -7,6 +7,8 @@ cuda_sources = [
   'cuda_kernel.cpp',
   'cuda_compute_ops.cpp',
   'cuda_rmsnorm.cpp',
+  'cuda_layernorm.cpp',
+  'cuda_gelu.cpp',
 ]
 
 cuda_headers = [
@@ -18,6 +20,8 @@ cuda_headers = [
   'cuda_module.h',
   'cuda_kernel.h',
   'cuda_rmsnorm.h',
+  'cuda_layernorm.h',
+  'cuda_gelu.h',
 ]
 
 foreach s : cuda_sources
