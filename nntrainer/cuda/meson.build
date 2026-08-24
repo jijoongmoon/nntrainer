@@ -11,6 +11,7 @@ cuda_sources = [
   'cuda_gelu.cpp',
   'cuda_elementwise.cpp',
   'cuda_blas_manager.cpp',
+  'cuda_fc_qs4cx.cpp',
 ]
 
 cuda_headers = [
@@ -26,6 +27,7 @@ cuda_headers = [
   'cuda_gelu.h',
   'cuda_elementwise.h',
   'cuda_blas_manager.h',
+  'cuda_fc_qs4cx.h',
 ]
 
 foreach s : cuda_sources

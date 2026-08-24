@@ -88,6 +88,9 @@ void CudaContext::initialize() noexcept {
     // nntr_env_on()).
     setenv("NNTR_CUDA_GEGLU", "1", 0);
     setenv("NNTR_CUDA_ELTWISE", "1", 0);
+    setenv("NNTR_CUDA_ROPE", "1", 0);
+    setenv("NNTR_FC_CUDA_CUBLAS", "1", 0);
+    setenv("NNTR_CUDA_PREWARM", "1", 0);
     if (!integrated && context_inst_.concurrentManagedAccess()) {
       // Discrete-GPU profile: let work queue up instead of draining after
       // every op. This is only legal when the driver reports concurrent
