@@ -101,6 +101,18 @@ public:
                             const int int_key = -1);
 
   /**
+   * @copydoc Context::runDecode
+   * @brief CUDA override of the decode/prefill step: capture the step into a
+   *        CUDA graph once and replay it, instead of re-issuing every launch.
+   *        With the graph flags unset this is a plain eager walk == the base,
+   *        so engine=cuda without them is byte-identical.
+   */
+  std::vector<std::shared_ptr<const Tensor>>
+  runDecode(NeuralNetwork &nn, unsigned int from, unsigned int to,
+            const std::vector<std::shared_ptr<const Tensor>> &input,
+            const std::vector<std::shared_ptr<const Tensor>> &label) override;
+
+  /**
    * @brief Create an Object from the integer key
    */
   template <typename T>
