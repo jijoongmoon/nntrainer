@@ -890,12 +890,28 @@ __global__ void dp4a_gemv(const signed char *q8, const signed char *plain,
   int Kh = (K + 1) >> 1;
   const signed char *wrow = plain + (long)n * Kh;
   int acc = 0;
-  for (int k = lane * 4; k + 4 <= K; k += 32 * 4) {
+  // K4 = the input channels covered by whole groups of 4; the dp4a loop can
+  // only consume those. k is a multiple of 4 so kb is even, but the 2-byte
+  // weight load also needs the ROW base aligned, and wrow = plain + n*Kh is
+  // 2-byte aligned only when Kh is even. Odd Kh (K % 4 == 1 or 2) leaves every
+  // odd n on an odd address, which aborts the launch with "misaligned address"
+  // rather than just computing wrong -- so those shapes read the byte pair
+  // directly. The predicate is launch-uniform and loop-invariant: no warp
+  // divergence, and K % 4 == 0 (every LLM projection width) keeps the wide load.
+  const int K4 = K & ~3;
+  const bool wide_w = ((Kh & 1) == 0);
+  for (int k = lane * 4; k < K4; k += 32 * 4) {
     int a = *(const int *)(q8 + k);
-    int kb = k >> 1; // = lane*2 -> 2-byte aligned for the short load (K even)
-    unsigned int w16 = *(const unsigned short *)(wrow + kb);
-    int b0 = w16 & 0xFF;
-    int b1 = (w16 >> 8) & 0xFF;
+    int kb = k >> 1;
+    int b0, b1;
+    if (wide_w) {
+      unsigned int w16 = *(const unsigned short *)(wrow + kb);
+      b0 = w16 & 0xFF;
+      b1 = (w16 >> 8) & 0xFF;
+    } else {
+      b0 = (unsigned char)wrow[kb];
+      b1 = (unsigned char)wrow[kb + 1];
+    }
     int w0 = ((int)(signed char)(b0 << 4)) >> 4;
     int w1 = ((int)(signed char)b0) >> 4;
     int w2 = ((int)(signed char)(b1 << 4)) >> 4;
@@ -903,6 +919,19 @@ __global__ void dp4a_gemv(const signed char *q8, const signed char *plain,
     int w = (w0 & 0xFF) | ((w1 & 0xFF) << 8) | ((w2 & 0xFF) << 16) |
             ((w3 & 0xFF) << 24);
     acc = __dp4a(a, w, acc);
+  }
+  // Scalar tail for K % 4 != 0: the loop above consumes whole groups of 4, so
+  // without this the last 1..3 input channels are dropped from every output.
+  // One channel per lane over lanes 0..(K-K4-1) -- each is added exactly once
+  // by the warp reduction below. Same nibble decode as dp4a_gemm's own tail.
+  {
+    int k = K4 + lane;
+    if (k < K) {
+      int b = (unsigned char)wrow[k >> 1];
+      int wv = (k & 1) ? (((int)(signed char)b) >> 4)
+                       : (((int)(signed char)(b << 4)) >> 4);
+      acc += (int)q8[k] * wv;
+    }
   }
 #pragma unroll
   for (int o = 16; o > 0; o >>= 1)
