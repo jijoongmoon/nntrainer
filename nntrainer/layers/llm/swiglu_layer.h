@@ -13,9 +13,9 @@
  *
  * @details One thin Layer owning shape and orchestration, with the kernel
  * delegated to the active backend through the tensor's op table
- * (in1.getOps()->swiglu(...)). It replaces the OpenCL SwiGLULayerCl fork,
- * which duplicated the whole layer in order to change the two lines that did
- * the maths.
+ * (in1.getOps()->swiglu(...)). It replaces the OpenCL SwiGLULayerCl fork and
+ * the CausalLM application's SwiGLU fork, both of which duplicated the whole
+ * layer in order to change the two lines that did the maths.
  */
 
 #ifndef __SWIGLU_LAYER_H__
@@ -41,7 +41,7 @@ public:
   /**
    * @brief Construct a new SwiGLU layer object
    */
-  SwiGLULayer() : Layer(), swiglu_props(props::Print()) {}
+  SwiGLULayer() : Layer(), swiglu_props(props::Print(), props::SkipPrefill()) {}
 
   /**
    * @brief Destroy the SwiGLU layer object
@@ -71,6 +71,13 @@ public:
   void calcDerivative(RunLayerContext &context) override;
 
   /**
+   * @copydoc Layer::updateTensorsByInputDimensions(RunLayerContext &context,
+   * std::vector<TensorDim> input_dimensions)
+   */
+  void updateTensorsByInputDimensions(
+    RunLayerContext &context, std::vector<TensorDim> input_dimensions) override;
+
+  /**
    * @copydoc bool supportBackwarding() const
    */
   bool supportBackwarding() const override { return false; };
@@ -94,7 +101,11 @@ public:
   static constexpr const char *type = "swiglu";
 
 private:
-  std::tuple<props::Print> swiglu_props; /**< swiglu layer properties */
+  /**< SkipPrefill: a layer that shares another layer's KV cache produces no
+       new keys or values during prefill, so its whole feed-forward branch is
+       dead work there. The model sets the property; the layer just obeys it. */
+  std::tuple<props::Print, props::SkipPrefill> swiglu_props;
+  bool skip_prefill = false; /**< cached SkipPrefill, resolved in finalize() */
 };
 
 } // namespace nntrainer

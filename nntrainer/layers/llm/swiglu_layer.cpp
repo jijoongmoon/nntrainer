@@ -26,6 +26,9 @@ static constexpr size_t INPUT_IDX_2 = 1; /**< up */
 
 void SwiGLULayer::finalize(InitLayerContext &context) {
   context.setOutputDimensions({context.getInputDimensions()[0]});
+
+  if (!std::get<props::SkipPrefill>(swiglu_props).empty())
+    skip_prefill = std::get<props::SkipPrefill>(swiglu_props).get();
 }
 
 void SwiGLULayer::setProperty(const std::vector<std::string> &values) {
@@ -52,18 +55,38 @@ void SwiGLULayer::forwarding(RunLayerContext &context, bool training) {
 void SwiGLULayer::incremental_forwarding(RunLayerContext &context,
                                          unsigned int from, unsigned int to,
                                          bool training) {
+  // A multi-token step is a prefill step, so a KV-shared layer skips it here
+  // exactly as it skips the from == 0 one: the branch produces nothing any
+  // later layer reads.
+  if (skip_prefill && (from == 0 || (to - from) > 1))
+    return;
+
   Tensor &in1 = context.getInput(INPUT_IDX_1);
   Tensor &in2 = context.getInput(INPUT_IDX_2);
   Tensor &out = context.getOutput(OUT_IDX);
 
-  if (from) {
-    NNTR_THROW_IF(to - from != 1, std::invalid_argument)
-      << "incremental step size is not 1";
-  }
+  // Every producer writes the live rows starting at the buffer base on every
+  // backend, so the offset is always 0 and the count is the live-row window.
+  // Rows are (batch, channel, height) flattened, so the window has to be
+  // scaled by batch*channel or a batch>1 shape only computes its first
+  // (to - from) rows.
+  const unsigned int bc = in1.batch() * in1.channel();
+  in1.getOps()->swiglu(in1, in2, out, (to - from) * bc, /*row_offset=*/0);
+}
 
-  in1.getOps()->swiglu(in1, in2, out,
-                       in1.batch() * in1.channel() * in1.height(),
-                       /*row_offset=*/0);
+void SwiGLULayer::updateTensorsByInputDimensions(
+  RunLayerContext &context, std::vector<TensorDim> input_dimensions) {
+  TensorDim input_dim1 = context.getInput(INPUT_IDX_1).getDim();
+  TensorDim input_dim2 = context.getInput(INPUT_IDX_2).getDim();
+  TensorDim output_dim = context.getOutput(OUT_IDX).getDim();
+
+  input_dim1.height(input_dimensions[0].height());
+  input_dim2.height(input_dimensions[0].height());
+  output_dim.height(input_dimensions[0].height());
+
+  context.updateInput(INPUT_IDX_1, input_dim1);
+  context.updateInput(INPUT_IDX_2, input_dim2);
+  context.updateOutput(OUT_IDX, output_dim);
 }
 
 void SwiGLULayer::calcDerivative(RunLayerContext &context) {

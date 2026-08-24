@@ -27,6 +27,7 @@
 #include <logit_softcapping.h>
 #include <qkv_layer.h>
 #include <scalar_multiply.h>
+#include <swiglu_layer.h>
 #include <tie_word_embedding.h>
 
 // The decode/prefill graph state machine needs the model walk and the CUDA
@@ -203,6 +204,9 @@ void CudaContext::add_default_object() {
   registerFactory(nntrainer::createLayer<QKVLayer>, QKVLayer::type);
   registerFactory(nntrainer::createLayer<ScalarMultiplyLayer>,
                   ScalarMultiplyLayer::type);
+  // swiglu dispatches to CudaComputeOps::swiglu, which does have a device
+  // kernel for it.
+  registerFactory(nntrainer::createLayer<SwiGLULayer>, SwiGLULayer::type);
   registerFactory(nntrainer::createLayer<TieWordEmbedding>,
                   TieWordEmbedding::type);
 }

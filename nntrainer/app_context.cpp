@@ -99,6 +99,7 @@
 #include <split_layer.h>
 #include <sqrt_layer.h>
 #include <subtract_layer.h>
+#include <swiglu_layer.h>
 #include <tangent_layer.h>
 #include <tie_word_embedding.h>
 #include <time_dist.h>
@@ -463,6 +464,7 @@ void AppContext::add_default_object() {
   registerFactory(nntrainer::createLayer<QKVLayer>, QKVLayer::type);
   registerFactory(nntrainer::createLayer<ScalarMultiplyLayer>,
                   ScalarMultiplyLayer::type);
+  registerFactory(nntrainer::createLayer<SwiGLULayer>, SwiGLULayer::type);
   registerFactory(nntrainer::createLayer<TieWordEmbedding>,
                   TieWordEmbedding::type);
 
