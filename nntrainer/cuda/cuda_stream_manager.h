@@ -108,6 +108,19 @@ public:
   bool isCapturing() const { return capturing_; }
 
   /**
+   * @brief Monotonic count of kernels dispatched on the backend stream.
+   *
+   * Producer/consumer ops that want to hand a derived buffer straight to the
+   * next op (rather than recomputing it) can only do so while NOTHING ELSE
+   * touched the source in between. A raw pointer equality test is not enough
+   * for that -- the activation pool recycles buffers, so a later, unrelated
+   * tensor can land on the very same address. Stamping the handoff with this
+   * counter turns "same pointer" into "same pointer AND not one kernel ran
+   * since", which the pool cannot forge.
+   */
+  unsigned long long dispatchSeq() const { return dispatch_seq_; }
+
+  /**
    * @brief Destroy the stream
    */
   ~StreamManager() override;
@@ -130,6 +143,7 @@ protected:
 private:
   cudaStream_t stream_{nullptr};
   bool capturing_{false};
+  unsigned long long dispatch_seq_{0};
 };
 
 /**

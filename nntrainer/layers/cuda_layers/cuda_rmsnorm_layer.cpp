@@ -17,6 +17,7 @@
 #include <cstdlib>
 
 #include <cuda_context_manager.h>
+#include <cuda_fc_qs4cx.h> // cuda_fc_qs4cx_rmsnorm_prequant_fp16 (fused norm+quant)
 #include <cuda_rmsnorm.h>
 #include <cuda_runtime.h>
 #include <cuda_stream_manager.h>
@@ -99,9 +100,19 @@ void rmsnorm_dispatch(const Tensor &in, const Tensor &gamma, Tensor &out,
       reinterpret_cast<const unsigned short *>(gamma.getData<_FP16>());
     unsigned short *yi =
       reinterpret_cast<unsigned short *>(out.getData<_FP16>());
-    if (dev_ok(xi) && dev_ok(gi) && dev_ok(yi) &&
-        cuda::cuda_rmsnorm_fp16(xi, gi, yi, eps, rows, width))
-      return;
+    if (dev_ok(xi) && dev_ok(gi) && dev_ok(yi)) {
+      // Decode fast path: the norm output feeds an int4 FC group whose first
+      // act is to quantize it to int8. Folding that quant into this launch
+      // (and letting the group's siblings consume the staging) removes two
+      // single-block kernels per norm from the decode graph. Falls through to
+      // the plain norm when the lever is off or the staging cannot be
+      // prepared.
+      if (cuda::cuda_fc_qs4cx_rmsnorm_prequant_fp16(xi, gi, yi, eps, rows,
+                                                    width))
+        return;
+      if (cuda::cuda_rmsnorm_fp16(xi, gi, yi, eps, rows, width))
+        return;
+    }
   }
 #endif
   // Host rmsnorm fallback: sync first so the host read of GPU-produced input is
