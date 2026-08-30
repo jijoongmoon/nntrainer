@@ -144,8 +144,22 @@ for scalar `_Float16` arithmetic.
   `T` yields `Half`; floating `T` yields `common_type<float, T>`, matching
   `_Float16`'s promotion rules.
 
-Streaming operators, `std::numeric_limits<Half>` and `std::to_string` are
-deliberately not provided; no call site needs them.
+Streaming operators and `std::to_string` are deliberately not provided; no call
+site needs them, and reaching for one is a compile error — the correct outcome
+for a missing piece of a stand-in.
+
+`std::numeric_limits<Half>` **is** provided, and is the exception to that rule
+for one reason: it is the only member of the set whose absence does not fail to
+compile. The primary template is defined for every type and value-initializes,
+so an unspecialized `Half` would answer `numeric_limits<_FP16>::max() == 0.0`,
+`infinity() == 0.0` and `is_specialized == false` on a wrapper build while the
+identical source answers 65504, inf and true on a native build — a wrong
+numeric result on exactly one platform, from code that compiles clean. The
+specialization is written as bit patterns through `Half::from_bits` so that
+every member can be `constexpr` as the standard requires (the converting
+constructor rounds through `float` with a `memcpy` and cannot be), and
+`unittest_half_fp16` compares each member against
+`std::numeric_limits<_Float16>`.
 
 ### 3.4 Where host half arithmetic actually lives
 
@@ -162,9 +176,18 @@ the x86 fp16 backend), which is unconditionally in the build whenever
 suite on GCC/Clang with `_FP16 == nntrainer::Half`, which exercises exactly the
 code MSVC will compile, on a platform where the tests can actually be run.
 
-The meaningful check is that the two implementations agree: run the fp16
-tensor / cpu-backend / activation suites once under `native` and once under
-`wrapper` and compare pass/fail per test.
+It is wired into CI: `.github/workflows/ubuntu_clean_meson_build.yml` carries
+`-Denable-fp16=true -Dfp16-impl=wrapper` as a third `meson_options` matrix
+entry, so every PR builds and runs the suite under both backing types. That
+leg is what catches a change using an `_FP16` operation `Half` does not
+provide, or one leaning on native promotion where `Half` differs.
+`unittest_half_fp16` cannot: it tests `Half` in isolation against
+`_Float16`, not the tree's thousands of `_FP16` uses. Neither can the MSVC
+job, which sets `enable-test = false` and is compile-and-link only.
+
+The meaningful check beyond pass/fail is that the two implementations agree
+numerically: run the fp16 tensor / cpu-backend / activation suites once under
+`native` and once under `wrapper` and compare per test.
 
 One expected difference, worth knowing before chasing it: for a *single*
 operation the two are bit-identical, but in a multi-operation expression the
