@@ -135,19 +135,18 @@ LayerNode::~LayerNode() = default;
  * @brief map a registered engine NAME onto the residency-plane enum: the
  *        tensor/residency plane (tensor_wrap_specs, InitLayerContext,
  *        RunLayerContext) still speaks LayerComputeEngine. cpu/gpu/qnn/cuda
- *        map 1:1; "npu" is a QNN context alias; any other registered name
- *        gets CPU (host) residency — its DISPATCH is name-based via
- *        getRegisteredContext, only the memory plane defaults to host.
+ *        map 1:1; any other registered name gets CPU (host) residency — its
+ *        DISPATCH is name-based via getRegisteredContext, only the memory
+ *        plane defaults to host.
  */
 static ml::train::LayerComputeEngine
 toLayerComputeEngine(const std::string &name) {
   // A registered context DECLARES its own residency plane via
   // Context::residencyEngine() -- the single authority, retiring the central
-  // name->enum string table below. Registry ALIASES collapse onto their backend
-  // for free: "npu" is registered as an alias of the "qnn" context
-  // (engine.cpp), so getRegisteredContext("npu") returns the QNN context and
-  // residencyEngine() reports QNN -- no per-alias special case here, and a new
-  // aliased/added backend just declares its plane in its Context override
+  // name->enum string table below. A registry ALIAS collapses onto its backend
+  // for free: an alias resolves to the same Context, whose residencyEngine()
+  // reports that backend's plane -- no per-alias special case here, and a new
+  // aliased or added backend just declares its plane in its Context override
   // (add-only, no edit here). See
   // docs/backend_guide/ARCHITECTURE_REFACTOR.md §5 step 1.
   try {
@@ -340,25 +339,28 @@ void LayerNode::setComputeEngine(
   this->compute_engine = "cpu";
 }
 
-bool LayerNode::isComputeEngineGPU() const {
+ml::train::LayerComputeEngine LayerNode::residencyEngine() const {
   if (!layer_node_props)
-    return false;
+    return ml::train::LayerComputeEngine::CPU;
   auto &ce = std::get<props::ComputeEngine>(*layer_node_props);
-  return !ce.empty() && istrequal(ce.get(), "gpu");
+  if (ce.empty())
+    return ml::train::LayerComputeEngine::CPU;
+  // The engine tag is a registered Context NAME, so the plane is whatever that
+  // Context declares (Context::residencyEngine()) -- not something decided
+  // here by comparing the name against a hardcoded spelling.
+  return toLayerComputeEngine(ce.get());
+}
+
+bool LayerNode::isComputeEngineGPU() const {
+  return residencyEngine() == ml::train::LayerComputeEngine::GPU;
 }
 
 bool LayerNode::isComputeEngineCUDA() const {
-  if (!layer_node_props)
-    return false;
-  auto &ce = std::get<props::ComputeEngine>(*layer_node_props);
-  return !ce.empty() && istrequal(ce.get(), "cuda");
+  return residencyEngine() == ml::train::LayerComputeEngine::CUDA;
 }
 
 bool LayerNode::isComputeEngineCPU() const {
-  if (!layer_node_props)
-    return true;
-  auto &ce = std::get<props::ComputeEngine>(*layer_node_props);
-  return ce.empty() || istrequal(ce.get(), "cpu");
+  return residencyEngine() == ml::train::LayerComputeEngine::CPU;
 }
 
 const std::string LayerNode::getName() const {
