@@ -716,8 +716,15 @@ public:
    * @brief Mark that this tensor's on-disk bytes are a legacy QINT4 record
    *        (u16 qscheme header + KAI Section A / plain container) that must be
    *        transcoded losslessly to the canonical QS4CX in-memory layout on
-   *        read. Set by NeuralNetwork::load for QS4CX weights of a legacy
-   *        ("QINT4-*" model_tensor_type) model.
+   *        read.
+   * @note  Nothing in tree sets this yet. A record carries no version, so the
+   *        model-loading path cannot tell a legacy one from a canonical one
+   *        and always takes the canonical branch. This is the hook for a
+   *        caller that does know which it holds -- an exporter-aware tool, or
+   *        a loader later taught the distinction. Until such a caller exists
+   *        the legacy branch is reached only by constructing the tensor and
+   *        setting the flag by hand, which is what the cpu_backend unit test
+   *        does.
    */
   void setOnDiskLegacyQint4(bool v) { on_disk_legacy_qint4_ = v; }
 
@@ -733,10 +740,12 @@ public:
    *        because the padded offset expression N * (K + 1) / 2 is evaluated
    *        left to right. It picks the stride at which QS4CX_Tensor::size()
    *        and getScale() place the scales, so it must be set before the
-   *        record is read. The default is the trimmed layout, which is what
-   *        the writer emits; a reader that finds the file only fits the padded
-   *        total sets this to true for that file. No effect on any other
-   *        tensor type.
+   *        record is read. No effect on any other tensor type.
+   * @note  Nothing in tree sets this yet, so the trimmed default -- what the
+   *        writer emits -- is the only stride the loader uses. It is the hook
+   *        for a caller that has established a given file was written with the
+   *        padded layout, for instance by finding the file size fits only the
+   *        padded total.
    */
   void setQs4cxRecordPadded(bool v) { qs4cx_record_padded_ = v; }
 

@@ -1883,7 +1883,8 @@ public:
 
   /**
    * @brief Mark the on-disk bytes as a legacy QINT4 record, so that read()
-   *        transcodes them to QS4CX.
+   *        transcodes them to QS4CX. @see TensorBase::setOnDiskLegacyQint4
+   *        for why no in-tree caller sets it yet.
    */
   void setOnDiskLegacyQint4(bool v);
 
