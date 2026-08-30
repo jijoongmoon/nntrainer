@@ -7,6 +7,8 @@ cl_op_sources = [
   'cl_compute_ops.cpp',
   'layernorm_cl_op.cpp',
   'gelu_cl_op.cpp',
+  'geglu_cl_op.cpp',
+  'swiglu_cl_op.cpp',
 ]
 
 cl_op_headers = [
