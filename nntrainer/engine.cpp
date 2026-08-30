@@ -11,6 +11,9 @@
  * @bug    No known bugs except for NYI items
  *
  */
+#include <algorithm>
+#include <cctype>
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <sstream>
@@ -49,6 +52,69 @@ Engine &Engine::Global() {
   return instance;
 }
 
+#if (defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1) ||                          \
+  (defined(ENABLE_CUDA) && ENABLE_CUDA == 1)
+namespace {
+
+/**
+ * @brief The compute engine this process asked for, lowercased, or "" if unset.
+ *
+ * Read from NNTR_ENGINE, the same variable the consumer layer already resolves
+ * a single engine from (Applications/CausalLM/llm_util.hpp causallm_engine():
+ * cpu | cuda | gpu, defaulting to "gpu" on an OpenCL build). Latched on first
+ * use: the contract -- shared with the pre-existing CUDA gate below -- is that
+ * NNTR_ENGINE is set before the first Engine::Global().
+ */
+const std::string &requestedEngine() {
+  static const std::string eng = []() -> std::string {
+    const char *e = std::getenv("NNTR_ENGINE");
+    if (e == nullptr)
+      return std::string();
+    std::string s(e);
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    return s;
+  }();
+  return eng;
+}
+
+/**
+ * @brief Should the named backend's Context be brought up in this process?
+ *
+ * SYMMETRY IS THE POINT. A process runs ONE compute engine (the consumer
+ * resolves exactly one from NNTR_ENGINE), but this translation unit used to be
+ * the place where every compiled-in backend was constructed unconditionally, so
+ * each lane paid the other's device bring-up:
+ *
+ *   - a CUDA run enumerated OpenCL and eagerly built ~50 CL programs that no
+ *     CL kernel would ever execute (measured 200-218 ms warm on an RTX 5060
+ *     box, and ~8.5 s on a launch where the OpenCL driver's compiler cache is
+ *     cold)
+ *   - a cpu-engine run paid that same OpenCL bring-up, plus the ~2.4 s wake of
+ *     a runtime-PM-suspended discrete GPU that the ICD loader triggers
+ *
+ * @param name       registry name of the backend ("gpu", "cuda")
+ * @param eager_env  env var that force-restores the unconditional bring-up
+ *                   (kept so the gate is A/B-able and so a genuinely mixed
+ *                   process can opt back in)
+ * @param on_by_default true for the backend that an unset NNTR_ENGINE selects
+ *                   (OpenCL "gpu": the consumer's own default; CUDA is opt-in)
+ * @return true when this run should construct that Context
+ */
+bool bringUpWanted(const char *name, const char *eager_env,
+                   bool on_by_default) {
+  const char *eager = std::getenv(eager_env);
+  if (eager != nullptr && eager[0] != '0')
+    return true;
+  const std::string &eng = requestedEngine();
+  if (eng.empty())
+    return on_by_default;
+  return eng == name;
+}
+
+} // namespace
+#endif
+
 void Engine::add_default_object() {
   /// @note all layers should be added to the app_context to guarantee that
   /// createLayer/createOptimizer class is created
@@ -62,9 +128,23 @@ void Engine::add_default_object() {
   registerContext("cpu", &app_context);
 
 #if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
-  auto &cl_context = nntrainer::ClContext::Global();
+  // Engine-conditional, the mirror of the CUDA gate below (see bringUpWanted).
+  // ClContext::Global() is leaked-by-design (never destroyed, cl_context.h), so
+  // on a non-OpenCL run it would leave a cl_context + command queue and ~50
+  // compiled programs alive for the whole process for nothing. Skipping the
+  // registration is safe because an engine name that is not registered resolves
+  // to "cpu" in parseComputeEngine, and every "gpu" consumer on the production
+  // path already try/catches a missing context.
+  // NNTR_CL_EAGER_CTX=1 restores the unconditional bring-up.
+  if (bringUpWanted("gpu", "NNTR_CL_EAGER_CTX", /*on_by_default=*/true)) {
+    auto &cl_context = nntrainer::ClContext::Global();
 
-  registerContext("gpu", &cl_context);
+    registerContext("gpu", &cl_context);
+  } else {
+    ml_logi("OpenCL/gpu backend compiled in but not brought up "
+            "(NNTR_ENGINE=%s); engine=gpu layers fall back to cpu.",
+            requestedEngine().c_str());
+  }
 #endif
 
 #if defined(ENABLE_HEXKL) && ENABLE_HEXKL == 1
