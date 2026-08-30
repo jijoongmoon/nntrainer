@@ -10,6 +10,7 @@ cl_op_sources = [
   'cl_tensor_backing_pool.cpp',
   'layernorm_cl_op.cpp',
   'gelu_cl_op.cpp',
+  'embedding_pool_cl_op.cpp',
   'geglu_cl_op.cpp',
   'swiglu_cl_op.cpp',
   'v8c_pack_cache.cpp',

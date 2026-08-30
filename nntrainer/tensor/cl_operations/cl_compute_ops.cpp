@@ -43,6 +43,7 @@
 #include <blas_kernels.h>
 #include <common_properties.h> // ActivationType, the act_type int encoding
 #include <compute_ops.h>
+#include <embedding_pool_cl_op.h>
 #include <geglu_cl_op.h>
 #include <gelu_cl_op.h>
 #include <layernorm_cl_op.h>
@@ -256,6 +257,20 @@ public:
                   float *Y, const unsigned int incY) override {
     for (unsigned int i = 0; i < N; ++i)
       Y[i * incY] = X[i * incX];
+  }
+
+  // The two row reductions of the sentence-embedding tail. Their callers are
+  // backend-neutral layers reaching them through in.getOps(), and before these
+  // overrides the same maths arrived as Tensor::average(2) -> sgemv_fp32 and
+  // normalization_i(3) -> snrm2_fp32 + sscal_fp32, none of which this table
+  // implements: the tail threw on a gpu-context tensor rather than running.
+  void mean_rows(const Tensor &in, Tensor &out, unsigned int active_rows,
+                 unsigned int row_offset) override {
+    mean_rows_cl_op(in, out, active_rows, row_offset);
+  }
+  void l2_normalize_rows(const Tensor &in, Tensor &out,
+                         float epsilon) override {
+    l2_normalize_rows_cl_op(in, out, epsilon);
   }
 
 #ifdef ENABLE_FP16

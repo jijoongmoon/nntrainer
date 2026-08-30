@@ -25,6 +25,7 @@
 #include <compute_ops.h>
 #include <concat_cl.h>
 #include <cstdlib>
+#include <embedding_pool_cl_op.h>
 #include <fc_layer_cl.h>
 #include <geglu_cl_op.h>
 #include <gelu_cl_op.h>
@@ -275,6 +276,12 @@ void ClContext::add_default_object() {
   // not with its kernel.
   if (!registerGeGLUClKernels(*this))
     ml_logw("failed to register the OpenCL GeGLU kernels");
+
+  // The embedding pooling / normalize row reductions. No layer of their own:
+  // the layers that consume ComputeOps::mean_rows and ::l2_normalize_rows are
+  // backend-neutral and reach them through the tensor.
+  if (!registerEmbeddingPoolClKernels(*this))
+    ml_logw("failed to register the OpenCL embedding pooling kernels");
 
   // The promoted LLM layers. None of them is an OpenCL fork: each is the core
   // class, running its maths through this context's ComputeOps table or,
