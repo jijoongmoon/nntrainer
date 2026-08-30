@@ -45,11 +45,32 @@ constexpr auto FWD = nntrainer::TensorLifespan::FORWARD_FUNC_LIFESPAN;
 constexpr auto GPU = ml::train::LayerComputeEngine::GPU;
 constexpr auto CPU = ml::train::LayerComputeEngine::CPU;
 
+/**
+ * @brief the process' registered OpenCL Context, or nullptr when there is
+ *        none.
+ *
+ * @details Engine::getRegisteredContext() THROWS std::invalid_argument for an
+ * unregistered name rather than returning null, and "unregistered" is a state
+ * this suite has to expect: a build with OpenCL compiled in still declines to
+ * bring the backend up when no device answers, which is the same reachable
+ * case ClBufferPool::clContext() is wrapped in a try for. Every case below
+ * needs the OpenCL backend, so each asks this first and skips, rather than
+ * dying by exception on a runner that has the build but not the device.
+ *
+ * @return the OpenCL context, or nullptr when the gpu backend is absent
+ */
+nntrainer::Context *gpuContext() {
+  try {
+    return nntrainer::Engine::Global().getRegisteredContext("gpu");
+  } catch (const std::exception &) {
+    return nullptr;
+  }
+}
+
 /** @brief the allocator the OpenCL context installs (shared virtual memory) */
 std::shared_ptr<nntrainer::MemAllocator> clAllocator() {
-  return nntrainer::Engine::Global()
-    .getRegisteredContext("gpu")
-    ->getMemAllocator();
+  auto *ctx = gpuContext();
+  return ctx != nullptr ? ctx->getMemAllocator() : nullptr;
 }
 
 nntrainer::TensorDim fp16Dim(unsigned int h, unsigned int w) {
@@ -117,10 +138,26 @@ std::vector<float> runModel(const std::string &engine, unsigned int in_w,
 } // namespace
 
 /**
+ * @brief Leave the case with a skip, not an exception, when the OpenCL
+ *        backend is not registered in this process.
+ * @details Written as a macro because GTEST_SKIP() returns from the case it
+ *          appears in, so it cannot live in a helper function.
+ */
+#define SKIP_WITHOUT_GPU_CONTEXT()                                             \
+  do {                                                                         \
+    if (gpuContext() == nullptr)                                               \
+      GTEST_SKIP() << "no \"gpu\" Context is registered in this process: the " \
+                      "OpenCL backend did not come up, so there is no device " \
+                      "plane to place a tensor in";                            \
+  } while (0)
+
+/**
  * @brief A tensor an OpenCL layer writes and only OpenCL layers read is placed
  *        in device memory, and hands out the buffer a kernel binds.
  */
 TEST(ClResidency, gpu_written_gpu_read_tensor_is_device_resident) {
+  SKIP_WITHOUT_GPU_CONTEXT();
+
   nntrainer::TensorPool pool(false, "", "residency_gpu",
                              ml::train::ExecutionMode::INFERENCE,
                              clAllocator());
@@ -141,6 +178,8 @@ TEST(ClResidency, gpu_written_gpu_read_tensor_is_device_resident) {
  *        can reach, so it is never half applied.
  */
 TEST(ClResidency, a_host_consumer_keeps_the_tensor_on_the_shared_plane) {
+  SKIP_WITHOUT_GPU_CONTEXT();
+
   nntrainer::TensorPool pool(false, "", "residency_mixed",
                              ml::train::ExecutionMode::INFERENCE,
                              clAllocator());
@@ -160,6 +199,8 @@ TEST(ClResidency, a_host_consumer_keeps_the_tensor_on_the_shared_plane) {
  * @brief A host-written tensor stays where the host wrote it, whoever reads it.
  */
 TEST(ClResidency, a_host_written_tensor_stays_on_the_shared_plane) {
+  SKIP_WITHOUT_GPU_CONTEXT();
+
   nntrainer::TensorPool pool(false, "", "residency_cpu_producer",
                              ml::train::ExecutionMode::INFERENCE,
                              clAllocator());
@@ -179,6 +220,8 @@ TEST(ClResidency, a_host_written_tensor_stays_on_the_shared_plane) {
  *        the point at which the two agree.
  */
 TEST(ClResidency, a_declared_input_boundary_is_raised_to_device_memory) {
+  SKIP_WITHOUT_GPU_CONTEXT();
+
   auto &policy = nntrainer::ResidencyPolicy::global();
   const std::string saved = policy.raise_patterns;
   policy.raise_patterns = "uploaded";
@@ -204,6 +247,8 @@ TEST(ClResidency, a_declared_input_boundary_is_raised_to_device_memory) {
  *        plane even when the heuristic would have placed it there.
  */
 TEST(ClResidency, a_declared_exclusion_is_kept_on_the_shared_plane) {
+  SKIP_WITHOUT_GPU_CONTEXT();
+
   auto &policy = nntrainer::ResidencyPolicy::global();
   const std::string saved = policy.exclude_patterns;
   policy.exclude_patterns = "cache_";
@@ -229,6 +274,8 @@ TEST(ClResidency, a_declared_exclusion_is_kept_on_the_shared_plane) {
  *        tensor keeps the plane both sides can address.
  */
 TEST(ClResidency, an_fp32_tensor_stays_on_the_shared_plane) {
+  SKIP_WITHOUT_GPU_CONTEXT();
+
   nntrainer::TensorPool pool(false, "", "residency_fp32",
                              ml::train::ExecutionMode::INFERENCE,
                              clAllocator());
@@ -266,6 +313,8 @@ TEST(ClResidency, a_host_pool_places_nothing_in_device_memory) {
  *        of the same handle rather than two handles over one region.
  */
 TEST(ClResidency, tensors_sharing_a_planner_offset_share_one_buffer) {
+  SKIP_WITHOUT_GPU_CONTEXT();
+
   nntrainer::TensorPool pool(false, "", "residency_reuse",
                              ml::train::ExecutionMode::INFERENCE,
                              clAllocator());
@@ -309,9 +358,9 @@ TEST(ClResidency, tensors_sharing_a_planner_offset_share_one_buffer) {
  * passing quietly.
  */
 TEST(ClResidency, a_gpu_graph_places_an_activation_on_the_device_plane) {
-  auto *gpu_ctx = nntrainer::Engine::Global().getRegisteredContext("gpu");
-  ASSERT_NE(gpu_ctx, nullptr);
-  if (gpu_ctx->residencyEngine() != GPU)
+  SKIP_WITHOUT_GPU_CONTEXT();
+
+  if (gpuContext()->residencyEngine() != GPU)
     GTEST_SKIP() << "the \"gpu\" Context does not declare the GPU residency "
                     "plane: Context::residencyEngine() is not overridden for "
                     "it, so every layer resolves to CPU residency and no real "
@@ -380,6 +429,8 @@ TEST(ClResidency, a_gpu_graph_places_an_activation_on_the_device_plane) {
  *       in every case after it, which is a diagnosis this suite must not give.
  */
 TEST(ClResidency, a_gpu_graph_matches_the_host_graph) {
+  SKIP_WITHOUT_GPU_CONTEXT();
+
   const unsigned int in_w = 8, unit = 4;
   std::vector<float> input(in_w);
   for (unsigned int i = 0; i < in_w; ++i)
