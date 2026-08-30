@@ -897,6 +897,10 @@ static inline float v8c_h2f(uint16_t h) {
 bool dotCl_v8c_prebuild_weight(const Tensor &weight) {
   if (!v8c_env_enabled())
     return false;
+  // Reclaim any submit-and-go upload staging from the load phase (memory
+  // hygiene only — the in-order queue already sequences those writes ahead
+  // of this GEMM). Relaxed-atomic no-op after the first forward.
+  v8c_flush_pending_uploads();
   if (weight.getDataType() != ml::train::TensorDim::DataType::QS4CX)
     return false;
   const unsigned int N = weight.width();

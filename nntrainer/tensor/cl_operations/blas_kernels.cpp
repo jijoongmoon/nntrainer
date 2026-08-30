@@ -17,11 +17,13 @@
 #include "cl_tensor_view.h"
 #include "util_func.h"
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <fp16.h>
 #include <opencl_loader.h>
+#include <thread>
 
 namespace nntrainer {
 
@@ -2094,6 +2096,86 @@ static bool v8c_hostptr_on() {
   return on;
 }
 
+// Submit-and-go weight uploads. The
+// blocking per-chunk write made every load worker pay a submit->wait round
+// trip per chunk even though the in-order queue already sequences all later
+// GEMMs after the writes — correctness needs NO barrier, only the staging
+// buffer's lifetime. Non-blocking writes hand their staging to this
+// registry; entries are freed once their event completes. Bounded: pushing
+// past the cap first drains everything queued so far.
+namespace {
+
+/**
+ * @brief One in-flight non-blocking weight upload: its completion event
+ *        plus the staging buffer that must outlive the transfer.
+ */
+struct V8cPendingUpload {
+  cl_event event = nullptr;
+  std::vector<uint8_t> staging;
+};
+
+std::mutex &v8c_pending_mtx() {
+  static std::mutex m;
+  return m;
+}
+std::vector<V8cPendingUpload> &v8c_pending_list() {
+  static std::vector<V8cPendingUpload> l;
+  return l;
+}
+std::atomic<size_t> v8c_pending_bytes{0};
+constexpr size_t V8C_PENDING_CAP_BYTES = 256u << 20;
+
+bool v8c_upload_async_on() {
+  static const bool on = []() {
+    const char *e = std::getenv("NNTR_V8C_UPLOAD_ASYNC");
+    return !(e && e[0] == '0'); // default ON; =0 restores blocking writes
+  }();
+  return on;
+}
+
+void v8c_wait_and_free(std::vector<V8cPendingUpload> &batch) {
+  for (auto &p : batch) {
+    if (p.event) {
+      opencl::clWaitForEvents(1, &p.event);
+      opencl::clReleaseEvent(p.event);
+    }
+  }
+  batch.clear();
+}
+
+void v8c_push_pending(cl_event ev, std::vector<uint8_t> &&staging) {
+  std::vector<V8cPendingUpload> overflow;
+  {
+    std::lock_guard<std::mutex> lock(v8c_pending_mtx());
+    auto &list = v8c_pending_list();
+    const size_t bytes = v8c_pending_bytes.load(std::memory_order_relaxed);
+    if (bytes + staging.size() > V8C_PENDING_CAP_BYTES) {
+      overflow.swap(list);
+      v8c_pending_bytes.store(0, std::memory_order_relaxed);
+    }
+    v8c_pending_bytes.fetch_add(staging.size(), std::memory_order_relaxed);
+    V8cPendingUpload p;
+    p.event = ev;
+    p.staging = std::move(staging);
+    list.push_back(std::move(p));
+  }
+  v8c_wait_and_free(overflow); // waits happen outside the lock
+}
+
+} // namespace
+
+void v8c_flush_pending_uploads() {
+  if (v8c_pending_bytes.load(std::memory_order_relaxed) == 0)
+    return;
+  std::vector<V8cPendingUpload> batch;
+  {
+    std::lock_guard<std::mutex> lock(v8c_pending_mtx());
+    batch.swap(v8c_pending_list());
+    v8c_pending_bytes.store(0, std::memory_order_relaxed);
+  }
+  v8c_wait_and_free(batch);
+}
+
 std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
   const uint8_t *plain_nibbles, const float *fp32_scales, unsigned int N,
   unsigned int K, cl_mem *out_scale_buf, cl_mem *out_row_sum_w_int4_buf) {
@@ -2212,31 +2294,102 @@ std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
     }
   };
 
-  // Pack into a bounded staging vector and upload with blocking writes; the
-  // in-order queue sequences later GEMMs after the writes. (The hostptr path
-  // packs straight into the mapped buffer.)
-  std::vector<uint8_t> packed;
-  if (!hostptr)
-    packed.assign(chunk_rows * v8c_row_bytes, 0);
-  for (size_t n0 = 0; n0 < N; n0 += chunk_rows) {
-    const size_t nrows = std::min(chunk_rows, (size_t)N - n0);
-    uint8_t *dst;
-    if (hostptr) {
-      dst = map_ptr + n0 * v8c_row_bytes;
-    } else {
-      dst = packed.data();
-      std::memset(dst, 0, nrows * v8c_row_bytes); // padding stays 0
+  // For the big weights (in practice the untied lm_head,
+  // N=262144 -> 336MB) the single-threaded permute is the longest pole of
+  // model init even once the per-weight builds run concurrently (the map
+  // lock split in blas_kernel_interface.cpp). Pack+upload independent
+  // chunks from a small crew: staging stays bounded at workers x
+  // CHUNK_BYTES (4 x 16MB), blocking writes to disjoint offsets are
+  // thread-safe on the shared queue, and row_sum rows are disjoint. Small
+  // weights keep the serial path (thread spin-up would dominate).
+  constexpr size_t PAR_THRESHOLD_BYTES = 64u << 20;
+  const size_t n_chunks = ((size_t)N + chunk_rows - 1) / chunk_rows;
+  if (!hostptr && total_bytes >= PAR_THRESHOLD_BYTES && n_chunks > 1) {
+    unsigned int hw = std::thread::hardware_concurrency();
+    if (hw == 0)
+      hw = 4;
+    const size_t n_workers =
+      std::min(std::min((size_t)hw, n_chunks), (size_t)4);
+    std::atomic<size_t> next_chunk{0};
+    std::atomic<cl_int> chunk_err{CL_SUCCESS};
+    std::vector<std::thread> crew;
+    crew.reserve(n_workers);
+    for (size_t t = 0; t < n_workers; ++t) {
+      crew.emplace_back([&]() {
+        std::vector<uint8_t> staging(chunk_rows * v8c_row_bytes);
+        for (;;) {
+          const size_t ci = next_chunk.fetch_add(1);
+          if (ci >= n_chunks || chunk_err.load() != CL_SUCCESS)
+            break;
+          const size_t n0 = ci * chunk_rows;
+          const size_t nrows = std::min(chunk_rows, (size_t)N - n0);
+          std::memset(staging.data(), 0, nrows * v8c_row_bytes);
+          pack_rows(n0, nrows, staging.data());
+          const cl_int werr = opencl::clEnqueueWriteBuffer(
+            cq, w_buf, CL_TRUE, n0 * v8c_row_bytes, nrows * v8c_row_bytes,
+            staging.data(), 0, nullptr, nullptr);
+          if (werr != CL_SUCCESS)
+            chunk_err.store(werr);
+        }
+      });
     }
-    pack_rows(n0, nrows, dst);
-    if (!hostptr) {
-      const cl_int werr = opencl::clEnqueueWriteBuffer(
-        cq, w_buf, CL_TRUE, n0 * v8c_row_bytes, nrows * v8c_row_bytes,
-        packed.data(), 0, nullptr, nullptr);
-      if (werr != CL_SUCCESS) {
-        opencl::clReleaseMemObject(w_buf);
-        throw std::runtime_error(
-          "make_v8c_weight_backing_from_qs4cx: chunk write failed: " +
-          std::to_string(werr));
+    for (auto &th : crew)
+      th.join();
+    if (chunk_err.load() != CL_SUCCESS) {
+      opencl::clReleaseMemObject(w_buf);
+      throw std::runtime_error(
+        "make_v8c_weight_backing_from_qs4cx: chunk write failed: " +
+        std::to_string(chunk_err.load()));
+    }
+  } else {
+    // Default: pack into a per-chunk staging vector,
+    // enqueue a NON-blocking write and hand the staging to the pending
+    // registry (freed on event completion). This removes the per-chunk
+    // submit->wait round trip from every load worker; the in-order queue
+    // sequences later GEMMs after the writes. NNTR_V8C_UPLOAD_ASYNC=0
+    // restores the blocking path (A/B lever).
+    const bool upload_async = !hostptr && v8c_upload_async_on();
+    std::vector<uint8_t> packed;
+    if (!hostptr && !upload_async)
+      packed.assign(chunk_rows * v8c_row_bytes, 0);
+    for (size_t n0 = 0; n0 < N; n0 += chunk_rows) {
+      const size_t nrows = std::min(chunk_rows, (size_t)N - n0);
+      std::vector<uint8_t> chunk_staging;
+      uint8_t *dst;
+      if (hostptr) {
+        dst = map_ptr + n0 * v8c_row_bytes;
+      } else if (upload_async) {
+        chunk_staging.assign(nrows * v8c_row_bytes, 0); // padding stays 0
+        dst = chunk_staging.data();
+      } else {
+        dst = packed.data();
+        std::memset(dst, 0, nrows * v8c_row_bytes); // padding stays 0
+      }
+      pack_rows(n0, nrows, dst);
+      if (!hostptr) {
+        if (upload_async) {
+          cl_event ev = nullptr;
+          const cl_int werr = opencl::clEnqueueWriteBuffer(
+            cq, w_buf, CL_FALSE, n0 * v8c_row_bytes, nrows * v8c_row_bytes,
+            chunk_staging.data(), 0, nullptr, &ev);
+          if (werr != CL_SUCCESS) {
+            opencl::clReleaseMemObject(w_buf);
+            throw std::runtime_error(
+              "make_v8c_weight_backing_from_qs4cx: chunk write failed: " +
+              std::to_string(werr));
+          }
+          v8c_push_pending(ev, std::move(chunk_staging));
+        } else {
+          const cl_int werr = opencl::clEnqueueWriteBuffer(
+            cq, w_buf, CL_TRUE, n0 * v8c_row_bytes, nrows * v8c_row_bytes,
+            packed.data(), 0, nullptr, nullptr);
+          if (werr != CL_SUCCESS) {
+            opencl::clReleaseMemObject(w_buf);
+            throw std::runtime_error(
+              "make_v8c_weight_backing_from_qs4cx: chunk write failed: " +
+              std::to_string(werr));
+          }
+        }
       }
     }
   }
