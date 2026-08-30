@@ -152,11 +152,26 @@ public:
                                row_offset);
   }
 
-  // Element-wise activation. Only gelu and tanh_gelu have OpenCL kernels;
-  // every other mode throws rather than quietly running a host loop, because a
-  // tensor on this context may live in device memory the host has unmapped,
-  // where a host loop is not merely slower but wrong. Which mode a backend can
-  // serve is a backend question, so the mapping lives here and not in a Layer.
+  // Element-wise activation. Only gelu and tanh_gelu have OpenCL kernels; the
+  // remaining modes run on the host table.
+  //
+  // That is the same answer apply_activation() above gives, and it has to be:
+  // both are handed the same tensors on the same context, so they cannot hold
+  // different beliefs about whether a host loop is valid on them. This
+  // function used to throw instead, arguing that a tensor here may live in
+  // device memory the host has unmapped -- but no tensor is device-resident on
+  // this tree yet, and while that stays true the throw only produces a worse
+  // outcome than the loop. ClContext registers the core ActivationLayer gated
+  // on the gelu kernels building, not on the mode, so engine=gpu with
+  // activation=relu constructed successfully and then failed at the first
+  // forward, mid-inference, while the fused epilogue computed the identical
+  // value for the identical tensor.
+  //
+  // supports_activation() below still reports only the accelerated pair: it
+  // answers "is this mode accelerated here", which is what a caller choosing
+  // between paths wants to know. This function answers "can this mode be
+  // served", and now it always can. When residency becomes real, this host
+  // branch and apply_activation() change together.
   void activation(const Tensor &in, Tensor &out, int act_type,
                   unsigned int active_rows, unsigned int row_offset) override {
     switch (static_cast<ActivationType>(act_type)) {
@@ -167,9 +182,8 @@ public:
       nntrainer::gelu_cl_op(in, out, /*mode=*/1, active_rows, row_offset);
       return;
     default:
-      throw std::invalid_argument(
-        "ClComputeOps::activation: only gelu and tanh_gelu are accelerated on "
-        "this backend; use the cpu engine for the other activations");
+      get_cpu_ops()->activation(in, out, act_type, active_rows, row_offset);
+      return;
     }
   }
 
@@ -207,6 +221,61 @@ public:
       nntrainer::add_i_cl(hidden, input);
     }
   }
+
+  // Tensor::add() and Tensor::multiply() reach the table the same way
+  // Tensor::copy() does -- straight through, with no supports_*() guard for a
+  // caller to consult -- so leaving these off the table is not a missing
+  // acceleration but a throw: an addition between two tensors on this context
+  // raised "ComputeOps::ele_add_fp32 not implemented by this backend" from the
+  // base default. Serve them on the host table, for the same reason
+  // residual_op's FP32 path does: the addition kernel reads its result back
+  // into the caller's pointer, which is exactly the read into shared memory
+  // that does not land, and both operands are host-addressable here anyway.
+  // Putting these on a kernel is blocked behind that read-back fix, not behind
+  // a missing kernel.
+  void ele_add_fp32(const unsigned int N, const float *X, const float *Y,
+                    float *Z, float alpha, float beta, unsigned int i_stride,
+                    unsigned int o_stride) override {
+    get_cpu_ops()->ele_add_fp32(N, X, Y, Z, alpha, beta, i_stride, o_stride);
+  }
+  void ele_mul_fp32(const unsigned int N, const float *X, const float *Y,
+                    float *Z, float alpha, float beta, unsigned int i_stride,
+                    unsigned int o_stride) override {
+    get_cpu_ops()->ele_mul_fp32(N, X, Y, Z, alpha, beta, i_stride, o_stride);
+  }
+  void ele_sub_fp32(const unsigned int N, const float *X, const float *Y,
+                    float *Z, float alpha, float beta, unsigned int i_stride,
+                    unsigned int o_stride) override {
+    get_cpu_ops()->ele_sub_fp32(N, X, Y, Z, alpha, beta, i_stride, o_stride);
+  }
+  void ele_div_fp32(const unsigned int N, const float *X, const float *Y,
+                    float *Z, float alpha, float beta, unsigned int i_stride,
+                    unsigned int o_stride) override {
+    get_cpu_ops()->ele_div_fp32(N, X, Y, Z, alpha, beta, i_stride, o_stride);
+  }
+
+#ifdef ENABLE_FP16
+  void ele_add_fp16(const unsigned int N, const _FP16 *X, const _FP16 *Y,
+                    _FP16 *Z, float alpha, float beta, unsigned int i_stride,
+                    unsigned int o_stride) override {
+    get_cpu_ops()->ele_add_fp16(N, X, Y, Z, alpha, beta, i_stride, o_stride);
+  }
+  void ele_mul_fp16(const unsigned int N, const _FP16 *X, const _FP16 *Y,
+                    _FP16 *Z, float alpha, float beta, unsigned int i_stride,
+                    unsigned int o_stride) override {
+    get_cpu_ops()->ele_mul_fp16(N, X, Y, Z, alpha, beta, i_stride, o_stride);
+  }
+  void ele_sub_fp16(const unsigned int N, const _FP16 *X, const _FP16 *Y,
+                    _FP16 *Z, float alpha, float beta, unsigned int i_stride,
+                    unsigned int o_stride) override {
+    get_cpu_ops()->ele_sub_fp16(N, X, Y, Z, alpha, beta, i_stride, o_stride);
+  }
+  void ele_div_fp16(const unsigned int N, const _FP16 *X, const _FP16 *Y,
+                    _FP16 *Z, float alpha, float beta, unsigned int i_stride,
+                    unsigned int o_stride) override {
+    get_cpu_ops()->ele_div_fp16(N, X, Y, Z, alpha, beta, i_stride, o_stride);
+  }
+#endif
 
   // Tensor::copy() reaches the table with no supports_*() guard, so without
   // these a copy of a tensor on this context would throw "not implemented" --

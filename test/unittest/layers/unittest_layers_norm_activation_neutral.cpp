@@ -152,12 +152,17 @@ TEST(NeutralNormActivation, GpuOpsImplementLayerNormAndGelu) {
 
 /**
  * @brief R3 / checklist item 16: OpenCL has kernels for gelu and tanh_gelu
- *        only, and THROWS for the rest — no silent host fallback onto a
- *        possibly cl_mem/SVM-resident tensor. supports_activation() is the
- *        non-throwing query. This is the former ActivationLayerCl::getGeluMode
- *        contract, now enforced in the op table instead of in a forked Layer.
+ *        only, and supports_activation() reports exactly that pair -- it is
+ *        the query a caller uses to learn whether a mode is ACCELERATED here.
+ *        Whether a mode can be SERVED is a different question, and every mode
+ *        can: an unaccelerated one runs on the host table, which is the same
+ *        table apply_activation() uses for the fused epilogue on these very
+ *        tensors. Throwing instead would leave engine=gpu with a non-gelu
+ *        activation constructing successfully and then failing at the first
+ *        forward, because the registration is gated on the kernels building
+ *        rather than on the mode.
  */
-TEST(NeutralNormActivation, GpuActivationThrowsForUnacceleratedModes) {
+TEST(NeutralNormActivation, GpuActivationServesEveryModeAndReportsTheFastPair) {
   auto *ops = opsOf("gpu");
   ASSERT_NE(ops, nullptr);
 
@@ -173,10 +178,47 @@ TEST(NeutralNormActivation, GpuActivationThrowsForUnacceleratedModes) {
   nntrainer::TensorDim::TensorType t_fp32 = {nntrainer::Tformat::NCHW,
                                              nntrainer::Tdatatype::FP32};
   nntrainer::Tensor in(1, 1, 1, 8, t_fp32), out(1, 1, 1, 8, t_fp32);
-  in.setValue(0.5f);
-  EXPECT_THROW(
-    ops->activation(in, out, (int)nntrainer::ActivationType::ACT_RELU, 1, 0),
-    std::invalid_argument);
+
+  /** an unaccelerated mode computes rather than throwing, and computes right */
+  in.setValue(-0.5f);
+  EXPECT_NO_THROW(
+    ops->activation(in, out, (int)nntrainer::ActivationType::ACT_RELU, 1, 0));
+  for (unsigned int i = 0; i < 8; ++i)
+    EXPECT_FLOAT_EQ(out.getValue<float>(0, 0, 0, i), 0.0f);
+
+  in.setValue(2.0f);
+  EXPECT_NO_THROW(
+    ops->activation(in, out, (int)nntrainer::ActivationType::ACT_RELU, 1, 0));
+  for (unsigned int i = 0; i < 8; ++i)
+    EXPECT_FLOAT_EQ(out.getValue<float>(0, 0, 0, i), 2.0f);
+}
+
+/**
+ * @brief The element-wise ops Tensor::add() and friends reach the table with
+ *        no supports_*() guard, so a table that omits them does not fall back
+ *        -- it throws out of the base default, mid-forward, for an ordinary
+ *        addition between two tensors on this context. Assert that arithmetic
+ *        on a gpu-engine tensor computes.
+ */
+TEST(NeutralNormActivation, GpuTableServesElementwiseArithmetic) {
+  auto *ops = opsOf("gpu");
+  ASSERT_NE(ops, nullptr);
+
+  nntrainer::TensorDim::TensorType t_fp32 = {nntrainer::Tformat::NCHW,
+                                             nntrainer::Tdatatype::FP32};
+  nntrainer::Tensor a(1, 1, 1, 8, t_fp32), b(1, 1, 1, 8, t_fp32);
+  a.setValue(1.5f);
+  b.setValue(2.5f);
+
+  nntrainer::Tensor sum;
+  EXPECT_NO_THROW(sum = a.add(b));
+  for (unsigned int i = 0; i < 8; ++i)
+    EXPECT_FLOAT_EQ(sum.getValue<float>(0, 0, 0, i), 4.0f);
+
+  nntrainer::Tensor prod;
+  EXPECT_NO_THROW(prod = a.multiply(b));
+  for (unsigned int i = 0; i < 8; ++i)
+    EXPECT_FLOAT_EQ(prod.getValue<float>(0, 0, 0, i), 3.75f);
 }
 
 #ifdef ENABLE_FP16
