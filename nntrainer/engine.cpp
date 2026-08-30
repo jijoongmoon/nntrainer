@@ -52,8 +52,11 @@ Engine &Engine::Global() {
   return instance;
 }
 
-#if (defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1) ||                          \
-  (defined(ENABLE_CUDA) && ENABLE_CUDA == 1)
+// Guarded on exactly the backends that call bringUpWanted() below, which today
+// is OpenCL alone. Widening this to ENABLE_CUDA before a CUDA call site exists
+// leaves two unused statics and a -Wunused-function in a CUDA-on/OpenCL-off
+// build; the guard widens in the change that adds the second caller.
+#if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
 namespace {
 
 /**
@@ -205,6 +208,17 @@ Engine::parseComputeEngine(const std::vector<std::string> &props) const {
                      [](unsigned char c) { return std::tolower(c); });
       if (engines.find(name) != engines.end())
         return name;
+
+      // An open registry cannot treat an unknown name as an error, but it must
+      // not swallow it either. A typo ("gpuu"), a backend compiled out, and a
+      // backend the bring-up gate declined all arrive here and all resolve to
+      // the CPU; without this line the only trace is a once-per-process
+      // bring-up warning that names no layer. Report the requested and the
+      // resolved engine together so the fallback is readable from the log.
+      ml_logw("engine=%s is not a backend registered in this process; "
+              "resolving this layer to engine=cpu instead",
+              value.c_str());
+      return "cpu";
     }
   }
 
