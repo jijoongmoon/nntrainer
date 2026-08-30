@@ -460,9 +460,9 @@ bool Tensor::operator==(const Tensor &rhs) const {
       return itensorCompare<CharTensor>(itensor_.get(), rhs.itensor_.get());
     } else if (getDataType() == Tdatatype::QINT4) {
       throw std::invalid_argument(
-      "QINT4 is an on-disk format only: int4 weights materialise as QS4CX. "
-      "Load them through a QS4CX tensor, or mark the record legacy with "
-      "Tensor::setOnDiskLegacyQint4().");
+        "QINT4 is an on-disk format only: int4 weights materialise as QS4CX. "
+        "Load them through a QS4CX tensor, or mark the record legacy with "
+        "Tensor::setOnDiskLegacyQint4().");
     } else if (getDataType() == Tdatatype::BCQ) {
 #ifdef ENABLE_BIQGEMM
       return itensorCompare<BCQTensor>(itensor_.get(), rhs.itensor_.get());
