@@ -30,6 +30,7 @@ cl_op_kernels = [
   'sscal.cl',
   'swiglu.cl',
   'gelu.cl',
+  'embedding_pool.cl',
   'geglu.cl',
   'transpose_16bit.cl',
   'transpose_32bit_16bit.cl',
