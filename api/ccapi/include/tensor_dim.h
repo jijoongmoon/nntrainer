@@ -75,15 +75,6 @@ public:
   };
 
   /**
-   * @brief True if @p d is a per-channel int4 weight format - the canonical
-   *        QS4CX or the deprecated QINT4 (both KleidiAI qsi4cxp). Centralizes
-   *        int4 dispatch so call sites stop enumerating (QINT4 || QS4CX).
-   */
-  static bool isInt4Weight(DataType d) {
-    return d == DataType::QINT4 || d == DataType::QS4CX;
-  }
-
-  /**
    * @brief Tensor Data Storage Order. Row-major or Column-major
    *
    */
