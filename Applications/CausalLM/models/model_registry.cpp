@@ -23,7 +23,12 @@
  */
 #include "model_registry.h"
 
+#include <cstdlib>
 #include <mutex>
+
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 
 #include <factory.h>
 
@@ -57,9 +62,39 @@
 
 namespace causallm {
 
+namespace {
+
+/**
+ * @brief Cap the number of glibc malloc arenas to one.
+ *
+ * The weight loader fans out over hardware_concurrency() worker threads, and
+ * glibc hands each of them its own per-thread arena. Those arenas are never
+ * returned to the OS for the life of the process, so they sit on the peak: the
+ * 8-worker loader costs ~120MB of host VmHWM purely in arena fragmentation
+ * (measured 1206 -> 1084 MiB on a 29.2K-token summarization; the generated
+ * tokens are byte-identical and prefill/decode TPS are unchanged, 6985 / 103.9
+ * either way). One arena serializes malloc across the loader threads,
+ * but the loaders are I/O- and memcpy-bound, not allocator-bound.
+ *
+ * Must run before the loader threads spawn -- glibc only honours a lowered
+ * M_ARENA_MAX for arenas not yet created. If the user set MALLOC_ARENA_MAX in
+ * the environment, glibc has already applied it at startup and their choice
+ * wins; do nothing in that case.
+ */
+void capMallocArenas() {
+#if defined(__GLIBC__)
+  if (std::getenv("MALLOC_ARENA_MAX") != nullptr)
+    return;
+  mallopt(M_ARENA_MAX, 1);
+#endif
+}
+
+} // namespace
+
 void registerAllModels() {
   static std::once_flag once;
   std::call_once(once, []() {
+    capMallocArenas();
     causallm::Factory::Instance().registerModel(
       "LlamaForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
         return std::make_unique<causallm::CausalLM>(cfg, generation_cfg,
