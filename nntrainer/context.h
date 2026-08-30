@@ -52,14 +52,17 @@ class Tensor;
 
 /**
  * @struct DeviceCaps
- * @brief Read-only snapshot of device capabilities, probed ONCE per backend at
- *        Context init from real device queries (clGetDeviceInfo /
- *        cudaGetDeviceProperties via the per-backend ContextManagers) rather
- *        than from NNTR_* env flags. Currently LOG-ONLY — no decision site
- *        reads it yet; it is the input the ExecPlan resolver consumes (see
- *        docs/backend_guide/ARCHITECTURE_REFACTOR.md §6). Fields describe
+ * @brief Read-only snapshot of device capabilities, probed ONCE per backend
+ *        from real device queries (clGetDeviceInfo / cudaGetDeviceProperties
+ *        via the per-backend ContextManagers) rather than from NNTR_* env
+ *        flags. The probe is per-Context and runs on the first caps() call —
+ *        ClContext::caps() is the one implemented today; the base Context
+ *        answers with the CPU defaults below and probes nothing, which is the
+ *        correct answer for a host backend. Currently LOG-ONLY — no decision
+ *        site reads it yet; it is the input the ExecPlan resolver consumes
+ *        (see docs/backend_guide/ARCHITECTURE_REFACTOR.md §6). Fields describe
  *        attributes (what the device can do), never identity (who it is);
- *        unknown values stay at the defaults below.
+ *        a field the probe cannot answer stays at the default below.
  */
 struct DeviceCaps {
   std::string backend = "cpu";  /**< "cpu" / "gpu" (OpenCL) / "cuda" */
@@ -90,9 +93,12 @@ struct DeviceCaps {
                           non-DPAS Intel iGPUs into the DPAS kernel
                           (IGC emulates it — catastrophic slowdown). This
                           is the real XMX-capability gate. Declared LAST
-                          so appending it leaves the other field offsets
-                          unmoved (ABI-safe for an app built against the
-                          old DeviceCaps). */
+                          because that is where a later field belongs:
+                          appending leaves every earlier field's offset
+                          unmoved. DeviceCaps ships for the first time in
+                          this change, so there is no older layout to be
+                          compatible with yet — the rule is for the next
+                          field, not this one. */
 
   /**
    * @brief One-line human-readable dump for the init-time log.
@@ -379,11 +385,12 @@ public:
 
   /**
    * @brief Read-only device capability snapshot for this backend, probed once
-   *        at init. The base returns CPU caps (host-coherent, no accelerator);
-   *        ClContext / CudaContext override with a probed snapshot. LOG-ONLY
-   *        for now (see docs/backend_guide/ARCHITECTURE_REFACTOR.md §6) — no
-   *        decision site reads it yet, so adding or overriding it is
-   *        byte-identical.
+   *        on the first call. The base returns CPU caps (host-coherent, no
+   *        accelerator) and probes nothing, which is the whole truth for a host
+   *        backend; ClContext overrides it with a real clGetDeviceInfo probe.
+   *        LOG-ONLY for now (see
+   *        docs/backend_guide/ARCHITECTURE_REFACTOR.md §6) — no decision site
+   *        reads it yet, so overriding it is byte-identical.
    *
    * @return const DeviceCaps& capabilities of the device backing this context
    */
@@ -422,10 +429,10 @@ public:
    *        map a registered engine NAME onto the tensor/residency-plane enum
    *        (toLayerComputeEngine, layer_node.cpp) — retiring the central
    *        name→enum string table (ComputeEngineTypeInfo::EnumStr) in favour of
-   *        a per-context declaration. The base is CPU (host residency);
-   *        ClContext→GPU, CudaContext→CUDA, QNNContext→QNN override it. A new
-   *        aliased/added backend just declares its plane here, with no central
-   *        table to edit (add-only). See
+   *        a per-context declaration. The base is CPU (host residency), which
+   *        is the right answer for AppContext; ClContext overrides it with GPU.
+   *        A backend that arrives later (CUDA, QNN) declares its own plane the
+   *        same way, with no central table to edit (add-only). See
    *        docs/backend_guide/ARCHITECTURE_REFACTOR.md §5 step 1.
    * @note  NEW vtable tail: appended after every pre-existing slot so a rebuilt
    *        libnntrainer.so stays ABI-compatible with an app/ccapi built against
