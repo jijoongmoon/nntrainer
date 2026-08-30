@@ -38,8 +38,14 @@ namespace {
 // [header @0, 64B][blob regions ...][index @header.index_off]
 // The header's index_off stays 0 until the finalize rename, so a temp file
 // that never finalized (crash, IO error) can never validate.
-constexpr char kMagic[8] = {'N', 'T', 'V', '8', 'P', 'C', '0', '1'};
+// '02': the index record gained the source fingerprint, so a v01 pack (whose
+// records cannot carry one) must be rejected rather than reinterpreted.
+constexpr char kMagic[8] = {'N', 'T', 'V', '8', 'P', 'C', '0', '2'};
 constexpr size_t kBlobStart = 4096; // header page reserved
+// Upper bound on the index a pack may declare, so a corrupted count cannot
+// drive a multi-gigabyte resize before the bounds check has a chance to run.
+// One record per weight tensor; the largest models in scope are far below it.
+constexpr uint32_t kMaxIndexRecords = 1u << 20;
 
 struct FileHeader {
   char magic[8];
@@ -63,8 +69,9 @@ struct IndexRecord {
   uint64_t rowsum_len;
   uint64_t payload_sample_fnv;
   uint64_t rowsum_fnv;
+  uint64_t src_sample_fnv;
 };
-static_assert(sizeof(IndexRecord) == 72, "pack index record must stay 72B");
+static_assert(sizeof(IndexRecord) == 80, "pack index record must stay 80B");
 
 uint64_t fnv1a64(const void *data, size_t len,
                  uint64_t h = 1469598103934665603ull) {
@@ -219,17 +226,27 @@ bool try_open_pack(Manager &m, const std::string &path) {
   const uint8_t *base = static_cast<const uint8_t *>(p);
   FileHeader h{};
   std::memcpy(&h, base, sizeof(h));
+  // Every offset and length below is read verbatim out of a file that lives
+  // outside the trust boundary (next to the model, or under a cache directory
+  // an environment variable names). Bounds are therefore checked in the
+  // SUBTRACTION form: `off + len > file_len` wraps for a crafted or corrupted
+  // pair whose sum exceeds 2^64 and would then pass, leaving the reads below
+  // to run off the end of the mapping.
+  const uint64_t flen = (uint64_t)len;
+  const uint64_t index_bytes = (uint64_t)h.index_count * sizeof(IndexRecord);
   bool ok = std::memcmp(h.magic, kMagic, sizeof(kMagic)) == 0 &&
             h.src_size == m.src_size && h.src_mtime_ns == m.src_mtime_ns &&
             h.index_off >= kBlobStart && h.index_count > 0 &&
-            h.index_off + (uint64_t)h.index_count * sizeof(IndexRecord) <= len;
+            h.index_count <= kMaxIndexRecords && index_bytes <= flen &&
+            h.index_off <= flen - index_bytes;
   if (ok) {
     m.index.resize(h.index_count);
     std::memcpy(m.index.data(), base + h.index_off,
                 h.index_count * sizeof(IndexRecord));
     for (const auto &r : m.index) {
-      if (r.payload_off < kBlobStart || r.payload_off + r.payload_len > len ||
-          r.rowsum_off < kBlobStart || r.rowsum_off + r.rowsum_len > len) {
+      if (r.payload_off < kBlobStart || r.payload_len > flen ||
+          r.payload_off > flen - r.payload_len || r.rowsum_off < kBlobStart ||
+          r.rowsum_len > flen || r.rowsum_off > flen - r.rowsum_len) {
         ok = false;
         break;
       }
@@ -298,8 +315,12 @@ void set_source(const char *model_bin_path) {
           m.pack_path.c_str());
 }
 
+uint64_t source_fingerprint(const void *data, size_t len) {
+  return sample_fnv(static_cast<const uint8_t *>(data), len);
+}
+
 bool lookup(const char *name, unsigned int N, unsigned int K, size_t row_bytes,
-            size_t payload_len, Hit &out) {
+            size_t payload_len, uint64_t src_fnv, Hit &out) {
   if (!cache_enabled() || !name || !*name)
     return false;
   Manager &m = mgr();
@@ -308,7 +329,7 @@ bool lookup(const char *name, unsigned int N, unsigned int K, size_t row_bytes,
   const uint64_t nh = fnv1a64(name, std::strlen(name));
   for (const auto &r : m.index) {
     if (r.name_fnv != nh || r.N != N || r.K != K || r.row_bytes != row_bytes ||
-        r.payload_len != payload_len)
+        r.payload_len != payload_len || r.src_sample_fnv != src_fnv)
       continue;
     if (r.rowsum_len != (uint64_t)N * sizeof(int32_t))
       return false;
@@ -340,7 +361,8 @@ void payload_consumed(const Hit &hit) {
 }
 
 RecordWriter *begin_record(const char *name, unsigned int N, unsigned int K,
-                           size_t row_bytes, size_t payload_len) {
+                           size_t row_bytes, size_t payload_len,
+                           uint64_t src_fnv) {
   if (!cache_enabled() || !name || !*name)
     return nullptr;
   if (payload_len < min_payload_bytes())
@@ -374,6 +396,7 @@ RecordWriter *begin_record(const char *name, unsigned int N, unsigned int K,
   }
   auto *rw = new RecordWriter();
   rw->rec.name_fnv = fnv1a64(name, std::strlen(name));
+  rw->rec.src_sample_fnv = src_fnv;
   rw->rec.N = N;
   rw->rec.K = K;
   rw->rec.row_bytes = row_bytes;
@@ -555,12 +578,14 @@ namespace v8c_pack {
 struct RecordWriter {};
 void set_source(const char *) {}
 void load_complete() {}
-bool lookup(const char *, unsigned int, unsigned int, size_t, size_t, Hit &) {
+bool lookup(const char *, unsigned int, unsigned int, size_t, size_t, uint64_t,
+            Hit &) {
   return false;
 }
+uint64_t source_fingerprint(const void *, size_t) { return 0; }
 void payload_consumed(const Hit &) {}
 RecordWriter *begin_record(const char *, unsigned int, unsigned int, size_t,
-                           size_t) {
+                           size_t, uint64_t) {
   return nullptr;
 }
 void record_write(RecordWriter *, size_t, const void *, size_t) {}
