@@ -34,6 +34,13 @@ ComputeOps *get_cpu_ops() {
 
 namespace {
 
+/**
+ * @todo These scalar helpers are the reference form of the activation, and the
+ * baseline every other backend table is checked against. A vectorized form
+ * (NEON/AVX, riding the link-time arch dispatch that nntrainer::sgemm already
+ * uses) is intended but not written yet.
+ */
+
 /** gelu, tanh approximation (gelu_pytorch_tanh) */
 inline float gelu_tanh_f(float x) {
   constexpr float k = 0.7978845608028654f; // sqrt(2/pi)
@@ -46,6 +53,10 @@ inline float silu_f(float x) { return x / (1.0f + std::exp(-x)); }
  * @brief Run a binary element-wise op over the row window, dispatching on the
  *        activation dtype once instead of per element. FP16 operands are
  *        computed in float and rounded back, so the two dtypes agree.
+ * @todo This is a scalar reference implementation, and also the cross-backend
+ * correctness baseline. NEON/AVX specializations can ride the existing
+ * link-time arch dispatch (the nntrainer::sgemm pattern), and row-level
+ * threading applies to prefill windows; neither is done yet.
  */
 template <typename Op>
 void elementwise2_rows(const Tensor &in1, const Tensor &in2, Tensor &out,
@@ -97,6 +108,12 @@ void elementwise2_rows(const Tensor &in1, const Tensor &in2, Tensor &out,
  * @param T activation dtype
  * @param G weight dtype of gamma/beta, which need not equal T -- the core
  *          LayerNormalizationLayer requests them at the weight dtype.
+ * @todo Scalar reference implementation (also the cross-backend correctness
+ * baseline). An arch-specialized version can follow the existing
+ * rms_norm_wrt_width_*_intrinsic pattern (x86/avx2_impl.h, arm/neon_impl.h) --
+ * LayerNorm adds mean subtraction and gamma/beta but the row-wise reduction
+ * structure is identical; row-level threading applies for prefill windows.
+ * Not yet implemented.
  */
 template <typename T, typename G>
 void layernorm_rows(const T *x, const G *g, const G *b, T *y, unsigned int rows,
@@ -126,6 +143,10 @@ void layernorm_rows(const T *x, const G *g, const G *b, T *y, unsigned int rows,
  * @brief GELU computed in float. The constants match __fallback_gelu_v2 /
  *        __fallback_tanh_gelu so the FP16 path agrees with the FP32 one.
  * @param tanh_mode false = erf-exact GELU, true = tanh approximation
+ * @todo This is a scalar reference implementation, and also the cross-backend
+ * correctness baseline. A NEON/AVX specialization can ride the existing
+ * link-time arch dispatch (the nntrainer::sgemm pattern) the way the FP32 path
+ * already reaches nntrainer::gelu_v2; it is not done yet.
  */
 template <typename T>
 void gelu_elems(const T *x, T *y, size_t n, bool tanh_mode) {
