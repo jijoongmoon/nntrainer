@@ -635,13 +635,26 @@ flash_attention_prefill_f16_blockq(
   const int last_row =
     (((m0 + FBQ_TM - 1) < M) ? (m0 + FBQ_TM - 1) : (M - 1)) + q_pos_off;
   const int n_last = is_causal ? min(N_kv - 1, last_row) : (N_kv - 1);
+  // [window-skip] With a sliding window, keys below EVERY row's window bound
+  // contribute to no row in this tile: row r's low bound is
+  // (m0+q_pos_off+r) - local_window + 1 and only GROWS with r, so the tile
+  // union's low bound is row 0's. Start the key walk there instead of 0 --
+  // the flash-decode kernel already clips this way (win_start), but the
+  // prefill walk did not, so every sliding layer ran O(M*N) instead of
+  // O(M*(W+TM)) (sliding layers with W=1024 waste ~8x key visits at 16K,
+  // worse at 32K). Bit-identical by construction: every
+  // skipped key was already masked (`continue`) for every row of this tile,
+  // contributing exactly nothing to acc/l/m.
+  const int n_lo = (is_causal && local_window > 0)
+                     ? max(0, m0 + q_pos_off - local_window + 1)
+                     : 0;
 
 #ifdef FBQ_SG
   // Subgroup-reduce path: one key at a time, full d-dot = sub_group_reduce_add
   // of each WI's fv_hsum partial (no LDS staging, no barriers). The reduce is
   // called uniformly across lanes (m0/n/M are WG-uniform, r is the loop var),
   // so the per-row causal `continue` does not break subgroup uniformity.
-  for (int n = 0; n <= n_last; ++n) {
+  for (int n = n_lo; n <= n_last; ++n) {
     const long k_base = k_head_base + (long)n * k_row_stride;
     const FVFLOAT k_reg = FV_CVT_F(FV_VLOAD(K, (k_base + lane0) / VPL));
     float sdot[FBQ_TM];
@@ -676,7 +689,7 @@ flash_attention_prefill_f16_blockq(
     }
   }
 #else
-  for (int n0 = 0; n0 <= n_last; n0 += FLASH_VEC_BLOCK_KV) {
+  for (int n0 = n_lo; n0 <= n_last; n0 += FLASH_VEC_BLOCK_KV) {
     const int nb = min(FLASH_VEC_BLOCK_KV, n_last - n0 + 1);
 
     // (1) Load K[n] ONCE per key; partial d-dot for ALL TM rows -> red_sh.
@@ -865,3 +878,299 @@ flash_decode_reduce(__global const float *part_acc, // [H_q][n_chunks][d]
   const long o_base = (long)head_q * d;
   FV_VSTORE(FV_CVT_H(acc_g * inv), (o_base + lane0) / VPL, O);
 }
+
+// ===========================================================================
+// XMX (DPAS) flash prefill (#r30-q4) — the full-attention long-N term.
+// One SUBGROUP (16 lanes, one per WG) owns 8 query rows of one head_q and
+// walks keys in 16-key tiles. QK^T and P*V run on the fp16 systolic array
+// (intel_sub_group_f16_f16_matrix_mad_k16: A 8x16 fp16, B 16x16 fp16 VNNI,
+// C 8x16 fp32), replacing the scalar per-(row,key) dot + subgroup-reduce
+// that dominates the blockq kernel's O(M*N) full-attention cost.
+//
+// Operand layouts (SG16, K=16):
+//   A short8: lane l element r = A[r][l]      (Q rows / P rows)
+//   B int8  : lane l element k2 = VNNI pair (B[2k2][l], B[2k2+1][l])
+//   C float8: lane l element r = C[r][l]      (l = key / d-column)
+// K's B-fragment needs pairs along d — ADJACENT in the K cache row, so K is
+// consumed with plain int8 loads, NO repack. V's B-fragment needs pairs
+// across KEYS (different rows), so the 16-key V tile is staged in SLM and
+// VNNI-packed on read. Softmax bookkeeping (m/l/alpha) stays fp32; P is
+// truncated to fp16 for the DPAS A operand (values in [0,1]).
+// Masking uses the -1e30f sentinel (not -INFINITY: -cl-finite-math-only is
+// in the default copts); rows clamped for tails are never stored.
+// Compiled ONLY when the host passes -DFLASH_XMX=1 (caps().dpas devices);
+// other devices never see this code.
+// ===========================================================================
+#if defined(FLASH_XMX)
+#pragma OPENCL EXTENSION cl_intel_subgroups : enable
+#pragma OPENCL EXTENSION cl_intel_subgroup_matrix_multiply_accumulate : enable
+
+#ifndef FXA_D
+#define FXA_D 128
+#endif
+#define FXA_KT 16
+#define FXA_KCH (FXA_D / 16)
+// Query rows per subgroup tile = the DPAS M dimension.
+#ifndef FXA_TM
+#define FXA_TM 8
+#endif
+// FXA_NSG (v2): subgroups per WG, each owning a d-slice of FXA_D/FXA_NSG.
+// For d=512 this halves the per-lane chunk count back to the d=256 register
+// envelope (no spill at TM=8) and doubles lane residency per WG. QK^T
+// partials are summed across subgroups via SLM once per key tile; the
+// softmax bookkeeping is then recomputed identically (deterministically)
+// in every subgroup, and P*V / O are d-slice-local. Barrier count per tile
+// is unchanged (2).
+#ifndef FXA_NSG
+#define FXA_NSG 1
+#endif
+// FXA_XB: key-tiles per psum-exchange batch (NSG>1 only). The exchange's
+// SLM round-trip + WG barrier serialize ~300ns per tile per WG; batching
+// XB tiles' QK partials into one exchange cuts that stall frequency by XB
+// at the cost of XB*NSG*TM*KT*4B extra SLM. V staging is subgroup-local
+// (each subgroup reads only the slice it wrote), so it moves inside the
+// per-tile phase under a cheap sub_group_barrier.
+#ifndef FXA_XB
+#define FXA_XB 1
+#endif
+#define FXA_DSUB (FXA_D / FXA_NSG)
+#define FXA_KCH_SUB (FXA_DSUB / 16)
+// Row tiles are built from DPAS M<=8 fragments: FXA_FR rows per fragment,
+// FXA_FRAG fragments per tile. TM=16 exists because the kernel is K/V
+// MEMORY-BANDWIDTH-bound (TM=4 A/B: 2.24x slower = traffic-proportional):
+// doubling the rows served per K/V pass halves the dominant traffic, and
+// the K/V fragment loads are SHARED by both DPAS fragments.
+#if FXA_TM == 16
+#define FXA_FR 8
+#define FXA_FRAG 2
+#elif FXA_TM == 8
+#define FXA_FR 8
+#define FXA_FRAG 1
+#elif FXA_TM == 4
+#define FXA_FR 4
+#define FXA_FRAG 1
+#else
+#error "FXA_TM must be 4, 8 or 16"
+#endif
+#if FXA_FR == 8
+#define FXA_AV short8
+#define FXA_CV float8
+#define FXA_AV_LOAD(p) vload8(0, p)
+#define FXA_CV_STORE(v, p) vstore8(v, 0, p)
+#else
+#define FXA_AV short4
+#define FXA_CV float4
+#define FXA_AV_LOAD(p) vload4(0, p)
+#define FXA_CV_STORE(v, p) vstore4(v, 0, p)
+#endif
+
+__attribute__((intel_reqd_sub_group_size(16)))
+__attribute__((reqd_work_group_size(16 * FXA_NSG, 1, 1))) __kernel void
+flash_attention_prefill_f16_xmx(
+  __global const half *Q, // [M, HD_Q]
+  __global const half *K, // OHWI (k_stride>0) or concat
+  __global const half *V, // [N_kv, HD_KV]
+  __global half *O,       // [M, HD_Q]
+  const int M, const int N_kv, const int d, const int HD_Q, const int HD_KV,
+  const int gqa, const int is_causal, const float scale, const int k_stride,
+  const float softcap, const int local_window) {
+  const int lane = get_sub_group_local_id();
+  const int sg = get_sub_group_id(); // 0..FXA_NSG-1 (d-slice owner)
+  const int dbase = sg * FXA_DSUB;
+  const int grp = get_group_id(0);
+  const int n_row_tiles = (M + FXA_TM - 1) / FXA_TM;
+  const int head_q = grp / n_row_tiles;
+  const int tile = grp % n_row_tiles;
+  const int m0 = tile * FXA_TM;
+  const int total_groups = (HD_Q / FXA_D) * n_row_tiles;
+  if (grp >= total_groups || m0 >= M)
+    return;
+
+  const int head_kv = head_q / gqa;
+  const long k_head_base = (k_stride > 0)
+                             ? ((long)head_kv * (long)k_stride * (long)FXA_D)
+                             : ((long)head_kv * (long)FXA_D);
+  const long k_row_stride = (k_stride > 0) ? (long)FXA_D : (long)HD_KV;
+  const long v_head_base = (long)head_kv * (long)FXA_D;
+
+  // Q A-fragments for THIS subgroup's d-slice, loaded once:
+  // qa[ch][r] = Q[m0+r][dbase + ch*16 + lane].
+  short qa[FXA_KCH_SUB][FXA_TM];
+#pragma unroll
+  for (int ch = 0; ch < FXA_KCH_SUB; ++ch)
+#pragma unroll
+    for (int r = 0; r < FXA_TM; ++r) {
+      const int m = (m0 + r < M) ? (m0 + r) : (M - 1); // clamp; never stored
+      qa[ch][r] = as_short(
+        Q[(long)m * HD_Q + (long)head_q * FXA_D + dbase + ch * 16 + lane]);
+    }
+
+  float m_i[FXA_TM], l_i[FXA_TM], alpha[FXA_TM], p[FXA_TM];
+  float acc[FXA_TM][FXA_KCH_SUB];
+#pragma unroll
+  for (int r = 0; r < FXA_TM; ++r) {
+    m_i[r] = -1e30f;
+    l_i[r] = 0.0f;
+#pragma unroll
+    for (int ch = 0; ch < FXA_KCH_SUB; ++ch)
+      acc[r][ch] = 0.0f;
+  }
+
+  const int q_pos_off = N_kv - M;
+  const int last_row =
+    (((m0 + FXA_TM - 1) < M) ? (m0 + FXA_TM - 1) : (M - 1)) + q_pos_off;
+  const int n_last = is_causal ? min(N_kv - 1, last_row) : (N_kv - 1);
+
+  __local half vtile[FXA_KT * FXA_D];
+#if FXA_NSG > 1
+  __local float psum[FXA_XB * FXA_NSG * FXA_TM * FXA_KT];
+#endif
+
+  const int n0_start =
+    (is_causal && local_window > 0)
+      ? ((max(0, m0 + q_pos_off - local_window + 1) / FXA_KT) * FXA_KT)
+      : 0;
+  for (int n0g = n0_start; n0g <= n_last; n0g += FXA_XB * FXA_KT) {
+    float scb[FXA_XB][FXA_TM];
+
+    // ---- phase 1: QK^T partials for every tile in the batch
+#pragma unroll
+    for (int b = 0; b < FXA_XB; ++b) {
+      const int n0 = n0g + b * FXA_KT;
+      if (n0 <= n_last) {
+        const int kt = min(FXA_KT, n_last - n0 + 1);
+        const int nk = n0 + ((lane < kt) ? lane : (kt - 1));
+        const __global half *krow = K + k_head_base + (long)nk * k_row_stride;
+        FXA_CV c8[FXA_FRAG];
+#pragma unroll
+        for (int f = 0; f < FXA_FRAG; ++f)
+          c8[f] = (FXA_CV)(0.0f);
+#pragma unroll
+        for (int ch = 0; ch < FXA_KCH_SUB; ++ch) {
+          const int8 bv =
+            vload8(0, (__global const int *)(krow + dbase + ch * 16));
+#pragma unroll
+          for (int f = 0; f < FXA_FRAG; ++f) {
+            const FXA_AV av = FXA_AV_LOAD(qa[ch] + f * FXA_FR);
+            c8[f] = intel_sub_group_f16_f16_matrix_mad_k16(av, bv, c8[f]);
+          }
+        }
+#pragma unroll
+        for (int f = 0; f < FXA_FRAG; ++f)
+          FXA_CV_STORE(c8[f], scb[b] + f * FXA_FR);
+      }
+    }
+
+    // ---- one exchange (write + WG barrier + read) per XB tiles
+#if FXA_NSG > 1
+    barrier(CLK_LOCAL_MEM_FENCE); // protect psum from prev-batch readers
+#pragma unroll
+    for (int b = 0; b < FXA_XB; ++b)
+      if (n0g + b * FXA_KT <= n_last)
+#pragma unroll
+        for (int r = 0; r < FXA_TM; ++r)
+          psum[((b * FXA_NSG + sg) * FXA_TM + r) * FXA_KT + lane] = scb[b][r];
+    barrier(CLK_LOCAL_MEM_FENCE); // psum visible
+#endif
+
+    // ---- phase 2: per tile -- full scores, softmax, V stage, P*V
+#pragma unroll
+    for (int b = 0; b < FXA_XB; ++b) {
+      const int n0 = n0g + b * FXA_KT;
+      if (n0 > n_last)
+        continue;
+      const int kt = min(FXA_KT, n_last - n0 + 1);
+      const int nk = n0 + ((lane < kt) ? lane : (kt - 1));
+      float sc[FXA_TM];
+#if FXA_NSG > 1
+#pragma unroll
+      for (int r = 0; r < FXA_TM; ++r) {
+        float s = 0.0f;
+#pragma unroll
+        for (int g = 0; g < FXA_NSG; ++g)
+          s += psum[((b * FXA_NSG + g) * FXA_TM + r) * FXA_KT + lane];
+        sc[r] = s;
+      }
+#else
+#pragma unroll
+      for (int r = 0; r < FXA_TM; ++r)
+        sc[r] = scb[b][r];
+#endif
+
+      // ---- stage the V-tile d-slice (SUBGROUP-LOCAL: this subgroup writes
+      // and reads only its own slice, so a sub_group barrier suffices)
+      sub_group_barrier(CLK_LOCAL_MEM_FENCE); // protect from prev-tile reads
+      {
+        const __global half *vrow = V + v_head_base + (long)nk * (long)HD_KV;
+#pragma unroll
+        for (int c8i = 0; c8i < FXA_DSUB / 8; ++c8i)
+          vstore8(vload8(c8i, vrow + dbase), c8i, vtile + lane * FXA_D + dbase);
+      }
+      sub_group_barrier(CLK_LOCAL_MEM_FENCE); // slice visible
+
+      // ---- flash softmax update; every subgroup's lane owns the same key
+      const int key = n0 + lane;
+#pragma unroll
+      for (int r = 0; r < FXA_TM; ++r) {
+        float s = scale * sc[r];
+        if (softcap > 0.0f)
+          s = softcap * tanh(s / softcap);
+        const int mabs = m0 + r + q_pos_off;
+        const int ok =
+          (lane < kt) && ((m0 + r) < M) &&
+          (!is_causal ||
+           (key <= mabs && (local_window <= 0 || key + local_window > mabs)));
+        s = ok ? s : -1e30f;
+        const float tmax = sub_group_reduce_max(s);
+        const float m_new = fmax(m_i[r], tmax);
+        alpha[r] = exp(m_i[r] - m_new);
+        p[r] = exp(s - m_new);
+        l_i[r] = alpha[r] * l_i[r] + sub_group_reduce_add(p[r]);
+        m_i[r] = m_new;
+      }
+
+      // ---- P*V via DPAS over this subgroup's d-slice
+      short parr[FXA_TM];
+#pragma unroll
+      for (int r = 0; r < FXA_TM; ++r)
+        parr[r] = as_short(convert_half(p[r]));
+#pragma unroll
+      for (int ch = 0; ch < FXA_KCH_SUB; ++ch) {
+        int vbarr[8];
+#pragma unroll
+        for (int k2 = 0; k2 < 8; ++k2) {
+          const ushort lo =
+            as_ushort(vtile[(2 * k2) * FXA_D + dbase + ch * 16 + lane]);
+          const ushort hi =
+            as_ushort(vtile[(2 * k2 + 1) * FXA_D + dbase + ch * 16 + lane]);
+          vbarr[k2] = (int)(((uint)hi << 16) | (uint)lo);
+        }
+        const int8 vb = vload8(0, vbarr);
+#pragma unroll
+        for (int f = 0; f < FXA_FRAG; ++f) {
+          const FXA_AV pa = FXA_AV_LOAD(parr + f * FXA_FR);
+          const FXA_CV pv8 =
+            intel_sub_group_f16_f16_matrix_mad_k16(pa, vb, (FXA_CV)(0.0f));
+          float pvarr[FXA_FR];
+          FXA_CV_STORE(pv8, pvarr);
+#pragma unroll
+          for (int rr = 0; rr < FXA_FR; ++rr)
+            acc[f * FXA_FR + rr][ch] =
+              alpha[f * FXA_FR + rr] * acc[f * FXA_FR + rr][ch] + pvarr[rr];
+        }
+      }
+    }
+  }
+
+#pragma unroll
+  for (int r = 0; r < FXA_TM; ++r) {
+    if (m0 + r >= M)
+      continue;
+    const float inv = (l_i[r] > 0.0f) ? (1.0f / l_i[r]) : 0.0f;
+    const long o_base = (long)(m0 + r) * HD_Q + (long)head_q * FXA_D;
+#pragma unroll
+    for (int ch = 0; ch < FXA_KCH_SUB; ++ch)
+      O[o_base + dbase + ch * 16 + lane] = convert_half(acc[r][ch] * inv);
+  }
+}
+#endif // FLASH_XMX
