@@ -281,6 +281,7 @@ void TensorPool::allocate(bool init) {
       ResidencyClass cls = planner.classify(
         details->engine, details->all_consumers_device,
         spec.tensor->getDataType() == ml::train::TensorDim::DataType::FP16,
+        spec.tensor->getInitializer() != Initializer::NONE,
         spec.tensor->getName());
       /** The allocator has the last word on the class, because a placement
        *  is only available if the memory behind it is. Demote rather than
