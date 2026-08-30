@@ -14,10 +14,10 @@ endif
 
 # Common Includes Definition
 #
-# The last entry is TEMPORARY and app-local: four layer TUs here (mha_core,
-# reshaped_rms_norm, rms_norm_gpu, per_layer_slice_gpu) still include the raw
-# OpenCL kernel wrappers <blas_kernels.h> / <attention_kernels.h> instead of
-# going through the ComputeOps table. Those two headers are private to
+# The last entry is TEMPORARY and app-local: the layer TUs here (mha_core,
+# reshaped_rms_norm) still include the raw OpenCL kernel wrappers
+# <blas_kernels.h> / <attention_kernels.h> instead of going through the
+# ComputeOps table. Those two headers are private to
 # libnntrainer and are deliberately not installed, so the ndk build reaches
 # them through the nntrainer source dir rather than through the prebuilt
 # include export. Delete that entry together with the last raw
@@ -34,6 +34,7 @@ CAUSALLM_COMMON_INCLUDES := \
     $(LOCAL_PATH)/../models/qwen3_moe \
     $(LOCAL_PATH)/../models/qwen3_slim_moe \
     $(LOCAL_PATH)/../models/qwen3_cached_slim_moe \
+    $(LOCAL_PATH)/../models/gemma2 \
     $(LOCAL_PATH)/../models/gemma3 \
     $(LOCAL_PATH)/../models/bert \
     $(LOCAL_PATH)/../models/timm_vit \
@@ -43,12 +44,18 @@ CAUSALLM_COMMON_INCLUDES := \
     $(LOCAL_PATH)/../models/lfm2 \
     $(LOCAL_PATH)/../third_party/minja/include \
     $(LOCAL_PATH)/../third_party \
+    $(NNTRAINER_ROOT)/nntrainer/utils \
     $(NNTRAINER_ROOT)/nntrainer/tensor/cl_operations \
 
 # Common compile flags. -std=c++17/-fexceptions/-frtti come from Application.mk
 # (APP_CPPFLAGS); -march and the FP16 ABI defines are inherited from the
 # prebuilt nntrainer modules below via LOCAL_EXPORT_CFLAGS.
-CAUSALLM_COMMON_CFLAGS := -O3 -ffast-math \
+#
+# -DENABLE_OPENCL=1 stays app-side: it selects the app's GPU-routed layer
+# implementations (the cl paths inside
+# mha_core). Dropping it silently compiles the whole GPU stack out and the
+# app falls back to CPU (Adreno gemma4 191 vs 2400 TPS).
+CAUSALLM_COMMON_CFLAGS := -O3 -ffast-math -DENABLE_OPENCL=1 \
     -Wno-nan-infinity-disabled -Wno-deprecated-literal-operator
 
 # Prebuilt nntrainer libraries. The generated Android.mk exports the include
@@ -59,6 +66,15 @@ $(error $(NNTRAINER_PREBUILT_MK) not found. Build nntrainer first (tools/package
 endif
 include $(NNTRAINER_PREBUILT_MK)
 LOCAL_PATH := $(CAUSALLM_JNI_PATH)
+
+# OpenCL driver: linked by the GPU-native binary that calls clSVMAlloc /
+# clEnqueueSVM* directly. libnntrainer.so resolves these dynamically via
+# its own loader; standalone binaries need the link explicitly.
+include $(CLEAR_VARS)
+LOCAL_MODULE := OpenCL
+LOCAL_SRC_FILES := $(NNTRAINER_ROOT)/builddir/opencl/lib/$(TARGET_ARCH_ABI)/libOpenCL.so
+LOCAL_EXPORT_C_INCLUDES := $(NNTRAINER_ROOT)/builddir/opencl/include
+include $(PREBUILT_SHARED_LIBRARY)
 
 # Tokenizer library
 include $(CLEAR_VARS)
@@ -78,6 +94,7 @@ LOCAL_SRC_FILES := \
     ../models/causal_lm.cpp \
     ../models/transformer.cpp \
     ../models/sentence_transformer.cpp \
+    ../models/model_registry.cpp \
     ../kv_cache_manager.cpp \
     ../models/qwen2/qwen2_causallm.cpp \
     ../models/qwen2/qwen2_embedding.cpp \
@@ -99,11 +116,13 @@ LOCAL_SRC_FILES := \
     ../layers/reshaped_rms_norm.cpp \
     ../layers/custom_multiply.cpp \
     ../layers/causal_conv1d_layer.cpp \
+    ../layers/rms_reverse_norm.cpp \
     ../layers/rms_norm.cpp \
     ../models/qwen3_cached_slim_moe/qwen_moe_layer_cached.cpp \
     ../models/qwen3_slim_moe/qwen_moe_layer_fsu.cpp \
     ../models/gpt_oss/gpt_oss_moe_layer.cpp \
     ../models/gpt_oss_cached_slim/gpt_oss_moe_layer_cached.cpp \
+    ../models/gemma2/gemma2_causallm.cpp \
     ../models/gemma3/gemma3_causallm.cpp \
     ../models/gemma3/embedding_gemma.cpp \
     ../models/gemma4/gemma4_causallm.cpp \
@@ -112,7 +131,6 @@ LOCAL_SRC_FILES := \
     ../models/timm_vit/timm_vit_transformer.cpp \
     ../models/deberta_v2/deberta_v2.cpp \
     ../models/bert/bert_transformer.cpp \
-    ../models/bert/multilingual_tinybert_16mb.cpp \
     ../models/xlm_roberta/xlm_roberta.cpp \
     ../layers/deberta_attention_layer.cpp \
     ../layers/shared_fully_connected_layer.cpp \
@@ -191,6 +209,7 @@ LOCAL_SRC_FILES := ../quantize.cpp \
     ../models/causal_lm.cpp \
     ../models/transformer.cpp \
     ../models/sentence_transformer.cpp \
+    ../models/model_registry.cpp \
     ../kv_cache_manager.cpp \
     ../models/qwen2/qwen2_causallm.cpp \
     ../models/qwen2/qwen2_embedding.cpp \
@@ -211,11 +230,13 @@ LOCAL_SRC_FILES := ../quantize.cpp \
     ../layers/reshaped_rms_norm.cpp \
     ../layers/custom_multiply.cpp \
     ../layers/causal_conv1d_layer.cpp \
+    ../layers/rms_reverse_norm.cpp \
     ../layers/rms_norm.cpp \
     ../models/qwen3_cached_slim_moe/qwen_moe_layer_cached.cpp \
     ../models/qwen3_slim_moe/qwen_moe_layer_fsu.cpp \
     ../models/gpt_oss/gpt_oss_moe_layer.cpp \
     ../models/gpt_oss_cached_slim/gpt_oss_moe_layer_cached.cpp \
+    ../models/gemma2/gemma2_causallm.cpp \
     ../models/gemma3/gemma3_causallm.cpp \
     ../models/gemma3/embedding_gemma.cpp \
     ../models/gemma4/gemma4_causallm.cpp \
@@ -223,11 +244,9 @@ LOCAL_SRC_FILES := ../quantize.cpp \
     ../models/gemma3/function.cpp \
     ../models/deberta_v2/deberta_v2.cpp \
     ../models/bert/bert_transformer.cpp \
-    ../models/bert/multilingual_tinybert_16mb.cpp \
     ../models/xlm_roberta/xlm_roberta.cpp \
     ../layers/deberta_attention_layer.cpp \
     ../layers/shared_fully_connected_layer.cpp \
-    ../huggingface_tokenizer.cpp \
     ../api/streamer.cpp
 
 LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
@@ -244,12 +263,14 @@ LOCAL_C_INCLUDES += \
     $(LOCAL_PATH)/../models/qwen3_moe \
     $(LOCAL_PATH)/../models/qwen3_slim_moe \
     $(LOCAL_PATH)/../models/qwen3_cached_slim_moe \
+    $(LOCAL_PATH)/../models/gemma2 \
     $(LOCAL_PATH)/../models/gemma3 \
     $(LOCAL_PATH)/../models/bert \
     $(LOCAL_PATH)/../models/deberta_v2 \
     $(LOCAL_PATH)/../models/gemma4 \
     $(LOCAL_PATH)/../models/xlm_roberta \
     $(LOCAL_PATH)/../models/lfm2 \
+    $(NNTRAINER_ROOT)/nntrainer/utils \
     $(NNTRAINER_ROOT)/nntrainer/tensor/cl_operations \
 
 include $(BUILD_EXECUTABLE)
@@ -317,7 +338,6 @@ LOCAL_SRC_FILES := \
     $(UNITTEST_MODELS_DIR)/unittest_causallm_embedding_gemma_reference.cpp \
     $(UNITTEST_MODELS_DIR)/unittest_causallm_tinybert_reference.cpp \
     $(UNITTEST_MODELS_DIR)/unittest_causallm_deberta_v2_reference.cpp \
-    $(UNITTEST_MODELS_DIR)/unittest_causallm_xlm_roberta_reference.cpp \
     $(UNITTEST_MODELS_DIR)/unittest_causallm_lfm2.cpp \
     $(UNITTEST_MODELS_DIR)/unittest_causallm_lfm2_reference.cpp
 
