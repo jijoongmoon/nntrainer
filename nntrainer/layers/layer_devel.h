@@ -425,18 +425,24 @@ public:
               NNTR_THROW_IF(weight.getDataType() != TensorDim::DataType::FP32,
                             std::runtime_error)
                 << "Save with quantization only supports for FP32 weight.";
-              // Unlike the Q4_0 branch above there is no height == 1 carve
-              // out: Q4_0 has to skip a bias because its 32-value block does
-              // not fit one, whereas a QS4CX scale is per output channel and
-              // covers a K == 1 column exactly. Skipping would also desync the
-              // writer from the reader, since QS4CX_Tensor::size() sizes every
-              // record as nibbles + N fp32 scales whatever the height, and it
-              // is that stride the loader accumulates to find the next
-              // weight's offset. Quantizing throughout keeps the file
-              // byte-identical to the one the previous writer emitted.
-              Quantization::createQuantizer(QScheme::QS4CX)
-                ->quantize(weight, dtype)
-                .save(file);
+              TensorDim dim = weight.getDim();
+
+              // Skip quantization for bias-like tensors (1D with height == 1),
+              // as the Q4_0 branch above does. The reason here is not the
+              // block size but the reader: a layer that quantizes its weight
+              // requests its bias as FP32 (see FullyConnectedLayer::finalize),
+              // so an FP32 bias is exactly what load() goes on to read.
+              // Quantizing it would write a nibbles + scales record where the
+              // reader expects N floats. NeuralNetwork::save() mirrors this
+              // policy in resolveStoredDtype() when it sizes the same records
+              // for a safetensors header, so the two must agree.
+              if (dim.height() == 1) {
+                weight.save(file);
+              } else {
+                Quantization::createQuantizer(QScheme::QS4CX)
+                  ->quantize(weight, dtype)
+                  .save(file);
+              }
             } else {
               NNTR_THROW_IF(true, std::runtime_error)
                 << "This dtype is not supported in save with quantization";
