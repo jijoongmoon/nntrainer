@@ -7,13 +7,13 @@
  * @see     https://github.com/nntrainer/nntrainer
  * @author  Jijoong Moon <jijoong.moon@samsung.com>
  * @bug     No known bugs except for NYI items
- * @brief   MemAllocator subclass that routes MemoryPool allocations through CUDA
- *          Unified Memory (cudaMallocManaged), the direct analogue of the
- *          OpenCL SVM path (ClSVMAllocator): one pointer that is both host-
- *          addressable and device-accessible, so engine=cuda tensors are
- *          device-resident without a separate copy step. CudaContext installs an
- *          instance at engine init. Falls back to host memory if the managed
- *          allocation fails, so a missing-UVM device degrades rather than fails.
+ * @brief   MemAllocator subclass that routes MemoryPool allocations through
+ * CUDA Unified Memory (cudaMallocManaged), the direct analogue of the OpenCL
+ * SVM path (ClSVMAllocator): one pointer that is both host- addressable and
+ * device-accessible, so engine=cuda tensors are device-resident without a
+ * separate copy step. CudaContext installs an instance at engine init. Falls
+ * back to host memory if the managed allocation fails, so a missing-UVM device
+ * degrades rather than fails.
  */
 
 #ifndef __CUDA_MEM_ALLOCATOR_H__
@@ -37,8 +37,8 @@ public:
    * @param device_only when true, alloc() uses cudaMalloc (real device memory,
    *        NOT host-addressable) instead of cudaMallocManaged (UVM). Used for
    *        the activation pool so the CPU never touches it -> no host<->device
-   *        page migration under async (the UVM thrash). Weights keep UVM (false)
-   *        because the host writes them at load. The OpenCL cl_mem analog.
+   *        page migration under async (the UVM thrash). Weights keep UVM
+   * (false) because the host writes them at load. The OpenCL cl_mem analog.
    */
   explicit CudaMemAllocator(bool device_only = false);
 
@@ -58,7 +58,9 @@ public:
    */
   void free(void *ptr) override;
 
-  std::string getName() override { return device_only_ ? "cuda-dev" : "cuda-uvm"; }
+  std::string getName() override {
+    return device_only_ ? "cuda-dev" : "cuda-uvm";
+  }
 
   // UVM (device_only_=false) is unified host+device memory (the SVM analogue)
   // -> host-addressable; a device_only_ allocator's CONTRACT is "device

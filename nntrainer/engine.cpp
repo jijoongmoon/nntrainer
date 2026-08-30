@@ -40,7 +40,6 @@ static const std::string func_tag = "[Engine] ";
 
 namespace nntrainer {
 
-
 std::mutex engine_mutex;
 
 std::once_flag global_engine_init_flag;

@@ -7,11 +7,12 @@
  * @see     https://github.com/nntrainer/nntrainer
  * @author  Jijoong Moon <jijoong.moon@samsung.com>
  * @bug     No known bugs except for NYI items
- * @brief   NVIDIA CUDA application context implementation (mirror of ClContext).
+ * @brief   NVIDIA CUDA application context implementation (mirror of
+ * ClContext).
  */
 
-#include <env_compat.h>
 #include <cuda_context.h>
+#include <env_compat.h>
 
 #include <mutex>
 
@@ -73,7 +74,8 @@ void CudaContext::initialize() noexcept {
       }
     }
     if (!cudaInit()) {
-      ml_loge("Error: CudaContext::initialize() failed (no usable CUDA device)");
+      ml_loge(
+        "Error: CudaContext::initialize() failed (no usable CUDA device)");
       return;
     }
 
@@ -179,7 +181,8 @@ void CudaContext::add_default_object() {
   registerFactory(nntrainer::createLayer<LayerNormalizationLayer>,
                   LayerNormalizationLayer::type,
                   ml::train::LayerType::LAYER_LAYER_NORMALIZATION);
-  registerFactory(nntrainer::createLayer<ActivationLayer>, ActivationLayer::type,
+  registerFactory(nntrainer::createLayer<ActivationLayer>,
+                  ActivationLayer::type,
                   ml::train::LayerType::LAYER_ACTIVATION);
 }
 
@@ -187,8 +190,9 @@ template <typename T>
 const int CudaContext::registerFactory(const FactoryType<T> factory,
                                        const std::string &key,
                                        const int int_key) {
-  static_assert(isSupported<T>::value,
-                "cuda_context: given type is not supported for current context");
+  static_assert(
+    isSupported<T>::value,
+    "cuda_context: given type is not supported for current context");
 
   auto &index = std::get<IndexType<T>>(factory_map);
   auto &str_map = std::get<StrIndexType<T>>(index);
@@ -270,7 +274,6 @@ template const int CudaContext::registerFactory<nntrainer::Layer>(
   const FactoryType<nntrainer::Layer> factory, const std::string &key,
   const int int_key);
 
-
 // CUDA override of the decode/prefill step.
 //
 // A single-token decode step issues on the order of a thousand tiny kernels,
@@ -296,10 +299,10 @@ template const int CudaContext::registerFactory<nntrainer::Layer>(
 // mean "on" here while the attention layer's own value-checked gate turned OFF
 // -- and that split state is not a slowdown, it is corruption: the replay
 // rewrites K/V at the first captured slot every step.
-sharedConstTensors
-CudaContext::runDecode(NeuralNetwork &nn, unsigned int from, unsigned int to,
-                       const sharedConstTensors &input,
-                       const sharedConstTensors &label) {
+sharedConstTensors CudaContext::runDecode(NeuralNetwork &nn, unsigned int from,
+                                          unsigned int to,
+                                          const sharedConstTensors &input,
+                                          const sharedConstTensors &label) {
   sharedConstTensors out;
 
   static const bool decode_graph = nntr_env_on("NNTR_CUDA_GRAPH");
@@ -318,7 +321,8 @@ CudaContext::runDecode(NeuralNetwork &nn, unsigned int from, unsigned int to,
   const bool feed_declared = !nn.getGraphReplayFeedNodes().empty();
   const bool single_token = (to - from) == 1 && from != 0;
 
-  if (decode_graph && feed_declared && !single_token && cached_exec != nullptr) {
+  if (decode_graph && feed_declared && !single_token &&
+      cached_exec != nullptr) {
     // A new sequence, or a resumed multi-token step, is about to run eagerly.
     // That forward may free and reallocate the scratch the captured graph holds
     // pointers into, so the graph has to go now; replaying it afterwards would

@@ -22,7 +22,6 @@
 
 namespace nntrainer::cuda {
 
-
 /**
  * @brief Smallest output width N at which a decode (M == 1) QS4CX FC takes the
  *        fp-ACTIVATION int4 GEMV instead of the w4a8 dp4a route.
@@ -89,7 +88,8 @@ bool cuda_fc_qs4cx_fpact_gemv_fp16(const unsigned short *Xh,
  *        (one per N), converted to fp32 in-kernel.
  *
  * @param X            [M,K] row-major FP32 activation (device-accessible)
- * @param plain_w      plain QS4CX nibble payload = weight.getData() (device-acc)
+ * @param plain_w      plain QS4CX nibble payload = weight.getData()
+ * (device-acc)
  * @param scales_fp16  N fp16 per-channel scales (device-acc; see
  *                     cuda_fc_qs4cx_scales_to_uvm_fp16)
  * @param Y            [M,N] row-major FP32 output (device-accessible)
@@ -132,14 +132,14 @@ bool cuda_fc_qs4cx_gemm_fp32_resident(const float *host_X,
  *        device-accessible (UVM). Requires N%4==0, K%32==0 (load invariant).
  *
  * @param X            [M,K] row-major FP32 activation (device-accessible)
- * @param plain_w      plain QS4CX nibble payload = weight.getData() (device-acc)
+ * @param plain_w      plain QS4CX nibble payload = weight.getData()
+ * (device-acc)
  * @param scales_fp16  N fp16 per-channel scales (device-accessible)
  * @param Y            [M,N] row-major FP32 output (device-accessible)
  * @param M,N,K        GEMM dims
  * @return true on success
  */
-bool cuda_fc_qs4cx_dp4a_gemm_fp32(const float *X,
-                                  const unsigned char *plain_w,
+bool cuda_fc_qs4cx_dp4a_gemm_fp32(const float *X, const unsigned char *plain_w,
                                   const unsigned short *scales_fp16, float *Y,
                                   unsigned int M, unsigned int N,
                                   unsigned int K);
@@ -225,9 +225,6 @@ bool cuda_fc_qs4cx_cublas_i8_gemm_fp16(const unsigned short *Xh,
 bool cuda_fc_qs4cx_prewarm(const unsigned char *plain_w, unsigned int N,
                            unsigned int K);
 
-
-
-
 /**
  * @brief True when the dp4a derived cache exists for this
  *        plain pointer -- dispatch may then treat the pointer as a pure key
@@ -248,7 +245,8 @@ bool cuda_fc_qs4cx_has_cache(const unsigned char *plain_w);
  *
  * @param maxM max decode token rows (1 for decode; larger is a harmless grow)
  * @param maxK max FC input dim (hidden size; covers every decode FC's K)
- * @param maxN max FC output dim (max(vocab, intermediate); covers lm_head + FFN)
+ * @param maxN max FC output dim (max(vocab, intermediate); covers lm_head +
+ * FFN)
  */
 bool cuda_fc_qs4cx_dp4a_prewarm(unsigned int maxM, unsigned int maxK,
                                 unsigned int maxN);
@@ -262,15 +260,16 @@ bool cuda_fc_qs4cx_dp4a_prewarm(unsigned int maxM, unsigned int maxK,
  *        buffer and returns the device pointer. Returns nullptr if the buffer
  *        can't be obtained (OOM, or a graph capture before the buffer was
  *        prewarmed) so the caller falls back to the host path. Pre-grown by
- *        cuda_fc_qs4cx_dp4a_prewarm so the copy is a pure cap-hit under capture.
+ *        cuda_fc_qs4cx_dp4a_prewarm so the copy is a pure cap-hit under
+ * capture.
  *
  * @param host_Xh [M,K] row-major fp16 activation on the host heap
  * @param M,K     activation dims
  * @return device pointer to the staged fp16 X, or nullptr on failure
  */
-const unsigned short *cuda_fc_qs4cx_stage_host_x_fp16(const unsigned short *host_Xh,
-                                                      unsigned int M,
-                                                      unsigned int K);
+const unsigned short *
+cuda_fc_qs4cx_stage_host_x_fp16(const unsigned short *host_Xh, unsigned int M,
+                                unsigned int K);
 
 /**
  * @brief Stage a HOST-resident QS4CX weight (plain payload + fp16 scales) to

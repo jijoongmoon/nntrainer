@@ -13,9 +13,9 @@
  * for each row (token), head and each k in [0, head_dim/2):
  *   out[k]      = in[k]*cos[k] - in[k+half]*sin[k]
  *   out[k+half] = in[k]*sin[k] + in[k+half]*cos[k]
- * Full rotation over head_dim; FP32 math, fp16 I/O. Handles num_rows>1 (prefill)
- * with a per-row position from+row. The cos/sin LUTs are flat device buffers
- * [num_positions * head_dim/2] (uploaded once by the caller).
+ * Full rotation over head_dim; FP32 math, fp16 I/O. Handles num_rows>1
+ * (prefill) with a per-row position from+row. The cos/sin LUTs are flat device
+ * buffers [num_positions * head_dim/2] (uploaded once by the caller).
  */
 
 #ifndef __CUDA_ROPE_H__
@@ -25,7 +25,8 @@ namespace nntrainer::cuda {
 
 /**
  * @brief  Apply RoPE on the device to interleaved fp16 rows
- *         [num_rows, num_heads*head_dim]. in/out + the LUTs are device-resident.
+ *         [num_rows, num_heads*head_dim]. in/out + the LUTs are
+ * device-resident.
  * @param in        [num_rows, num_heads*head_dim] fp16 bits (device)
  * @param out       same shape (device); may == in
  * @param cos_lut   flat device LUT [num_positions, head_dim/2] fp16 bits
@@ -37,17 +38,18 @@ namespace nntrainer::cuda {
  * @return true on success
  */
 bool cuda_rope_fp16(const unsigned short *in, unsigned short *out,
-                    const unsigned short *cos_lut, const unsigned short *sin_lut,
-                    int num_heads, int head_dim, int num_rows, int from);
+                    const unsigned short *cos_lut,
+                    const unsigned short *sin_lut, int num_heads, int head_dim,
+                    int num_rows, int from);
 
 /**
- * @brief Device-pos variant of cuda_rope_fp16: the RoPE position `from` is read from
- *        the device cuda_pos_buffer() ([0]) instead of a baked int, so a captured
- *        CUDA graph stays valid across decode tokens. When @p out_slot_dpos != 0,
- *        each input row is written to OUTPUT row (from + row) -- pass @p out as the
+ * @brief Device-pos variant of cuda_rope_fp16: the RoPE position `from` is read
+ * from the device cuda_pos_buffer() ([0]) instead of a baked int, so a captured
+ *        CUDA graph stays valid across decode tokens. When @p out_slot_dpos !=
+ * 0, each input row is written to OUTPUT row (from + row) -- pass @p out as the
  *        cache BASE pointer for the K-into-cache write so the slot is computed
- *        on-device from the live position. out_slot_dpos == 0 keeps row-relative
- *        output (query, in-place). Same math as cuda_rope_fp16.
+ *        on-device from the live position. out_slot_dpos == 0 keeps
+ * row-relative output (query, in-place). Same math as cuda_rope_fp16.
  */
 bool cuda_rope_fp16_dpos(const unsigned short *in, unsigned short *out,
                          const unsigned short *cos_lut,

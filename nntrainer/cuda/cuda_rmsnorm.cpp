@@ -14,8 +14,8 @@
 
 #include <cuda_common.h> // cuda_vec4_rows_ok
 #include <cuda_context.h>
-#include <cuda_fc_qs4cx.h> // cuda_fc_qs4cx_fused_normq_enabled
 #include <cuda_context_manager.h>
+#include <cuda_fc_qs4cx.h> // cuda_fc_qs4cx_fused_normq_enabled
 #include <cuda_stream_manager.h>
 
 #include <nntrainer_log.h>

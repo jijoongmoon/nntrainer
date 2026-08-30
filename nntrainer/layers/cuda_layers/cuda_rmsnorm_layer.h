@@ -59,7 +59,8 @@ public:
 
 private:
   std::array<unsigned int, 1> wt_idx;
-  std::tuple<nntrainer::props::Epsilon, nntrainer::props::SkipPrefill> rms_props;
+  std::tuple<nntrainer::props::Epsilon, nntrainer::props::SkipPrefill>
+    rms_props;
   bool skip_prefill = false;
 };
 

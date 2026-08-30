@@ -21,8 +21,8 @@
 #include <cuda_runtime.h>
 
 #ifdef _WIN32
-#include <windows.h>
 #include <delayimp.h>
+#include <windows.h>
 #endif
 
 namespace nntrainer::cuda {
@@ -38,7 +38,7 @@ namespace nntrainer::cuda {
 // __pfnDliFailureHook2 intercepts dliFailLoadLib/dliFailGetProc so we can
 // print one clear fatal message and exit deliberately.
 static FARPROC WINAPI nntr_dli_failure_hook(unsigned dliNotify,
-                                             PDelayLoadInfo pdli) {
+                                            PDelayLoadInfo pdli) {
   const char *dll = (pdli && pdli->szDll) ? pdli->szDll : "(unknown)";
   const char *verb = dliNotify == dliFailGetProc ? "resolved" : "loaded";
   // nvcuda.dll ships with the NVIDIA driver itself (not the CUDA toolkit),
@@ -159,11 +159,12 @@ bool ContextManager::CreateDefaultGPUDevice() {
 
   // NNTR_CUDA_DBG: a VISIBLE (stderr, logger-independent) dump of the residency
   // facts the GPU-vs-host dispatch gates depend on. On Tegra/Orin the critical
-  // unknown is whether cudaMallocManaged memory reports as cudaMemoryTypeManaged
-  // (==2) -- if it instead reports Host(1)/Unregistered(0), every dev()/dev_ok()
-  // residency gate fails and the GPU ops silently
-  // fall to the host => deterministic garbage + low GPU% + slow. This self-probe
-  // prints the actual type so that hypothesis is confirmable in one run.
+  // unknown is whether cudaMallocManaged memory reports as
+  // cudaMemoryTypeManaged
+  // (==2) -- if it instead reports Host(1)/Unregistered(0), every
+  // dev()/dev_ok() residency gate fails and the GPU ops silently fall to the
+  // host => deterministic garbage + low GPU% + slow. This self-probe prints the
+  // actual type so that hypothesis is confirmable in one run.
   if (std::getenv("NNTR_CUDA_DBG") != nullptr) {
     int cma = 0, pma = 0;
     cudaDeviceGetAttribute(&cma, cudaDevAttrConcurrentManagedAccess,
@@ -185,14 +186,15 @@ bool ContextManager::CreateDefaultGPUDevice() {
       cudaFree(dp);
     }
     cudaGetLastError();
-    std::fprintf(stderr,
-                 "[CUDA-DBG] %s sm_%d%d integrated=%d concurrentManagedAccess=%d "
-                 "pageableMemoryAccess=%d | cudaPointerGetAttributes.type: "
-                 "managed=%d device=%d (expect managed==2 device==2; "
-                 "type enum 0=unreg 1=host 2=device... NOTE managed reports as "
-                 "type 2/Device OR 3 depending on driver -- gates accept 2&3)\n",
-                 device_name_.c_str(), cc_major_, cc_minor_, (int)integrated_,
-                 cma, pma, mtype, dtype);
+    std::fprintf(
+      stderr,
+      "[CUDA-DBG] %s sm_%d%d integrated=%d concurrentManagedAccess=%d "
+      "pageableMemoryAccess=%d | cudaPointerGetAttributes.type: "
+      "managed=%d device=%d (expect managed==2 device==2; "
+      "type enum 0=unreg 1=host 2=device... NOTE managed reports as "
+      "type 2/Device OR 3 depending on driver -- gates accept 2&3)\n",
+      device_name_.c_str(), cc_major_, cc_minor_, (int)integrated_, cma, pma,
+      mtype, dtype);
     std::fflush(stderr);
   }
   return true;

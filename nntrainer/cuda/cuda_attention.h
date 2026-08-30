@@ -9,12 +9,13 @@
  * @bug     No known bugs except for NYI items
  * @brief   CUDA flash-style attention core for the gemma4 mha (FP32-safe).
  *
- * O[h,i,:] = sum_j softmax_j( softcap * tanh( (Q[h,i]·K[hkv,j]) / (softcap*sqrt(d)) ) ) * V[hkv,j]
- * with a causal (j<=i_abs) + sliding-window (j > i_abs - window) mask and GQA
- * (hkv = h / gqa). One block per (query head h, query row i); online (flash)
- * softmax in FP32. Q/K/V/O are per-head contiguous [head, rows, head_dim].
- * softcap<=0 disables the tanh soft-cap. This is the O(M^2) compute that
- * dominates prefill on the host path; RoPE / KV-cache fill stay outside.
+ * O[h,i,:] = sum_j softmax_j( softcap * tanh( (Q[h,i]·K[hkv,j]) /
+ * (softcap*sqrt(d)) ) ) * V[hkv,j] with a causal (j<=i_abs) + sliding-window (j
+ * > i_abs - window) mask and GQA (hkv = h / gqa). One block per (query head h,
+ * query row i); online (flash) softmax in FP32. Q/K/V/O are per-head contiguous
+ * [head, rows, head_dim]. softcap<=0 disables the tanh soft-cap. This is the
+ * O(M^2) compute that dominates prefill on the host path; RoPE / KV-cache fill
+ * stay outside.
  */
 
 #ifndef __CUDA_ATTENTION_H__
@@ -48,9 +49,9 @@ bool cuda_attention_core_fp32(const float *Q, const float *K, const float *V,
  *        head-interleaved fp16 query step [N_q, num_heads_Q*head_dim] and the
  *        fp16 KV cache [N_kv, num_heads_KV*head_dim] directly (de-interleave +
  *        fp16->fp32 happen inside the kernel), runs the flash core in FP32, and
- *        writes the interleaved fp16 output [N_q, num_heads_Q*head_dim]. Matches
- *        gemm_attention's math: scale 1/sqrt(d), causal + sliding mask with the
- *        cache_from offset, GQA; softcap<=0 (gemm_attention applies none).
+ *        writes the interleaved fp16 output [N_q, num_heads_Q*head_dim].
+ * Matches gemm_attention's math: scale 1/sqrt(d), causal + sliding mask with
+ * the cache_from offset, GQA; softcap<=0 (gemm_attention applies none).
  *
  * @param q_fp16   query step, fp16 bits (device-accessible)
  * @param k_fp16   KV cache key, fp16 bits
@@ -73,7 +74,8 @@ bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
  * @brief Pre-grow the split-KV decode scratch buffers to the model's max decode
  *        capacity at load, so the M=1 flash-decode path never cudaMalloc/Frees
  *        during a CUDA-graph stream capture (which would invalidate the graph).
- * @param max_seq_len max KV length (=> max chunks at NNTR_CUDA_FLASH_DECODE size)
+ * @param max_seq_len max KV length (=> max chunks at NNTR_CUDA_FLASH_DECODE
+ * size)
  * @param max_hq      max number of query heads across attention layers
  * @param max_head_dim max head_dim across layers (gemma4: global 512 vs 256)
  */
