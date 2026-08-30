@@ -827,9 +827,8 @@ void FloatTensor::dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
     } else {
       /// @todo Replace with standard CPU INT4 computation
       for (unsigned int i = 0; i < input.size(); ++i) {
-        cpu_o->gemm_q4_0_fp32(M, Ns[i], K, data, K,
-                              (void *)input[i]->getData(), Ns[i], rdatas[i],
-                              Ns[i]);
+        cpu_o->gemm_q4_0_fp32(M, Ns[i], K, data, K, (void *)input[i]->getData(),
+                              Ns[i], rdatas[i], Ns[i]);
       }
     }
   }
