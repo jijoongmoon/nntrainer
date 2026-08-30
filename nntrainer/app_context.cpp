@@ -86,6 +86,7 @@
 #include <preprocess_flip_layer.h>
 #include <preprocess_l2norm_layer.h>
 #include <preprocess_translate_layer.h>
+#include <qkv_layer.h>
 #include <reduce_mean_layer.h>
 #include <reduce_sum_layer.h>
 #include <rnn.h>
@@ -448,8 +449,11 @@ void AppContext::add_default_object() {
 
   // Backend-neutral LLM layers, registered by type string only (no
   // LayerType enum): the same C++ class serves every engine, dispatching
-  // its math through the op table.
+  // its math through the op table. LayerType is a closed enum shared with
+  // the C API and these carry no C-API identity, so an accelerator context
+  // can register the very same classes under the very same names.
   registerFactory(nntrainer::createLayer<GeGLULayer>, GeGLULayer::type);
+  registerFactory(nntrainer::createLayer<QKVLayer>, QKVLayer::type);
 
   registerFactory(AppContext::unknownFactory<nntrainer::Layer>, "unknown",
                   LayerType::LAYER_UNKNOWN);

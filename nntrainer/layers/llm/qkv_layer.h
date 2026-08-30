@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
- * Copyright (C) 2020 Jijoong Moone <jijoong.moon@samsung.com>
+ * Copyright (C) 2020 Jijoong Moon <jijoong.moon@samsung.com>
  *
  * @file   qkv_layer.h
  * @date   14 May 2020
- * @brief  This is Fully Connected Layer Class of Neural Network
+ * @brief  Fused query/key/value projection layer
  * @see    https://github.com/nntrainer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @author Eunju Yang <ej.yang@samsung.com>
@@ -26,7 +26,7 @@
 #include <common_properties.h>
 #include <layer_impl.h>
 
-namespace causallm {
+namespace nntrainer {
 
 namespace props {
 
@@ -51,24 +51,25 @@ public:
 } // namespace props
 
 /**
- * @class   FullyConnecedLayer
- * @brief   fully connected layer
+ * @class   QKVLayer
+ * @brief   One layer holding the query, key and value projection weights, so a
+ *          single dot() call produces all three outputs from one input read.
  */
 WIN_EXPORT class QKVLayer : public nntrainer::LayerImpl {
 public:
   /**
-   * @brief     Constructor of Fully Connected Layer
+   * @brief     Constructor of QKV Layer
    */
   WIN_EXPORT QKVLayer();
 
   /**
-   * @brief     Destructor of Fully Connected Layer
+   * @brief     Destructor of QKV Layer
    */
   WIN_EXPORT ~QKVLayer() = default;
 
   /**
    *  @brief  Move constructor.
-   *  @param[in] FullyConnected &&
+   *  @param[in] rhs QKVLayer to be moved.
    */
   WIN_EXPORT QKVLayer(QKVLayer &&rhs) noexcept = default;
 
@@ -90,9 +91,9 @@ public:
                              bool training) override;
 
   /**
-￼   * @copydoc Layer::incremental_forwarding(RunLayerContext &context, unsigned
-￼   * int from, unsigned int to, bool training)
-￼   */
+   * @copydoc Layer::incremental_forwarding(RunLayerContext &context, unsigned
+   * int from, unsigned int to, bool training)
+   */
   WIN_EXPORT void incremental_forwarding(nntrainer::RunLayerContext &context,
                                          unsigned int from, unsigned int to,
                                          bool training) override;
@@ -136,6 +137,10 @@ public:
    */
   WIN_EXPORT void setProperty(const std::vector<std::string> &values) override;
 
+  /**
+   * @copydoc Layer::updateTensorsByInputDimensions(RunLayerContext &context,
+   * std::vector<TensorDim> input_dimensions)
+   */
   WIN_EXPORT void updateTensorsByInputDimensions(
     nntrainer::RunLayerContext &context,
     std::vector<nntrainer::TensorDim> input_dimensions) override;
@@ -147,7 +152,7 @@ private:
   std::array<unsigned int, 3> weight_idx; /**< indices of the weights */
 };
 
-} // namespace causallm
+} // namespace nntrainer
 
 #endif /* __cplusplus */
 #endif /* __QKV_LAYER_H__ */

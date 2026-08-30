@@ -1,8 +1,11 @@
 # Backend-neutral LLM layers. Compiled straight into libnntrainer (the loss/
-# subdir pattern), not as per-layer shared_library plugins. Add sources
-# incrementally, one per layer.
+# subdir pattern), not as per-layer shared_library plugins. Each one owns shape
+# and orchestration only and reaches its kernel through the tensor's ComputeOps
+# table, so one class serves every backend. Add sources incrementally, one per
+# layer.
 llm_layer_sources = [
   'geglu_layer.cpp',
+  'qkv_layer.cpp',
   'swiglu_layer.cpp',
 ]
 
