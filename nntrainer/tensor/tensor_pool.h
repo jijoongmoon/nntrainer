@@ -210,6 +210,12 @@ public:
    * @note returns empty tensor which will be filled when allocate is called.
    * @note we assume that the caller checks if the exec_order and lifespan are
    * compatible.
+   * @note @a init and @a engine are not independent. An initializer writes the
+   * host side of the allocation, and no upload path exists in core, so a
+   * tensor that declares one is never placed in device memory however its
+   * engine classifies: the planner refuses the combination and keeps it on
+   * the shared plane, where both the initialisation and the kernels see the
+   * same bytes. See ResidencyPlanner::classify().
    */
   Tensor *request(
     const std::string &name, const TensorDim &dim,

@@ -13,7 +13,8 @@
  * what the graph already knows before it runs: the producing layer's compute
  * engine, whether every consumer is on the same engine, the data type, the
  * tensor name against the application-declared boundaries (ResidencyPolicy),
- * and what the pool's allocator can actually back.
+ * whether the tensor declares an Initializer that writes host bytes, and what
+ * the pool's allocator can actually back.
  *
  * It is a planner decision rather than a runtime one on purpose. Flipping a
  * tensor between the shared and the device plane per edge, at execution time,
@@ -54,12 +55,14 @@ struct ResidencyPlanner {
    * @param engine compute engine of the producing / requesting layer
    * @param all_consumers_device every view consumer is on the same engine
    * @param is_fp16 tensor data type is FP16
+   * @param needs_host_init the tensor declares an Initializer, so its bytes
+   *        are written on the host plane before the first kernel runs
    * @param name tensor name, matched against the declared boundaries
    * @return the static ResidencyClass
    */
   ResidencyClass classify(ml::train::LayerComputeEngine engine,
                           bool all_consumers_device, bool is_fp16,
-                          const std::string &name) const {
+                          bool needs_host_init, const std::string &name) const {
     /** A host-only allocator has one plane and nothing to decide. */
     if (!device_backed)
       return ResidencyClass::HOST;
@@ -94,11 +97,37 @@ struct ResidencyPlanner {
         (!device_pool || nameMatchesAny(name, exclude)))
       cls = ResidencyClass::SVM;
 
+    /** A declared Initializer and the device plane are incompatible here, so
+     *  the combination is refused rather than half honoured. The initializer
+     *  writes the host side of the allocation; nothing in this plane uploads
+     *  those bytes -- core deliberately owns no upload path, because a raise
+     *  boundary makes the copy the application's, at the point where the two
+     *  planes are declared to agree. Placing such a tensor in device memory
+     *  would leave the kernels reading a buffer that never saw the
+     *  initialisation. The shared plane honours both: the bytes the
+     *  initializer wrote ARE the bytes the device reads. */
+    if (cls == ResidencyClass::GPU_CLMEM && needs_host_init)
+      cls = ResidencyClass::SVM;
+
     return cls;
   }
 
 private:
-  /** comma-separated substring match against a declared pattern list. */
+  /**
+   * @brief comma-separated substring match against a declared pattern list.
+   *
+   * @details Substring, not glob and not regex: a pattern "fc" matches every
+   * tensor whose name contains those two characters, "fc1" and "fc12" among
+   * them. A comma always separates, so a pattern cannot contain one. That is
+   * deliberately the least machinery that expresses a boundary, and it is the
+   * matcher an application has to write its patterns against -- pick a prefix
+   * the model's naming makes unambiguous ("cache_" rather than "c"). Empty
+   * tokens are ignored, so a trailing or doubled comma is harmless.
+   *
+   * @param name tensor name to test
+   * @param list comma-separated pattern list, or nullptr for "no patterns"
+   * @return true if any non-empty pattern occurs in @a name
+   */
   static bool nameMatchesAny(const std::string &name, const char *list) {
     if (list == nullptr)
       return false;
