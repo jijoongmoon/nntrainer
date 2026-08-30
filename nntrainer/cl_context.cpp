@@ -40,6 +40,10 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+#else
+// For the kernel cache directory ownership/permission check below.
+#include <sys/stat.h>
+#include <unistd.h>
 #endif
 
 namespace nntrainer {
@@ -49,6 +53,62 @@ static constexpr bool KERNEL_CACHE_ENABLED = true;
 static constexpr bool KERNEL_CACHE_ENABLED = false;
 #endif
 std::mutex cl_factory_mutex;
+
+// Guards ClContext::ocl_kernel_map, the process-wide compiled-kernel cache.
+// Separate from cl_factory_mutex, which guards the layer factory registry: the
+// two are unrelated maps taken on unrelated paths, and sharing one lock would
+// put a cold kernel compile in front of every layer registration.
+static std::mutex ocl_kernel_map_mutex;
+
+// Whether the resolved cache directory is safe to load GPU program binaries
+// from. Set once at init and read on every cached lookup; false leaves the
+// cache disabled for the process without disabling anything else.
+static bool kernel_cache_usable = false;
+
+/**
+ * @brief Is the kernel cache directory writable only by its owner, and owned
+ *        by the user this process runs as?
+ *
+ * A cached binary goes straight to clCreateProgramWithBinary, so anyone who
+ * can write the file chooses what the GPU driver compiles. The file name is no
+ * protection: the key is a hash over kernel sources that ship in this
+ * repository plus device strings any local user can read. Decline the cache
+ * rather than trust a directory that somebody else can write into -- the cost
+ * is one cold kernel compile, and the alternative is a local code-execution
+ * surface that appears the moment a process is started from a shared
+ * directory.
+ *
+ * @param path cache directory
+ * @return true when the directory may be read from and written to
+ */
+static bool kernelCacheDirIsPrivate(const std::string &path) {
+#if defined(_WIN32) || defined(__ANDROID__)
+  // Windows permissions do not map onto the POSIX bits this checks, and on
+  // Android the directory is inside the app's own private storage.
+  (void)path;
+  return true;
+#else
+  struct stat st;
+  if (::stat(path.c_str(), &st) != 0) {
+    ml_logw("Cannot stat the kernel cache directory %s; not caching kernels",
+            path.c_str());
+    return false;
+  }
+  if (st.st_uid != ::geteuid()) {
+    ml_logw("The kernel cache directory %s is owned by another user; not "
+            "caching kernels",
+            path.c_str());
+    return false;
+  }
+  if ((st.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+    ml_logw("The kernel cache directory %s is writable by other users; not "
+            "caching kernels",
+            path.c_str());
+    return false;
+  }
+  return true;
+#endif
+}
 
 std::vector<std::byte> readBinaryFile(const std::string &path) {
   // reading binary
@@ -87,12 +147,12 @@ void ClContext::initialize() noexcept {
     }
     if (KERNEL_CACHE_ENABLED) {
       // Best effort: the binary cache is an optimisation. A read-only or
-      // otherwise unwritable working directory must not take the whole
-      // context down with it -- create_directories throws
-      // std::filesystem::filesystem_error, and everything below (the kernel
-      // registration, the memory allocator, the ops table) would then be
-      // skipped by the catch at the end of this function, leaving a context
-      // that registers no layer and hands out no allocator.
+      // otherwise unwritable directory must not take the whole context down
+      // with it -- create_directories throws std::filesystem::filesystem_error,
+      // and everything below (the kernel registration, the memory allocator,
+      // the ops table) would then be skipped by the catch at the end of this
+      // function, leaving a context that registers no layer and hands out no
+      // allocator.
       std::error_code ec;
       std::filesystem::create_directories(opencl::Program::DEFAULT_KERNEL_PATH,
                                           ec);
@@ -101,6 +161,9 @@ void ClContext::initialize() noexcept {
                 "compiling kernels from source without caching them",
                 opencl::Program::DEFAULT_KERNEL_PATH.c_str(),
                 ec.message().c_str());
+      } else {
+        kernel_cache_usable =
+          kernelCacheDirIsPrivate(opencl::Program::DEFAULT_KERNEL_PATH);
       }
     }
 
@@ -337,12 +400,28 @@ ClContext::registerClKernel(const std::string &kernel_string,
   // kernel per layer.
   const std::string key = kernel_name + compile_options;
 
-  auto it = ocl_kernel_map.find(key);
-  if (it != ocl_kernel_map.end())
-    return it->second;
+  // ocl_kernel_map is a process-wide static reached from the per-op dispatch
+  // path, not only from init, so it takes the same treatment clCreateKernel
+  // gives program_cache one frame below. Leaving the outer map unguarded while
+  // the inner one is locked is not a lost cache hit but a data race on an
+  // unordered_map, and therefore undefined behaviour. It gets its own lock
+  // because clCreateKernel takes program_cache_mtx while this one is not held,
+  // and clCreateKernel never calls back in here, so there is no reentrancy.
+  {
+    const std::lock_guard<std::mutex> lock(ocl_kernel_map_mutex);
+    auto it = ocl_kernel_map.find(key);
+    if (it != ocl_kernel_map.end())
+      return it->second;
+  }
 
-  // creating shared_ptr for kernel object. clCreateKernel takes mutable
-  // references, so the cold path makes the copies it needs.
+  // Built outside the lock: a cold compile can take hundreds of milliseconds
+  // and holding the map across it would serialise every other lookup behind
+  // it. Two threads racing on the same cold key both compile, and try_emplace
+  // below keeps the first one home -- wasted work on a rare race, never a torn
+  // map.
+  //
+  // clCreateKernel takes mutable references, so the cold path makes the copies
+  // it needs.
   std::string source = kernel_string;
   std::string name = kernel_name;
   std::string options = compile_options;
@@ -351,9 +430,9 @@ ClContext::registerClKernel(const std::string &kernel_string,
     ml_loge("Failed to register kernel %s", kernel_name.c_str());
     return nullptr;
   }
-  // add to map
-  ocl_kernel_map.emplace(key, kernelPtr);
-  return ocl_kernel_map[key];
+
+  const std::lock_guard<std::mutex> lock(ocl_kernel_map_mutex);
+  return ocl_kernel_map.try_emplace(key, kernelPtr).first->second;
 }
 
 bool ClContext::clCreateKernel(std::string &kernel_string,
@@ -396,11 +475,12 @@ bool ClContext::clCreateKernel(std::string &kernel_string,
     std::to_string(program.GetKernelHash(kernel_string,
                                          compile_options + "|" + device_sig)) +
     ".cl.bin";
-  auto binary_data = KERNEL_CACHE_ENABLED ? readBinaryFile(binary_file_path)
-                                          : std::vector<std::byte>();
+  auto binary_data = (KERNEL_CACHE_ENABLED && kernel_cache_usable)
+                       ? readBinaryFile(binary_file_path)
+                       : std::vector<std::byte>();
 
   bool loaded_from_binary = false;
-  if (KERNEL_CACHE_ENABLED && !binary_data.empty()) {
+  if (KERNEL_CACHE_ENABLED && kernel_cache_usable && !binary_data.empty()) {
     ml_logi("Using cached version of kernel: %s at path %s",
             kernel_name.c_str(), binary_file_path.c_str());
     loaded_from_binary = program.CreateCLProgramWithBinary(
@@ -422,7 +502,7 @@ bool ClContext::clCreateKernel(std::string &kernel_string,
                               opencl::ContextManager::Global().GetDeviceId(),
                               kernel_string, compile_options);
 
-    if (KERNEL_CACHE_ENABLED && result) {
+    if (KERNEL_CACHE_ENABLED && kernel_cache_usable && result) {
       // Best-effort cache write: the freshly compiled program is already
       // usable, so failing to persist it is a warning, not a build failure.
       auto binary = program.GetProgramBinary(
