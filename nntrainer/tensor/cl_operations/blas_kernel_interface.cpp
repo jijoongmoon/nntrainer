@@ -488,16 +488,21 @@ struct V8cWeightEntry {
   cl_mem weight_image =
     nullptr; // cached image2d view (also released via TensorBacking)
   cl_mem weight_buf = nullptr; // raw backing buffer (buffer-path / Intel NEO)
-  // N exceeds the device image2d height cap (the untied lm_head, N=vocab), so
-  // an image view can never exist for this weight. Kept SEPARATE from
-  // (weight_image == nullptr): on the buffer path the image is skipped for
-  // every weight, and only this flag may route to the imageless lm_head GEMV.
-  bool huge_n = false;
+  // No image2d view can serve this weight, for either of two reasons: N
+  // exceeds the device's image2d height cap (the untied lm_head, N=vocab), or
+  // the driver declined the image for a reason the cap query did not predict.
+  // Both leave the row-major buffer as the only readable form, which is why
+  // one flag names the consequence rather than each cause.
+  // Kept SEPARATE from (weight_image == nullptr): on the buffer path the image
+  // is skipped for EVERY weight although an image would be creatable, and only
+  // this flag may route to the imageless lm_head GEMV.
+  bool imageless = false;
   // Forward-pass generation this weight was last dispatched in. Used only to
   // INFER a pass boundary for the shared-quant cache below (a weight is
   // dispatched at most once per pass, so seeing it twice in one generation
-  // means a new pass began). The inference is incomplete -- see the LIMITATION
-  // note at the bump site in dotCl_v8c.
+  // means a new pass began). The inference cannot cover every graph shape, so
+  // the dispatches it cannot vouch for refuse the cache rather than risk a
+  // stale hit -- see the boundary note in dotCl_v8c.
   unsigned long long last_use_gen = 0;
 };
 
@@ -753,14 +758,20 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
   // Is N past the device's image2d height cap? Ask the device instead of
   // inferring it from a failed clCreateImage, so the buffer path (which never
   // creates the image) can still identify the oversized lm_head.
+  //
+  // This queries CL directly rather than reading Context::caps(), which is the
+  // rule everywhere else in this path. The exception is deliberate and narrow:
+  // DeviceCaps carries no image geometry, and widening the shared struct for
+  // one caller belongs in the change that owns it, not here. Reached through
+  // ClContext::Global() -- the same accessor the pitch decision above uses --
+  // because Engine::getRegisteredContext throws when the GPU backend was never
+  // brought up, and this path must decline rather than propagate.
   {
-    auto *cc =
-      static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
     size_t img_h_cap = 0;
-    opencl::clGetDeviceInfo(cc->context_inst_.GetDeviceId(),
+    opencl::clGetDeviceInfo(ClContext::Global().context_inst_.GetDeviceId(),
                             CL_DEVICE_IMAGE2D_MAX_HEIGHT, sizeof(img_h_cap),
                             &img_h_cap, nullptr);
-    e.huge_n = (img_h_cap != 0 && (size_t)N > img_h_cap);
+    e.imageless = (img_h_cap != 0 && (size_t)N > img_h_cap);
   }
 
   // [buffer-path image skip] On the buffer path (Intel NEO) the GEMM binds
@@ -769,29 +780,27 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
   // avoids creating hundreds of dead cl_mem objects; outputs are
   // byte-identical. The image path (Adreno) is unaffected: v8c_buffer_path() is
   // false there, so the view is built.
-  if (!v8c_buffer_path() && !e.huge_n) {
+  if (!v8c_buffer_path() && !e.imageless) {
     try {
       e.weight_image = e.backing->imageView(ws);
-      if (std::getenv("NNTR_V8C_IMG_TRACE"))
-        std::fprintf(stderr, "[v8cimg] OK   N=%u K=%u wpitch=%u(=K/2)\n", N, K,
-                     K / 2),
-          std::fflush(stderr);
+      ml_logd("[v8c] image view built for %s: N=%u K=%u pitch=%zu",
+              weight.getName().c_str(), N, K, ws.row_pitch_bytes);
     } catch (...) {
       // Creation can still fail for a reason the cap query did not predict
       // (pitch alignment). The row-major weight_buf + scale_buf remain valid,
-      // so fall back to the imageless (GEMV) route rather than the CPU path.
+      // so fall back to the imageless (GEMV) route rather than the CPU path --
+      // which is the second way this weight becomes imageless, and why the
+      // flag names the consequence rather than the height cap alone.
       e.weight_image = nullptr;
-      e.huge_n = true;
-      if (std::getenv("NNTR_V8C_IMG_TRACE"))
-        std::fprintf(stderr, "[v8cimg] FAIL N=%u K=%u wpitch=%u(=K/2)\n", N, K,
-                     K / 2),
-          std::fflush(stderr);
-      static int logged = 0;
-      if (!logged++)
-        std::fprintf(stderr,
-                     "[v8c] image view unavailable for N=%u K=%u (>image cap); "
-                     "keeping buffer path for the GEMV\n",
-                     N, K);
+      e.imageless = true;
+      static bool logged = false;
+      if (!logged) {
+        logged = true;
+        ml_logw("[v8c] image view unavailable for %s (N=%u K=%u): the device "
+                "declined the image2d, so this weight takes the imageless "
+                "GEMV over its row-major buffer",
+                weight.getName().c_str(), N, K);
+      }
     }
   }
   // Re-take the map lock for insertion; DROP_PLAIN below stays inside it so
@@ -836,8 +845,8 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
   // dispatches QS4CX to dotQs4cx(), which reads exactly these nibbles plus the
   // fp32 scale tail (float_tensor.cpp). That fallback is reachable: dotCl_v8c
   // returns false from ~10 sites AFTER the weight has been built, cached and
-  // dropped (allocation failures, kernel-registration failures, and the huge_n
-  // untied-lm_head branch, which returns false unconditionally on an
+  // dropped (allocation failures, kernel-registration failures, and the
+  // imageless untied-lm_head branch, which returns false unconditionally on an
   // fp16-disabled build). The result would be a well-formed, entirely wrong
   // output with no exception and no log. Re-enabling by default needs the
   // fallback to fail loudly on a dropped weight first.
@@ -1106,10 +1115,23 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
   // no int8 act quant). Only decode (M=1) is supported -- the lm_head FC runs
   // only on the last position and prefill is skipped; any larger M with no
   // image legitimately falls back to the host path.
-  // Keyed on huge_n, NOT (weight_image == nullptr): the buffer path leaves the
-  // image null for EVERY weight (it is dead there), and those must still take
-  // the normal buffer GEMM below.
-  if (w->huge_n) {
+  // Keyed on imageless, NOT (weight_image == nullptr): the buffer path leaves
+  // the image null for EVERY weight (it is dead there), and those must still
+  // take the normal buffer GEMM below.
+  if (w->imageless) {
+    // Join the pass-boundary detector before taking the early exit. This
+    // weight is the untied lm_head: it uses no shared-quant cache itself, but
+    // it is the one FC guaranteed to be dispatched on every decode pass, so
+    // leaving it out would hide a boundary from every weight that does use
+    // the cache. The scratch lock is taken and released here because the GEMV
+    // below runs outside it.
+    {
+      std::lock_guard<std::mutex> glock(v8c_cache_mtx());
+      V8cScratch &gsc = v8c_scratch();
+      if (w->last_use_gen != 0 && w->last_use_gen == gsc.pass_gen)
+        ++gsc.pass_gen;
+      w->last_use_gen = gsc.pass_gen;
+    }
 #ifdef ENABLE_FP16
     if (M == 1 && input.getDataType() == ml::train::TensorDim::DataType::FP16 &&
         (output.getDataType() == ml::train::TensorDim::DataType::FP16 ||
