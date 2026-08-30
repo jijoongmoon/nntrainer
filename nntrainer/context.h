@@ -39,6 +39,14 @@
 
 namespace nntrainer {
 
+// Forward declarations for the decode seam below — kept as forward
+// declarations so context.h does NOT pull in the heavy tensor.h or
+// neuralnet.h. The seam's tensor type is
+// std::vector<std::shared_ptr<const Tensor>>, which only needs Tensor to be
+// declared: a shared_ptr of an incomplete type is fine.
+class NeuralNetwork;
+class Tensor;
+
 // ContextData lives in its own header so that layer_context.h / layer_node.h
 // can pull it in without triggering the context.h → layer_devel.h cycle.
 
@@ -48,10 +56,10 @@ namespace nntrainer {
  *        Context init from real device queries (clGetDeviceInfo /
  *        cudaGetDeviceProperties via the per-backend ContextManagers) rather
  *        than from NNTR_* env flags. Currently LOG-ONLY — no decision site
- *        reads it yet; it is the input the ExecPlan resolver will consume (see
- *        docs/backend_guide/ARCHITECTURE_REFACTOR.md §6). Fields describe attributes
- *        (what the device can do), never identity (who it is); unknown values
- *        stay at the defaults below.
+ *        reads it yet; it is the input the ExecPlan resolver consumes (see
+ *        docs/backend_guide/ARCHITECTURE_REFACTOR.md §6). Fields describe
+ *        attributes (what the device can do), never identity (who it is);
+ *        unknown values stay at the defaults below.
  */
 struct DeviceCaps {
   std::string backend = "cpu";  /**< "cpu" / "gpu" (OpenCL) / "cuda" */
@@ -138,9 +146,9 @@ inline const char *toString(GemmPath p) {
  *        This is the output of the ExecPlan resolver — the single place where
  *        device attributes (and later ModelFeatures) decide which kernels run,
  *        replacing scattered NNTR_* env flags. Currently a SHADOW
- *        (docs/backend_guide/ARCHITECTURE_REFACTOR.md §6): resolved, logged and asserted
- *        ==  the current env-driven choice, but NOT yet authoritative — no
- *        decision site reads it, so it is byte-identical.
+ *        (docs/backend_guide/ARCHITECTURE_REFACTOR.md §6): resolved, logged
+ *        and asserted equal to the current env-driven choice, but NOT yet
+ *        authoritative — no decision site reads it, so it is byte-identical.
  *
  *        Only cleanly caps-derivable cells are resolved here. Cells that are
  *        NOT a pure function of caps stay env overrides for now and are NOT
@@ -374,8 +382,9 @@ public:
    * @brief Read-only device capability snapshot for this backend, probed once
    *        at init. The base returns CPU caps (host-coherent, no accelerator);
    *        ClContext / CudaContext override with a probed snapshot. LOG-ONLY
-   * for now (docs/backend_guide/ARCHITECTURE_REFACTOR.md §6) — no decision site reads it
-   * yet, so adding/overriding it is byte-identical.
+   *        for now (see docs/backend_guide/ARCHITECTURE_REFACTOR.md §6) — no
+   *        decision site reads it yet, so adding or overriding it is
+   *        byte-identical.
    *
    * @return const DeviceCaps& capabilities of the device backing this context
    */
@@ -429,6 +438,36 @@ public:
   virtual ml::train::LayerComputeEngine residencyEngine() const {
     return ml::train::LayerComputeEngine::CPU;
   }
+
+  /**
+   * @brief Run one decode or prefill forward step for the model — the
+   *        execution seam a backend needs when its decode strategy is not a
+   *        plain graph walk. The base IS the plain walk
+   *        (nn.incremental_forwarding(...)), so CPU and OpenCL are
+   *        byte-identical to the pre-seam code; a backend whose decode is a
+   *        capture/replay state machine overrides this instead of adding a
+   *        compile-guarded block to neuralnet.cpp.
+   *        docs/backend_guide/ARCHITECTURE_REFACTOR.md §6 states the rule: a
+   *        backend-specific decode strategy belongs behind one Context hook.
+   * @note  Appended at the vtable tail, after residencyEngine(), so every
+   *        pre-existing slot keeps its index and a rebuilt libnntrainer.so
+   *        stays ABI-compatible with an app built against the old vtable.
+   * @note  The parameter and return type is spelled out as
+   *        std::vector<std::shared_ptr<const Tensor>> (sharedConstTensors) to
+   *        keep tensor.h out of this header; defined out of line in
+   *        neuralnet.cpp.
+   *
+   * @param nn    the model to step
+   * @param from  first token position of this step
+   * @param to    one past the last token position of this step
+   * @param input model inputs for this step
+   * @param label model labels for this step
+   * @return the model outputs for this step
+   */
+  virtual std::vector<std::shared_ptr<const Tensor>>
+  runDecode(NeuralNetwork &nn, unsigned int from, unsigned int to,
+            const std::vector<std::shared_ptr<const Tensor>> &input,
+            const std::vector<std::shared_ptr<const Tensor>> &label);
 
 private:
   /**
