@@ -16,6 +16,7 @@
 
 #include <activation_layer.h>
 #include <addition_layer.h>
+#include <attention_kernels.h>
 #include <blas_kernels.h>
 #include <cl_context.h>
 #include <cl_kernels/cl_kernels.h>
@@ -393,6 +394,11 @@ void ClContext::initAttentionClKernels() {
     for (auto &t : lazy_tasks)
       t();
   }
+
+  // The attention dispatchers own a second family of lazily built programs:
+  // the in-place RoPE source also hosts the KV scatter/copy kernels, so one
+  // registration builds the program all of them share.
+  attention_prewarm_programs(*this);
 
   attention_kernels_initialized = true;
 }
