@@ -124,8 +124,8 @@ void FullyConnectedLayerCl::forwarding(RunLayerContext &context,
   Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
   Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
 
-  // output = input * weight. The backend's ComputeOps owns the GEMM (OpenCL v8c
-  // / CUDA cuda_fc_qint4 / host dot).
+  // output = input * weight. The backend's ComputeOps owns the GEMM
+  // (ClComputeOps::fc on the gpu engine, the host dot on the CPU table).
   input_.getOps()->fc(input_, weight, hidden_);
 
   if (auto &disable_bias = std::get<props::DisableBias>(*layer_impl_props);
@@ -142,9 +142,9 @@ void FullyConnectedLayerCl::forwarding(RunLayerContext &context,
   }
 
   // fused activation epilogue via the op table — same backend-neutral
-  // dispatch as the core FC (ClComputeOps on gpu, CudaComputeOps on cuda).
-  // Inert for the LLM stack (no fc+activation); fires only when a
-  // FusionRealizer sets fused_activation (a GPU CNN/MLP).
+  // dispatch as the core FC. Inert for a decoder stack (no fc+activation);
+  // fires only when the FusionRealizer set fused_activation on an inference
+  // graph (a GPU CNN/MLP).
   auto &fused_act = std::get<props::FusedActivation>(fc_props);
   if (!fused_act.empty() && fused_act.get() != ActivationType::ACT_NONE)
     hidden_.getOps()->apply_activation(hidden_, (int)fused_act.get());
@@ -227,7 +227,7 @@ void FullyConnectedLayerCl::read(std::ifstream &file,
               fsu, start_offset, read_from_offset, file_fd);
   // Eager backend weight build at load (see header). Not under FSU: the weight
   // data may be streamed back out, invalidating the host pointer the cache is
-  // keyed on. No-op on backends without a prebuild (CPU/CUDA).
+  // keyed on. No-op on a backend that needs no prebuild (the CPU table).
   if (!opt_var && !fsu) {
     Tensor &w = run_context.getWeight(weight_idx[FCParams::weight]);
     w.getOps()->fc_prebuild_weight(w);

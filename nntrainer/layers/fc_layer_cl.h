@@ -4,18 +4,17 @@
  *
  * @file   fc_layer_cl.h
  * @date   7 May 2024
- * @brief  Backend-neutral quantized Fully Connected layer for the CausalLM
- *         accelerator path (OpenCL / CUDA).
+ * @brief  Backend-neutral quantized Fully Connected layer (op-table dispatch).
  * @see    https://github.com/nntrainer/nntrainer
  * @author Debadri Samaddar <s.debadri@samsung.com>
  * @bug    No known bugs except for NYI items
  *
- * @details Collapses the former FullyConnectedLayerCl (OpenCL) and CudaFcLayer
- * (CUDA) forks into one thin Layer that owns the weight/bias binding and
- * dispatches the matmul through the op table: input.getOps()->fc(...) lands on
- * ClComputeOps::fc (v8c w4a8 GPU GEMM) / CudaComputeOps::fc (cuda_fc_qint4) /
- * CpuComputeOps::fc (host Tensor::dot). The eager weight transform at load is
- * fc_prebuild_weight(). Registered for both the "gpu" and "cuda" engines; the
+ * @details A thin Layer that owns the weight/bias binding and dispatches the
+ * matmul through the op table: input.getOps()->fc(...) lands on
+ * ClComputeOps::fc (the OpenCL GEMM) on the gpu engine and on
+ * CpuComputeOps::fc (host Tensor::dot) with no accelerator ContextData
+ * attached. The eager weight transform at load is fc_prebuild_weight(), a
+ * no-op on a backend that needs none. Registered for the "gpu" engine; the
  * general FullyConnectedLayer (LoRA/quantizer) stays separate for cpu.
  */
 
