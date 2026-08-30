@@ -143,6 +143,11 @@ public:
     file_offset = rhs.file_offset;
     src_tensor = rhs.src_tensor;
     ct_data_ = rhs.ct_data_;
+    // Carried because it describes the LAYOUT of the buffer being shared here,
+    // not a read-time intention: a QS4CX copy that fell back to the default
+    // stride would read the per-channel scales out of the middle of the
+    // nibbles. @see setQs4cxRecordPadded
+    qs4cx_record_padded_ = rhs.qs4cx_record_padded_;
   }
 
   /**
@@ -258,6 +263,19 @@ public:
    * require packing
    */
   virtual void pack() {}
+
+  /**
+   * @brief Pack the weight data eagerly for the fp16-activation KAI path
+   * @note Default implementation does nothing. QS4CX overrides this to build
+   * the fp16-scale KAI rhs consumed by HalfTensor::dot — a different byte
+   * layout than pack(), which builds the fp32-activation facade's rhs.
+   */
+  virtual void packF16Activation() {}
+
+  /**
+   * @brief Whether packF16Activation() has produced a packed buffer
+   */
+  virtual bool isPackedF16Activation() const { return false; }
 
   /**
    * @brief     i data index
@@ -685,6 +703,39 @@ public:
   void setFileOffset(size_t off);
 
   /**
+   * @brief Mark that this tensor's on-disk bytes are a legacy QINT4 record
+   *        (u16 qscheme header + KAI Section A / plain container) that must be
+   *        transcoded losslessly to the canonical QS4CX in-memory layout on
+   *        read. Set by NeuralNetwork::load for QS4CX weights of a legacy
+   *        ("QINT4-*" model_tensor_type) model.
+   */
+  void setOnDiskLegacyQint4(bool v) { on_disk_legacy_qint4_ = v; }
+
+  /**
+   * @brief Whether this tensor's on-disk bytes are a legacy QINT4 record.
+   */
+  bool isOnDiskLegacyQint4() const { return on_disk_legacy_qint4_; }
+
+  /**
+   * @brief Select which of the two QS4CX record layouts this tensor uses:
+   *        padded (nibbles + floor(N/2) pad + fp32 scales) when true, trimmed
+   *        (nibbles + fp32 scales) when false. The two differ only for even K,
+   *        because the padded offset expression N * (K + 1) / 2 is evaluated
+   *        left to right. It picks the stride at which QS4CX_Tensor::size()
+   *        and getScale() place the scales, so it must be set before the
+   *        record is read. The default is the trimmed layout, which is what
+   *        the writer emits; a reader that finds the file only fits the padded
+   *        total sets this to true for that file. No effect on any other
+   *        tensor type.
+   */
+  void setQs4cxRecordPadded(bool v) { qs4cx_record_padded_ = v; }
+
+  /**
+   * @brief Whether this tensor uses the padded QS4CX record layout.
+   */
+  bool isQs4cxRecordPadded() const { return qs4cx_record_padded_; }
+
+  /**
    * @brief     set Tensor Dim
    * @param[in] d TensorDim
    * @note      Throws std::invalid_argument if size mismatch
@@ -912,6 +963,11 @@ protected:
   std::shared_ptr<ContextData> ct_data_; /**< per-Context dispatch table */
   size_t offset;
   size_t file_offset; /**< offset of the tensor in the file */
+  bool on_disk_legacy_qint4_ =
+    false; /**< on-disk bytes are a legacy QINT4 record to transcode to QS4CX */
+  bool qs4cx_record_padded_ =
+    false; /**< QS4CX record uses the padded stride (see setQs4cxRecordPadded)
+            */
 
   /**<
    * When using shared_data with tensor, this stores the ptr of the source
