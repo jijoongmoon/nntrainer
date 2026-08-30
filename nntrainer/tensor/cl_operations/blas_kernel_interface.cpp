@@ -1085,19 +1085,15 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
   // On BOTH device families that fallback is a measured performance cliff
   // (a driver-chosen work-group is pathological for some N), so align to 64
   // by default. Padded rows are computed but never stored (M-valid store
-  // guard in the kernel), so output is bit-identical. Override with
-  // NNTR_FC_MPAD_ALIGN (multiple of V8C_TM). Only applied for prefill-sized
-  // M (M >= align): decode (M=1) must never pad to 64 (that would be a 64x
-  // FC blow-up) -- guarded by eff_align below.
-  static const unsigned int _mpad_align = []() {
-    const char *e = std::getenv("NNTR_FC_MPAD_ALIGN");
-    unsigned int v = e ? (unsigned int)std::atoi(e) : 64u;
-    if (v < V8C_TM)
-      v = V8C_TM;
-    v = (v + V8C_TM - 1) / V8C_TM * V8C_TM; // keep a multiple of V8C_TM
-    return v;
-  }();
-  const unsigned int eff_align = (M >= _mpad_align) ? _mpad_align : V8C_TM;
+  // guard in the kernel), so output is bit-identical. The alignment is fixed
+  // rather than tunable: it is derived from the work-group above, not swept.
+  // Only applied for prefill-sized M (M >= align): decode (M=1) must never pad
+  // to 64 (that would be a 64x FC blow-up) -- guarded by eff_align below.
+  constexpr unsigned int V8C_MPAD_ALIGN = 64;
+  static_assert(V8C_MPAD_ALIGN % V8C_TM == 0,
+                "M_pad alignment must stay a multiple of the kernel tile");
+  const unsigned int eff_align =
+    (M >= V8C_MPAD_ALIGN) ? V8C_MPAD_ALIGN : V8C_TM;
   const unsigned int M_pad = (M + eff_align - 1) / eff_align * eff_align;
 
   auto *blas_cc =

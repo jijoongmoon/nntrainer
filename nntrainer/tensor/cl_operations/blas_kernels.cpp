@@ -1380,24 +1380,16 @@ static const tv::DeviceImageCaps &v8c_device_caps() {
 }
 
 /**
- * @brief Shared v8c LWS policy: preferred 4×16 (env NNTR_V8C_LWS overrides),
- * capped to the device max work-group size and required to divide gws.
+ * @brief Shared v8c LWS policy: 4×16 preferred, capped to the device max
+ * work-group size and required to divide gws.
  * @return whether a valid LWS was chosen; out is filled when true.
  */
 static bool v8c_pick_lws(size_t gws_x, size_t gws_y,
                          std::array<size_t, 2> &out) {
-  static const std::array<size_t, 2> pref = []() {
-    const char *e = std::getenv("NNTR_V8C_LWS");
-    size_t lx = 4, ly = 16; // swept sweet spot @ M=1024 (WG=64), 8.9× vs NULL.
-    if (e) {
-      long a = 0, b = 0;
-      if (std::sscanf(e, "%ld,%ld", &a, &b) == 2 && a > 0 && b > 0) {
-        lx = (size_t)a;
-        ly = (size_t)b;
-      }
-    }
-    return std::array<size_t, 2>{lx, ly};
-  }();
+  // Swept sweet spot @ M=1024 (WG=64), 8.9× vs a NULL work-group. Fixed, not
+  // tunable: the sweep that produced it is a bring-up activity, not something
+  // a deployment re-runs.
+  static const std::array<size_t, 2> pref = {4, 16};
   size_t ox = 0, oy = 0;
   bool ok = tv::select2dLws(gws_x, gws_y, pref[0], pref[1], v8c_device_caps(),
                             &ox, &oy);
@@ -1486,17 +1478,7 @@ void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
   // buffers; widths derived from K (int4 weight texel = 32 K, act texel = 16
   // K).
   const bool use_buf = v8c_use_buffer_path();
-  // NNTR_FC_BUF=1 (probe): route ONLY the FC GEMMs through the buffer-load
-  // kernels while the rest of the pipeline (attention images, copts) stays
-  // on the image path. The image-capable program always contains the buffer
-  // kernels too, so the compile opts stay "" — this also sidesteps the
-  // on-disk .cl.bin cache collision (its filename ignores copts). Callers
-  // must pass buffer handles for act/weight when setting this.
-  static const bool fc_buf_probe = []() {
-    const char *e = getenv("NNTR_FC_BUF");
-    return e && atoi(e) != 0;
-  }();
-  const bool buf_kernel = use_buf || fc_buf_probe;
+  const bool buf_kernel = use_buf;
   const char *kname =
     buf_kernel
       ? (use_m1 ? "v8c_gemm_int8_int4_m1_buf" : "v8c_gemm_int8_int4_buf")
