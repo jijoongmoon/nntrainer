@@ -722,14 +722,22 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
     if (it != cache.end() && it->second.N == N && it->second.K == K) {
       // A concurrent caller built this weight while we were outside the
       // lock (theoretical: the load-time prebuild fires once per weight).
-      // Keep the first entry; release our duplicate device objects (the
-      // weight backing frees itself via e.backing's unique_ptr).
+      // Keep the first entry; release our duplicate device objects.
+      // scale_buf and row_sum_w_int4 are standalone clCreateBuffer results
+      // this entry owns outright, so they must be released here.
+      // weight_image must NOT be: it is the image2d view returned by
+      // TensorBacking::imageView(), which caches it in image_cache_ and
+      // releases every cached view in ~TensorBacking. e.backing's unique_ptr
+      // runs that destructor as e goes out of scope on this path, so
+      // releasing the image here too would drop the refcount twice and free
+      // a live cl_mem (the winning entry's GEMM keeps sampling its own view;
+      // the second release corrupts the driver's object table -- observed
+      // class of failure is a crash or a garbage weight read on the very
+      // next FC).
       if (e.scale_buf)
         opencl::clReleaseMemObject(e.scale_buf);
       if (e.row_sum_w_int4)
         opencl::clReleaseMemObject(e.row_sum_w_int4);
-      if (e.weight_image)
-        opencl::clReleaseMemObject(e.weight_image);
       return &it->second;
     }
     if (it != cache.end())
