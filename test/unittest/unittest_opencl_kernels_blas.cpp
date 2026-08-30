@@ -17,11 +17,11 @@
 #include <vector>
 
 #include "fallback_internal.h"
+#include "gelu_cl_op.h"
 #include "int4_utils.h"
+#include "layernorm_cl_op.h"
 #include "nntrainer_test_util.h"
 #include "q4_0_utils.h"
-#include "gelu_cl_op.h"
-#include "layernorm_cl_op.h"
 #include "swiglu_cl_op.h"
 #include "tensor_dim.h"
 #include "timer.h"
@@ -646,7 +646,7 @@ TEST(blas_kernels, rmsnorm_fp32) {
   EXPECT_IN_RANGE((float)cosSim, 0.99, 1);
 }
 
-// [T7] LayerNorm / GELU whole-ops. These go through the op entry points
+// LayerNorm / GELU whole-ops. These go through the op entry points
 // (layernorm_cl_op / gelu_cl_op) rather than the former blas_kernels wrappers,
 // i.e. exactly the symbols ClComputeOps::layer_norm / ::activation forward to,
 // so they cover the argument binding AND the kernel math. Tensors here come
@@ -698,8 +698,9 @@ TEST(blas_kernels, layernorm_fp32) {
     var /= width;
     double inv = 1.0 / std::sqrt(var + (double)kEpsilon);
     for (unsigned int w = 0; w < width; ++w) {
-      double ref = (ip[h * width + w] - mean) * inv * gamma.getData<float>()[w] +
-                   beta.getData<float>()[w];
+      double ref =
+        (ip[h * width + w] - mean) * inv * gamma.getData<float>()[w] +
+        beta.getData<float>()[w];
       float gpu = out.getData<float>()[h * width + w];
       float err = std::fabs(gpu - (float)ref);
       if (err > maxAbsErr)
@@ -766,9 +767,9 @@ TEST(blas_kernels, layernorm_fp32_row_window) {
 TEST(blas_kernels, gelu_fp32) {
   // Fixed FP32 input of 24 values spanning negatives/zero/positives.
   const std::vector<float> host_in = {
-    -6.0f,  -4.5f, -3.0f, -2.5f, -2.0f, -1.5f, -1.0f, -0.75f,
-    -0.5f,  -0.25f, -0.1f, 0.0f,  0.1f,  0.25f, 0.5f,  0.75f,
-    1.0f,   1.5f,  2.0f,  2.5f,  3.0f,  4.5f,  6.0f,  8.0f};
+    -6.0f, -4.5f,  -3.0f, -2.5f, -2.0f, -1.5f, -1.0f, -0.75f,
+    -0.5f, -0.25f, -0.1f, 0.0f,  0.1f,  0.25f, 0.5f,  0.75f,
+    1.0f,  1.5f,   2.0f,  2.5f,  3.0f,  4.5f,  6.0f,  8.0f};
   const unsigned int num_elems = (unsigned int)host_in.size();
 
   nntrainer::init_backend();
@@ -778,8 +779,7 @@ TEST(blas_kernels, gelu_fp32) {
                                              nntrainer::Tdatatype::FP32};
   nntrainer::Tensor in(1, 1, 1, num_elems, t_fp32);
   nntrainer::Tensor out(1, 1, 1, num_elems, t_fp32);
-  std::memcpy(in.getData<float>(), host_in.data(),
-              num_elems * sizeof(float));
+  std::memcpy(in.getData<float>(), host_in.data(), num_elems * sizeof(float));
 
   // Double-precision CPU reference for both GELU variants.
   auto ref_gelu = [](double x, int mode) -> double {

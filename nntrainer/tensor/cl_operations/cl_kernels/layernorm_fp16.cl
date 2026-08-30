@@ -21,13 +21,13 @@ REQD_SUBGROUP_SIZE_64
 // (half accumulation loses precision / overflows once activations are squared),
 // matching the FP32-accumulation policy of rmsnorm_fp16.cl. One workgroup per
 // row; each work item strides the row and the per-row sums are collapsed with
-// sub_group_reduce_add. gamma/beta are loaded per element (weight pointers carry
-// no 16-byte vector-load alignment guarantee).
+// sub_group_reduce_add. gamma/beta are loaded per element (weight pointers
+// carry no 16-byte vector-load alignment guarantee).
 __kernel void
-layernorm_cl_fp16(__global const half *input,  // Input tensor
-                  __global half *output,       // Output tensor
-                  __global const half *gamma,  // Scale (one for each width)
-                  __global const half *beta,   // Shift (one for each width)
+layernorm_cl_fp16(__global const half *input, // Input tensor
+                  __global half *output,      // Output tensor
+                  __global const half *gamma, // Scale (one for each width)
+                  __global const half *beta,  // Shift (one for each width)
                   float epsilon,
                   int H, // Height of feature map (batch*channel*height rows)
                   int W  // Width of feature map (normalized dimension)
@@ -54,9 +54,8 @@ layernorm_cl_fp16(__global const half *input,  // Input tensor
 
   // out = (x - mean) * scale * gamma + beta
   for (int i = get_local_id(0); i < W; i += get_local_size(0)) {
-    const float o =
-      ((float)input[index + i] - mean) * scale * (float)gamma[i] +
-      (float)beta[i];
+    const float o = ((float)input[index + i] - mean) * scale * (float)gamma[i] +
+                    (float)beta[i];
     output[index + i] = (half)o;
   }
 }
