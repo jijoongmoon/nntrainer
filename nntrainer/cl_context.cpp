@@ -326,4 +326,13 @@ template const int ClContext::registerFactory<nntrainer::Layer>(
   const FactoryType<nntrainer::Layer> factory, const std::string &key,
   const int int_key);
 
+// Non-template seam (Context::registerLayerFactory override): forwards to the
+// per-class registerFactory<Layer> here in the same translation unit, so the
+// explicit instantiation above is the one used and no template crosses the .so
+// boundary.
+int ClContext::registerLayerFactory(PtrFactoryType<nntrainer::Layer> factory,
+                                    const std::string &key, const int int_key) {
+  return registerFactory<nntrainer::Layer>(factory, key, int_key);
+}
+
 } // namespace nntrainer
