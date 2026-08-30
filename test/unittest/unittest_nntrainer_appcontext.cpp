@@ -263,6 +263,159 @@ TEST(AppContextTest, callingUnknownFactoryOptimizerWithIntKey_n) {
 }
 
 /**
+ * @brief   ExecPlan resolver tests (caps-only overload)
+ *
+ */
+TEST(ExecPlanResolverTest, capsOnly_cpuBackend_p) {
+  nntrainer::DeviceCaps caps;
+  caps.backend = "cpu";
+
+  auto plan = nntrainer::resolveExecPlan(caps);
+  EXPECT_EQ(plan.gemm_path, nntrainer::GemmPath::CPU);
+}
+
+TEST(ExecPlanResolverTest, capsOnly_gpuWithDpas_p) {
+  nntrainer::DeviceCaps caps;
+  caps.backend = "gpu";
+  caps.dpas = true;
+
+  auto plan = nntrainer::resolveExecPlan(caps);
+  EXPECT_EQ(plan.gemm_path, nntrainer::GemmPath::XMX);
+}
+
+TEST(ExecPlanResolverTest, capsOnly_gpuWithoutDpas_p) {
+  nntrainer::DeviceCaps caps;
+  caps.backend = "gpu";
+  caps.dpas = false;
+
+  auto plan = nntrainer::resolveExecPlan(caps);
+  EXPECT_EQ(plan.gemm_path, nntrainer::GemmPath::DP4A);
+}
+
+TEST(ExecPlanResolverTest, capsOnly_cudaBackend_p) {
+  nntrainer::DeviceCaps caps;
+  caps.backend = "cuda";
+
+  auto plan = nntrainer::resolveExecPlan(caps);
+  EXPECT_EQ(plan.gemm_path, nntrainer::GemmPath::CUBLAS);
+}
+
+TEST(ExecPlanResolverTest, capsOnly_hostCoherentMirrorsIntegrated_p) {
+  nntrainer::DeviceCaps integrated_caps;
+  integrated_caps.backend = "gpu";
+  integrated_caps.integrated = true;
+  EXPECT_EQ(nntrainer::resolveExecPlan(integrated_caps).host_coherent, true);
+
+  nntrainer::DeviceCaps discrete_caps;
+  discrete_caps.backend = "gpu";
+  discrete_caps.integrated = false;
+  EXPECT_EQ(nntrainer::resolveExecPlan(discrete_caps).host_coherent, false);
+}
+
+TEST(ExecPlanResolverTest, capsOnly_decodeGpuDefaultsFalse_p) {
+  nntrainer::DeviceCaps caps;
+  caps.backend = "gpu";
+  caps.dpas = true;
+
+  auto plan = nntrainer::resolveExecPlan(caps);
+  EXPECT_EQ(plan.decode_gpu, false);
+}
+
+/**
+ * @brief   ExecPlan resolver tests (caps + ModelFeatures matcher overload)
+ *
+ */
+TEST(ExecPlanResolverTest, matcher_decodeGpuOnGpuBackend_p) {
+  nntrainer::DeviceCaps caps;
+  caps.backend = "gpu";
+  caps.dpas = true;
+
+  nntrainer::ModelFeatures features;
+  features.decode_gpu = true;
+
+  auto plan = nntrainer::resolveExecPlan(caps, features);
+  EXPECT_EQ(plan.decode_gpu, true);
+}
+
+TEST(ExecPlanResolverTest, matcher_decodeGpuOnCudaBackend_p) {
+  nntrainer::DeviceCaps caps;
+  caps.backend = "cuda";
+
+  nntrainer::ModelFeatures features;
+  features.decode_gpu = true;
+
+  auto plan = nntrainer::resolveExecPlan(caps, features);
+  EXPECT_EQ(plan.decode_gpu, true);
+}
+
+TEST(ExecPlanResolverTest, matcher_decodeGpuGatedOffOnCpuBackend_n) {
+  nntrainer::DeviceCaps caps;
+  caps.backend = "cpu";
+
+  nntrainer::ModelFeatures features;
+  features.decode_gpu = true;
+
+  auto plan = nntrainer::resolveExecPlan(caps, features);
+  EXPECT_EQ(plan.decode_gpu, false);
+}
+
+TEST(ExecPlanResolverTest, matcher_decodeGpuFalseStaysFalseOnGpuBackend_n) {
+  nntrainer::DeviceCaps caps;
+  caps.backend = "gpu";
+  caps.dpas = true;
+
+  nntrainer::ModelFeatures features;
+  features.decode_gpu = false;
+
+  auto plan = nntrainer::resolveExecPlan(caps, features);
+  EXPECT_EQ(plan.decode_gpu, false);
+}
+
+TEST(ExecPlanResolverTest, matcher_capsDerivedCellsMatchCapsOnlyOverload_p) {
+  nntrainer::DeviceCaps caps;
+  caps.backend = "gpu";
+  caps.dpas = true;
+  caps.integrated = false;
+
+  nntrainer::ModelFeatures features;
+  features.decode_gpu = true;
+
+  auto caps_only_plan = nntrainer::resolveExecPlan(caps);
+  auto matcher_plan = nntrainer::resolveExecPlan(caps, features);
+
+  EXPECT_EQ(matcher_plan.gemm_path, caps_only_plan.gemm_path);
+  EXPECT_EQ(matcher_plan.host_coherent, caps_only_plan.host_coherent);
+}
+
+/**
+ * @brief   toString() smoke tests for the ExecPlan/ModelFeatures resolver
+ *          types and their enums
+ *
+ */
+TEST(ExecPlanResolverTest, toString_execPlanContainsGemmPathKey_p) {
+  nntrainer::ExecPlan plan;
+  std::string dump = plan.toString();
+
+  EXPECT_FALSE(dump.empty());
+  EXPECT_NE(dump.find("gemm_path="), std::string::npos);
+}
+
+TEST(ExecPlanResolverTest, toString_modelFeaturesContainsQkNormKey_p) {
+  nntrainer::ModelFeatures features;
+  std::string dump = features.toString();
+
+  EXPECT_FALSE(dump.empty());
+  EXPECT_NE(dump.find("qk_norm="), std::string::npos);
+}
+
+TEST(ExecPlanResolverTest, toString_gemmPathEnumLiterals_p) {
+  EXPECT_STREQ(nntrainer::toString(nntrainer::GemmPath::CPU), "CPU");
+  EXPECT_STREQ(nntrainer::toString(nntrainer::GemmPath::DP4A), "DP4A");
+  EXPECT_STREQ(nntrainer::toString(nntrainer::GemmPath::XMX), "XMX");
+  EXPECT_STREQ(nntrainer::toString(nntrainer::GemmPath::CUBLAS), "CUBLAS");
+}
+
+/**
  * @brief Main gtest
  */
 int main(int argc, char **argv) {
