@@ -80,7 +80,18 @@ void load_complete();
  *        set_source).
  */
 bool lookup(const char *name, unsigned int N, unsigned int K, size_t row_bytes,
-            size_t payload_len, Hit &out);
+            size_t payload_len, uint64_t src_fnv, Hit &out);
+
+/**
+ * @brief Fingerprint of the SOURCE bytes a record is derived from, to be
+ *        passed to lookup() and begin_record(). The file-level identity
+ *        (size + mtime) cannot see a weight file replaced in place with one
+ *        of the same size and timestamp -- a restored archive, a regenerated
+ *        build artefact, or any filesystem with a coarse mtime -- and serving
+ *        a stale pack there would infer with silently wrong weights. Sampled
+ *        (both ends plus interior pages), so it costs nothing on a hit.
+ */
+uint64_t source_fingerprint(const void *data, size_t len);
 
 /**
  * @brief Drop the (clean, file-backed) payload pages of a consumed hit.
@@ -94,7 +105,8 @@ void payload_consumed(const Hit &hit);
  *        pack). Must be paired with commit_record or abort_record.
  */
 RecordWriter *begin_record(const char *name, unsigned int N, unsigned int K,
-                           size_t row_bytes, size_t payload_len);
+                           size_t row_bytes, size_t payload_len,
+                           uint64_t src_fnv);
 
 /**
  * @brief Tee one packed chunk at @p payload_off (bytes into this record's

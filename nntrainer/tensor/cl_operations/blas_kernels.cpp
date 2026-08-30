@@ -1637,8 +1637,14 @@ void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
     if (e && atoi(e) == 0)
       return false; // NNTR_FC_XMX=0 force-disables regardless of caps
     const char *force = getenv("NNTR_FC_XMX_FORCE");
-    if (force && std::string(force) == "1")
-      return requested; // debug escape hatch: skip the capability check
+    if (force && std::string(force) == "1") {
+      // Debug escape hatch: skip the capability check. Say so loudly -- on a
+      // device with no matrix engine this asks the driver to emulate the DPAS
+      // builtin, which is far slower than the fallback it replaces.
+      ml_logw("[XMX] NNTR_FC_XMX_FORCE=1: dispatching the DPAS kernel without "
+              "checking for a matrix engine. Benchmarking only.");
+      return requested;
+    }
     return requested && ClContext::Global().caps().dpas;
   }();
   // One-shot warning (stderr + ml_logw): XMX was requested/defaulted but this
@@ -1667,7 +1673,8 @@ void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
   if (!xmx_gate_logged) {
     xmx_gate_logged = true;
     const bool gate = xmx_fc && M > 4 && buf_kernel && (N % 64) == 0 &&
-                      (K % 64) == 0 && K >= 128;
+                      (K % 64) == 0 && K >= 128 &&
+                      v8c_wrow_bytes(K) == (size_t)K / 2;
     // Quiet by default (SDK surface): always report the surprising case
     // (XMX requested but gated OFF = silent perf loss), the rest only
     // under NNTR_GPU_VERBOSE.
@@ -1685,26 +1692,45 @@ void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
   // K == 64 -> 32 bytes. At K >= 128, K/2 >= 64 clears the width minimum and
   // K % 64 == 0 already makes K/2 a multiple of 32, clearing the pitch rule.
   // Narrower shapes fall through to dp4a: correct, just slower.
+  // The kernel hardcodes the weight surface's width and pitch as K/2 rather
+  // than reading the stride argument it is passed, so it is only correct while
+  // the row stride IS K/2. That holds on the buffer path today, but buf_kernel
+  // can also be set by the probe override while the row stride is the padded
+  // image-path one, so the invariant is checked here instead of assumed.
   if (xmx_fc && M > 4 && buf_kernel && (N % 64) == 0 && (K % 64) == 0 &&
-      K >= 128) {
-    // Shape-adaptive tile. The microbench's NT=4/SG_M=1 (tuned for the square
-    // N=K=4096 case) badly underutilizes the real FC shapes: NT=2 is broadly
-    // best, and SG_M (subgroups stacked along M, re-using the fetched N-block
-    // weight) must grow with the problem -- measured best/shape: large-K down
-    // proj -> SG8, large-N gate/up -> SG4..8, small (qwen3) -> SG1. e.g. gemma4
-    // gate/up (N6144,K1536) 2.76 -> 13.5 TOP/s, gemma2 down (N2304,K9216) ->
-    // 10.4. Each (MT,NT,SG_M) is a distinct -D copts string => registerClKernel
-    // caches a separate compiled program (key = name+copts). NNTR_XMX_NT /
-    // NNTR_XMX_SGM override the heuristic for tuning.
-    // NT=2 + SG_M=4 measured uniformly best IN-MODEL across gemma2/qwen3/gemma4
-    // (prefill +3% / +32% / +50% vs the microbench NT=4/SG_M=1). The standalone
-    // sweep favored SG_M=8 for the large-K down-proj, but that collapses
-    // occupancy in-model (gemma2 -32%), so SG_M=4 is the robust default.
+      K >= 128 && v8c_wrow_bytes(K) == (size_t)K / 2) {
+    // ONE fixed tile, deliberately -- not a per-shape heuristic. A standalone
+    // sweep does favour a different (NT, SG_M) per projection shape (SG_M=8
+    // for the deep down-projections, SG_M=1 for the narrow models), but those
+    // wins do not survive the whole model: SG_M=8 collapses occupancy in-model
+    // by up to a third. NT=2 with SG_M=4 measured uniformly best in-model
+    // across every validated LLM (prefill +3% to +50% against the microbench's
+    // NT=4/SG_M=1), so it is the robust default and the only shape-dependent
+    // logic below is the repair of an override N cannot divide.
+    // Each (MT, NT, SG_M) is a distinct -D option string, so registerClKernel
+    // caches a separate compiled program per tile (key = name + options).
     int xmx_mt = 4, xmx_nt = 2, xmx_sgm = 4;
-    if (const char *e = getenv("NNTR_XMX_NT"))
-      xmx_nt = atoi(e);
-    if (const char *e = getenv("NNTR_XMX_SGM"))
-      xmx_sgm = atoi(e);
+    // Validate the overrides. These are documented tuning knobs, so a typo is
+    // a realistic input, and an unvalidated one is not a bad tile but a
+    // crash: 0 (which is also what a non-numeric string parses to) reaches
+    // `N % (nt * 16)` and `M % (MT * 8 * SG_M)` as a division by zero, and a
+    // negative value reaches the local size as a huge size_t. Reject anything
+    // outside the range the kernel supports and keep the default.
+    auto tile_override = [](const char *var, int lo, int hi, int dflt) {
+      const char *e = getenv(var);
+      if (!e || !*e)
+        return dflt;
+      char *end = nullptr;
+      const long v = std::strtol(e, &end, 10);
+      if (end == e || *end != '\0' || v < lo || v > hi) {
+        ml_logw("[XMX] ignoring %s=\"%s\": expected an integer in [%d, %d]",
+                var, e, lo, hi);
+        return dflt;
+      }
+      return (int)v;
+    };
+    xmx_nt = tile_override("NNTR_XMX_NT", 1, 8, xmx_nt);
+    xmx_sgm = tile_override("NNTR_XMX_SGM", 1, 16, xmx_sgm);
     if (N % ((unsigned)xmx_nt * 16) != 0)
       xmx_nt = 4; // N%64==0 guaranteed by the dispatch gate
     char xmx_co[176];
@@ -2250,10 +2276,19 @@ std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
   // pack mapping -- no staging copy, no permute, no row-sum pass -- and drop
   // the file pages per chunk, so the transient residency of the pack stays at
   // one chunk instead of the whole payload.
+  // Fingerprint of the SOURCE nibbles, so a weight file replaced in place
+  // with one of the same size and timestamp cannot serve a stale pack. It is
+  // sampled, so it costs a fixed ~192 KB of hashing whether the lookup hits
+  // or misses.
+  const uint64_t src_fnv =
+    (cache_name != nullptr)
+      ? v8c_pack::source_fingerprint(plain_nibbles, (size_t)N * plain_row_bytes)
+      : 0;
   bool from_cache = false;
   if (!hostptr && cache_name != nullptr) {
     v8c_pack::Hit hit;
-    if (v8c_pack::lookup(cache_name, N, K, v8c_row_bytes, total_bytes, hit)) {
+    if (v8c_pack::lookup(cache_name, N, K, v8c_row_bytes, total_bytes, src_fnv,
+                         hit)) {
       constexpr size_t UP_CHUNK = 64u << 20;
       cl_int werr = CL_SUCCESS;
       for (size_t off = 0; off < total_bytes && werr == CL_SUCCESS;
@@ -2287,8 +2322,8 @@ std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
     }
   } pack_rec;
   if (!from_cache && !hostptr && cache_name != nullptr)
-    pack_rec.rw =
-      v8c_pack::begin_record(cache_name, N, K, v8c_row_bytes, total_bytes);
+    pack_rec.rw = v8c_pack::begin_record(cache_name, N, K, v8c_row_bytes,
+                                         total_bytes, src_fnv);
 
   // hostptr: map the whole buffer once and build straight into it (no staging).
   uint8_t *map_ptr = nullptr;
@@ -2342,14 +2377,21 @@ std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
     }
   };
 
-  // For the big weights (in practice the untied lm_head,
+  // For the big weights (in practice an untied output projection,
   // N=262144 -> 336MB) the single-threaded permute is the longest pole of
-  // model init even once the per-weight builds run concurrently (the map
-  // lock split in blas_kernel_interface.cpp). Pack+upload independent
-  // chunks from a small crew: staging stays bounded at workers x
-  // CHUNK_BYTES (4 x 16MB), blocking writes to disjoint offsets are
-  // thread-safe on the shared queue, and row_sum rows are disjoint. Small
-  // weights keep the serial path (thread spin-up would dominate).
+  // model init even once the per-weight builds run concurrently. Pack
+  // independent chunks from a small crew: writes to disjoint offsets are
+  // thread-safe on the shared queue and the row-sum rows are disjoint too.
+  // Small weights keep the serial path (thread spin-up would dominate).
+  //
+  // What this parallelizes is the CPU permute, not the upload: the crew's
+  // writes are blocking on one in-order queue, so they still serialize
+  // behind each other. The permute is the pole, so that is where the win is.
+  //
+  // Bound, stated honestly: this function is itself called concurrently by
+  // the loader's weight workers, so the crew below is per CALL. The peak is
+  // therefore (concurrent builds) x n_workers x CHUNK_BYTES, capped by the
+  // global budget below rather than by the per-call limit alone.
   constexpr size_t PAR_THRESHOLD_BYTES = 64u << 20;
   const size_t n_chunks = ((size_t)N + chunk_rows - 1) / chunk_rows;
   if (from_cache) {
@@ -2358,8 +2400,31 @@ std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
     unsigned int hw = std::thread::hardware_concurrency();
     if (hw == 0)
       hw = 4;
-    const size_t n_workers =
-      std::min(std::min((size_t)hw, n_chunks), (size_t)4);
+    // Global budget over every concurrent build, so N loader workers cannot
+    // each spawn a full crew and oversubscribe the machine (and its staging)
+    // by a factor of N. A build that finds the budget spent packs serially.
+    static std::atomic<size_t> crew_budget{std::max<size_t>(hw, 4)};
+    size_t n_workers = std::min(std::min((size_t)hw, n_chunks), (size_t)4);
+    size_t taken = 0;
+    for (size_t want = n_workers; want > 0; --want) {
+      size_t avail = crew_budget.load(std::memory_order_relaxed);
+      if (avail == 0)
+        break;
+      const size_t give = std::min(avail, want);
+      if (crew_budget.compare_exchange_weak(avail, avail - give,
+                                            std::memory_order_relaxed)) {
+        taken = give;
+        break;
+      }
+    }
+    // At least one worker either way: an exhausted budget must degrade to a
+    // serial pack of this weight, never to no pack at all.
+    n_workers = std::max<size_t>(taken, 1);
+    struct CrewBudget {
+      size_t n;
+      std::atomic<size_t> *b;
+      ~CrewBudget() { b->fetch_add(n, std::memory_order_relaxed); }
+    } crew_budget_guard{taken, &crew_budget};
     std::atomic<size_t> next_chunk{0};
     std::atomic<cl_int> chunk_err{CL_SUCCESS};
     std::vector<std::thread> crew;
