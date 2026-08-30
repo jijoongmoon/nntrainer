@@ -960,6 +960,7 @@ static void v8c_write_output_resident(cl_mem y_fp16, Tensor &output,
   // async handoff shows stale reads).
   static const bool fc_svm_sync = std::getenv("NNTR_FC_SVM_SYNC") != nullptr;
   cc->command_queue_inst_.enqueueSVMMap(out_svm, out_bytes, true,
+                                        /** event */ nullptr,
                                         /** async */ !fc_svm_sync);
 }
 
@@ -990,6 +991,7 @@ static void v8c_copy_svm_to_clmem(const void *in_svm, cl_mem out,
   // no host access before then, in-order queue preserves ordering.
   cc->command_queue_inst_.enqueueSVMMap(const_cast<void *>(in_svm),
                                         (size_t)n * (fp16 ? 2 : 4), true,
+                                        /** event */ nullptr,
                                         /** async */ true);
 }
 

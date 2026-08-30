@@ -325,8 +325,8 @@ bool CommandQueueManager::EnqueueUnmapMemObject(cl_mem buffer, void *mapped_ptr,
 }
 
 bool CommandQueueManager::enqueueSVMMap(void *svm_ptr, size_t size,
-                                        bool read_only, bool async,
-                                        cl_event *event) {
+                                        bool read_only, cl_event *event,
+                                        bool async) {
   // managing read/write flags
   const cl_map_flags map_flag = read_only ? CL_MAP_READ : CL_MAP_WRITE;
 
