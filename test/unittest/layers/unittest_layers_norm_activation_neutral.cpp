@@ -141,9 +141,8 @@ TEST(NeutralNormActivation, GpuOpsImplementLayerNormAndGelu) {
   nntrainer::Tensor gin(1, 1, 1, 8, t_fp32), gout(1, 1, 1, 8, t_fp32);
   for (unsigned int i = 0; i < 8; ++i)
     gin.getData<float>()[i] = -2.0f + 0.5f * i;
-  ASSERT_NO_THROW(ops->activation(gin, gout,
-                                  (int)nntrainer::ActivationType::ACT_GELU, 1,
-                                  0));
+  ASSERT_NO_THROW(
+    ops->activation(gin, gout, (int)nntrainer::ActivationType::ACT_GELU, 1, 0));
   for (unsigned int i = 0; i < 8; ++i) {
     const double x = gin.getData<float>()[i];
     const double ref = 0.5 * x * (1.0 + std::erf(x * 0.70710678118654752));
@@ -175,9 +174,9 @@ TEST(NeutralNormActivation, GpuActivationThrowsForUnacceleratedModes) {
                                              nntrainer::Tdatatype::FP32};
   nntrainer::Tensor in(1, 1, 1, 8, t_fp32), out(1, 1, 1, 8, t_fp32);
   in.setValue(0.5f);
-  EXPECT_THROW(ops->activation(in, out,
-                               (int)nntrainer::ActivationType::ACT_RELU, 1, 0),
-               std::invalid_argument);
+  EXPECT_THROW(
+    ops->activation(in, out, (int)nntrainer::ActivationType::ACT_RELU, 1, 0),
+    std::invalid_argument);
 }
 
 #ifdef ENABLE_FP16
@@ -224,16 +223,16 @@ TEST(NeutralNormActivation, CpuOpsServiceEveryActivationMode) {
   for (unsigned int i = 0; i < 8; ++i)
     in.getData<float>()[i] = -2.0f + 0.5f * i;
 
-  ASSERT_NO_THROW(ops->activation(
-    in, out, (int)nntrainer::ActivationType::ACT_RELU, 1, 0));
+  ASSERT_NO_THROW(
+    ops->activation(in, out, (int)nntrainer::ActivationType::ACT_RELU, 1, 0));
   for (unsigned int i = 0; i < 8; ++i)
     EXPECT_FLOAT_EQ(out.getData<float>()[i],
                     std::max(0.0f, in.getData<float>()[i]));
 
   // ACT_NONE is a straight copy over the window.
   out.setValue(-99.0f);
-  ASSERT_NO_THROW(ops->activation(
-    in, out, (int)nntrainer::ActivationType::ACT_NONE, 1, 0));
+  ASSERT_NO_THROW(
+    ops->activation(in, out, (int)nntrainer::ActivationType::ACT_NONE, 1, 0));
   for (unsigned int i = 0; i < 8; ++i)
     EXPECT_FLOAT_EQ(out.getData<float>()[i], in.getData<float>()[i]);
 }

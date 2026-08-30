@@ -16,16 +16,17 @@ REQD_SUBGROUP_SIZE_64
 #endif
 
 __kernel void
-layernorm_cl(__global const float *input,  // Input tensor
-             __global float *output,       // Output tensor
-             __global const float *gamma,  // Scale (one for each width)
-             __global const float *beta,   // Shift (one for each width)
+layernorm_cl(__global const float *input, // Input tensor
+             __global float *output,      // Output tensor
+             __global const float *gamma, // Scale (one for each width)
+             __global const float *beta,  // Shift (one for each width)
              float epsilon,
              int H, // Height of feature map (batch*channel*height rows)
              int W  // Width of feature map (normalized dimension)
 ) {
-  // One workgroup normalizes one row (h); each work item strides the row and the
-  // per-row reductions are collapsed with sub_group_reduce_add (mirrors rmsnorm).
+  // One workgroup normalizes one row (h); each work item strides the row and
+  // the per-row reductions are collapsed with sub_group_reduce_add (mirrors
+  // rmsnorm).
   int h = get_group_id(0);
   int index = h * W;
   const int W4 = W / 4;
