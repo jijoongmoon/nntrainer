@@ -21,12 +21,25 @@ while [[ $# -gt 0 ]]; do
             MESON_ARGS+=("$1")
             shift
             ;;
+        --arm-arch)
+            # The space-separated spelling reaches here rather than the case
+            # above. tools/package_android.sh only matches --arm-arch=<version>,
+            # so say which spelling to use instead of reporting the option as
+            # unknown -- it is the option name that is right and the separator
+            # that is wrong.
+            echo "Error: use --arm-arch=<version>, not --arm-arch <version>"
+            echo "  tools/package_android.sh, which this forwards to, parses"
+            echo "  only the '=' form."
+            exit 1
+            ;;
         *)
             echo "Unknown option: $1"
             echo "Usage: $0 [--cache] [-Doption=value ...] [--arm-arch=<version>]"
             echo "  --cache        Reuse existing nntrainer builddir if available"
             echo "  -D*            Passed through to meson via tools/package_android.sh"
-            echo "  --arm-arch=*   Passed through to tools/package_android.sh"
+            echo "  --arm-arch=*   Passed through to tools/package_android.sh."
+            echo "                 The '=' form only: the space-separated"
+            echo "                 spelling is not accepted downstream."
             echo "Example: $0 -Denable-opencl=true"
             exit 1
             ;;
