@@ -285,7 +285,7 @@ bool two_conv_attention_prefill_f16_ohwi_kvimg_view_cl(
 /// path's scores round-trip + L2 thrash) and 3 enqueues collapse to 1.
 /// Q stays SVM; O written SVM. Adreno image path only (read_imageui).
 /// Constraints: max_seq_len <= 1024, head_dim <= 128, both %8==0.
-/// Env-gated by NNTR_FLASH_IMG=1 in the gpu_native caller.
+/// Selected by the caller; NNTR_FLASH_IMG=1 forces it on where available.
 bool fused_row_attention_f16_ohwi_img_cl(
   const uint16_t *Q_svm, cl_mem K_image_ohwi, cl_mem V_image_ohwi,
   uint16_t *O_svm, unsigned int M, unsigned int N_kv, unsigned int num_heads_Q,
@@ -307,20 +307,19 @@ bool fused_row_attention_f16_ohwi_img_cl(
 /// GQA is resolved inside the kernel: head_kv = head_q / (num_heads_Q
 /// / num_heads_KV).
 ///
-/// Env-gated by NNTR_GPU_MHA=1. Returns false on shape mismatch or
-/// when the env is unset; caller falls back to CPU mha. First stage of
-/// the everything-on-GPU plan (see TENSOR_VIRTUALIZATION_PLAN.md).
+/// Returns false on a shape mismatch or when the operands are not
+/// device-resident, so a caller can fall back to the CPU path.
 ///
 /// Second stage: real online-softmax body. K may be in OHWI layout
-/// (K[head_kv*max_seq_len*d + n*d + x], the gpu_native cache_k_svm form)
+/// (K[head_kv*max_seq_len*d + n*d + x], the KV-mirror form)
 /// or pure concat ([N_kv, HD_KV]); pass max_seq_len = the OHWI S_max
 /// row-stride when K is OHWI, or 0 when K is pure concat. V is always
 /// concat ([N_kv, HD_KV]); Q and O are always concat ([*, HD_Q]). This
 /// matches the buffers fed by two_conv_attention_prefill_f16_ohwi_cl so
 /// the flash path is bit-comparable to the 3-kernel baseline it replaces.
-/// Env-gated by NNTR_GPU_MHA=1 (legacy) OR called directly via the
-/// NNTR_FLASH=1 gate in qwen3_forward. Returns false on shape mismatch
-/// or when neither env is set; caller falls back to the 3-kernel path.
+/// Returns false on a shape mismatch, on a head dimension no selected
+/// variant can tile, or when the operands are not device-resident; the
+/// caller then falls back to the staged three-kernel path.
 bool flash_attention_prefill_f16_cl(
   const uint16_t *Q_host, const uint16_t *K_host, const uint16_t *V_host,
   uint16_t *O_host, unsigned int M, unsigned int N_kv, unsigned int num_heads_Q,

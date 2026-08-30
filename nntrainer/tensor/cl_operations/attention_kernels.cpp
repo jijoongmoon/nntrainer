@@ -449,7 +449,7 @@ __kernel void scatter_copy_f16_row(__global const half *in, __global half *out,
 }
 // OHWI K scatter: src concat [t, hKV, d] -> dst OHWI [hKV, max_S, d] at
 // (position+t). Feeds the K image2d view (qk_matmul_f16_ohwi_img). Mirrors
-// gpu_native k_scatter_ohwi.
+// the K-side scatter into the OHWI mirror.
 __kernel void k_scatter_ohwi(__global const half *src, __global half *dst,
                              const int M, const int hKV, const int d,
                              const int max_S, const int position,
@@ -466,7 +466,7 @@ __kernel void k_scatter_ohwi(__global const half *src, __global half *dst,
 }
 // OHWI-transposed V scatter: src concat [t, hKV, d] -> dst reversed-OHWI
 // [hKV, d, max_S] at (position+t). Feeds the V image2d view
-// (sv_matmul_f16_ohwi_img). Mirrors gpu_native v_scatter_ohwi_t.
+// (sv_matmul_f16_ohwi_img): the transposed V-side scatter.
 __kernel void v_scatter_ohwi_t(__global const half *src, __global half *dst,
                                const int M, const int hKV, const int d,
                                const int max_S, const int position,
@@ -879,7 +879,7 @@ bool gpu_copy_f16_row_cl(const uint16_t *in, uint16_t *out_base, unsigned int N,
 // kvimg_view_cl) can read K/V via read_imageui (texture cache). The layer-graph
 // KV cache is SVM (no cl_mem handle) and an image cannot wrap an SVM pointer,
 // so this is a separate cl_mem mirror filled by k_scatter_ohwi /
-// v_scatter_ohwi_t. Mirrors gpu_native's cache_{k,v}_buf_ohwi +
+// v_scatter_ohwi_t, writing the cache_{k,v} OHWI mirrors plus
 // cache_{k,v}_image_ohwi creation.
 //   K: OHWI [hKV, S_max, d]            -> image w=d/8,     h=hKV*S_max,
 //   pitch=d*2 V: reversed-OHWI [hKV, d, S_max]   -> image w=S_max/8, h=hKV*d,
@@ -953,7 +953,7 @@ void release_cl_mem(void *mem) {
 // kernel walks texels along the sequence axis, and a pitch sized to the
 // allocation cap (e.g. 2048) instead of the live sequence wastes texture
 // cache on padding (measured: S_max 2048 -> 1024 cuts sv_matmul 63 -> 41ms
-// M=843; gpu_native runs tight at 1024). The sv kernels address V purely
+// M=843; a tight run reaches 1024). The sv kernels address V purely
 // through image coordinates (their S_max argument is unused for V), so a
 // tight view needs no kernel change -- only the scatter stride must match.
 bool create_ohwi_v_image_view(void *v_buf, unsigned int num_heads_KV,
@@ -2112,7 +2112,7 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
   {
     const char *k1_name =
       k_image_in != nullptr ? "qk_matmul_f16_ohwi_img" : "qk_matmul_f16_ohwi";
-    // Per-call-site kernel handle cache (gpu_native pattern): registerClKernel
+    // Per-call-site kernel handle cache: registerClKernel
     // measured ~12ms per cached lookup from this wrapper (3x/layer = the
     // 36ms/layer host issue tax the CL-event profiler shows as GPU idle).
     static ClContext::SharedPtrClKernel kp_img, kp_buf;
@@ -2206,7 +2206,7 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
     // silent performance cliff: any M with ceil(M/TM_QK) % lws.y != 0
     // (e.g. the prompt_1k M=843 -> mx=211) failed the divisibility guard
     // and fell back to the driver-chosen NULL lws = qk 190ms vs 45ms
-    // (4.7x: measured against gpu_native's M=1024 run of this same
+    // (4.7x: measured against an M=1024 run of this same
     // kernel, which happened to divide evenly).
     const size_t lx = LWS_X > 0 ? LWS_X : 1;
     const size_t ly = LWS_Y > 0 ? LWS_Y : 1;
@@ -2486,9 +2486,9 @@ bool fused_row_attention_f16_ohwi_img_cl(
 //       or pure concat [N_kv, HD_KV] (pass max_seq_len = 0)
 //   V : [N_kv, HD_KV] concat fp16
 //   O : [M, HD_Q] concat fp16
-// SVM-input path only (svm_inputs == true) — the gpu_native callers feed
-// SVM buffers. cl_mem (svm_inputs == false) path is not used here and
-// returns false.
+// Device-resident operands only (svm_inputs == true): every caller of this
+// entry point feeds SVM buffers, so the host-upload path is not implemented
+// here and the call returns false.
 // =============================================================================
 bool flash_attention_prefill_f16_cl(
   const uint16_t *Q_host, const uint16_t *K_host, const uint16_t *V_host,
@@ -2514,7 +2514,7 @@ bool flash_attention_prefill_f16_cl(
                     // d=128)
   }
   if (!svm_inputs)
-    return false; // gpu_native feeds SVM only
+    return false; // device-resident operands only
 
   static int logged_trip = 0;
   if (!logged_trip && std::getenv("NNTR_GPU_MHA_TRIP") != nullptr) {
