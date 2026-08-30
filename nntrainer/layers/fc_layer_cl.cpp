@@ -69,16 +69,21 @@ void FullyConnectedLayerCl::finalize(InitLayerContext &context) {
   context.setOutputDimensions(output_dims);
 
   /** set weight specifications */
-  /// @note The bias follows the activation dtype, not the weight dtype -- see
-  /// FullyConnectedLayer::finalize() for the on-disk contract. This layer backs
-  /// LAYER_FC on both the OpenCL and the CUDA context, so it reads the same
-  /// .bin the host FC does; asking for the weight dtype would size the bias as
-  /// a quantized record (a QS4CX bias of unit elements is 5*unit bytes, not
-  /// 2*unit) and shift every weight after it.
-  TensorDim bias_dim(
-    1, is_nchw ? 1 : unit, 1, is_nchw ? unit : 1,
-    TensorDim::TensorType(context.getFormat(), context.getActivationDataType()),
-    is_nchw ? 0b0001 : 0b0100);
+  /// @note The bias dtype follows the same on-disk contract
+  /// FullyConnectedLayer::finalize() states, byte for byte: the bias is never
+  /// quantized, so a float weight leaves it in the activation dtype and a
+  /// quantized weight leaves it FP32 on disk. Requesting the weight dtype (as
+  /// this layer did before) sizes the bias as a quantized record -- a QS4CX
+  /// bias of unit elements is 5*unit bytes, not 2*unit -- and shifts every
+  /// weight read after it.
+  const auto weight_dtype = context.getWeightDataType();
+  const bool weight_is_float = (weight_dtype == TensorDim::DataType::FP32 ||
+                                weight_dtype == TensorDim::DataType::FP16);
+  const auto bias_dtype = weight_is_float ? context.getActivationDataType()
+                                          : TensorDim::DataType::FP32;
+  TensorDim bias_dim(1, is_nchw ? 1 : unit, 1, is_nchw ? unit : 1,
+                     TensorDim::TensorType(context.getFormat(), bias_dtype),
+                     is_nchw ? 0b0001 : 0b0100);
 
   TensorDim weight_dim(
     1, is_nchw ? 1 : unit, is_nchw ? in_dim.width() : 1,
