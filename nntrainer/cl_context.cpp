@@ -21,14 +21,17 @@
 #include <cl_svm_allocator.h>
 #include <compute_ops.h>
 #include <concat_cl.h>
+#include <cstdlib>
 #include <fc_layer_cl.h>
 #include <geglu_cl_op.h>
 #include <gelu_cl_op.h>
 #include <layer_normalization_layer.h>
 #include <layernorm_cl_op.h>
 #include <opencl_context_manager.h>
+#include <opencl_loader.h>
 #include <reshape_cl.h>
 #include <rmsnorm_layer_cl.h>
+#include <string>
 #include <swiglu_cl_op.h>
 #include <swiglu_layer.h>
 #include <transpose_cl.h>
@@ -85,6 +88,58 @@ void ClContext::initialize() noexcept {
       ml_loge("Error: ClContext::initialize() failed");
       return;
     }
+
+    // Probe the device's capabilities once, here, where the device has just
+    // been enumerated. The struct is a plain POD of attributes (what the
+    // device can do), never identity, and every consumer reads it through
+    // Context::caps() rather than re-querying CL or matching a device name.
+    if (const auto *di = context_inst_.getDeviceInfo()) {
+      // CL_DEVICE_VENDOR_ID for Intel. Used only to derive the two attributes
+      // below whose real signal is a compiler/driver trait no CL query
+      // reports; it is never compared against a device name.
+      constexpr uint32_t INTEL_VENDOR_ID = 0x8086;
+
+      caps_.backend = "gpu";
+      caps_.device_name = di->getDeviceName();
+      // CL_DEVICE_NAME is stored sized to include the query's trailing NUL; an
+      // embedded NUL would truncate the %s log line, so strip trailing NUL/ws.
+      while (!caps_.device_name.empty()) {
+        const char c = caps_.device_name.back();
+        if (c == '\0' || c == ' ' || c == '\n' || c == '\r' || c == '\t')
+          caps_.device_name.pop_back();
+        else
+          break;
+      }
+      caps_.vendor_id = di->getDeviceVendorId();
+      caps_.compute_units = di->getDeviceMaxComputeUnits();
+      caps_.max_alloc_bytes = di->getDeviceMaxMemAllocSize();
+      caps_.unified_memory = di->getDeviceSVMCapabilities() != 0;
+      caps_.subgroups = di->getDeviceExtensions().find("cl_intel_subgroups") !=
+                        std::string::npos;
+      // cl_intel_subgroups is advertised by every Intel GPU since Gen9
+      // (including non-DPAS Xe-LPG parts), so it cannot gate a DPAS/XMX
+      // matrix-engine kernel. The matrix-multiply-accumulate extension is
+      // DPAS-specific, so it is the real capability signal.
+      caps_.dpas =
+        di->getDeviceExtensions().find(
+          "cl_intel_subgroup_matrix_multiply_accumulate") != std::string::npos;
+      // image_v8c: whether the device should prefer an image2d-based path over
+      // a cl_mem buffer path. No clean device query distinguishes the two
+      // (both report CL_DEVICE_IMAGE_SUPPORT); the practical split is that
+      // Intel NEO's compiler rejects integer-coordinate read_imageui kernels.
+      // Keyed off vendor_id -- a stable, queryable, vendor-wide attribute (the
+      // quirk is a compiler trait, not a per-model one), not the brittle
+      // device_name. Intel => buffer; others keep the image default.
+      caps_.image_v8c = (caps_.vendor_id != INTEL_VENDOR_ID);
+      cl_bool host_unified = CL_FALSE;
+      caps_.integrated =
+        (opencl::clGetDeviceInfo(
+           context_inst_.GetDeviceId(), CL_DEVICE_HOST_UNIFIED_MEMORY,
+           sizeof(host_unified), &host_unified, nullptr) == CL_SUCCESS) &&
+        (host_unified == CL_TRUE);
+      ml_logi("[ClContext] %s", caps_.toString().c_str());
+    }
+
     if (KERNEL_CACHE_ENABLED) {
       // Best effort: the binary cache is an optimisation. A read-only or
       // otherwise unwritable working directory must not take the whole
