@@ -383,6 +383,8 @@ void Conv2DLayer::finalize(InitLayerContext &context) {
   // ActiFunc a standalone ActivationLayer would, for a value-identical
   // epilogue.
   auto &fused_act = std::get<props::FusedActivation>(conv_props);
+  rejectFusedActivationOnTrainingGraph(fused_act, context.getExecutionMode(),
+                                       "Conv2D");
   if (!fused_act.empty() && fused_act.get() != ActivationType::ACT_NONE) {
     if (context.getActivationDataType() == TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16

@@ -100,6 +100,10 @@ void FullyConnectedLayerCl::finalize(InitLayerContext &context) {
       context.requestWeight(bias_dim, bias_initializer, WeightRegularizer::NONE,
                             1.0f, bias_decay, "bias", true);
   }
+
+  rejectFusedActivationOnTrainingGraph(
+    std::get<props::FusedActivation>(fc_props), context.getExecutionMode(),
+    "FC");
 }
 
 void FullyConnectedLayerCl::exportTo(
