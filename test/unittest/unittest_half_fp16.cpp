@@ -24,6 +24,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 #include <half_fp16.h>
@@ -301,6 +302,55 @@ TEST(HalfFp16, IncrementDecrementMatchNative) {
     --n;
     ASSERT_TRUE(same_half(w.bits_, native_bits(n)));
   }
+}
+
+/**
+ * @brief std::numeric_limits answers the same thing for Half as for the native
+ *        half type.
+ *
+ * This is the one query that would not fail to compile if Half were left
+ * unspecialized: the primary template value-initializes, so every value member
+ * would silently answer 0.0 on a wrapper build and correctly on a native one.
+ * Compare the two side by side rather than against hand-written constants, so
+ * the test says what it means -- the stand-in stands in here too.
+ */
+TEST(HalfFp16, NumericLimitsMatchTheNativeHalf) {
+  using WL = std::numeric_limits<Half>;
+  using NL = std::numeric_limits<NativeHalf>;
+
+  ASSERT_TRUE(WL::is_specialized);
+  EXPECT_EQ(WL::is_signed, NL::is_signed);
+  EXPECT_EQ(WL::is_integer, NL::is_integer);
+  EXPECT_EQ(WL::is_exact, NL::is_exact);
+  EXPECT_EQ(WL::has_infinity, NL::has_infinity);
+  EXPECT_EQ(WL::has_quiet_NaN, NL::has_quiet_NaN);
+  EXPECT_EQ(WL::is_bounded, NL::is_bounded);
+  EXPECT_EQ(WL::is_modulo, NL::is_modulo);
+  EXPECT_EQ(WL::radix, NL::radix);
+  EXPECT_EQ(WL::digits, NL::digits);
+  EXPECT_EQ(WL::digits10, NL::digits10);
+  EXPECT_EQ(WL::max_digits10, NL::max_digits10);
+  EXPECT_EQ(WL::min_exponent, NL::min_exponent);
+  EXPECT_EQ(WL::min_exponent10, NL::min_exponent10);
+  EXPECT_EQ(WL::max_exponent, NL::max_exponent);
+  EXPECT_EQ(WL::max_exponent10, NL::max_exponent10);
+
+  /** the value members, compared as bit patterns so NaN compares too */
+  EXPECT_EQ(WL::min().bits_, native_bits(NL::min()));
+  EXPECT_EQ(WL::max().bits_, native_bits(NL::max()));
+  EXPECT_EQ(WL::lowest().bits_, native_bits(NL::lowest()));
+  EXPECT_EQ(WL::epsilon().bits_, native_bits(NL::epsilon()));
+  EXPECT_EQ(WL::round_error().bits_, native_bits(NL::round_error()));
+  EXPECT_EQ(WL::infinity().bits_, native_bits(NL::infinity()));
+  EXPECT_EQ(WL::denorm_min().bits_, native_bits(NL::denorm_min()));
+
+  /** NaN payloads are unspecified, so assert the property, not the bits */
+  EXPECT_TRUE(std::isnan(static_cast<float>(WL::quiet_NaN())));
+  EXPECT_TRUE(std::isnan(static_cast<float>(WL::signaling_NaN())));
+
+  /** every member is usable in a constant expression, as the standard asks */
+  static_assert(WL::max().bits_ == 0x7BFF, "max must be constexpr and 65504");
+  static_assert(WL::infinity().bits_ == 0x7C00, "infinity must be constexpr");
 }
 
 #endif // ENABLE_FP16
