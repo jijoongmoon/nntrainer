@@ -280,6 +280,9 @@ std::shared_ptr<MemoryData> MemoryPool::getMemory(unsigned int idx) {
   // answers something else, silently. The flags belong to the TOKEN, not to
   // the allocator: no memory, no planes.
   mem_data->setSVM(shared != nullptr && allocator_->isSVM());
+  // Same rule for host addressability: a device-only plane (cudaMalloc) must be
+  // staged, never dereferenced, and the allocator is the only thing that knows.
+  mem_data->setHostAddressable(allocator_->isHostAddressable());
   return mem_data;
 }
 
