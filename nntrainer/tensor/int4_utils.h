@@ -148,8 +148,7 @@ public:
   static size_t plainNibbleBytes(size_t rows_count, size_t columns_count);
 
   /// @brief Byte offset of the fp32 scales inside the plain payload.
-  static size_t plainScalesOffsetBytes(size_t rows_count,
-                                       size_t columns_count);
+  static size_t plainScalesOffsetBytes(size_t rows_count, size_t columns_count);
 
   /// @brief Full plain payload size (excluding the u16 qscheme header):
   ///        ceil(N/8)*8 * (roundup(K,32)/2 + 12).
@@ -225,12 +224,9 @@ public:
    * @param out_plain_nibbles caller buffer of rows_count * ((K + 1) / 2) bytes.
    * @param out_fp32_scales   caller buffer of rows_count floats.
    */
-  static void readLegacyQint4RecordToQs4cx(const uint8_t *record,
-                                           size_t record_bytes,
-                                           size_t rows_count,
-                                           size_t columns_count,
-                                           uint8_t *out_plain_nibbles,
-                                           float *out_fp32_scales);
+  static void readLegacyQint4RecordToQs4cx(
+    const uint8_t *record, size_t record_bytes, size_t rows_count,
+    size_t columns_count, uint8_t *out_plain_nibbles, float *out_fp32_scales);
 
   /**
    * @brief Inverse of packPlainToSectionA + dequant: decode a KAI Section A
@@ -280,10 +276,10 @@ public:
    * @param columns_count   K (input channels). Must be a multiple of 32.
    * @param out_kai_packed  output buffer, sized to kaiRhsPackedBytes.
    */
-  static void
-  assembleKaiRhsPacked(const uint8_t *section_a, const uint16_t *fp16_scales,
-                       size_t rows_count, size_t columns_count,
-                       std::vector<uint8_t> &out_kai_packed);
+  static void assembleKaiRhsPacked(const uint8_t *section_a,
+                                   const uint16_t *fp16_scales,
+                                   size_t rows_count, size_t columns_count,
+                                   std::vector<uint8_t> &out_kai_packed);
 
   /**
    * @brief     Quantize one float value to 4-bits integer

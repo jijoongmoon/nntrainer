@@ -204,8 +204,8 @@ size_t Int4Utils::kaiRhsPackedBytes(size_t rows_count, size_t columns_count) {
     KAI_K_PAD_MULTIPLE;
   const size_t super_row_count = (rows_count + KAI_NR - 1) / KAI_NR;
   const size_t trailer_bytes_per_super_row = KAI_NR * (4 + 4 + 4);
-  return super_row_count * (KAI_NR * (k_internal / 2) +
-                             trailer_bytes_per_super_row);
+  return super_row_count *
+         (KAI_NR * (k_internal / 2) + trailer_bytes_per_super_row);
 }
 
 void Int4Utils::assembleKaiRhsPacked(const uint8_t *section_a,
@@ -227,8 +227,7 @@ void Int4Utils::assembleKaiRhsPacked(const uint8_t *section_a,
 
   for (size_t sr_idx = 0; sr_idx < super_row_count; ++sr_idx) {
     uint8_t *dst_row = out_kai_packed.data() + sr_idx * super_row_stride;
-    const uint8_t *src_row =
-      section_a + sr_idx * nibble_bytes_per_super_row;
+    const uint8_t *src_row = section_a + sr_idx * nibble_bytes_per_super_row;
 
     // Nibbles are byte-identical to Section A on disk — just copy them.
     std::memcpy(dst_row, src_row, nibble_bytes_per_super_row);
@@ -236,8 +235,8 @@ void Int4Utils::assembleKaiRhsPacked(const uint8_t *section_a,
     // Per-channel sums = sum_k int4[n][k] * 16. Decode each Section A byte
     // back to two int4 lanes via XOR 0x88 -> uint4 -> int4 = uint4 - 8.
     int32_t sums[KAI_NR] = {0, 0, 0, 0};
-    for (size_t dst_byte_idx = 0;
-         dst_byte_idx < nibble_bytes_per_super_row; ++dst_byte_idx) {
+    for (size_t dst_byte_idx = 0; dst_byte_idx < nibble_bytes_per_super_row;
+         ++dst_byte_idx) {
       const size_t block_idx = dst_byte_idx / block_length_in_bytes;
       const size_t nr_idx = block_idx % KAI_NR;
 
@@ -298,8 +297,7 @@ size_t Int4Utils::plainRecordPayloadBytes(size_t rows_count,
 void Int4Utils::quantizePlain(const float *weights, const size_t rows_count,
                               const size_t columns_count,
                               std::vector<uint8_t> &out_plain_nibbles,
-                              std::vector<uint16_t> &out_scales,
-                              bool range15) {
+                              std::vector<uint16_t> &out_scales, bool range15) {
   // Per-channel scales. Two formulas:
   //  - absmax/7 (default): the historical Section A writer formula — keeps
   //    plain nibbles bit-identical to existing qscheme-0x06 bins.
@@ -382,8 +380,7 @@ void Int4Utils::packPlainToSectionA(const uint8_t *plain_nibbles,
   const uint8_t pad_byte = (uint8_t)(8u | (8u << 4));   // uint4(0)|uint4(0)
 
   for (size_t dst_row_idx = 0; dst_row_idx < super_row_count; ++dst_row_idx) {
-    uint8_t *dst_row =
-      out_section_a + dst_row_idx * nibble_bytes_per_super_row;
+    uint8_t *dst_row = out_section_a + dst_row_idx * nibble_bytes_per_super_row;
 
     for (size_t dst_byte_idx = 0; dst_byte_idx < dst_num_bytes_per_row;
          ++dst_byte_idx) {
@@ -427,12 +424,12 @@ void Int4Utils::sectionAToPlain(const uint8_t *section_a, size_t rows_count,
                                 uint8_t *out_plain_nibbles) {
   // Exact inverse of packPlainToSectionA: walk the same Section A super-row /
   // block iteration, un-XOR 0x88, and scatter each recovered nibble back to its
-  // plain [n][k] position. Padding entries (n >= rows_count, k >= columns_count)
-  // come from clamped / pad reads in the forward and carry no unique data, so
-  // they are skipped. A valid plain nibble may be produced by more than one
-  // Section A byte (the forward reads it as both a k0 and a k1); every such copy
-  // holds the same value, so writing with |= over a zeroed buffer is idempotent
-  // and reproduces the plain layout byte-for-byte.
+  // plain [n][k] position. Padding entries (n >= rows_count, k >=
+  // columns_count) come from clamped / pad reads in the forward and carry no
+  // unique data, so they are skipped. A valid plain nibble may be produced by
+  // more than one Section A byte (the forward reads it as both a k0 and a k1);
+  // every such copy holds the same value, so writing with |= over a zeroed
+  // buffer is idempotent and reproduces the plain layout byte-for-byte.
   const size_t rhs_row_bytes = (columns_count + 1) / 2;
   std::memset(out_plain_nibbles, 0, rows_count * rhs_row_bytes);
 
@@ -445,7 +442,8 @@ void Int4Utils::sectionAToPlain(const uint8_t *section_a, size_t rows_count,
   const size_t block_length_in_bytes = KAI_KR / KAI_SR; // = 8
 
   for (size_t dst_row_idx = 0; dst_row_idx < super_row_count; ++dst_row_idx) {
-    const uint8_t *src_row = section_a + dst_row_idx * nibble_bytes_per_super_row;
+    const uint8_t *src_row =
+      section_a + dst_row_idx * nibble_bytes_per_super_row;
 
     for (size_t dst_byte_idx = 0; dst_byte_idx < dst_num_bytes_per_row;
          ++dst_byte_idx) {
@@ -467,8 +465,9 @@ void Int4Utils::sectionAToPlain(const uint8_t *section_a, size_t rows_count,
         continue; // padding super-row (clamped in the forward)
 
       const uint8_t qs0 = (uint8_t)(src_row[dst_byte_idx] ^ 0x88);
-      const uint8_t src_x0_lo = (uint8_t)(qs0 & 0x0F);        // nibble at (n0,k0)
-      const uint8_t src_x0_hi = (uint8_t)((qs0 >> 4) & 0x0F); // nibble at (n0,k1)
+      const uint8_t src_x0_lo = (uint8_t)(qs0 & 0x0F); // nibble at (n0,k0)
+      const uint8_t src_x0_hi =
+        (uint8_t)((qs0 >> 4) & 0x0F); // nibble at (n0,k1)
 
       if (k0_idx < columns_count) {
         const size_t bi = n0_idx * rhs_row_bytes + (k0_idx / 2);
@@ -482,12 +481,9 @@ void Int4Utils::sectionAToPlain(const uint8_t *section_a, size_t rows_count,
   }
 }
 
-void Int4Utils::readLegacyQint4RecordToQs4cx(const uint8_t *record,
-                                             size_t record_bytes,
-                                             size_t rows_count,
-                                             size_t columns_count,
-                                             uint8_t *out_plain_nibbles,
-                                             float *out_fp32_scales) {
+void Int4Utils::readLegacyQint4RecordToQs4cx(
+  const uint8_t *record, size_t record_bytes, size_t rows_count,
+  size_t columns_count, uint8_t *out_plain_nibbles, float *out_fp32_scales) {
   const size_t N = rows_count;
   const size_t K = columns_count;
   const size_t hdr = sizeof(uint16_t);
@@ -519,7 +515,8 @@ void Int4Utils::readLegacyQint4RecordToQs4cx(const uint8_t *record,
     // 0x01: PR#3978 plain container (padded plain nibbles + fp32 scales).
     const size_t pay = plainRecordPayloadBytes(N, K);
     NNTR_THROW_IF(record_bytes < hdr + pay, std::runtime_error)
-      << "[readLegacyQint4RecordToQs4cx] plain-container record truncated: have "
+      << "[readLegacyQint4RecordToQs4cx] plain-container record truncated: "
+         "have "
       << record_bytes << " need " << (hdr + pay);
     // Normalize the padded plain nibbles to the canonical (unpadded) plain
     // layout by round-tripping through Section A (drops the KAI nr=8 / K->32
@@ -543,7 +540,7 @@ void Int4Utils::dequantizeSectionAToFp32(const uint8_t *section_a,
   // Inverse of the Section A super-row packing (mirrors the GPU v8c builder
   // decode in blas_kernels.cpp): undo the XOR 0x88 + the nr=4 / kr=16 / sr=2
   // 16-K interleave to recover row-major int4(n,k) = uint4 - 8, then scale.
-  constexpr size_t KAI_KR_BY_SR = 8;            // KR/SR
+  constexpr size_t KAI_KR_BY_SR = 8; // KR/SR
   const size_t k_blocks = K / 32;
   const size_t super_row_count = N / KAI_NR;
   const size_t nibble_bytes_per_super_row = KAI_NR * (K / 2);

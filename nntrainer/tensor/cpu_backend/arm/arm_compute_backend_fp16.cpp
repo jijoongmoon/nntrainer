@@ -510,15 +510,14 @@ void nntr_gemm_qai8dxp_qsi4cxp_packed(size_t m, size_t n, size_t k,
   constexpr size_t kVariantF16Dotprod = 1;
   constexpr size_t kVariantF16I8mm = 3;
   const size_t variant =
-    (m > 1 && __kai_get_num_ukernel_variants_f16_qai8dxp_qsi4cxp() >
-                kVariantF16I8mm)
+    (m > 1 &&
+     __kai_get_num_ukernel_variants_f16_qai8dxp_qsi4cxp() > kVariantF16I8mm)
       ? kVariantF16I8mm
       : kVariantF16Dotprod;
 
-  __kai_gemm_f16_qai8dxp_qsi4cxp(m, n, k, lhs_native_mtx_f16,
-                                 rhs_packed_mtx_qs4cx, dst_act_mtx_f16, variant,
-                                 static_cast<float>(lower_bound),
-                                 static_cast<float>(upper_bound));
+  __kai_gemm_f16_qai8dxp_qsi4cxp(
+    m, n, k, lhs_native_mtx_f16, rhs_packed_mtx_qs4cx, dst_act_mtx_f16, variant,
+    static_cast<float>(lower_bound), static_cast<float>(upper_bound));
 }
 
 size_t nntr_get_rhs_packed_size_qsi8d32p_qsi4c32p(size_t n, size_t k,
