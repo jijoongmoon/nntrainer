@@ -34,6 +34,7 @@ layer_sources = [
   'conv2d_layer.cpp',
   'conv1d_layer.cpp',
   'fc_layer.cpp',
+  'fc_layer_cl.cpp',
   'flatten_layer.cpp',
   'input_layer.cpp',
   'multiout_layer.cpp',
