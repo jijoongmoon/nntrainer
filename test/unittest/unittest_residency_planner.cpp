@@ -10,10 +10,13 @@
  * @brief  Tests for ResidencyPlanner::classify(), the pure function that
  *         decides where a planned tensor lives.
  *
- * @details Deliberately built WITHOUT OpenCL and without FP16. classify() is a
- * header-only pure function of five facts the graph already knows, so it needs
- * no device, no driver and no GPU build to exercise -- and the CI jobs that
- * run the test suite are the ones with OpenCL off. Keeping the decision table
+ * @details Deliberately built WITHOUT OpenCL and without FP16, and it includes
+ * nothing that would pull either in. classify() is a header-only pure function
+ * of five facts the graph already knows, so it needs no device, no driver and
+ * no GPU build to exercise -- and the CI jobs that run the test suite are the
+ * ones with OpenCL off. The allocator's demote step that follows classify()
+ * is driven here too, through a host allocator that declines a class rather
+ * than through a real device. Keeping the decision table
  * here means the rules are covered on every runner; the companion suite
  * (unittest_cl_residency) covers what only a device can answer: that a placed
  * tensor really comes back as a cl_mem, that offset reuse shares one handle,
@@ -25,8 +28,11 @@
 
 #include <gtest/gtest.h>
 
+#include <basic_planner.h>
+#include <mem_allocator.h>
 #include <residency_planner.h>
 #include <residency_policy.h>
+#include <tensor_pool.h>
 
 namespace {
 
@@ -172,6 +178,54 @@ TEST(ResidencyPlanner, pattern_lists_are_comma_separated_substrings) {
 
   p.exclude = nullptr;
   EXPECT_EQ(classify(p, GPU, true, true, false, "cache_v"), RC::GPU_CLMEM);
+}
+
+/**
+ * @brief The step after classify(): the allocator has the last word, and a
+ *        class it cannot back is demoted rather than bound.
+ *
+ * @details TensorPool::allocate() asks the allocator whether the class the
+ * planner arrived at is one it can actually produce, because a placement is
+ * only available if the memory behind it is. That step sits outside
+ * classify() and was reachable only through the device-gated suite. Here it
+ * is driven from a host build with an allocator that reports device-visible
+ * memory without shared virtual memory: the planner says SVM, the allocator
+ * cannot back SVM, and the tensor lands on the host plane with a pointer its
+ * reader can dereference -- demoted, never left half-placed.
+ */
+TEST(ResidencyPlanner, the_allocator_demotes_a_class_it_cannot_back) {
+  /**
+   * @brief device-visible memory with no shared plane, allocated on the host
+   */
+  class DeviceVisibleNotShared : public nntrainer::MemAllocator {
+  public:
+    /** @copydoc MemAllocator::isDeviceVisible */
+    bool isDeviceVisible() const override { return true; }
+    /** @copydoc MemAllocator::isSVM */
+    bool isSVM() const override { return false; }
+  };
+
+  nntrainer::TensorPool pool(false, "", "residency_demote",
+                             ml::train::ExecutionMode::INFERENCE,
+                             std::make_shared<DeviceVisibleNotShared>());
+  const nntrainer::TensorDim dim(
+    1, 1, 4, 16, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::FP32});
+  auto *t = pool.request("act", dim, {0},
+                         nntrainer::TensorLifespan::FORWARD_FUNC_LIFESPAN,
+                         nntrainer::Initializer::NONE,
+                         /*is_weight_grad=*/false, GPU);
+  pool.view("act_view", "act", dim, {1},
+            nntrainer::TensorLifespan::FORWARD_FUNC_LIFESPAN, 0, GPU);
+
+  pool.finalize(nntrainer::BasicPlanner(), 0, 2);
+  pool.allocate();
+
+  ASSERT_NE(t->getMemoryData(), nullptr);
+  EXPECT_EQ(t->getMemoryData()->residency(), RC::HOST);
+  EXPECT_FALSE(t->isClMem());
+  EXPECT_NE(t->getData<float>(), nullptr);
+
+  pool.deallocate();
 }
 
 /**
