@@ -141,6 +141,11 @@ public:
    * backend states what its memory is once and this follows. Overriding it is
    * for a backend with a plane the predicates do not describe.
    *
+   * @note This is installed API: ResidencyClass (memory_data.h, also
+   * installed) enters the contract an out-of-tree MemAllocator subclass is
+   * written against, and memory_data.h states the rule that keeps it stable
+   * across -dev packages -- enumerators may be appended, never renumbered.
+   *
    * @param cls the residency class the planner arrived at
    * @return true if a tensor may be placed in that class
    */

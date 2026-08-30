@@ -40,6 +40,35 @@ namespace nntrainer {
 
 /**
  * @brief Process-wide, application-populated residency boundary policy.
+ *
+ * @details WRITE WINDOW, and the limits that follow from it. The policy is a
+ * process-wide singleton the application fills in ONCE, before it builds any
+ * model, and does not touch again. Two separate reads depend on that:
+ * Manager::requestInputs() consults isEngineNeutral() while the graph is being
+ * built, and TensorPool::allocate() reads the pattern lists at allocation. A
+ * write between those two points produces a graph planned against one policy
+ * and allocated against another, and nothing diagnoses it -- the placements
+ * simply disagree with the consumer votes that were recorded earlier.
+ *
+ * Three consequences are stated rather than enforced, because enforcing them
+ * means moving the policy onto the model (or onto the TensorPool), which is
+ * where it belongs once a second caller needs a second policy:
+ *
+ *   - TWO MODELS IN ONE PROCESS SHARE ONE POLICY. A second model with
+ *     different residency boundaries is NOT supported: the last write wins,
+ *     for every model. This is the same process-wide latching NNTR_ENGINE
+ *     has, and it is deliberate only in the sense that no caller needs
+ *     otherwise yet.
+ *   - NOT SYNCHRONISED. There is no lock. Populating it from one thread while
+ *     another builds or allocates a graph is a data race.
+ *   - NOT RE-READ. Changing a pattern after allocate() has run does not move
+ *     a tensor; placement is a planner decision taken once (see
+ *     residency_planner.h), so a late write affects only pools allocated
+ *     after it.
+ *
+ * The patterns themselves are comma-separated substrings, not globs and not
+ * regular expressions -- see ResidencyPlanner::nameMatchesAny() for exactly
+ * what matches.
  */
 struct ResidencyPolicy {
   /** comma-separated substring patterns for input-boundary RAISE tensors */
@@ -57,11 +86,16 @@ struct ResidencyPolicy {
    * @note  Defined out-of-line in tensor_pool.cpp so there is exactly one
    *        instance in the library, shared across the shared-object boundary
    *        with the application that populates it.
+   * @note  Write it before building a model and leave it alone afterwards;
+   *        the class comment states what a later write does and does not do.
+   * @return the one policy instance in this process
    */
   static ResidencyPolicy &global();
 
   /**
    * @brief is @a layer_type an application-declared engine-neutral consumer
+   * @param layer_type the consuming layer's registered type name
+   * @return true if the application declared that type engine-neutral
    */
   bool isEngineNeutral(const std::string &layer_type) const {
     for (const auto &t : engine_neutral_types)
