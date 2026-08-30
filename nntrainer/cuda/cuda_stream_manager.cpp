@@ -15,16 +15,124 @@
 #include "cuda_context_manager.h"
 #include "cuda_kernel.h"
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 namespace nntrainer::cuda {
+
+namespace {
+
+/**
+ * @brief The CUDA state that must be ONE per process, not one per module.
+ *
+ * See StreamManager::initialize() for why "per module" is the default here and
+ * what it breaks. Three fields, and each is shared for the same reason: the
+ * M2-B capture records ONE stream, the capture flag decides whether a guard
+ * fires, and the decode-position buffer is the fixed device address the
+ * captured RoPE/attention/KV nodes were recorded against.
+ */
+struct SharedCudaState {
+  cudaStream_t stream = nullptr;
+  int capturing = 0;
+  int *pos_dev = nullptr; // device int[2] {pos, n_kv}
+};
+
+#ifdef _WIN32
+/**
+ * @brief Process-wide lock for the publish-or-adopt handshake below.
+ *
+ * A plain std::mutex cannot serialise this: it would itself be one lock per
+ * module, which is precisely the problem being solved. The name carries the PID
+ * so two nntrainer processes never wait on each other.
+ */
+class ProcLock {
+public:
+  ProcLock() {
+    char nm[64];
+    std::snprintf(nm, sizeof(nm), "nntr_cuda_shared_state_%lu",
+                  (unsigned long)GetCurrentProcessId());
+    h_ = CreateMutexA(nullptr, FALSE, nm);
+    if (h_ != nullptr)
+      WaitForSingleObject(h_, INFINITE);
+  }
+  ~ProcLock() {
+    if (h_ != nullptr) {
+      ReleaseMutex(h_);
+      CloseHandle(h_);
+    }
+  }
+
+private:
+  HANDLE h_ = nullptr;
+};
+#else
+// POSIX: the layer plugins link nntrainer DYNAMICALLY and ELF symbol
+// interposition already collapses these singletons to one copy, so there is
+// nothing to hand over -- keep the plain per-process object and no lock.
+class ProcLock {};
+#endif
+
+/**
+ * @brief The one SharedCudaState of this process, found by every module.
+ *
+ * The Win32 environment block is the lookup table used deliberately: it is
+ * per-process, and every module in this process binds the SAME UCRT, so it is
+ * the one place they can all read without importing anything from each other.
+ * The value is the address of a heap object -- all modules share one address
+ * space and one UCRT heap, so a raw pointer is all that has to travel.
+ */
+SharedCudaState *shared_cuda_state() {
+  static SharedCudaState *s = []() -> SharedCudaState * {
+#ifdef _WIN32
+    static const char *KEY = "__NNTR_CUDA_SHARED_STATE";
+    ProcLock lk;
+    char buf[32] = {0};
+    if (GetEnvironmentVariableA(KEY, buf, (DWORD)sizeof(buf)) > 0) {
+      const auto v = (uintptr_t)_strtoui64(buf, nullptr, 16);
+      if (v != 0)
+        return reinterpret_cast<SharedCudaState *>(v);
+    }
+    auto *p = new SharedCudaState();
+    char out[32];
+    std::snprintf(out, sizeof(out), "%llx",
+                  (unsigned long long)(uintptr_t)p);
+    SetEnvironmentVariableA(KEY, out);
+    return p;
+#else
+    static SharedCudaState local;
+    return &local;
+#endif
+  }();
+  return s;
+}
+
+} // namespace
+
 
 void StreamManager::initialize() noexcept {
   // make sure the device + primary context exist before creating a stream
   ContextManager::Global().EnsureCurrent();
-  if (!cudaCheck(cudaStreamCreate(&stream_), "cudaStreamCreate"))
-    stream_ = nullptr;
+  auto *sh = shared_cuda_state();
+  capture_flag_ = &sh->capturing;
+  {
+    ProcLock lk;
+    if (sh->stream != nullptr) {
+      stream_ = sh->stream; // adopt: another module published first
+      owns_stream_ = false;
+      return;
+    }
+    if (!cudaCheck(cudaStreamCreate(&stream_), "cudaStreamCreate")) {
+      stream_ = nullptr;
+      return;
+    }
+    sh->stream = stream_;
+    owns_stream_ = true;
+  }
 }
 
 bool StreamManager::EnqueueWriteBuffer(void *dst_dev, size_t size,
@@ -76,7 +184,7 @@ static bool graph_debug() {
 }
 
 void StreamManager::finish() {
-  if (capturing_) {
+  if (isCapturing()) {
     // An in-capture cudaStreamSynchronize is illegal; the drain is deferred to
     // after the graph replay. A host read that depended on this drain now
     // consumes stale bytes, which is a bug in the caller rather than here, so
@@ -128,7 +236,7 @@ static bool cuda_async_mode() {
 }
 
 void StreamManager::maybeFinish() {
-  if (capturing_)
+  if (isCapturing())
     return;
   // NNTR_CUDA_PACE=<N> (default off): depth-N submission pacing -- the middle
   // ground between the full per-op drain (sync mode; WDDM decode ~29 TPS) and
@@ -165,7 +273,7 @@ void StreamManager::maybeFinish() {
 }
 
 void StreamManager::finishIfAsync() {
-  if (capturing_) {
+  if (isCapturing()) {
     // Same as finish(): callers of finishIfAsync are host-fallback preambles,
     // so a hit during capture means a host op ran inside the graph.
     if (graph_debug()) {
@@ -188,22 +296,27 @@ bool StreamManager::beginCapture() {
   if (!cudaCheck(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeRelaxed),
                  "cudaStreamBeginCapture"))
     return false;
-  capturing_ = true;
+  *capture_flag_ = 1;
   return true;
 }
 
 bool StreamManager::endCapture(cudaGraph_t *graph) {
-  capturing_ = false;
+  *capture_flag_ = 0;
   if (!stream_ || graph == nullptr)
     return false;
   return cudaCheck(cudaStreamEndCapture(stream_, graph), "cudaStreamEndCapture");
 }
 
 StreamManager::~StreamManager() {
-  if (stream_) {
+  // Only the module that CREATED the process stream destroys it; the adopters
+  // merely borrowed the handle (see initialize()). Destroying it from each of
+  // them would hand the survivors a dangling stream during static teardown,
+  // whose order across modules is unspecified.
+  if (stream_ && owns_stream_) {
+    shared_cuda_state()->stream = nullptr;
     cudaStreamDestroy(stream_);
-    stream_ = nullptr;
   }
+  stream_ = nullptr;
 }
 
 StreamManager &StreamManager::Global() {
@@ -216,12 +329,24 @@ StreamManager &StreamManager::Global() {
 }
 
 int *cuda_pos_buffer() {
-  static int *g_pos_dev = []() -> int * {
-    int *p = nullptr;
-    cudaMalloc((void **)&p, 2 * sizeof(int));
-    return p;
-  }();
-  return g_pos_dev;
+  // Process-wide, for the same reason as the stream: the captured RoPE /
+  // attention / KV-write nodes bake THIS device address in, and the scaffold
+  // that rewrites the 8 bytes per token (cuda_set_pos, called from the CUDA
+  // context) lives in a different module from the kernels that read them
+  // (mha_core's DLL). A per-module buffer left every replay reading the
+  // position frozen at capture time.
+  auto *sh = shared_cuda_state();
+  if (sh->pos_dev == nullptr) {
+    ProcLock lk;
+    if (sh->pos_dev == nullptr) {
+      int *p = nullptr;
+      if (cudaMalloc((void **)&p, 2 * sizeof(int)) == cudaSuccess)
+        sh->pos_dev = p;
+      else
+        cudaGetLastError();
+    }
+  }
+  return sh->pos_dev;
 }
 
 void cuda_set_pos(int pos, int n_kv) {

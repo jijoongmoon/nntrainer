@@ -104,8 +104,14 @@ public:
 
   /**
    * @brief True while a capture is in progress (drains are suppressed).
+   *
+   * Reads the PROCESS-wide flag, not a member: with separately-linked modules
+   * the guard has to see the capture another module started (see
+   * initialize()). capture_flag_ points at this object's own int until
+   * initialize() re-points it at the shared state, so it is safe to read
+   * before initialization.
    */
-  bool isCapturing() const { return capturing_; }
+  bool isCapturing() const { return *capture_flag_ != 0; }
 
   /**
    * @brief Monotonic count of kernels dispatched on the backend stream.
@@ -142,7 +148,13 @@ protected:
 
 private:
   cudaStream_t stream_{nullptr};
-  bool capturing_{false};
+  /// true only in the module that CREATED the process stream; the adopters
+  /// borrowed the handle and must not destroy it (see ~StreamManager).
+  bool owns_stream_{false};
+  /// Fallback storage used until initialize() points capture_flag_ at the
+  /// process-wide SharedCudaState::capturing.
+  int own_capture_flag_{0};
+  int *capture_flag_{&own_capture_flag_};
   unsigned long long dispatch_seq_{0};
 };
 
