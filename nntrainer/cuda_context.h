@@ -156,6 +156,15 @@ public:
   }
 
   /**
+   * @copydoc Context::registerLayerFactory
+   */
+  int registerLayerFactory(PtrFactoryType<nntrainer::Layer> factory,
+                           const std::string &key = "",
+                           const int int_key = -1) override {
+    return registerFactory<nntrainer::Layer>(factory, key, int_key);
+  }
+
+  /**
    * @brief Create a Layer object from the string key
    */
   std::unique_ptr<nntrainer::Layer>
