@@ -305,44 +305,58 @@ TEST(HalfFp16, IncrementDecrementMatchNative) {
 }
 
 /**
- * @brief std::numeric_limits answers the same thing for Half as for the native
- *        half type.
+ * @brief std::numeric_limits<Half> answers binary16's real values.
  *
  * This is the one query that would not fail to compile if Half were left
- * unspecialized: the primary template value-initializes, so every value member
- * would silently answer 0.0 on a wrapper build and correctly on a native one.
- * Compare the two side by side rather than against hand-written constants, so
- * the test says what it means -- the stand-in stands in here too.
+ * unspecialized: the primary template is defined for every type and
+ * value-initializes, so every value member would silently answer 0.0.
+ *
+ * The assertions are against binary16's own constants rather than against
+ * std::numeric_limits<NativeHalf>, because the native type is NOT a usable
+ * reference here. libstdc++ specializes numeric_limits for _Float16 only from
+ * C++23, where __STDCPP_FLOAT16_T__ is defined; this project builds C++17
+ * (C++20 on Windows), so on a native build the native limits value-initialize
+ * exactly the way an unspecialized Half would. Measured on GCC 13.3:
+ * is_specialized 0, max() 0, infinity() 0 under -std=c++17, and 1 / 65504 /
+ * inf under -std=c++23.
+ *
+ * The parity check is therefore made conditional on the native type actually
+ * being specialized, so it starts asserting the moment the standard level or
+ * the library provides it, and does not compare against zeros until then.
  */
-TEST(HalfFp16, NumericLimitsMatchTheNativeHalf) {
+TEST(HalfFp16, NumericLimitsAnswerTheRealBinary16Values) {
   using WL = std::numeric_limits<Half>;
-  using NL = std::numeric_limits<NativeHalf>;
 
   ASSERT_TRUE(WL::is_specialized);
-  EXPECT_EQ(WL::is_signed, NL::is_signed);
-  EXPECT_EQ(WL::is_integer, NL::is_integer);
-  EXPECT_EQ(WL::is_exact, NL::is_exact);
-  EXPECT_EQ(WL::has_infinity, NL::has_infinity);
-  EXPECT_EQ(WL::has_quiet_NaN, NL::has_quiet_NaN);
-  EXPECT_EQ(WL::is_bounded, NL::is_bounded);
-  EXPECT_EQ(WL::is_modulo, NL::is_modulo);
-  EXPECT_EQ(WL::radix, NL::radix);
-  EXPECT_EQ(WL::digits, NL::digits);
-  EXPECT_EQ(WL::digits10, NL::digits10);
-  EXPECT_EQ(WL::max_digits10, NL::max_digits10);
-  EXPECT_EQ(WL::min_exponent, NL::min_exponent);
-  EXPECT_EQ(WL::min_exponent10, NL::min_exponent10);
-  EXPECT_EQ(WL::max_exponent, NL::max_exponent);
-  EXPECT_EQ(WL::max_exponent10, NL::max_exponent10);
+  EXPECT_TRUE(WL::is_signed);
+  EXPECT_FALSE(WL::is_integer);
+  EXPECT_FALSE(WL::is_exact);
+  EXPECT_TRUE(WL::has_infinity);
+  EXPECT_TRUE(WL::has_quiet_NaN);
+  EXPECT_TRUE(WL::is_bounded);
+  EXPECT_FALSE(WL::is_modulo);
+  EXPECT_EQ(WL::radix, 2);
+  EXPECT_EQ(WL::digits, 11);
+  EXPECT_EQ(WL::digits10, 3);
+  EXPECT_EQ(WL::max_digits10, 5);
+  EXPECT_EQ(WL::min_exponent, -13);
+  EXPECT_EQ(WL::min_exponent10, -4);
+  EXPECT_EQ(WL::max_exponent, 16);
+  EXPECT_EQ(WL::max_exponent10, 4);
 
-  /** the value members, compared as bit patterns so NaN compares too */
-  EXPECT_EQ(WL::min().bits_, native_bits(NL::min()));
-  EXPECT_EQ(WL::max().bits_, native_bits(NL::max()));
-  EXPECT_EQ(WL::lowest().bits_, native_bits(NL::lowest()));
-  EXPECT_EQ(WL::epsilon().bits_, native_bits(NL::epsilon()));
-  EXPECT_EQ(WL::round_error().bits_, native_bits(NL::round_error()));
-  EXPECT_EQ(WL::infinity().bits_, native_bits(NL::infinity()));
-  EXPECT_EQ(WL::denorm_min().bits_, native_bits(NL::denorm_min()));
+  /** the value members, as bit patterns */
+  EXPECT_EQ(WL::min().bits_, 0x0400);     /**< 2^-14 */
+  EXPECT_EQ(WL::max().bits_, 0x7BFF);     /**< 65504 */
+  EXPECT_EQ(WL::lowest().bits_, 0xFBFF);  /**< -65504 */
+  EXPECT_EQ(WL::epsilon().bits_, 0x1400); /**< 2^-10 */
+  EXPECT_EQ(WL::round_error().bits_, 0x3800);
+  EXPECT_EQ(WL::infinity().bits_, 0x7C00);
+  EXPECT_EQ(WL::denorm_min().bits_, 0x0001); /**< 2^-24 */
+
+  /** and as values, through the same conversion every other operator uses */
+  EXPECT_FLOAT_EQ(static_cast<float>(WL::max()), 65504.0f);
+  EXPECT_FLOAT_EQ(static_cast<float>(WL::lowest()), -65504.0f);
+  EXPECT_TRUE(std::isinf(static_cast<float>(WL::infinity())));
 
   /** NaN payloads are unspecified, so assert the property, not the bits */
   EXPECT_TRUE(std::isnan(static_cast<float>(WL::quiet_NaN())));
@@ -351,6 +365,23 @@ TEST(HalfFp16, NumericLimitsMatchTheNativeHalf) {
   /** every member is usable in a constant expression, as the standard asks */
   static_assert(WL::max().bits_ == 0x7BFF, "max must be constexpr and 65504");
   static_assert(WL::infinity().bits_ == 0x7C00, "infinity must be constexpr");
+
+  /**
+   * Parity with the native type, once the library actually provides it. Until
+   * then numeric_limits<_Float16> is unspecialized and comparing against it
+   * would only assert that two things are both zero.
+   */
+  using NL = std::numeric_limits<NativeHalf>;
+  if (NL::is_specialized) {
+    EXPECT_EQ(WL::digits, NL::digits);
+    EXPECT_EQ(WL::max_exponent, NL::max_exponent);
+    EXPECT_EQ(WL::min_exponent, NL::min_exponent);
+    EXPECT_EQ(WL::max().bits_, native_bits(NL::max()));
+    EXPECT_EQ(WL::lowest().bits_, native_bits(NL::lowest()));
+    EXPECT_EQ(WL::epsilon().bits_, native_bits(NL::epsilon()));
+    EXPECT_EQ(WL::infinity().bits_, native_bits(NL::infinity()));
+    EXPECT_EQ(WL::denorm_min().bits_, native_bits(NL::denorm_min()));
+  }
 }
 
 #endif // ENABLE_FP16
