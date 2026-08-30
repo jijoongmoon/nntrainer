@@ -128,14 +128,13 @@ public:
   // is not int4, the shape is outside what the kernel covers, or the path is
   // switched off), so the fallbacks below stay reachable: a quantized weight
   // the kernel declined is dotted on the host, and everything else keeps the
-  // dotCl route this layer has always used.
+  // dotCl route this layer has always used. Neither fallback accumulates
+  // either -- Tensor::dot takes beta = 0 by default and every quantized
+  // FloatTensor::dot kernel stores -- so the no-zero-fill contract above holds
+  // unchanged for all three routes out of this function.
   void fc(Tensor &input, Tensor &weight, Tensor &output) override {
     if (nntrainer::dotCl_v8c(input, weight, output))
       return;
-
-    // The v8c GEMM produces its output; the fallbacks below accumulate into
-    // theirs, so zero it here and only here.
-    output.setZero();
 
     switch (weight.getDataType()) {
     case ml::train::TensorDim::DataType::QINT4:
