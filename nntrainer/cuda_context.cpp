@@ -14,6 +14,8 @@
 #include <cuda_context.h>
 #include <env_compat.h>
 
+#include <algorithm>
+#include <cctype>
 #include <mutex>
 
 #include <activation_layer.h>
@@ -57,19 +59,25 @@ void CudaContext::initialize() noexcept {
     // on an OpenCL-enabled build (where the engine default is "gpu",
     // mirroring causallm_engine()). Non-cuda runs never legitimately touch
     // this context (prewarm/StreamManager gate on the engine string).
-    // NNTR_CUDA_EAGER_INIT=1 restores the old eager behavior.
+    //
+    // This test MUST match Engine::add_default_object()'s gate for "cuda"
+    // exactly: same environment variable, same escape hatch, same default.
+    // Two gates that merely resemble each other is the bug -- one of them
+    // then registers a context the other declines to bring up, or brings up a
+    // device nothing will use. NNTR_ENGINE is the single selector (lowercased
+    // there, so compare case-insensitively here), the default is off because
+    // CUDA is opt-in, and NNTR_CUDA_EAGER_CTX is the one flag that restores
+    // the unconditional bring-up on both sides.
     {
       const char *eng = std::getenv("NNTR_ENGINE");
-      const char *eager = std::getenv("NNTR_CUDA_EAGER_INIT");
-      const bool eager_on = eager && eager[0] == '1';
-#if defined(ENABLE_OPENCL)
-      const bool cuda_active = eng && std::string(eng) == "cuda";
-#else
-      const bool cuda_active = !eng || std::string(eng) == "cuda";
-#endif
-      if (!cuda_active && !eager_on) {
-        ml_logi("[CudaContext] bring-up deferred (engine=%s)",
-                eng ? eng : "(unset; OpenCL default)");
+      const char *eager = std::getenv("NNTR_CUDA_EAGER_CTX");
+      const bool eager_on = eager != nullptr && eager[0] != '0';
+      std::string eng_l = eng != nullptr ? std::string(eng) : std::string();
+      std::transform(eng_l.begin(), eng_l.end(), eng_l.begin(),
+                     [](unsigned char c) { return std::tolower(c); });
+      if (eng_l != "cuda" && !eager_on) {
+        ml_logi("[CudaContext] bring-up deferred (NNTR_ENGINE=%s)",
+                eng ? eng : "(unset)");
         return;
       }
     }
