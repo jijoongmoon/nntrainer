@@ -65,12 +65,18 @@ bool LoadOpenCL() {
     return true;
   }
 
-#if !defined(_WIN32)
+#if defined(__ANDROID__)
   // Android Qualcomm/Adreno: the vendor's libOpenCL.so is not always reachable
   // through the default linker namespace from a shell-launched executable, so
   // try the well-known vendor paths explicitly. The alternative is asking the
   // caller to set LD_LIBRARY_PATH=/system/vendor/lib64, which on some devices
   // drags in libandroid_runtime.so with unresolved symbols.
+  //
+  // Guarded on Android rather than on "not Windows", which is what the paths
+  // themselves say. A desktop Linux build was trying all four of them after
+  // the normal load already failed, and the last failure is the one reported
+  // below -- so a box with no ICD logged a missing /system/vendor path instead
+  // of the real libOpenCL.so error.
   static const char *kAndroidVendorPaths[] = {
     "/vendor/lib64/libOpenCL.so",
     "/system/vendor/lib64/libOpenCL.so",

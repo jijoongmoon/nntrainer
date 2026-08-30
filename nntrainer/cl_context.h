@@ -304,8 +304,10 @@ private:
     if (!result)
       return result;
 
-    // initialize device buffers
-    clbuffInstance.initBuffers();
+    // No device-buffer initialization here any more: every staging region is
+    // allocated on its first use, so there is nothing to do at bring-up.
+    // ClBufferManager::initBuffers() is an empty body kept only for the
+    // installed header's ABI, and calling it would say otherwise.
     cl_initialized = result;
     return cl_initialized;
   };
