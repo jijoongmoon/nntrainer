@@ -39,6 +39,7 @@ void ClBufferManager::initBuffers() {
 }
 
 opencl::Buffer *ClBufferManager::getInBufferA() {
+  std::lock_guard<std::mutex> lk(bufferMutex());
   if (inBufferA == nullptr) {
     inBufferA = new opencl::Buffer(context_inst_, buffer_size_bytes, true);
   }
@@ -46,6 +47,7 @@ opencl::Buffer *ClBufferManager::getInBufferA() {
 }
 
 opencl::Buffer *ClBufferManager::getInBufferB() {
+  std::lock_guard<std::mutex> lk(bufferMutex());
   if (inBufferB == nullptr) {
     inBufferB = new opencl::Buffer(context_inst_, buffer_size_bytes, true);
   }
@@ -53,6 +55,7 @@ opencl::Buffer *ClBufferManager::getInBufferB() {
 }
 
 opencl::Buffer *ClBufferManager::getInBufferC() {
+  std::lock_guard<std::mutex> lk(bufferMutex());
   if (inBufferC == nullptr) {
     inBufferC = new opencl::Buffer(context_inst_, buffer_size_bytes, true);
   }
@@ -60,6 +63,7 @@ opencl::Buffer *ClBufferManager::getInBufferC() {
 }
 
 opencl::Buffer *ClBufferManager::getOutBufferA() {
+  std::lock_guard<std::mutex> lk(bufferMutex());
   if (outBufferA == nullptr) {
     outBufferA = new opencl::Buffer(context_inst_, buffer_size_bytes, false);
   }
@@ -67,6 +71,7 @@ opencl::Buffer *ClBufferManager::getOutBufferA() {
 }
 
 opencl::Buffer *ClBufferManager::getOutBufferB() {
+  std::lock_guard<std::mutex> lk(bufferMutex());
   if (outBufferB == nullptr) {
     outBufferB = new opencl::Buffer(context_inst_, buffer_size_bytes, false);
   }

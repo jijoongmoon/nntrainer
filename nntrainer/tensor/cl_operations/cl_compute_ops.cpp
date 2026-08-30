@@ -106,8 +106,17 @@ public:
   // Fully-connected matmul, for the neutral fully-connected layer: the layer
   // keeps the weight and bias binding and the shape logic, and only the GEMM
   // comes here. dotCl picks the dot, GEMV or GEMM kernel from the operand
-  // shapes, exactly as the layer used to do inline. It writes the result
-  // rather than accumulating into it, which is why no zero-fill precedes it.
+  // shapes, exactly as the layer used to do inline.
+  //
+  // dotCl is contracted to PRODUCE its output, not accumulate into it, which
+  // is why no zero-fill precedes this call. One shape does not honour that
+  // yet: the FP32 general-GEMM branch still dispatches through the CLBlast
+  // wrapper with beta = 1.0, so it reads the destination it is about to
+  // overwrite. That branch is deleted by the CLBlast removal this PR depends
+  // on, which routes the same shape to sgemm_cl -- which stores, like the
+  // other three shapes and like the whole FP16 branch. Do not add a zero-fill
+  // here to paper over it: that would cost a full-output memset on every
+  // forward for one transitional branch.
   void fc(Tensor &input, Tensor &weight, Tensor &output) override {
     nntrainer::dotCl(input, weight, output);
   }
