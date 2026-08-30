@@ -23,6 +23,7 @@
 #include <concat_cl.h>
 #include <fc_layer_cl.h>
 #include <geglu_cl_op.h>
+#include <geglu_layer.h>
 #include <gelu_cl_op.h>
 #include <layer_normalization_layer.h>
 #include <layernorm_cl_op.h>
@@ -266,15 +267,22 @@ void ClContext::add_default_object() {
                     ml::train::LayerType::LAYER_ACTIVATION);
   }
 
-  // GeGLU registers its kernels and no factory. The neutral GeGLULayer is
-  // registered on the application context under a string key only, and it
-  // reaches ComputeOps::geglu through its input tensor, so all this context
-  // owes it is a compiled kernel. Adding a factory here would need an explicit
-  // integer key as well -- the auto-assigned one is str_map.size() + 1 and
-  // collides with an enum key -- so that belongs with the layer's promotion,
-  // not with its kernel.
-  if (!registerGeGLUClKernels(*this))
+  // GeGLU: gelu_tanh(gate) * up, dispatching to ClComputeOps::geglu -- a
+  // device kernel where the gate and up rows are device-resident, and the
+  // inherited host implementation over the SVM-coherent buffer otherwise, so
+  // the op table side of this layer is complete on this backend once its
+  // kernel compiles. What was missing was the factory: ml::train::LayerType
+  // has no GeGLU enumerator, so, matching how the application context
+  // registers the same class, this is a string-keyed factory with an
+  // auto-assigned integer key. Without it, createLayer("geglu", {engine=gpu})
+  // throws "Key is not found for the object", and a gemma-family graph -- the
+  // only in-tree consumer of this type -- cannot be built under engine=gpu at
+  // all.
+  if (registerGeGLUClKernels(*this)) {
+    registerFactory(nntrainer::createLayer<GeGLULayer>, GeGLULayer::type);
+  } else {
     ml_logw("failed to register the OpenCL GeGLU kernels");
+  }
 }
 
 template <typename T>
