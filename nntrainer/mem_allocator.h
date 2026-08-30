@@ -17,6 +17,8 @@
 #include <memory>
 #include <string>
 
+#include <memory_data.h> // ResidencyClass
+
 namespace nntrainer {
 
 class MemoryPool;
@@ -124,6 +126,25 @@ public:
    * tensor in.
    */
   virtual bool supportsDevicePool() const { return false; }
+
+  /**
+   * @brief Can this allocator back a tensor placed in @a cls?
+   *
+   * The residency planner reasons about the graph — who writes a tensor, who
+   * reads it, what type it is — and arrives at a class. This is the other
+   * half of that decision, and the allocator is the only thing that can
+   * answer it: a placement is only available if the memory behind it is.
+   * TensorPool asks before it binds, and falls back to a class the allocator
+   * does answer for rather than leaving the tensor half-placed.
+   *
+   * Derived from the capability predicates above rather than stored, so a
+   * backend states what its memory is once and this follows. Overriding it is
+   * for a backend with a plane the predicates do not describe.
+   *
+   * @param cls the residency class the planner arrived at
+   * @return true if a tensor may be placed in that class
+   */
+  virtual bool supportsResidency(ResidencyClass cls) const;
 
   /**
    * @brief Build the MemoryPool that a TensorPool allocates from.

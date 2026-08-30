@@ -252,7 +252,8 @@ void TensorPool::allocate(bool init) {
   const auto &policy = ResidencyPolicy::global();
   ResidencyPlanner planner;
   planner.device_backed = allocator_ && allocator_->isDeviceVisible();
-  planner.device_pool = allocator_ && allocator_->supportsDevicePool();
+  planner.device_pool =
+    allocator_ && allocator_->supportsResidency(ResidencyClass::GPU_CLMEM);
   planner.raise =
     policy.raise_patterns.empty() ? nullptr : policy.raise_patterns.c_str();
   planner.lower =
@@ -281,6 +282,15 @@ void TensorPool::allocate(bool init) {
         details->engine, details->all_consumers_device,
         spec.tensor->getDataType() == ml::train::TensorDim::DataType::FP16,
         spec.tensor->getName());
+      /** The allocator has the last word on the class, because a placement
+       *  is only available if the memory behind it is. Demote rather than
+       *  refuse: the shared plane, and then the host plane, are always
+       *  reachable by whoever was going to read the tensor. */
+      if (allocator_ && !allocator_->supportsResidency(cls))
+        cls = allocator_->supportsResidency(ResidencyClass::SVM)
+                ? ResidencyClass::SVM
+                : ResidencyClass::HOST;
+
       void *dev = nullptr;
       if (cls == ResidencyClass::GPU_CLMEM) {
         dev = mem_pool->deviceMemory(details->token);

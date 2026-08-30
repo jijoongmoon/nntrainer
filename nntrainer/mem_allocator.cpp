@@ -70,6 +70,21 @@ void MemAllocator::free(void *ptr) {
 #endif
 }
 
+bool MemAllocator::supportsResidency(ResidencyClass cls) const {
+  switch (cls) {
+  case ResidencyClass::HOST:
+    /** Every allocator the pool can dereference has a host plane; one that
+     *  hands out device-only memory does not, and says so here. */
+    return isHostAddressable();
+  case ResidencyClass::SVM:
+    return isSVM();
+  case ResidencyClass::GPU_CLMEM:
+    return supportsDevicePool();
+  default:
+    return false;
+  }
+}
+
 std::shared_ptr<MemoryPool>
 MemAllocator::makePool(const std::shared_ptr<MemAllocator> &self) {
   return std::make_shared<MemoryPool>(self);
