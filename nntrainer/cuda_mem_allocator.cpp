@@ -21,6 +21,7 @@
 #include <cuda_runtime.h>
 
 #include <cuda_context_manager.h>
+#include <nntrainer_log.h>
 
 namespace nntrainer {
 
@@ -162,17 +163,35 @@ void CudaMemAllocator::alloc(void **ptr, size_t size, size_t alignment) {
 #endif
         }
       }
-      // Calloc contract: cudaMalloc and
-      // cudaMallocManaged contents are undefined. Device-side memset covers
-      // both (legal on managed under WDDM cMA==0 — it is a DEVICE access);
-      // weights are fully overwritten at load so the only lasting cost is a
-      // one-time device fill at allocation.
+      // Calloc contract: cudaMalloc and cudaMallocManaged contents are
+      // undefined. A device-side memset covers both (legal on managed memory
+      // under WDDM cMA==0 -- it is a DEVICE access); weights are fully
+      // overwritten at load, so the only lasting cost is a one-time device
+      // fill at allocation.
+      //
+      // cudaMemset is asynchronous with respect to the host for device and
+      // managed targets, so it is NOT the calloc contract on its own: alloc()
+      // could return with the fill still in flight, and a caller that reads or
+      // host-writes the buffer immediately would either observe non-zero bytes
+      // or have its own store overwritten when the fill lands. Synchronize
+      // before handing the pointer out. This is once per allocation, off every
+      // step path.
       cudaMemset(dptr, 0, size);
-      *ptr = dptr;
-      if (dbg)
-        fprintf(stderr, "[UVMDBG] %s %zu bytes -> %p OK\n",
-                dev_only ? "cudaMalloc" : "cudaMallocManaged", size, dptr);
-      return;
+      const cudaError_t se = cudaDeviceSynchronize();
+      if (se != cudaSuccess) {
+        // The buffer cannot be handed out zeroed, so it cannot be handed out
+        // at all under this contract. Release it and take the host path below.
+        ml_logw("[CUDA] zero-fill of %zu bytes did not complete (%s); falling "
+                "back to host memory",
+                size, cudaGetErrorString(se));
+        cudaFree(dptr);
+      } else {
+        *ptr = dptr;
+        if (dbg)
+          fprintf(stderr, "[UVMDBG] %s %zu bytes -> %p OK\n",
+                  dev_only ? "cudaMalloc" : "cudaMallocManaged", size, dptr);
+        return;
+      }
     }
     if (dbg)
       fprintf(stderr, "[UVMDBG] %s %zu bytes FAILED -> host\n",

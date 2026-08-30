@@ -16,6 +16,11 @@
 
 #include <cstdlib>
 #include <filesystem>
+#ifndef _WIN32
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+#endif
 #include <fstream>
 #include <functional>
 #include <sstream>
@@ -29,12 +34,57 @@ std::size_t Module::GetKernelHash(const std::string &code,
   return std::hash<std::string>{}(code + std::string("\x01") + options);
 }
 
+/**
+ * @brief Directory for the compiled-kernel disk cache.
+ *
+ * The cached image is handed straight to cuModuleLoadData, so whoever can
+ * write a file here can get arbitrary machine code executed on the GPU inside
+ * this process. It therefore has to land in a directory only this user can
+ * write. HOME is unset on Windows and in plenty of Linux service and container
+ * environments, and the old fallback of "$HOME or /tmp" put the cache in a
+ * world-writable place exactly there. Resolve a per-user location per platform
+ * instead, and return "" when there is none -- the caller then compiles every
+ * time rather than trusting a directory it cannot vouch for.
+ */
 static std::string cacheDir() {
   if (const char *e = getenv("NNTR_CUDA_CACHE"))
     return e;
-  const char *home = getenv("HOME");
-  return (home ? std::string(home) : std::string("/tmp")) +
-         "/.cache/nntrainer_cuda";
+#ifdef _WIN32
+  for (const char *v : {"LOCALAPPDATA", "USERPROFILE"}) {
+    if (const char *base = getenv(v))
+      return std::string(base) + "\\nntrainer\\cuda_kernel_cache";
+  }
+  return std::string();
+#else
+  if (const char *xdg = getenv("XDG_CACHE_HOME"))
+    return std::string(xdg) + "/nntrainer_cuda";
+  if (const char *home = getenv("HOME"))
+    return std::string(home) + "/.cache/nntrainer_cuda";
+  return std::string();
+#endif
+}
+
+/**
+ * @brief True if the directory exists and is writable by anyone but its owner.
+ *
+ * A cache directory another user can write into is a code-execution channel,
+ * not merely a stale-data risk, so a directory that fails this test is
+ * refused rather than repaired: repairing it would race whoever created it.
+ */
+static bool dirIsUnsafe(const std::string &path) {
+#ifdef _WIN32
+  (void)path;
+  return false; // the per-user roots above are already ACL'd to this user
+#else
+  struct stat st;
+  if (::stat(path.c_str(), &st) != 0)
+    return false; // does not exist yet; makeDirs creates it 0700 below
+  if (!S_ISDIR(st.st_mode))
+    return true;
+  if (st.st_uid != ::geteuid())
+    return true;
+  return (st.st_mode & (S_IWGRP | S_IWOTH)) != 0;
+#endif
 }
 
 /// best-effort recursive mkdir (mkdir -p semantics)
@@ -45,6 +95,12 @@ static void makeDirs(const std::string &path) {
   // uncreatable) — matches the old ignore-return behaviour.
   std::error_code ec;
   std::filesystem::create_directories(path, ec);
+#ifndef _WIN32
+  // Owner-only: see cacheDir(). create_directories applies the process umask,
+  // which cannot be relied on to clear the group and other bits.
+  std::filesystem::permissions(path, std::filesystem::perms::owner_all,
+                               std::filesystem::perm_options::replace, ec);
+#endif
 }
 
 static bool readFile(const std::string &p, std::string &out) {
@@ -152,22 +208,32 @@ bool Module::CreateModuleFromSource(const std::string &source,
                                     const std::string &options) {
   ContextManager::Global().EnsureCurrent();
 
-  const std::string dir = cacheDir();
+  std::string dir = cacheDir();
+  if (!dir.empty() && dirIsUnsafe(dir)) {
+    ml_logw("[CUDA] kernel cache directory %s is not owner-only; compiling "
+            "without a cache",
+            dir.c_str());
+    dir.clear();
+  }
   std::string sig = ContextManager::Global().GetDeviceSignature();
   for (auto &c : sig)
     if (c == '|' || c == ' ' || c == '/')
       c = '_';
-  const std::string key = dir + "/" + sig + "_" +
-                          std::to_string(GetKernelHash(source, options)) +
-                          (useCubin() ? ".cubin" : ".ptx");
+  const std::string key = dir.empty()
+                            ? std::string()
+                            : dir + "/" + sig + "_" +
+                                std::to_string(GetKernelHash(source, options)) +
+                                (useCubin() ? ".cubin" : ".ptx");
 
   std::string ptx;
-  bool have_cache = readFile(key, ptx) && !ptx.empty();
+  bool have_cache = !key.empty() && readFile(key, ptx) && !ptx.empty();
   if (!have_cache) {
     if (!compileWithNVRTC(source, options, ptx, name_for_log))
       return false;
-    makeDirs(dir);
-    writeFile(key, ptx);
+    if (!key.empty()) {
+      makeDirs(dir);
+      writeFile(key, ptx);
+    }
   }
 
   CUresult lr = cuModuleLoadData(&module_, ptx.c_str());

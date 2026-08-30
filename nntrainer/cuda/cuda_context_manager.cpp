@@ -36,23 +36,40 @@ namespace nntrainer::cuda {
 // (0xC06D007E) instead of a normal error return. Unhandled, that looks like
 // a silent hang/crash rather than a diagnosable failure. Installing
 // __pfnDliFailureHook2 intercepts dliFailLoadLib/dliFailGetProc so we can
-// print one clear fatal message and exit deliberately.
+// print one clear message naming the DLL before the loader's own error path
+// runs.
+static bool is_cuda_delayload_dll(const char *dll) {
+  static const char *kOurs[] = {"cublas64_13.dll", "cublasLt64_13.dll",
+                                "nvrtc64_130_0.dll", "nvcuda.dll"};
+  for (const char *n : kOurs)
+    if (_stricmp(dll, n) == 0)
+      return true;
+  return false;
+}
+
 static FARPROC WINAPI nntr_dli_failure_hook(unsigned dliNotify,
                                             PDelayLoadInfo pdli) {
   const char *dll = (pdli && pdli->szDll) ? pdli->szDll : "(unknown)";
   const char *verb = dliNotify == dliFailGetProc ? "resolved" : "loaded";
+  // __pfnDliFailureHook2 is per MODULE, not per DLL: once linked in it sees
+  // the failure of EVERY delay-loaded import in this binary, including ones
+  // that have nothing to do with CUDA and including runs on another engine.
+  // Decline those -- returning nullptr leaves the loader's own error path
+  // intact, which is what an embedding application can actually handle.
+  if (!is_cuda_delayload_dll(dll))
+    return nullptr;
   // nvcuda.dll ships with the NVIDIA driver itself (not the CUDA toolkit),
   // so its absence means "no NVIDIA GPU / no driver" rather than "missing
   // redistributable DLL" -- point the user at the right fix.
   if (_stricmp(dll, "nvcuda.dll") == 0) {
     fprintf(stderr,
-            "[NNTRAINER][FATAL] %s could not be %s: NVIDIA driver not "
+            "[NNTRAINER][ERROR] %s could not be %s: NVIDIA driver not "
             "installed or no NVIDIA GPU -- the cuda backend needs an "
             "NVIDIA GPU with a current driver\n",
             dll, verb);
   } else {
     fprintf(stderr,
-            "[NNTRAINER][FATAL] CUDA runtime DLL could not be %s: %s\n"
+            "[NNTRAINER][ERROR] CUDA runtime DLL could not be %s: %s\n"
             "  The CUDA backend needs the NVIDIA driver plus the CUDA runtime "
             "DLLs shipped in the SDK bin/ directory\n"
             "  (cudart64_13.dll, cublas64_13.dll, cublasLt64_13.dll, "
@@ -61,7 +78,12 @@ static FARPROC WINAPI nntr_dli_failure_hook(unsigned dliNotify,
             verb, dll);
   }
   fflush(stderr);
-  TerminateProcess(GetCurrentProcess(), 0xC7);
+  // Do NOT terminate. This is a library: killing the host process denies an
+  // embedding application any chance to report the failure or fall back to
+  // another engine. Returning nullptr lets the delay-load machinery raise its
+  // own structured exception, which the caller can handle -- and the message
+  // above is what makes that failure diagnosable rather than a silent crash,
+  // which was the whole reason for installing this hook.
   return nullptr;
 }
 extern "C" const PfnDliHook __pfnDliFailureHook2 = nntr_dli_failure_hook;
