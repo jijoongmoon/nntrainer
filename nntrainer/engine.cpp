@@ -59,11 +59,16 @@ namespace {
 /**
  * @brief The compute engine this process asked for, lowercased, or "" if unset.
  *
- * Read from NNTR_ENGINE, the same variable the consumer layer already resolves
- * a single engine from (Applications/CausalLM/llm_util.hpp causallm_engine():
- * cpu | cuda | gpu, defaulting to "gpu" on an OpenCL build). Latched on first
- * use: the contract -- shared with the pre-existing CUDA gate below -- is that
- * NNTR_ENGINE is set before the first Engine::Global().
+ * Read from NNTR_ENGINE. This is the process-wide backend selector: a consumer
+ * that runs one engine exports it before the first Engine::Global(), and that
+ * ordering is the contract -- the value is latched on first use, so a later
+ * setenv() has no effect. Unset means "no preference", which keeps the
+ * historical default (see bringUpWanted's on_by_default).
+ *
+ * @note This is the only reader of NNTR_ENGINE in the tree. A backend that adds
+ *       its own read must route through this function rather than comparing
+ *       getenv() exactly, or NNTR_ENGINE=GPU registers a context that the
+ *       backend's own gate then declines.
  */
 const std::string &requestedEngine() {
   static const std::string eng = []() -> std::string {
@@ -103,6 +108,9 @@ const std::string &requestedEngine() {
  */
 bool bringUpWanted(const char *name, const char *eager_env,
                    bool on_by_default) {
+  // Not latched, unlike requestedEngine(): this is the per-backend A/B escape
+  // hatch, read once per backend at bring-up, so a static per call site would
+  // buy nothing and would need one static per name.
   const char *eager = std::getenv(eager_env);
   if (eager != nullptr && eager[0] != '0')
     return true;
@@ -141,7 +149,9 @@ void Engine::add_default_object() {
 
     registerContext("gpu", &cl_context);
   } else {
-    ml_logi("OpenCL/gpu backend compiled in but not brought up "
+    // Warn, not info: a model that ran on the GPU yesterday now runs on the
+    // CPU, and this line is the only trace of it.
+    ml_logw("OpenCL/gpu backend compiled in but not brought up "
             "(NNTR_ENGINE=%s); engine=gpu layers fall back to cpu.",
             requestedEngine().c_str());
   }

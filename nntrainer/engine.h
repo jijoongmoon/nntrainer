@@ -187,7 +187,10 @@ public:
    * @param creator layer creator (createLayer<T> result)
    * @param key string key (empty ⇒ derived from getType())
    * @param int_key integer key (-1 ⇒ auto-assigned)
-   * @return registered integer key, or -1 if the backend cannot register
+   * @return registered integer key, or -1 if the backend is registered but
+   *         declines to register a factory. An engine name that is not
+   *         registered at all throws std::invalid_argument from
+   *         getRegisteredContext().
    */
   int registerLayerFactory(
     const std::string &engine,
