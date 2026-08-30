@@ -12,7 +12,6 @@
 
 #include <fc_layer_cl.h>
 
-#include <cstdlib>
 #include <limits>
 
 #include <common_properties.h>
@@ -63,20 +62,6 @@ void FullyConnectedLayerCl::finalize(InitLayerContext &context) {
   auto const &in_dim = context.getInputDimensions()[0];
   output_dims[0] = in_dim;
   is_nchw ? output_dims[0].width(unit) : output_dims[0].channel(unit);
-
-  // CausalLM lm_head (name "output_of_causallm"): an untied QINT4 vocab
-  // projection (unit=vocab) that is skip_prefill, so it only ever computes the
-  // last position (decode M=1). Planning its output at the full graph-build
-  // height makes a vocab-wide dead activation plane (~1GB) that uniformly slows
-  // every decode kernel via bandwidth pressure. Force height=1 (rows>0 are
-  // never produced). NNTR_LMHEAD_OUT_FULL restores the old full-height
-  // planning.
-  if (skip_prefill && context.getName() == "output_of_causallm") {
-    static const bool keep_full =
-      std::getenv("NNTR_LMHEAD_OUT_FULL") != nullptr;
-    if (!keep_full)
-      output_dims[0].height(1);
-  }
 
   output_dims[0].setTensorType(
     {context.getFormat(), context.getActivationDataType()});
