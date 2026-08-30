@@ -20,6 +20,7 @@
 #include <compute_ops.h>
 #include <cuda_mem_allocator.h>
 #include <cuda_rmsnorm_layer.h>
+#include <fc_layer_cl.h>
 #include <layer_normalization_layer.h>
 
 // The decode/prefill graph state machine needs the model walk and the CUDA
@@ -161,6 +162,13 @@ void CudaContext::add_default_object() {
   // per-backend Layer fork, which is the entire point of the Tensor-level
   // whole-op surface.
   //
+  // fully connected: the same backend-neutral class the OpenCL context
+  // registers. Its GEMM goes out through in.getOps()->fc(), which lands on
+  // CudaComputeOps::fc -- the quantized device path (QS4CX dp4a / cuBLAS) with
+  // the inherited host implementation as the fallback. The layer itself
+  // contains no CUDA code and no #ifdef.
+  registerFactory(nntrainer::createLayer<FullyConnectedLayerCl>,
+                  FullyConnectedLayerCl::type, ml::train::LayerType::LAYER_FC);
   // addition: host Tensor ops, correct on the host-coherent managed buffers;
   // its residual_op dispatch is where the residual stream can stay in place.
   registerFactory(nntrainer::createLayer<AdditionLayer>, AdditionLayer::type,
