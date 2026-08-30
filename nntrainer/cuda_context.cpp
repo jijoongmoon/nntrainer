@@ -24,6 +24,7 @@
 #include <cuda_mem_allocator.h>
 #include <cuda_rmsnorm_layer.h>
 #include <fc_layer_cl.h>
+#include <geglu_layer.h>
 #include <layer_normalization_layer.h>
 
 // The decode/prefill graph state machine needs the model walk and the CUDA
@@ -193,6 +194,17 @@ void CudaContext::add_default_object() {
   registerFactory(nntrainer::createLayer<ActivationLayer>,
                   ActivationLayer::type,
                   ml::train::LayerType::LAYER_ACTIVATION);
+  // geglu: gelu_tanh(gate) * up, dispatching to CudaComputeOps::geglu -- a
+  // device FP16 kernel where the inputs are device-resident, and the inherited
+  // host implementation over the managed buffer otherwise, so the op table
+  // side of this layer is complete on this backend. The registration is what
+  // was missing: ml::train::LayerType has no GeGLU enumerator, so this is a
+  // string-keyed factory with an auto-assigned integer key, the same shape the
+  // application context uses. Without it createLayer("geglu", {engine=cuda})
+  // throws "Key is not found for the object", and a gemma-family graph -- the
+  // only in-tree consumer of this type -- cannot be built under engine=cuda at
+  // all.
+  registerFactory(nntrainer::createLayer<GeGLULayer>, GeGLULayer::type);
 }
 
 template <typename T>
