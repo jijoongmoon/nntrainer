@@ -12,11 +12,11 @@
 
 #include "cuda_attention.h"
 
-#include <env_compat.h>
 #include <cuda_blas_manager.h>
 #include <cuda_context.h>
 #include <cuda_context_manager.h>
 #include <cuda_stream_manager.h>
+#include <env_compat.h>
 
 #include <cublas_v2.h>
 
@@ -197,8 +197,8 @@ const unsigned short *mirror_kv(const unsigned short *host, size_t elems) {
   // Integrated GPU (Tegra/Jetson Orin): the iGPU reads ordinary host memory
   // directly (one shared physical pool), so NO device mirror is needed. Passing
   // through also avoids a latent stale-KV bug -- the mirror snapshots the host
-  // cache, and a host-side V-copy that updates the slot AFTER the snapshot would
-  // be served stale keys/values. Discrete GPUs keep the mirror.
+  // cache, and a host-side V-copy that updates the slot AFTER the snapshot
+  // would be served stale keys/values. Discrete GPUs keep the mirror.
   static const bool integrated = ContextManager::Global().isIntegrated();
   if (integrated)
     return host;
@@ -223,10 +223,11 @@ const unsigned short *mirror_kv(const unsigned short *host, size_t elems) {
 }
 } // namespace
 
-// Flash-decoding (split-KV) for M=1 decode: the single-pass kernel launches only
-// num_heads blocks (8 for gemma4) -- it underutilizes the SMs and serializes the
-// long KV loop. Split the KV axis into chunks so num_heads*n_chunks blocks run a
-// partial online-softmax in parallel, then a small reduce combines the chunks.
+// Flash-decoding (split-KV) for M=1 decode: the single-pass kernel launches
+// only num_heads blocks (8 for gemma4) -- it underutilizes the SMs and
+// serializes the long KV loop. Split the KV axis into chunks so
+// num_heads*n_chunks blocks run a partial online-softmax in parallel, then a
+// small reduce combines the chunks.
 static const char *ATTN_SPLITKV_SRC = R"CU(
 extern "C" {
 __device__ __forceinline__ float s_h2f(unsigned short h) {
@@ -455,9 +456,9 @@ __global__ void attn_reduce_t(const float *pm, const float *pl,
 // contains ZERO barriers and NW keys are in flight per block. A single
 // __syncthreads at the end merges the NW warp partials, in fixed warp order, to
 // exactly the (m, l, acc) triple attn_partial wrote -- so the scratch layout
-// (h * max_n_chunks + c), the replayed-graph d_pos/live-chunk contract and attn_reduce
-// are all untouched, and the launch geometry (grid HQ x max_n_chunks, block
-// 128) is bit-for-bit the same under graph capture.
+// (h * max_n_chunks + c), the replayed-graph d_pos/live-chunk contract and
+// attn_reduce are all untouched, and the launch geometry (grid HQ x
+// max_n_chunks, block 128) is bit-for-bit the same under graph capture.
 //
 // Numerics: same online-softmax, same fp32 accumulators, same key order per
 // chunk. Only the summation ORDER of the d-dot (32 lane partials of VPL
@@ -882,10 +883,11 @@ namespace {
 float *g_pm = nullptr, *g_pl = nullptr, *g_pacc = nullptr;
 size_t g_pm_cap = 0, g_pacc_cap = 0;
 std::mutex g_sk_mtx;
-// Graph replay: the FIXED chunk-count stride that the split-KV scratch (g_pm/g_pl/g_pacc)
-// is pre-sized to at prewarm. The captured graph launches gridDim.y and strides
-// partial<->reduce by THIS value (not the per-token live n_chunks) so one capture
-// is valid for every token. 0 until prewarm runs (then graph replay is unavailable -> per-step capture).
+// Graph replay: the FIXED chunk-count stride that the split-KV scratch
+// (g_pm/g_pl/g_pacc) is pre-sized to at prewarm. The captured graph launches
+// gridDim.y and strides partial<->reduce by THIS value (not the per-token live
+// n_chunks) so one capture is valid for every token. 0 until prewarm runs (then
+// graph replay is unavailable -> per-step capture).
 int g_sk_max_nchunks = 0;
 bool ensure_sk(size_t mn, size_t acc) {
   if (mn > g_pm_cap) {
@@ -896,8 +898,10 @@ bool ensure_sk(size_t mn, size_t acc) {
     // falls back rather than corrupting the graph.
     if (StreamManager::Global().isCapturing())
       return false;
-    if (g_pm) cudaFree(g_pm);
-    if (g_pl) cudaFree(g_pl);
+    if (g_pm)
+      cudaFree(g_pm);
+    if (g_pl)
+      cudaFree(g_pl);
     if (cudaMalloc(&g_pm, mn * sizeof(float)) != cudaSuccess ||
         cudaMalloc(&g_pl, mn * sizeof(float)) != cudaSuccess)
       return false;
@@ -906,7 +910,8 @@ bool ensure_sk(size_t mn, size_t acc) {
   if (acc > g_pacc_cap) {
     if (StreamManager::Global().isCapturing())
       return false;
-    if (g_pacc) cudaFree(g_pacc);
+    if (g_pacc)
+      cudaFree(g_pacc);
     if (cudaMalloc(&g_pacc, acc * sizeof(float)) != cudaSuccess)
       return false;
     g_pacc_cap = acc;
@@ -915,16 +920,18 @@ bool ensure_sk(size_t mn, size_t acc) {
 }
 
 bool attention_splitkv_decode(const unsigned short *q, const unsigned short *k,
-                              const unsigned short *v, unsigned short *o, int HQ,
-                              int HKV, int N_kv, int cache_from, int d,
+                              const unsigned short *v, unsigned short *o,
+                              int HQ, int HKV, int N_kv, int cache_from, int d,
                               int window, float softcap, int chunk_kv) {
   const int n_chunks = (N_kv + chunk_kv - 1) / chunk_kv;
-  // Graph replay: when the device pos buffer is bound, the captured graph uses the FIXED
-  // max-chunk stride/grid (g_sk_max_nchunks, published at prewarm) so one capture
-  // serves every token. M1/non-graph (dpos=nullptr) uses the live n_chunks ->
-  // bit-identical to the original. Mirrors the dense path's decode-graph gate below.
+  // Graph replay: when the device pos buffer is bound, the captured graph uses
+  // the FIXED max-chunk stride/grid (g_sk_max_nchunks, published at prewarm) so
+  // one capture serves every token. M1/non-graph (dpos=nullptr) uses the live
+  // n_chunks -> bit-identical to the original. Mirrors the dense path's
+  // decode-graph gate below.
   static const bool decode_graph = nntr_env_on("NNTR_CUDA_GRAPH");
-  const int *dpos = (decode_graph && g_sk_max_nchunks > 0) ? cuda_pos_buffer() : nullptr;
+  const int *dpos =
+    (decode_graph && g_sk_max_nchunks > 0) ? cuda_pos_buffer() : nullptr;
   int max_nc = dpos ? g_sk_max_nchunks : n_chunks;
   // On a sliding layer only the keys inside the window are ever
   // read, so anchoring the chunk grid at the window's chunk-aligned low bound
@@ -933,12 +940,12 @@ bool attention_splitkv_decode(const unsigned short *q, const unsigned short *k,
   // the dropped chunks are the softmax identity. NNTR_CUDA_SPLITKV_CLIP=0 is
   // the kill switch (restores the whole-context grid verbatim).
   //
-  // Graph-replay contract: the captured graph freezes the grid and the partial<->reduce
-  // stride, so the clipped stride must be a pure function of the LAYER (window,
-  // chunk) and never of the live key count -- ceil(window/chunk)+1 is the
-  // maximum a window anchored at a chunk boundary can span, for every token.
-  // The scratch is sized by the prewarm at the unclipped maximum, so a smaller
-  // stride is always in bounds.
+  // Graph-replay contract: the captured graph freezes the grid and the
+  // partial<->reduce stride, so the clipped stride must be a pure function of
+  // the LAYER (window, chunk) and never of the live key count --
+  // ceil(window/chunk)+1 is the maximum a window anchored at a chunk boundary
+  // can span, for every token. The scratch is sized by the prewarm at the
+  // unclipped maximum, so a smaller stride is always in bounds.
   static const bool clip_on = []() {
     const char *e = std::getenv("NNTR_CUDA_SPLITKV_CLIP");
     return !(e != nullptr && e[0] == '0');
@@ -1013,10 +1020,11 @@ bool attention_splitkv_decode(const unsigned short *q, const unsigned short *k,
     snprintf(fname, sizeof(fname), "attn_partial_w%d_h%d", d, hpw);
     wname = fname;
   }
-  auto kp = warp_ok ? CudaContext::Global().registerCudaKernel(
-                        ATTN_SPLITKV_WARP_SRC, wname)
-                    : CudaContext::Global().registerCudaKernel(ATTN_SPLITKV_SRC,
-                                                               "attn_partial");
+  auto kp =
+    warp_ok
+      ? CudaContext::Global().registerCudaKernel(ATTN_SPLITKV_WARP_SRC, wname)
+      : CudaContext::Global().registerCudaKernel(ATTN_SPLITKV_SRC,
+                                                 "attn_partial");
   const int B = 128;
   // [reduce-tile] wide-grid merge (see attn_reduce_t). Needs (B + max_nc)
   // floats of shared memory; anything larger falls back to the one-block-per-
@@ -1082,17 +1090,18 @@ bool attention_splitkv_decode(const unsigned short *q, const unsigned short *k,
 }
 
 // GEMM-based multi-row prefill attention. The per-key flash kernel
-// (attn_core_il) is fetch/sync-bound (~0.4% of peak on d=128) because it serial-
-// reduces every key; for prefill (N_q>1) materialising scores via cuBLAS fp16
-// GEMMs (QK^T -> softmax -> PV) is far faster and head_dim-agnostic, so it also
-// helps the head_dim=128 (qwen3/llama) case that block-Q does not.
-// Layout (interleaved fp16, column-major cuBLAS): per query-head h (kv-head
-// hkv=h/gqa) scores_cm[N_kv,N_q] = K_h^T*Q_h reads back as row-major
-// scores[N_q,N_kv]; then O_cm[d,N_q] = V_h@scores_cm.
+// (attn_core_il) is fetch/sync-bound (~0.4% of peak on d=128) because it
+// serial- reduces every key; for prefill (N_q>1) materialising scores via
+// cuBLAS fp16 GEMMs (QK^T -> softmax -> PV) is far faster and
+// head_dim-agnostic, so it also helps the head_dim=128 (qwen3/llama) case that
+// block-Q does not. Layout (interleaved fp16, column-major cuBLAS): per
+// query-head h (kv-head hkv=h/gqa) scores_cm[N_kv,N_q] = K_h^T*Q_h reads back
+// as row-major scores[N_q,N_kv]; then O_cm[d,N_q] = V_h@scores_cm.
 float *g_scores = nullptr;
 size_t g_scores_cap = 0;
 std::mutex g_ga_mtx;
-bool attention_gemm_prefill_fp16(const unsigned short *q, const unsigned short *k,
+bool attention_gemm_prefill_fp16(const unsigned short *q,
+                                 const unsigned short *k,
                                  const unsigned short *v, unsigned short *o,
                                  int HQ, int HKV, int N_q, int N_kv,
                                  int cache_from, int d, int window,
@@ -1127,16 +1136,16 @@ bool attention_gemm_prefill_fp16(const unsigned short *q, const unsigned short *
   const size_t shmem = (size_t)B * sizeof(float);
   for (int h = 0; h < HQ; ++h) {
     const int hkv = h / gqa;
-    const unsigned short *Qh = q + (long)h * d;     // [N_q,d] ld=HD_Q
-    const unsigned short *Kh = k + (long)hkv * d;   // [N_kv,d] ld=HD_KV
-    const unsigned short *Vh = v + (long)hkv * d;   // [N_kv,d] ld=HD_KV
-    unsigned short *Oh = o + (long)h * d;           // [N_q,d] ld=HD_Q
+    const unsigned short *Qh = q + (long)h * d;   // [N_q,d] ld=HD_Q
+    const unsigned short *Kh = k + (long)hkv * d; // [N_kv,d] ld=HD_KV
+    const unsigned short *Vh = v + (long)hkv * d; // [N_kv,d] ld=HD_KV
+    unsigned short *Oh = o + (long)h * d;         // [N_q,d] ld=HD_Q
     // scores_cm[N_kv,N_q] = (K_h^T)[N_kv,d] @ Q_h[d,N_q] * scale -> row-major
     // scores[i*N_kv+j] = scale*dot(Q_i,K_j).
-    cublasStatus_t s1 = cublasGemmEx(
-      bh, CUBLAS_OP_T, CUBLAS_OP_N, N_kv, N_q, d, &scale, Kh, CUDA_R_16F, HD_KV,
-      Qh, CUDA_R_16F, HD_Q, &zero, scores, CUDA_R_16F, N_kv, CUBLAS_COMPUTE_32F,
-      CUBLAS_GEMM_DEFAULT);
+    cublasStatus_t s1 =
+      cublasGemmEx(bh, CUBLAS_OP_T, CUBLAS_OP_N, N_kv, N_q, d, &scale, Kh,
+                   CUDA_R_16F, HD_KV, Qh, CUDA_R_16F, HD_Q, &zero, scores,
+                   CUDA_R_16F, N_kv, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
     if (s1 != CUBLAS_STATUS_SUCCESS)
       return false;
     sm->SetKernelArguments(0, &scores, sizeof(scores));
@@ -1150,10 +1159,10 @@ bool attention_gemm_prefill_fp16(const unsigned short *q, const unsigned short *
     if (!StreamManager::Global().DispatchCommand(*sm, sg, sb, shmem))
       return false;
     // O_cm[d,N_q] = V_h[d,N_kv] @ scores_cm[N_kv,N_q] -> row-major O[i,e].
-    cublasStatus_t s2 = cublasGemmEx(
-      bh, CUBLAS_OP_N, CUBLAS_OP_N, d, N_q, N_kv, &one, Vh, CUDA_R_16F, HD_KV,
-      scores, CUDA_R_16F, N_kv, &zero, Oh, CUDA_R_16F, HD_Q, CUBLAS_COMPUTE_32F,
-      CUBLAS_GEMM_DEFAULT);
+    cublasStatus_t s2 =
+      cublasGemmEx(bh, CUBLAS_OP_N, CUBLAS_OP_N, d, N_q, N_kv, &one, Vh,
+                   CUDA_R_16F, HD_KV, scores, CUDA_R_16F, N_kv, &zero, Oh,
+                   CUDA_R_16F, HD_Q, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
     if (s2 != CUBLAS_STATUS_SUCCESS)
       return false;
   }
@@ -1183,7 +1192,8 @@ bool cuda_attention_splitkv_prewarm(int max_seq_len, int max_hq,
   if (!ensure_sk(mn, mn * (size_t)max_head_dim))
     return false;
   // Publish the fixed stride so attention_splitkv_decode + the kernels all use
-  // the SAME value the scratch was just sized with (replay-capture correctness).
+  // the SAME value the scratch was just sized with (replay-capture
+  // correctness).
   g_sk_max_nchunks = max_nchunks;
   return true;
 }
@@ -1210,14 +1220,14 @@ bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
   static const int sk_chunk = []() {
     const char *e = std::getenv("NNTR_CUDA_FLASH_DECODE");
     if (!e)
-      return 0;            // off
+      return 0; // off
     int c = atoi(e);
     return c > 0 ? c : 64; // =1 -> default chunk 64; or an explicit chunk size
   }();
   if (sk_chunk > 0 && N_q == 1 && N_kv > sk_chunk) {
     if (attention_splitkv_decode(q_fp16, k_fp16, v_fp16, o_fp16, num_heads_Q,
-                                 num_heads_KV, N_kv, cache_from, head_dim, window,
-                                 softcap, sk_chunk)) {
+                                 num_heads_KV, N_kv, cache_from, head_dim,
+                                 window, softcap, sk_chunk)) {
       StreamManager::Global().maybeFinish();
       return true;
     }
@@ -1268,12 +1278,13 @@ bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
      (integrated_gpu || (win_bq == 0 && N_kv >= gemm_min_kv)));
   // head_dim 256/512 (gemma4 sliding/global) were historically excluded because
   // block-Q beat the cuBLAS path on RTX/Adreno. On Orin (sm_87) block-Q runs at
-  // only ~0.2 TFLOP/s, so the cuBLAS int8/fp16 Tensor-Core QK/PV is worth trying
-  // here -- opt-in via NNTR_CUDA_GEMM_ATTN, so other arches keep block-Q.
+  // only ~0.2 TFLOP/s, so the cuBLAS int8/fp16 Tensor-Core QK/PV is worth
+  // trying here -- opt-in via NNTR_CUDA_GEMM_ATTN, so other arches keep
+  // block-Q.
   if (gemm_attn_on && N_q > 1) {
     if (attention_gemm_prefill_fp16(q_fp16, k_fp16, v_fp16, o_fp16, num_heads_Q,
-                                    num_heads_KV, N_q, N_kv, cache_from, head_dim,
-                                    window, softcap)) {
+                                    num_heads_KV, N_q, N_kv, cache_from,
+                                    head_dim, window, softcap)) {
       StreamManager::Global().maybeFinish();
       return true;
     }
@@ -1336,8 +1347,9 @@ bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
   kernel->SetKernelArguments(9, &head_dim, sizeof(head_dim));
   kernel->SetKernelArguments(10, &window, sizeof(window));
   kernel->SetKernelArguments(11, &softcap, sizeof(softcap));
-  // Graph replay: bind the device position buffer so the captured graph reads the live
-  // cache_from/N_kv on replay; nullptr keeps the baked-arg (non-graph) path.
+  // Graph replay: bind the device position buffer so the captured graph reads
+  // the live cache_from/N_kv on replay; nullptr keeps the baked-arg (non-graph)
+  // path.
   static const bool decode_graph_attn = nntr_env_on("NNTR_CUDA_GRAPH");
   const int *attn_dpos = decode_graph_attn ? cuda_pos_buffer() : nullptr;
   kernel->SetKernelArguments(12, &attn_dpos, sizeof(attn_dpos));
@@ -1347,17 +1359,19 @@ bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
     (unsigned int)(sizeof(float) * ((size_t)head_dim + B));
   static const bool dbg = std::getenv("NNTR_CUDA_ATTN_DBG") != nullptr;
   if (dbg)
-    fprintf(stderr,
-            "[ATTNDBG] HQ=%d HKV=%d N_q=%d N_kv=%d from=%d d=%d win=%d cap=%.0f "
-            "shmem=%u\n",
-            num_heads_Q, num_heads_KV, N_q, N_kv, cache_from, head_dim, window,
-            softcap, shmem);
+    fprintf(
+      stderr,
+      "[ATTNDBG] HQ=%d HKV=%d N_q=%d N_kv=%d from=%d d=%d win=%d cap=%.0f "
+      "shmem=%u\n",
+      num_heads_Q, num_heads_KV, N_q, N_kv, cache_from, head_dim, window,
+      softcap, shmem);
   if (!StreamManager::Global().DispatchCommand(*kernel, grid, block, shmem))
     return false;
   StreamManager::Global().maybeFinish();
   cudaError_t e = cudaGetLastError();
   if (e != cudaSuccess) {
-    ml_loge("[CUDA] attn_core_il_fp16 runtime error: %s", cudaGetErrorString(e));
+    ml_loge("[CUDA] attn_core_il_fp16 runtime error: %s",
+            cudaGetErrorString(e));
     return false;
   }
   return true;

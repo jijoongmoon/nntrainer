@@ -19,8 +19,9 @@
 
 namespace nntrainer::cuda {
 
-// One block per (row, head); threads sweep the rotated-pair index k in [0,half).
-// Per-row position is from + blockIdx.x, indexing the flat device cos/sin LUTs.
+// One block per (row, head); threads sweep the rotated-pair index k in
+// [0,half). Per-row position is from + blockIdx.x, indexing the flat device
+// cos/sin LUTs.
 static const char *ROPE_FP16_SRC = R"CU(
 extern "C" {
 __device__ __forceinline__ float rp_h2f(unsigned short h) {
@@ -98,8 +99,9 @@ __global__ void rope_fp16_dpos(const unsigned short *in, unsigned short *out,
 )CU";
 
 bool cuda_rope_fp16(const unsigned short *in, unsigned short *out,
-                    const unsigned short *cos_lut, const unsigned short *sin_lut,
-                    int num_heads, int head_dim, int num_rows, int from) {
+                    const unsigned short *cos_lut,
+                    const unsigned short *sin_lut, int num_heads, int head_dim,
+                    int num_rows, int from) {
   if (num_heads == 0 || head_dim == 0 || num_rows == 0)
     return true;
   const int half = head_dim / 2;
@@ -132,8 +134,8 @@ bool cuda_rope_fp16_dpos(const unsigned short *in, unsigned short *out,
   if (num_heads == 0 || head_dim == 0 || num_rows == 0)
     return true;
   const int half = head_dim / 2;
-  auto kernel = CudaContext::Global().registerCudaKernel(ROPE_FP16_SRC,
-                                                         "rope_fp16_dpos");
+  auto kernel =
+    CudaContext::Global().registerCudaKernel(ROPE_FP16_SRC, "rope_fp16_dpos");
   if (!kernel) {
     ml_loge("[CUDA] rope_fp16_dpos: kernel registration failed");
     return false;

@@ -17,11 +17,13 @@
 
 namespace nntrainer::cuda {
 
-/** @brief out[i] = gelu_tanh(gate[i]) * up[i], gelu_tanh = pytorch-tanh approx */
+/** @brief out[i] = gelu_tanh(gate[i]) * up[i], gelu_tanh = pytorch-tanh approx
+ */
 bool cuda_geglu_fp16(const unsigned short *gate, const unsigned short *up,
                      unsigned short *out, unsigned int n);
 
-/** @brief out[i] = silu(gate[i]) * up[i], silu(x) = x/(1+exp(-x)) (qwen3 FFN) */
+/** @brief out[i] = silu(gate[i]) * up[i], silu(x) = x/(1+exp(-x)) (qwen3 FFN)
+ */
 bool cuda_swiglu_fp16(const unsigned short *gate, const unsigned short *up,
                       unsigned short *out, unsigned int n);
 
@@ -34,9 +36,9 @@ bool cuda_scalar_mul_fp16(const unsigned short *in, unsigned short *out,
                           unsigned int n, float scalar);
 
 /**
- * @brief Device-slot KV V-copy: out_base[d_pos[0]*width + i] = scalar * in[i], with the
- *        cache slot read from the device cuda_pos_buffer() so a captured graph
- *        writes V to the live (new-token) slot on every replay. @p out_base is
+ * @brief Device-slot KV V-copy: out_base[d_pos[0]*width + i] = scalar * in[i],
+ * with the cache slot read from the device cuda_pos_buffer() so a captured
+ * graph writes V to the live (new-token) slot on every replay. @p out_base is
  *        the cache BASE (batch) pointer; @p width is the per-row element count.
  */
 bool cuda_scalar_mul_fp16_slot(const unsigned short *in,

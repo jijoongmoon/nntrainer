@@ -64,15 +64,16 @@ static void writeFile(const std::string &p, const std::string &data) {
 }
 
 // Default to CUBIN (native SASS for the device's real arch) instead of PTX so
-// cuModuleLoadData loads machine code directly and skips the PTX->SASS JIT. That
-// JIT rejects PTX whose ISA version exceeds what the driver knows -- e.g. a CUDA
-// 13.3 NVRTC feeding a driver that only advertises CUDA 13.1 ("cuModuleLoadData:
-// the provided PTX was compiled with an unsupported toolchain"), which blocked
-// every kernel on a Windows box with a slightly-older driver. A cubin for a
-// driver-supported arch (Blackwell sm_120 here) has no ISA-version gate and also
-// loads faster (no JIT). GetComputeArch() returns the DEVICE's real cc, so the
-// SASS always matches the current GPU -- no portability loss vs PTX (we compile
-// per-device at runtime anyway). NNTR_CUDA_PTX forces the legacy PTX path.
+// cuModuleLoadData loads machine code directly and skips the PTX->SASS JIT.
+// That JIT rejects PTX whose ISA version exceeds what the driver knows -- e.g.
+// a CUDA 13.3 NVRTC feeding a driver that only advertises CUDA 13.1
+// ("cuModuleLoadData: the provided PTX was compiled with an unsupported
+// toolchain"), which blocked every kernel on a Windows box with a
+// slightly-older driver. A cubin for a driver-supported arch (Blackwell sm_120
+// here) has no ISA-version gate and also loads faster (no JIT).
+// GetComputeArch() returns the DEVICE's real cc, so the SASS always matches the
+// current GPU -- no portability loss vs PTX (we compile per-device at runtime
+// anyway). NNTR_CUDA_PTX forces the legacy PTX path.
 static bool useCubin() {
   static const bool v = std::getenv("NNTR_CUDA_PTX") == nullptr;
   return v;
@@ -88,7 +89,8 @@ bool Module::compileWithNVRTC(const std::string &source,
                   "nvrtcCreateProgram"))
     return false;
 
-  // compute_XY -> sm_XY for the cubin path (real SASS target); PTX keeps virtual.
+  // compute_XY -> sm_XY for the cubin path (real SASS target); PTX keeps
+  // virtual.
   std::string archname = ContextManager::Global().GetComputeArch();
   if (useCubin()) {
     const std::string cprefix = "compute_";
@@ -171,7 +173,8 @@ bool Module::CreateModuleFromSource(const std::string &source,
   CUresult lr = cuModuleLoadData(&module_, ptx.c_str());
   if (lr != CUDA_SUCCESS && have_cache) {
     // cached PTX may be stale (driver update); recompile once and retry.
-    ml_logw("[CUDA] cached PTX load failed; recompiling %s", name_for_log.c_str());
+    ml_logw("[CUDA] cached PTX load failed; recompiling %s",
+            name_for_log.c_str());
     if (!compileWithNVRTC(source, options, ptx, name_for_log))
       return false;
     writeFile(key, ptx);

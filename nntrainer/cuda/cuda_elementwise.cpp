@@ -193,16 +193,18 @@ __global__ void argmax_p2(const float *pmax, const int *pidx, int g,
 )CU";
 
 namespace {
-constexpr int ARGMAX_GRID = 256; // pass-1 blocks (== pass-2 reduction width)
-float *g_am_pmax = nullptr;       // [ARGMAX_GRID] per-block partial max
-int *g_am_pidx = nullptr;         // [ARGMAX_GRID] per-block partial idx
+constexpr int ARGMAX_GRID = 256;   // pass-1 blocks (== pass-2 reduction width)
+float *g_am_pmax = nullptr;        // [ARGMAX_GRID] per-block partial max
+int *g_am_pidx = nullptr;          // [ARGMAX_GRID] per-block partial idx
 unsigned int *g_am_oidx = nullptr; // [1] device final index
-unsigned int *g_am_oidx_host = nullptr; // pinned host staging for the 4-byte D2H
+unsigned int *g_am_oidx_host =
+  nullptr; // pinned host staging for the 4-byte D2H
 
 // One-time allocation of the small fixed-size argmax scratch (partials + the
 // 1-int device/host result). Capture-safe: a cudaMalloc inside stream capture
 // invalidates the graph, so bail under capture (the buffers are tiny and are
-// allocated on the first non-captured call -- the gating env makes this opt-in).
+// allocated on the first non-captured call -- the gating env makes this
+// opt-in).
 bool ensure_argmax_scratch() {
   if (g_am_pmax && g_am_pidx && g_am_oidx && g_am_oidx_host)
     return true;
@@ -214,12 +216,10 @@ bool ensure_argmax_scratch() {
   if (!g_am_pidx &&
       cudaMalloc(&g_am_pidx, sizeof(int) * ARGMAX_GRID) != cudaSuccess)
     return false;
-  if (!g_am_oidx &&
-      cudaMalloc(&g_am_oidx, sizeof(unsigned int)) != cudaSuccess)
+  if (!g_am_oidx && cudaMalloc(&g_am_oidx, sizeof(unsigned int)) != cudaSuccess)
     return false;
-  if (!g_am_oidx_host &&
-      cudaHostAlloc(&g_am_oidx_host, sizeof(unsigned int),
-                    cudaHostAllocDefault) != cudaSuccess)
+  if (!g_am_oidx_host && cudaHostAlloc(&g_am_oidx_host, sizeof(unsigned int),
+                                       cudaHostAllocDefault) != cudaSuccess)
     return false;
   return true;
 }

@@ -99,8 +99,7 @@ SharedCudaState *shared_cuda_state() {
     }
     auto *p = new SharedCudaState();
     char out[32];
-    std::snprintf(out, sizeof(out), "%llx",
-                  (unsigned long long)(uintptr_t)p);
+    std::snprintf(out, sizeof(out), "%llx", (unsigned long long)(uintptr_t)p);
     SetEnvironmentVariableA(KEY, out);
     return p;
 #else
@@ -112,7 +111,6 @@ SharedCudaState *shared_cuda_state() {
 }
 
 } // namespace
-
 
 void StreamManager::initialize() noexcept {
   // make sure the device + primary context exist before creating a stream
@@ -225,11 +223,11 @@ static bool cuda_async_mode() {
     if (e == nullptr || e[0] != '1')
       return false;
     // Integrated GPU (Tegra/Jetson Orin): async drops the per-op stream drain,
-    // but on the shared-memory iGPU there is no UVM page-fault ordering to order
-    // a host read against an in-flight kernel write -> the host fallbacks read
-    // half-written buffers = corrupted tokens. Force SYNC on integrated
-    // regardless of the env (re-enable per-Orin only after a dedicated coherence
-    // benchmark). Discrete GPUs honor NNTR_CUDA_ASYNC.
+    // but on the shared-memory iGPU there is no UVM page-fault ordering to
+    // order a host read against an in-flight kernel write -> the host fallbacks
+    // read half-written buffers = corrupted tokens. Force SYNC on integrated
+    // regardless of the env (re-enable per-Orin only after a dedicated
+    // coherence benchmark). Discrete GPUs honor NNTR_CUDA_ASYNC.
     return !ContextManager::Global().isIntegrated();
   }();
   return async;
@@ -304,7 +302,8 @@ bool StreamManager::endCapture(cudaGraph_t *graph) {
   *capture_flag_ = 0;
   if (!stream_ || graph == nullptr)
     return false;
-  return cudaCheck(cudaStreamEndCapture(stream_, graph), "cudaStreamEndCapture");
+  return cudaCheck(cudaStreamEndCapture(stream_, graph),
+                   "cudaStreamEndCapture");
 }
 
 StreamManager::~StreamManager() {

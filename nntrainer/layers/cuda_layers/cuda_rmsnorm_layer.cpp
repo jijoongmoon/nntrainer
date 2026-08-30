@@ -40,9 +40,9 @@ void CudaRMSNormLayer::finalize(InitLayerContext &context) {
   TensorDim gamma_dim(
     1, 1, 1, dim[0].width(),
     TensorDim::TensorType(context.getFormat(), context.getWeightDataType()));
-  wt_idx[RMSParams::gamma] = context.requestWeight(
-    gamma_dim, props::InitializerInfo::Enum::NONE, WeightRegularizer::NONE, 1.0f,
-    0.0f, "gamma", false);
+  wt_idx[RMSParams::gamma] =
+    context.requestWeight(gamma_dim, props::InitializerInfo::Enum::NONE,
+                          WeightRegularizer::NONE, 1.0f, 0.0f, "gamma", false);
 }
 
 namespace {
@@ -74,8 +74,9 @@ void rmsnorm_dispatch(const Tensor &in, const Tensor &gamma, Tensor &out,
   if (std::getenv("NNTR_CUDA_DBG")) {
     static int _n = 0;
     if (_n++ < 3)
-      std::fprintf(stderr, "[CUDA-DBG] CudaRMSNormLayer USED rows=%u width=%u\n",
-                   rows, width);
+      std::fprintf(stderr,
+                   "[CUDA-DBG] CudaRMSNormLayer USED rows=%u width=%u\n", rows,
+                   width);
   }
   using DT = ml::train::TensorDim::DataType;
   const DT dt = in.getDataType();
@@ -83,14 +84,17 @@ void rmsnorm_dispatch(const Tensor &in, const Tensor &gamma, Tensor &out,
 #ifdef ENABLE_FP16
   // GPU path: fp16 in/out/gamma all device-resident (UVM). Block-per-row, FP32
   // sum-of-squares. Used only for small row counts (decode, rows~1): the kernel
-  // syncs per call, so for the wide prefill norm (rows=seq_len) the multi-thread
-  // host norm wins -- gating by rows gives the decode speedup (+~13%) without a
-  // prefill regression. NNTR_RMSNORM_CUDA_OFF disables; =all forces all rows.
+  // syncs per call, so for the wide prefill norm (rows=seq_len) the
+  // multi-thread host norm wins -- gating by rows gives the decode speedup
+  // (+~13%) without a prefill regression. NNTR_RMSNORM_CUDA_OFF disables; =all
+  // forces all rows.
   static const int gpu_max_rows = []() {
     const char *e = std::getenv("NNTR_RMSNORM_CUDA_OFF");
-    if (e && e[0] == 'a') return 1 << 30; // "all"
-    if (e) return 0;                       // off
-    return 32;                             // decode-only default
+    if (e && e[0] == 'a')
+      return 1 << 30; // "all"
+    if (e)
+      return 0; // off
+    return 32;  // decode-only default
   }();
   if (dt == DT::FP16 && gt == DT::FP16 && out.getDataType() == DT::FP16 &&
       (int)rows <= gpu_max_rows) {
@@ -144,8 +148,8 @@ void CudaRMSNormLayer::forwarding(RunLayerContext &context, bool training) {
 }
 
 void CudaRMSNormLayer::incremental_forwarding(RunLayerContext &context,
-                                              unsigned int from, unsigned int to,
-                                              bool training) {
+                                              unsigned int from,
+                                              unsigned int to, bool training) {
   if (skip_prefill && from == 0)
     return;
 

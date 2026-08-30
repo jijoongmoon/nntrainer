@@ -8,8 +8,8 @@
  * @author  Jijoong Moon <jijoong.moon@samsung.com>
  * @bug     No known bugs except for NYI items
  * @brief   CUDA wrapper for context/device management. Peer of
- *          nntrainer::opencl::ContextManager. Retains the device PRIMARY context
- *          so the Driver API (cuModuleLoad/cuLaunchKernel) and the Runtime API
+ *          nntrainer::opencl::ContextManager. Retains the device PRIMARY
+ * context so the Driver API (cuModuleLoad/cuLaunchKernel) and the Runtime API
  *          (cudaMalloc/cudaMemcpy) share one context.
  */
 
@@ -51,7 +51,8 @@ public:
   int GetDeviceOrdinal() const { return device_ordinal_; }
 
   /**
-   * @brief Get the active device name (e.g. "NVIDIA GeForce RTX 4070 Laptop GPU")
+   * @brief Get the active device name (e.g. "NVIDIA GeForce RTX 4070 Laptop
+   * GPU")
    */
   const std::string &GetDeviceName() const { return device_name_; }
 
@@ -67,10 +68,10 @@ public:
 
   /**
    * @brief true when the device supports CONCURRENT host access to managed
-   *        memory while kernels are in flight (cudaDevAttrConcurrentManagedAccess).
-   *        Linux discrete GPUs: 1. Windows WDDM: 0 -- there, host access to
-   *        ANY managed allocation is only legal while the device is idle
-   *        (pre-Pascal model), so async submission and the discrete env
+   *        memory while kernels are in flight
+   * (cudaDevAttrConcurrentManagedAccess). Linux discrete GPUs: 1. Windows WDDM:
+   * 0 -- there, host access to ANY managed allocation is only legal while the
+   * device is idle (pre-Pascal model), so async submission and the discrete env
    *        add-ons tuned around cMA=1 must be gated off.
    */
   bool concurrentManagedAccess() const { return concurrent_managed_access_; }
@@ -157,12 +158,12 @@ void drain_if_async();
 /**
  * @brief  Is pointer @p p reachable by a CUDA kernel? Accepts Managed/Device
  *         always; on an INTEGRATED GPU (Tegra/Orin) also accepts Host, because
- *         there cudaMallocManaged memory can report as cudaMemoryTypeHost yet is
- *         GPU-accessible (one shared physical pool). Without this every dev()
- *         gate rejects the (managed) activation pool on Orin and the GPU ops
- *         silently fall to the host => correct-but-slow (2 TPS). Single source
- *         of truth for the residency gates. Always false when the cuda engine
- *         was not selected (see engine_selected()).
+ *         there cudaMallocManaged memory can report as cudaMemoryTypeHost yet
+ * is GPU-accessible (one shared physical pool). Without this every dev() gate
+ * rejects the (managed) activation pool on Orin and the GPU ops silently fall
+ * to the host => correct-but-slow (2 TPS). Single source of truth for the
+ * residency gates. Always false when the cuda engine was not selected (see
+ * engine_selected()).
  */
 bool dev_accessible(const void *p);
 

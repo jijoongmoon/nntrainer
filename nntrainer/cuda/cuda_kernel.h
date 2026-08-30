@@ -9,8 +9,8 @@
  * @bug     No known bugs except for NYI items
  * @brief   CUDA wrapper for kernel (CUfunction) management. Peer of
  *          nntrainer::opencl::Kernel. Driver-API launches take an array of arg
- *          POINTERS, so SetKernelArguments copies each arg's bytes into internal
- *          storage and getKernelParams() builds the void* array at launch time.
+ *          POINTERS, so SetKernelArguments copies each arg's bytes into
+ * internal storage and getKernelParams() builds the void* array at launch time.
  */
 
 #ifndef __CUDA_KERNEL_H__

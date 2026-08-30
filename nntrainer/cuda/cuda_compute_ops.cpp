@@ -15,10 +15,10 @@
  *         the CUDA kernels land in P3 (cuda_operations/).
  */
 
-#include <env_compat.h>
 #include <common_properties.h> // ActivationType (the act_type int encoding)
 #include <compute_ops.h>
 #include <cpu_ops_table.h>
+#include <env_compat.h>
 #include <nntrainer_log.h>
 
 #include <cstdio>
@@ -36,8 +36,8 @@
 #include <cuda_gelu.h>
 #include <cuda_layernorm.h>
 #include <cuda_runtime.h>
-#include <int4_utils.h>
 #include <fp16.h>
+#include <int4_utils.h>
 #include <map>
 #include <mutex>
 #include <utility>
@@ -175,14 +175,12 @@ public:
     if (dt == ml::train::TensorDim::DataType::FP16) {
       static const bool gpu = nntr_env_on("NNTR_CUDA_GEGLU");
       if (gpu && n > 0) {
-        auto *a =
-          reinterpret_cast<const unsigned short *>(in1.getData<_FP16>() +
-                                                   elem_off);
-        auto *b =
-          reinterpret_cast<const unsigned short *>(in2.getData<_FP16>() +
-                                                   elem_off);
-        auto *o = reinterpret_cast<unsigned short *>(out.getData<_FP16>() +
-                                                     elem_off);
+        auto *a = reinterpret_cast<const unsigned short *>(
+          in1.getData<_FP16>() + elem_off);
+        auto *b = reinterpret_cast<const unsigned short *>(
+          in2.getData<_FP16>() + elem_off);
+        auto *o =
+          reinterpret_cast<unsigned short *>(out.getData<_FP16>() + elem_off);
         const bool dev = nntrainer::cuda::dev_accessible(a);
         if (dev && cuda::cuda_geglu_fp16(a, b, o, (unsigned int)n))
           return;
@@ -190,8 +188,8 @@ public:
     }
 #endif
 
-    // Host gelu fallback: sync first so the host read of GPU-produced gate/up is
-    // coherent under NNTR_CUDA_ASYNC (no-op in sync mode).
+    // Host gelu fallback: sync first so the host read of GPU-produced gate/up
+    // is coherent under NNTR_CUDA_ASYNC (no-op in sync mode).
     cuda::StreamManager::Global().finishIfAsync();
     CpuComputeOps::geglu(in1, in2, out, active_rows, row_offset);
   }
@@ -247,19 +245,22 @@ public:
                                                           elem_off);
       auto *gi =
         reinterpret_cast<const unsigned short *>(gamma.getData<_FP16>());
-      auto *bi = reinterpret_cast<const unsigned short *>(beta.getData<_FP16>());
+      auto *bi =
+        reinterpret_cast<const unsigned short *>(beta.getData<_FP16>());
       auto *yi =
         reinterpret_cast<unsigned short *>(out.getData<_FP16>() + elem_off);
       if (nntrainer::cuda::dev_accessible(xi) &&
           nntrainer::cuda::dev_accessible(gi) &&
           nntrainer::cuda::dev_accessible(bi) &&
           nntrainer::cuda::dev_accessible(yi) &&
-          cuda::cuda_layernorm_fp16(xi, gi, bi, yi, epsilon, active_rows, width))
+          cuda::cuda_layernorm_fp16(xi, gi, bi, yi, epsilon, active_rows,
+                                    width))
         return;
     }
 #endif
     // Host layernorm fallback (UNACCELERATED): sync first so the host read of a
-    // GPU-produced input is coherent under NNTR_CUDA_ASYNC (no-op in sync mode).
+    // GPU-produced input is coherent under NNTR_CUDA_ASYNC (no-op in sync
+    // mode).
     cuda::StreamManager::Global().finishIfAsync();
     CpuComputeOps::layer_norm(in, out, gamma, beta, epsilon, active_rows,
                               row_offset);
@@ -350,10 +351,14 @@ public:
         if (!ok)
           return 'u';
         switch (a.type) {
-        case cudaMemoryTypeManaged: return 'm';
-        case cudaMemoryTypeDevice: return 'd';
-        case cudaMemoryTypeHost: return 'h';
-        default: return '0';
+        case cudaMemoryTypeManaged:
+          return 'm';
+        case cudaMemoryTypeDevice:
+          return 'd';
+        case cudaMemoryTypeHost:
+          return 'h';
+        default:
+          return '0';
         }
       };
       fprintf(stderr,
@@ -446,10 +451,10 @@ public:
           // which then reports failure and lets the usual route take the call.
           if (M == 1 && N >= (int)cuda::CUDA_FC_FPACT_MIN_N)
             ok = cuda::cuda_fc_qs4cx_fpact_gemv_fp16(
-              (const uint16_t *)Xp, W, weight.getScale<float>(),
-              (uint16_t *)Yp, (unsigned)N, (unsigned)K);
-          const bool tried_cublas =
-            !ok && use_cublas_i8 && use_dp4a && M >= 32 && K <= (int)cublas_kmax;
+              (const uint16_t *)Xp, W, weight.getScale<float>(), (uint16_t *)Yp,
+              (unsigned)N, (unsigned)K);
+          const bool tried_cublas = !ok && use_cublas_i8 && use_dp4a &&
+                                    M >= 32 && K <= (int)cublas_kmax;
           if (tried_cublas)
             ok = cuda::cuda_fc_qs4cx_cublas_i8_gemm_fp16(
               (const uint16_t *)Xp, W, S, (uint16_t *)Yp, (unsigned)M,
@@ -476,16 +481,17 @@ public:
                               (const uint16_t *)Xp, W, S, (uint16_t *)Yp,
                               (unsigned)M, (unsigned)N, (unsigned)K);
         } else if (all_dev) {
-          ok = use_dp4a ? cuda::cuda_fc_qs4cx_dp4a_gemm_fp32(
-                            (const float *)Xp, W, S, (float *)Yp, (unsigned)M,
-                            (unsigned)N, (unsigned)K)
-                        : cuda::cuda_fc_qs4cx_gemm_fp32(
-                            (const float *)Xp, W, S, (float *)Yp, (unsigned)M,
-                            (unsigned)N, (unsigned)K);
+          ok = use_dp4a
+                 ? cuda::cuda_fc_qs4cx_dp4a_gemm_fp32((const float *)Xp, W, S,
+                                                      (float *)Yp, (unsigned)M,
+                                                      (unsigned)N, (unsigned)K)
+                 : cuda::cuda_fc_qs4cx_gemm_fp32((const float *)Xp, W, S,
+                                                 (float *)Yp, (unsigned)M,
+                                                 (unsigned)N, (unsigned)K);
         } else if (!fp16) {
-          ok = cuda::cuda_fc_qs4cx_gemm_fp32_resident(
-            (const float *)Xp, W, S, (float *)Yp, (unsigned)M, (unsigned)N,
-            (unsigned)K);
+          ok = cuda::cuda_fc_qs4cx_gemm_fp32_resident((const float *)Xp, W, S,
+                                                      (float *)Yp, (unsigned)M,
+                                                      (unsigned)N, (unsigned)K);
         }
         if (std::getenv("NNTR_FC_HOSTDBG") && !ok) {
           cudaPointerAttributes aw{}, ay{};

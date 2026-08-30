@@ -88,9 +88,8 @@ bool BlasManager::sgemmRowMajor(int M, int N, int K, const float *X,
   const float beta = 0.0f;
   // Column-major C[N,M] = W_view[N,K] * X_view[K,M] = (X*W)^T, read back
   // row-major as Y[M,N] = X*W. (orientation validated vs CPU reference)
-  cublasStatus_t s =
-    cublasSgemm(handle_, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, W, N, X, K,
-                &beta, Y, N);
+  cublasStatus_t s = cublasSgemm(handle_, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K,
+                                 &alpha, W, N, X, K, &beta, Y, N);
   if (s != CUBLAS_STATUS_SUCCESS) {
     ml_loge("[CUDA] cublasSgemm failed: %d", (int)s);
     return false;
@@ -117,21 +116,23 @@ bool BlasManager::igemmRowMajor(int M, int N, int K, const signed char *A,
   // K-chunking: the legacy cublasGemmEx int8 IMMA does an ILLEGAL MEMORY ACCESS
   // for large K on Orin/sm_87 (measured: k=6144 FFN down-proj faults; k<=2048
   // q/k/v/o/gate/up are fine; the identical call works on RTX/sm_89 -- it's an
-  // sm_87 large-K algo-selection bug, NOT a caller error). Split K into <=kchunk
-  // slices and accumulate in int32 (beta=1) so every cuBLAS call stays in the
-  // working regime. K<=kchunk is a single call (no overhead for the common FCs).
-  // A is act [K,M] col-major ld=K -> k-slice = A + k0 (rows). B is weight [N,K]
-  // col-major ld=N -> k-slice = B + k0*N (cols). Tunable: NNTR_CUBLAS_KCHUNK.
+  // sm_87 large-K algo-selection bug, NOT a caller error). Split K into
+  // <=kchunk slices and accumulate in int32 (beta=1) so every cuBLAS call stays
+  // in the working regime. K<=kchunk is a single call (no overhead for the
+  // common FCs). A is act [K,M] col-major ld=K -> k-slice = A + k0 (rows). B is
+  // weight [N,K] col-major ld=N -> k-slice = B + k0*N (cols). Tunable:
+  // NNTR_CUBLAS_KCHUNK.
   static const int kchunk = []() {
     const char *e = std::getenv("NNTR_CUBLAS_KCHUNK");
     if (e) {
       int v = atoi(e);
       return v > 0 ? v : 2048;
     }
-    // The K-chunk only works around an sm_87 (integrated Orin) large-K int8 IMMA
-    // algo-selection bug. Discrete GPUs (RTX) run the full-K call correctly and
-    // a few % faster (no per-chunk repack + extra accumulating GEMMs), so don't
-    // chunk there: a huge kchunk makes K>kchunk false -> one full-K call.
+    // The K-chunk only works around an sm_87 (integrated Orin) large-K int8
+    // IMMA algo-selection bug. Discrete GPUs (RTX) run the full-K call
+    // correctly and a few % faster (no per-chunk repack + extra accumulating
+    // GEMMs), so don't chunk there: a huge kchunk makes K>kchunk false -> one
+    // full-K call.
     return ContextManager::Global().isIntegrated() ? 2048 : (1 << 28);
   }();
   // GEMM algo probe (NNTR_CUBLAS_ALGO): the int8 GEMM is the prefill critical
@@ -144,10 +145,10 @@ bool BlasManager::igemmRowMajor(int M, int N, int K, const signed char *A,
   }();
   const bool chunked = K > kchunk;
   // When chunking, cublas's B operand = the activation A viewed [K,M] col-major
-  // ld=K -> a k-row-slice is STRIDED (ld=K>kc), which int8 IMMA rejects (illegal
-  // access). Repack each slice into a CONTIGUOUS [kc,M] (ld=kc) buffer via a
-  // strided D2D cudaMemcpy2D (no custom kernel) so every chunk runs in the
-  // proven contiguous k<=kchunk regime. A is [M,K] row-major: row m, cols
+  // ld=K -> a k-row-slice is STRIDED (ld=K>kc), which int8 IMMA rejects
+  // (illegal access). Repack each slice into a CONTIGUOUS [kc,M] (ld=kc) buffer
+  // via a strided D2D cudaMemcpy2D (no custom kernel) so every chunk runs in
+  // the proven contiguous k<=kchunk regime. A is [M,K] row-major: row m, cols
   // [k0,k0+kc) -> dst pitch kc, src pitch K.
   cudaStream_t stream = StreamManager::Global().GetStream();
   for (int k0 = 0; k0 < K; k0 += kchunk) {
@@ -177,10 +178,10 @@ bool BlasManager::igemmRowMajor(int M, int N, int K, const signed char *A,
       actB = g_i8_bchunk;
       ldB = kc;
     }
-    cublasStatus_t s = cublasGemmEx(
-      handle_, CUBLAS_OP_N, CUBLAS_OP_N, N, M, kc, &alpha,
-      B + (size_t)k0 * N, CUDA_R_8I, N, actB, CUDA_R_8I, ldB, &beta_c, C,
-      CUDA_R_32I, N, CUBLAS_COMPUTE_32I, igemm_algo);
+    cublasStatus_t s =
+      cublasGemmEx(handle_, CUBLAS_OP_N, CUBLAS_OP_N, N, M, kc, &alpha,
+                   B + (size_t)k0 * N, CUDA_R_8I, N, actB, CUDA_R_8I, ldB,
+                   &beta_c, C, CUDA_R_32I, N, CUBLAS_COMPUTE_32I, igemm_algo);
     if (s != CUBLAS_STATUS_SUCCESS) {
       if (dbg)
         fprintf(stderr,

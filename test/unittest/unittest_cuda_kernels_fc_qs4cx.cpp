@@ -179,15 +179,15 @@ struct Shape {
 
 // Decode-shaped (M=1), small-batch and prefill-shaped windows, all with K a
 // multiple of 4 -- the shape every real projection width has.
-static const std::vector<Shape> kShapes = {{1, 64, 128}, {4, 96, 256},
-                                           {32, 128, 512}};
+static const std::vector<Shape> kShapes = {
+  {1, 64, 128}, {4, 96, 256}, {32, 128, 512}};
 
 // Contraction widths that are NOT a multiple of 4, which the int8 routes read
 // four channels at a time. Both parities of (K+1)/2 are covered: an odd
 // half-width also puts every second weight row on an odd address.
 static const std::vector<Shape> kRaggedShapes = {
-  {1, 8, 7},  {1, 8, 19}, {1, 8, 31}, {1, 8, 131},
-  {1, 8, 5},  {1, 8, 17}, {1, 8, 33}, {1, 8, 129}};
+  {1, 8, 7}, {1, 8, 19}, {1, 8, 31}, {1, 8, 131},
+  {1, 8, 5}, {1, 8, 17}, {1, 8, 33}, {1, 8, 129}};
 
 } // namespace
 
@@ -226,7 +226,6 @@ TEST(cuda_kernels, fc_qs4cx_dequant_gemm_fp32) {
            s.N, s.K, rel);
     // FP32 accumulation in a different order than the host reference.
     EXPECT_LT(rel, 1e-5);
-
   }
 }
 
@@ -259,8 +258,8 @@ TEST(cuda_kernels, fc_qs4cx_dp4a_fp16) {
     std::memcpy(S, w.scales.data(), w.scales.size() * sizeof(unsigned short));
     std::memset(Y, 0, (size_t)s.M * s.N * sizeof(unsigned short));
 
-    ASSERT_TRUE(nntrainer::cuda::cuda_fc_qs4cx_dp4a_gemm_fp16(X, W, S, Y, s.M,
-                                                              s.N, s.K));
+    ASSERT_TRUE(
+      nntrainer::cuda::cuda_fc_qs4cx_dp4a_gemm_fp16(X, W, S, Y, s.M, s.N, s.K));
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
 
     double maxErr = 0.0;
@@ -272,7 +271,6 @@ TEST(cuda_kernels, fc_qs4cx_dp4a_fp16) {
     // The activation is quantized to int8 per row, so this route is a w4a8
     // approximation of the reference, not a reassociation of it.
     EXPECT_LT(rel, 3e-2);
-
   }
 }
 
@@ -319,7 +317,6 @@ TEST(cuda_kernels, fc_qs4cx_cublas_i8_fp16) {
   // Same w4a8 quantization as dp4a; the int32 accumulation is exact, so this
   // must land in the same band.
   EXPECT_LT(rel, 3e-2);
-
 }
 
 TEST(cuda_kernels, fc_qs4cx_dp4a_ragged_k) {
@@ -349,8 +346,9 @@ TEST(cuda_kernels, fc_qs4cx_dp4a_ragged_k) {
     Buf &b = bufs[si];
     ASSERT_EQ(cudaMallocManaged(&b.X, hx.size() * sizeof(unsigned short)),
               cudaSuccess);
-    ASSERT_EQ(cudaMallocManaged(&b.Y, (size_t)s.M * s.N * sizeof(unsigned short)),
-              cudaSuccess);
+    ASSERT_EQ(
+      cudaMallocManaged(&b.Y, (size_t)s.M * s.N * sizeof(unsigned short)),
+      cudaSuccess);
     ASSERT_EQ(cudaMallocManaged(&b.W, w.plain.size()), cudaSuccess);
     ASSERT_EQ(cudaMallocManaged(&b.S, w.scales.size() * sizeof(unsigned short)),
               cudaSuccess);

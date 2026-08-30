@@ -53,8 +53,7 @@ bool use_host_mapped() {
     const char *e = std::getenv("NNTR_CUDA_HOST_MAPPED");
     if (e != nullptr)
       return e[0] == '1';
-    return !nntrainer::cuda::ContextManager::Global()
-              .concurrentManagedAccess();
+    return !nntrainer::cuda::ContextManager::Global().concurrentManagedAccess();
   }();
   return on;
 }
@@ -116,8 +115,9 @@ void CudaMemAllocator::alloc(void **ptr, size_t size, size_t alignment) {
           std::memset(hp, 0, size);
           *ptr = hp;
           if (dbg)
-            fprintf(stderr, "[UVMDBG] cudaHostAlloc(mapped) %zu bytes -> %p OK\n",
-                    size, hp);
+            fprintf(stderr,
+                    "[UVMDBG] cudaHostAlloc(mapped) %zu bytes -> %p OK\n", size,
+                    hp);
           return;
         }
         // no UVA same-pointer guarantee: every call site hands the host
@@ -138,8 +138,8 @@ void CudaMemAllocator::alloc(void **ptr, size_t size, size_t alignment) {
         fprintf(stderr, "[UVMDBG] cudaHostAlloc %zu bytes FAILED -> managed\n",
                 size);
     }
-    const cudaError_t e = dev_only ? cudaMalloc(&dptr, size)
-                                   : cudaMallocManaged(&dptr, size);
+    const cudaError_t e =
+      dev_only ? cudaMalloc(&dptr, size) : cudaMallocManaged(&dptr, size);
     if (e == cudaSuccess && dptr != nullptr) {
       if (!dev_only && !integrated) {
         // Optionally pin the managed pages to the device. Opt-in

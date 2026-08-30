@@ -12,8 +12,8 @@
 
 #include "cuda_fc_qs4cx.h"
 
-#include <cuda_common.h> // cuda_vec4_rows_ok
 #include <cuda_blas_manager.h>
+#include <cuda_common.h> // cuda_vec4_rows_ok
 #include <cuda_context.h>
 #include <cuda_context_manager.h>
 #include <cuda_stream_manager.h>
@@ -130,8 +130,8 @@ bool cuda_fc_qs4cx_scales_to_uvm_fp32(const float *fp32_scales, unsigned int N,
       return !ContextManager::Global().concurrentManagedAccess();
     }();
     if (host_mapped) {
-      if (cudaHostAlloc(&usc, sizeof(float) * (size_t)N,
-                        cudaHostAllocMapped) != cudaSuccess)
+      if (cudaHostAlloc(&usc, sizeof(float) * (size_t)N, cudaHostAllocMapped) !=
+          cudaSuccess)
         return false;
     } else if (cudaMallocManaged(&usc, sizeof(float) * (size_t)N) !=
                cudaSuccess)
@@ -350,7 +350,8 @@ bool cuda_fc_qs4cx_gemm_fp32_resident(const float *host_X,
 // only the nibble encoding differs), and a __dp4a int8xint4 GEMM. Compiled for
 // the device arch (compute_89 on Ada), so __dp4a lowers to the dp4a PTX
 // instruction.
-static const char *FC_QS4CX_DP4A_SRC = R"CU(
+static const char *FC_QS4CX_DP4A_SRC =
+  R"CU(
 extern "C" {
 
 __device__ __forceinline__ float dp4a_h2f(unsigned short h) {
@@ -822,9 +823,10 @@ __global__ void repack_plain_i4(const unsigned char *qw, signed char *packed,
 }
 
 )CU"
-// NOTE: split here into two adjacent raw-string literals — MSVC caps a single
-// string literal at 16380 bytes (C2026); the two concatenate byte-identically.
-R"CU(
+  // NOTE: split here into two adjacent raw-string literals — MSVC caps a single
+  // string literal at 16380 bytes (C2026); the two concatenate
+  // byte-identically.
+  R"CU(
 // Y[m,n] = recip[m]*w_scale[n]*(sum_k q8[m,k]*int4(n,k) - zp[m]*rowsum_w[n]),
 // the asymmetric-activation dequant (zp from act_quant, rowsum_w from the
 // weight). via __dp4a.
@@ -1155,7 +1157,8 @@ struct DevWeightQ {
 };
 std::unordered_map<const void *, DevWeightQ> g_dp4a_plain_cache;
 // int8-unpacked weight [K,N] + per-channel rowsum, for the cuBLAS int8 path
-// (keyed by the QS4CX plain payload pointer; unpacked once, weights are static).
+// (keyed by the QS4CX plain payload pointer; unpacked once, weights are
+// static).
 struct DevWeightI8 {
   signed char *w8 = nullptr; // int8 weight [K,N] (w8[k*N+n] = int4(n,k))
   int *rowsum = nullptr;     // per-channel sum of int8 weight [N]
@@ -1187,7 +1190,8 @@ size_t g_dp4a_azp_cap = 0;
 // forwards: a different FC has a different input tensor -> different ptr ->
 // re-quantizes; only the immediate same-ptr siblings skip. Removes ~244 of 413
 // act_quant launches. Decision is made at graph-record time, so the captured
-// graph simply omits the redundant nodes (capture-safe). Disable: NNTR_QUANT_DEDUP=0.
+// graph simply omits the redundant nodes (capture-safe). Disable:
+// NNTR_QUANT_DEDUP=0.
 //
 // act-quant handoff: whoever last filled g_dp4a_q8 records WHAT it quantized
 // (activation pointer + K) and the stream dispatch count at that moment. A
@@ -1233,10 +1237,11 @@ size_t g_dp4a_yf_cap = 0;
 float *g_dp4a_xf = nullptr; // float X staging for the naive fp16 path
 size_t g_dp4a_xf_cap = 0;
 // fp16 X staging for a HOST-resident input on the device GPU qs4cx path: when
-// the FC input pointer is host memory (e.g. a captured decode graph feeds the token via
-// pinned host memory), the fp16 dp4a/cublas kernels still need a device X. The
-// M*K fp16 input is copied H2D into this buffer and the device pointer is used
-// instead of falling to the i8mm host dot (which SIGILLs on Orin).
+// the FC input pointer is host memory (e.g. a captured decode graph feeds the
+// token via pinned host memory), the fp16 dp4a/cublas kernels still need a
+// device X. The M*K fp16 input is copied H2D into this buffer and the device
+// pointer is used instead of falling to the i8mm host dot (which SIGILLs on
+// Orin).
 unsigned short *g_stage_xh = nullptr;
 size_t g_stage_xh_cap = 0;
 std::mutex g_dp4a_mtx;
@@ -1323,8 +1328,9 @@ bool dp4a_repack_and_gemm(const unsigned char *plain_w,
   kg->SetKernelArguments(5, &scales_fp16, sizeof(scales_fp16));
   kg->SetKernelArguments(6, &Yf, sizeof(Yf));
   if (gemv) {
-    // dp4a_gemv: one WARP per output, 4 warps (128 threads) per block -> ceil(N/4)
-    // blocks instead of N (4x fewer per-block launch/epilogue overheads).
+    // dp4a_gemv: one WARP per output, 4 warps (128 threads) per block ->
+    // ceil(N/4) blocks instead of N (4x fewer per-block launch/epilogue
+    // overheads).
     kg->SetKernelArguments(7, &n, sizeof(n));
     kg->SetKernelArguments(8, &k, sizeof(k));
     kg->SetKernelArguments(9, &out_fp16, sizeof(out_fp16));
@@ -1453,8 +1459,8 @@ bool cuda_fc_qs4cx_dp4a_prewarm(unsigned int maxM, unsigned int maxK,
   // float X/Y staging: exact sizes the fp16-naive / fp32-resident paths use
   // (g_dp4a_xf = M*K floats, g_dp4a_yf = M*N floats). yf is grown to maxM*maxN
   // so the largest decode FC (lm_head N = vocab) is covered.
-  // g_stage_xh (M*K fp16) covers the host-resident-input staging on the fp16 GPU
-  // path, so that copy is also a pure cap-hit under capture.
+  // g_stage_xh (M*K fp16) covers the host-resident-input staging on the fp16
+  // GPU path, so that copy is also a pure cap-hit under capture.
   return ensure_buf((void **)&g_dp4a_xf, &g_dp4a_xf_cap,
                     sizeof(float) * (size_t)maxM * maxK) &&
          ensure_buf((void **)&g_dp4a_yf, &g_dp4a_yf_cap,
@@ -1470,9 +1476,9 @@ bool cuda_fc_qs4cx_dp4a_prewarm(unsigned int maxM, unsigned int maxK,
 // (OOM, or a capture before prewarm sized it) so the caller falls back to the
 // host path. The copy is enqueued on the backend stream; the subsequent kernel
 // launch on the same stream sees it complete.
-const unsigned short *cuda_fc_qs4cx_stage_host_x_fp16(const unsigned short *host_Xh,
-                                                      unsigned int M,
-                                                      unsigned int K) {
+const unsigned short *
+cuda_fc_qs4cx_stage_host_x_fp16(const unsigned short *host_Xh, unsigned int M,
+                                unsigned int K) {
   if (host_Xh == nullptr || M == 0 || K == 0)
     return nullptr;
   std::lock_guard<std::mutex> lk(g_dp4a_mtx);
@@ -1725,10 +1731,11 @@ bool cuda_fc_qs4cx_prewarm(const unsigned char *plain_w, unsigned int N,
 
   // Also prewarm the cuBLAS int8 [K,N] weight cache when the cuBLAS prefill FC
   // path is on: otherwise its one-time GPU repack (repack_plain_i8_kn, ~32% of
-  // cold prefill GPU time) runs on the first prefill instead of at load. Mirrors
-  // repack_plain_i8_kn (w8[k*N+n]=int4(n,k)) + weight_rowsum_kn bit-exactly.
-  // Chunked along K ([k0,k1) rows of the [K,N] buffer are contiguous on both
-  // sides); the per-channel rowsum accumulates across chunks.
+  // cold prefill GPU time) runs on the first prefill instead of at load.
+  // Mirrors repack_plain_i8_kn (w8[k*N+n]=int4(n,k)) + weight_rowsum_kn
+  // bit-exactly. Chunked along K ([k0,k1) rows of the [K,N] buffer are
+  // contiguous on both sides); the per-channel rowsum accumulates across
+  // chunks.
   static const char *_cb = std::getenv("NNTR_FC_CUDA_CUBLAS");
   if (_cb && _cb[0] != '0' && !i8_jit_on() &&
       !g_i8_weight_cache.count(plain_w) && !g_i8_exempt.count(plain_w)) {
@@ -1805,7 +1812,7 @@ bool cuda_fc_qs4cx_rmsnorm_prequant_fp16(const unsigned short *x,
   if (!dp4a_stage_scratch(rows, width))
     return false;
   int m = (int)rows, kk = (int)width;
-  int has_gamma = (gamma == nullptr) ? 0
+  int has_gamma = (gamma == nullptr)                       ? 0
                   : (!vec4 || cuda_vec4_rows_ok(4, gamma)) ? 1
                                                            : 2;
   k->SetKernelArguments(0, &x, sizeof(x));
@@ -1828,15 +1835,14 @@ bool cuda_fc_qs4cx_rmsnorm_prequant_fp16(const unsigned short *x,
   return true;
 }
 
-bool cuda_fc_qs4cx_dp4a_gemm_fp32(const float *X,
-                                  const unsigned char *plain_w,
+bool cuda_fc_qs4cx_dp4a_gemm_fp32(const float *X, const unsigned char *plain_w,
                                   const unsigned short *scales_fp16, float *Y,
                                   unsigned int M, unsigned int N,
                                   unsigned int K) {
   if (M == 0 || N == 0 || K == 0)
     return true;
-  auto kq = CudaContext::Global().registerCudaKernel(FC_QS4CX_DP4A_SRC,
-                                                     "act_quant_i8");
+  auto kq =
+    CudaContext::Global().registerCudaKernel(FC_QS4CX_DP4A_SRC, "act_quant_i8");
   if (!kq) {
     ml_loge("[CUDA] fc_qs4cx dp4a: kernel registration failed");
     return false;
@@ -1868,8 +1874,8 @@ bool cuda_fc_qs4cx_dp4a_gemm_fp16(const unsigned short *Xh,
                                   unsigned int N, unsigned int K) {
   if (M == 0 || N == 0 || K == 0)
     return true;
-  const bool q_vec4 = fused_normq_on() && cuda_vec4_rows_small(M) &&
-                      cuda_vec4_rows_ok(K, Xh);
+  const bool q_vec4 =
+    fused_normq_on() && cuda_vec4_rows_small(M) && cuda_vec4_rows_ok(K, Xh);
   auto kqh = CudaContext::Global().registerCudaKernel(
     FC_QS4CX_DP4A_SRC, q_vec4 ? "act_quant_i8_h_v4" : "act_quant_i8_h");
   auto kc =
@@ -1905,13 +1911,13 @@ bool cuda_fc_qs4cx_dp4a_gemm_fp16(const unsigned short *Xh,
     if (!StreamManager::Global().DispatchCommand(*kqh, qg, qb))
       return false;
   }
-  // 2) repack + GEMM writing fp16 directly: the float->fp16 conversion is folded
-  // into the GEMM epilogue (out_fp16=1), removing the separate cvt_f2h kernel +
-  // the FP32 staging buffer (one fewer kernel per FC -- a decode launch-overhead
-  // win). (void)kc keeps the registration check above harmless.
+  // 2) repack + GEMM writing fp16 directly: the float->fp16 conversion is
+  // folded into the GEMM epilogue (out_fp16=1), removing the separate cvt_f2h
+  // kernel + the FP32 staging buffer (one fewer kernel per FC -- a decode
+  // launch-overhead win). (void)kc keeps the registration check above harmless.
   (void)kc;
-  if (!dp4a_repack_and_gemm(plain_w, scales_fp16,
-                            reinterpret_cast<float *>(Yh), M, N, K,
+  if (!dp4a_repack_and_gemm(plain_w, scales_fp16, reinterpret_cast<float *>(Yh),
+                            M, N, K,
                             /*out_fp16=*/1))
     return false;
   // Re-stamp the handoff past this FC's own dispatches so the NEXT sibling on
@@ -2007,14 +2013,15 @@ bool cuda_fc_qs4cx_fpact_gemv_fp16(const unsigned short *Xh,
 // int ALU (~10x the GEMM throughput at prefill M). The int32 accumulate is
 // exact so the result is bit-identical to dp4a; the int4->int8 weight unpack is
 // cached (one-time) to keep it off the per-call critical path.
-bool cuda_fc_qs4cx_cublas_i8_gemm_fp16(
-  const unsigned short *Xh, const unsigned char *plain_w,
-  const unsigned short *scales_fp16, unsigned short *Yh, unsigned int M,
-  unsigned int N, unsigned int K) {
+bool cuda_fc_qs4cx_cublas_i8_gemm_fp16(const unsigned short *Xh,
+                                       const unsigned char *plain_w,
+                                       const unsigned short *scales_fp16,
+                                       unsigned short *Yh, unsigned int M,
+                                       unsigned int N, unsigned int K) {
   if (M == 0 || N == 0 || K == 0)
     return true;
-  const bool q_vec4 = fused_normq_on() && cuda_vec4_rows_small(M) &&
-                      cuda_vec4_rows_ok(K, Xh);
+  const bool q_vec4 =
+    fused_normq_on() && cuda_vec4_rows_small(M) && cuda_vec4_rows_ok(K, Xh);
   auto kqh = CudaContext::Global().registerCudaKernel(
     FC_QS4CX_DP4A_SRC, q_vec4 ? "act_quant_i8_h_v4" : "act_quant_i8_h");
   auto kde = CudaContext::Global().registerCudaKernel(FC_QS4CX_DP4A_SRC,
@@ -2025,9 +2032,9 @@ bool cuda_fc_qs4cx_cublas_i8_gemm_fp16(
   }
   std::lock_guard<std::mutex> lk(g_dp4a_mtx);
   // cuBLAS int8 IMMA requires the GEMM dims to be multiples of 32 (measured:
-  // M=260/272 -> CUBLAS_STATUS_NOT_SUPPORTED, 256/320/512 OK). The prefill token
-  // count M is arbitrary (e.g. 511), so pad the activation row count up to a
-  // multiple of 32 for the GEMM only -- the extra rows are computed from
+  // M=260/272 -> CUBLAS_STATUS_NOT_SUPPORTED, 256/320/512 OK). The prefill
+  // token count M is arbitrary (e.g. 511), so pad the activation row count up
+  // to a multiple of 32 for the GEMM only -- the extra rows are computed from
   // (harmless int8) scratch and ignored by the epilogue, which writes just the
   // real M rows. N and K are multiples of 32 by the load invariant.
   const unsigned Mpad = ((M + 31u) / 32u) * 32u;
@@ -2040,8 +2047,9 @@ bool cuda_fc_qs4cx_cublas_i8_gemm_fp16(
   // FC (q/k/v share attention_norm; gate/up share ffn_norm) -- the buffer still
   // holds it. See g_last_quant_xh above.
   // Opt-in: measured gain is within the thermal noise floor on Orin (act_quant
-  // is not on the critical path -- the GEMM is), so default OFF; correct + ready
-  // if a less-throttled host or a power budget makes the redundant launches matter.
+  // is not on the critical path -- the GEMM is), so default OFF; correct +
+  // ready if a less-throttled host or a power budget makes the redundant
+  // launches matter.
   static const bool quant_dedup = []() {
     const char *e = std::getenv("NNTR_QUANT_DEDUP");
     return e != nullptr && e[0] == '1';
@@ -2134,8 +2142,8 @@ bool cuda_fc_qs4cx_cublas_i8_gemm_fp16(
     mark_quant_staged(Xh, k);
   maybe_finish(Yh);
   // Catch an ASYNC failure in the cuBLAS IMMA GEMM / epilogue (the sync cuBLAS
-  // status was already checked). On Orin a large-M IMMA can fault at runtime and
-  // leave a STICKY cuda error -- which then makes the NEXT layer's
+  // status was already checked). On Orin a large-M IMMA can fault at runtime
+  // and leave a STICKY cuda error -- which then makes the NEXT layer's
   // cudaPointerGetAttributes (rms_norm dev_ok gate) fail, dropping rms_norm to
   // its host path that reads device/managed activations under cMA=0 -> SIGSEGV.
   // Clearing + returning false makes the caller fall back to the (correct) dp4a
@@ -2144,10 +2152,11 @@ bool cuda_fc_qs4cx_cublas_i8_gemm_fp16(
     cudaError_t _e = cudaGetLastError();
     if (_e != cudaSuccess) {
       if (std::getenv("NNTR_IGEMM_DBG"))
-        std::fprintf(stderr,
-                     "[IGEMM] async error after GEMM M=%d N=%d K=%d: %s -> dp4a "
-                     "fallback\n",
-                     m, n, k, cudaGetErrorString(_e));
+        std::fprintf(
+          stderr,
+          "[IGEMM] async error after GEMM M=%d N=%d K=%d: %s -> dp4a "
+          "fallback\n",
+          m, n, k, cudaGetErrorString(_e));
       return false;
     }
   }
@@ -2164,8 +2173,8 @@ bool cuda_fc_qs4cx_gemm_fp16_naive(const unsigned short *Xh,
                                    unsigned int N, unsigned int K) {
   if (M == 0 || N == 0 || K == 0)
     return true;
-  auto kh2f = CudaContext::Global().registerCudaKernel(FC_QS4CX_DP4A_SRC,
-                                                       "cvt_h2f");
+  auto kh2f =
+    CudaContext::Global().registerCudaKernel(FC_QS4CX_DP4A_SRC, "cvt_h2f");
   auto kf2h =
     CudaContext::Global().registerCudaKernel(FC_QS4CX_DP4A_SRC, "cvt_f2h");
   if (!kh2f || !kf2h)
@@ -2184,8 +2193,8 @@ bool cuda_fc_qs4cx_gemm_fp16_naive(const unsigned short *Xh,
   if (!StreamManager::Global().DispatchCommand(*kh2f, xg, cb))
     return false;
   // naive plain-decode FP32-act GEMM (mutex-free; its own dispatch + finish).
-  if (!cuda_fc_qs4cx_gemm_fp32(g_dp4a_xf, plain_w, scales_fp16, g_dp4a_yf, M,
-                               N, K))
+  if (!cuda_fc_qs4cx_gemm_fp32(g_dp4a_xf, plain_w, scales_fp16, g_dp4a_yf, M, N,
+                               K))
     return false;
   kf2h->SetKernelArguments(0, &g_dp4a_yf, sizeof(g_dp4a_yf));
   kf2h->SetKernelArguments(1, &Yh, sizeof(Yh));
@@ -2301,7 +2310,8 @@ bool lmhead_gemv_q6_k_cuda(const void *w_q6k_dev,
                            int hidden) {
   if (vocab <= 0 || hidden <= 0 || (hidden % 256) != 0)
     return false;
-  auto kernel = CudaContext::Global().registerCudaKernel(Q6K_GEMV_SRC, "q6k_gemv");
+  auto kernel =
+    CudaContext::Global().registerCudaKernel(Q6K_GEMV_SRC, "q6k_gemv");
   if (!kernel)
     return false;
   kernel->SetKernelArguments(0, &w_q6k_dev, sizeof(w_q6k_dev));
