@@ -471,10 +471,18 @@ make_v8c_weight_backing(const uint8_t *osv32_packed,
  * the identical v8c backing/scale/row-sum the GEMM consumes.
  * @param[in] plain_nibbles QS4CX nibble payload (length N*((K+1)/2))
  * @param[in] fp32_scales   per-channel fp32 dequant scales (length N)
+ * @param[in] cache_name    stable weight identity (the tensor name) for the
+ *                          derive-once pack cache (v8c_pack_cache.h); nullptr
+ *                          disables caching for this build. On a validated hit
+ *                          the nibble permute and the row-sum fold are skipped
+ *                          and the upload streams from the mapped pack; on a
+ *                          miss the derive is teed to the pack writer. The
+ *                          result is byte-identical either way.
  */
 std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
   const uint8_t *plain_nibbles, const float *fp32_scales, unsigned int N,
-  unsigned int K, cl_mem *out_scale_buf, cl_mem *out_row_sum_w_int4_buf);
+  unsigned int K, cl_mem *out_scale_buf, cl_mem *out_row_sum_w_int4_buf,
+  const char *cache_name = nullptr);
 
 /**
  * @brief Wait out and free any submit-and-go weight-upload staging queued by

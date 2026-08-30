@@ -75,6 +75,17 @@
 
 namespace nntrainer {
 
+#if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
+// Derive-once GPU weight-pack cache
+// (tensor/cl_operations/v8c_pack_cache.h). Declared here rather than included
+// so this file stays free of the OpenCL headers; only these two calls, both
+// of which take plain arguments, are needed from the loader.
+namespace v8c_pack {
+void set_source(const char *model_bin_path);
+void load_complete();
+} // namespace v8c_pack
+#endif
+
 namespace {
 
 Tensor mapExternalTensor(float *buf, const TensorDim &dim) {
@@ -1083,6 +1094,14 @@ void NeuralNetwork::load(const std::string &file_path,
       NNTR_THROW_IF((model_file_fd == -1), std::invalid_argument)
         << "Cannot open file : " << f_path;
 
+#if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
+      // Bind the derive-once GPU weight-pack cache to this weight file, by
+      // file identity (size and modification time). Either maps a pack the
+      // load workers below can consume, or arms a one-time rewrite. A no-op
+      // when the cache is opted out of, and on every non-OpenCL build.
+      v8c_pack::set_source(f_path.c_str());
+#endif
+
       // Load weights with bounded thread number not to exceed mmap limits
       constexpr size_t MAX_LOAD_THREADS = 8;
       std::vector<std::shared_ptr<LayerNode>> load_nodes(model_graph.cbegin(),
@@ -1176,6 +1195,13 @@ void NeuralNetwork::load(const std::string &file_path,
         if (t.joinable())
           t.join();
       }
+
+#if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
+      // Every load-time weight pack has committed its record by now: finalize
+      // a pending rewrite off-thread, so writing the pack costs the load
+      // nothing. The writer is joined at exit.
+      v8c_pack::load_complete();
+#endif
 
     } else {
       for (auto iter = model_graph.cbegin(); iter != model_graph.cend();
