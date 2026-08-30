@@ -40,6 +40,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <type_traits>
 
 #if defined(_MSC_VER)
@@ -130,8 +131,17 @@ static inline float f16_bits_to_f32_sw(uint16_t h) {
  * compiled for them: cl.exe defines __AVX2__ under /arch:AVX2, and F16C is
  * present on every x86 part that has AVX2. Otherwise the software converter
  * runs. GCC/clang keep the software converter unconditionally, so the non-MSVC
- * behaviour is exactly what it was; unittest_half_fp16 pins the two paths to
- * the same bits over the whole half domain either way.
+ * behaviour is exactly what it was.
+ *
+ * Where this path is actually compiled: meson.build adds /arch:AVX2 project
+ * wide for an MSVC x86_64 build, so cl.exe does define __AVX2__ and the
+ * Windows fp16 job does build these intrinsics. What that job does NOT do is
+ * run them -- it sets enable-test=false -- and unittest_half_fp16 is gated on
+ * a native half type, so it never builds under cl.exe either. The test
+ * therefore pins the SOFTWARE converter against the native type over the whole
+ * half domain; the intrinsic path is compiled and linked, but nothing compares
+ * its bits against the software converter's. Pinning that pair needs a build
+ * that selects both, which no configuration here produces.
  */
 #if defined(_MSC_VER) && defined(__AVX2__)
 #define NNTR_HALF_HAS_F16C 1
@@ -176,6 +186,21 @@ struct Half {
    *        copyability / standard layout. Do NOT initialize bits_ here.
    */
   Half() = default;
+
+  /**
+   * @brief Wrap a raw binary16 bit pattern with no conversion. Needed by the
+   *        std::numeric_limits specialization below, whose members must be
+   *        constexpr: the converting constructor rounds through float with
+   *        memcpy and cannot be. Not a general-purpose entry point -- callers
+   *        that hold a value, not a bit pattern, want the constructor.
+   * @param b binary16 bit pattern
+   * @return the Half with exactly those bits
+   */
+  static constexpr Half from_bits(uint16_t b) {
+    Half h{};
+    h.bits_ = b;
+    return h;
+  }
 
   /**
    * @brief non-explicit construction from any built-in arithmetic type
@@ -274,7 +299,9 @@ struct Half {
  * storage format whose arithmetic promotes to float. The residual difference
  * is at most a couple of binary16 ULP and only in multi-operation expressions;
  * it is inherent to a value-type half and does not affect stored data, which
- * is bit-identical in every build.
+ * is bit-identical in every build. See
+ * docs/design/msvc_fp16_half_wrapper.md section 4 for the full treatment,
+ * including what it means when comparing fp16 goldens across builds.
  */
 inline Half operator+(Half a, Half b) {
   return Half(static_cast<float>(a) + static_cast<float>(b));
@@ -383,6 +410,92 @@ static_assert(std::is_standard_layout<Half>::value,
               "reinterpret_cast<unsigned short*> needs standard layout");
 
 } // namespace nntrainer
+
+/**
+ * @brief std::numeric_limits for the Half stand-in.
+ *
+ * This is the one place where leaving Half unspecialized would not fail to
+ * compile. The primary template is defined for every type: it value-
+ * initializes, so on a wrapper build numeric_limits<_FP16>::max() would answer
+ * Half() == 0.0, infinity() 0.0, epsilon() 0.0 and is_specialized false, while
+ * the identical source on a native _Float16 build answers 65504, inf, 2^-10
+ * and true. A wrong numeric answer on exactly one platform, from code that
+ * compiles clean, is the failure mode Half exists to prevent -- the mixed
+ * compound operators are here precisely so `h += f` rounds once like the
+ * native type -- so the limits are provided rather than declared out of scope.
+ *
+ * The values are binary16's, and every member is constexpr as the standard
+ * requires, which is why they are written as bit patterns through
+ * Half::from_bits rather than as float literals through the rounding
+ * constructor.
+ */
+namespace std {
+
+template <> class numeric_limits<nntrainer::Half> {
+public:
+  static constexpr bool is_specialized = true;
+  static constexpr bool is_signed = true;
+  static constexpr bool is_integer = false;
+  static constexpr bool is_exact = false;
+  static constexpr bool has_infinity = true;
+  static constexpr bool has_quiet_NaN = true;
+  static constexpr bool has_signaling_NaN = true;
+  static constexpr std::float_denorm_style has_denorm = std::denorm_present;
+  static constexpr bool has_denorm_loss = false;
+  static constexpr std::float_round_style round_style = std::round_to_nearest;
+  static constexpr bool is_iec559 = true;
+  static constexpr bool is_bounded = true;
+  static constexpr bool is_modulo = false;
+  static constexpr int digits = 11;      /**< 10 stored + 1 implicit */
+  static constexpr int digits10 = 3;     /**< floor((digits-1) * log10(2)) */
+  static constexpr int max_digits10 = 5; /**< ceil(digits * log10(2) + 1) */
+  static constexpr int radix = 2;
+  static constexpr int min_exponent = -13;
+  static constexpr int min_exponent10 = -4;
+  static constexpr int max_exponent = 16;
+  static constexpr int max_exponent10 = 4;
+  static constexpr bool traps = false;
+  static constexpr bool tinyness_before = false;
+
+  /** @brief smallest positive normal value, 2^-14 */
+  static constexpr nntrainer::Half min() noexcept {
+    return nntrainer::Half::from_bits(0x0400);
+  }
+  /** @brief largest finite value, 65504 */
+  static constexpr nntrainer::Half max() noexcept {
+    return nntrainer::Half::from_bits(0x7BFF);
+  }
+  /** @brief most negative finite value, -65504 */
+  static constexpr nntrainer::Half lowest() noexcept {
+    return nntrainer::Half::from_bits(0xFBFF);
+  }
+  /** @brief difference between 1 and the next representable value, 2^-10 */
+  static constexpr nntrainer::Half epsilon() noexcept {
+    return nntrainer::Half::from_bits(0x1400);
+  }
+  /** @brief maximum rounding error in half ULP, 0.5 */
+  static constexpr nntrainer::Half round_error() noexcept {
+    return nntrainer::Half::from_bits(0x3800);
+  }
+  /** @brief positive infinity */
+  static constexpr nntrainer::Half infinity() noexcept {
+    return nntrainer::Half::from_bits(0x7C00);
+  }
+  /** @brief a quiet NaN */
+  static constexpr nntrainer::Half quiet_NaN() noexcept {
+    return nntrainer::Half::from_bits(0x7E00);
+  }
+  /** @brief a signaling NaN */
+  static constexpr nntrainer::Half signaling_NaN() noexcept {
+    return nntrainer::Half::from_bits(0x7D00);
+  }
+  /** @brief smallest positive subnormal value, 2^-24 */
+  static constexpr nntrainer::Half denorm_min() noexcept {
+    return nntrainer::Half::from_bits(0x0001);
+  }
+};
+
+} // namespace std
 
 #endif /* __cplusplus */
 #endif /* __HALF_FP16_H__ */
