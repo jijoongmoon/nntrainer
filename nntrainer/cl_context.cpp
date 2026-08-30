@@ -21,6 +21,7 @@
 #include <cl_svm_allocator.h>
 #include <compute_ops.h>
 #include <concat_cl.h>
+#include <cstdlib>
 #include <fc_layer_cl.h>
 #include <geglu_cl_op.h>
 #include <geglu_layer.h>
@@ -177,6 +178,12 @@ void ClContext::initialize() noexcept {
       ml_loge("Error: ClContext::initialize() failed");
       return;
     }
+
+    // Take the device-capability snapshot now that the device is open, so it
+    // and its log line are in place before any kernel is registered. caps()
+    // is the one place it is filled.
+    (void)caps();
+
     if (KERNEL_CACHE_ENABLED && kernelCacheDir().empty()) {
       ml_logi("Kernel binary cache disabled (NNTR_KERNEL_CACHE_DIR=off, or no "
               "per-user cache directory); compiling kernels from source");
@@ -735,6 +742,15 @@ const DeviceCaps &ClContext::caps() const {
         return;
 
       device_caps_.device_name = info->getDeviceName();
+      // CL_DEVICE_NAME is stored sized to include the query's trailing NUL; an
+      // embedded NUL would truncate the %s log line, so strip trailing NUL/ws.
+      while (!device_caps_.device_name.empty()) {
+        const char c = device_caps_.device_name.back();
+        if (c == '\0' || c == ' ' || c == '\n' || c == '\r' || c == '\t')
+          device_caps_.device_name.pop_back();
+        else
+          break;
+      }
       device_caps_.vendor_id = static_cast<uint32_t>(info->getDeviceVendorId());
       device_caps_.compute_units =
         static_cast<uint32_t>(info->getDeviceMaxComputeUnits());
