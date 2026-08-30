@@ -11,6 +11,7 @@ cl_op_sources = [
   'gelu_cl_op.cpp',
   'geglu_cl_op.cpp',
   'swiglu_cl_op.cpp',
+  'v8c_pack_cache.cpp',
 ]
 
 cl_op_headers = [
