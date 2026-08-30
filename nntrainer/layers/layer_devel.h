@@ -425,19 +425,18 @@ public:
               NNTR_THROW_IF(weight.getDataType() != TensorDim::DataType::FP32,
                             std::runtime_error)
                 << "Save with quantization only supports for FP32 weight.";
-              TensorDim dim = weight.getDim();
-
-              // Skip quantization for bias-like tensors (1D with height == 1)
-              // as a per-channel scale would then cover a single value. This
-              // matches the Q4_0 branch above, and the policy the safetensors
-              // writer assumes when it sizes the same records.
-              if (dim.height() == 1) {
-                weight.save(file);
-              } else {
-                Quantization::createQuantizer(QScheme::QS4CX)
-                  ->quantize(weight, dtype)
-                  .save(file);
-              }
+              // Unlike the Q4_0 branch above there is no height == 1 carve
+              // out: Q4_0 has to skip a bias because its 32-value block does
+              // not fit one, whereas a QS4CX scale is per output channel and
+              // covers a K == 1 column exactly. Skipping would also desync the
+              // writer from the reader, since QS4CX_Tensor::size() sizes every
+              // record as nibbles + N fp32 scales whatever the height, and it
+              // is that stride the loader accumulates to find the next
+              // weight's offset. Quantizing throughout keeps the file
+              // byte-identical to the one the previous writer emitted.
+              Quantization::createQuantizer(QScheme::QS4CX)
+                ->quantize(weight, dtype)
+                .save(file);
             } else {
               NNTR_THROW_IF(true, std::runtime_error)
                 << "This dtype is not supported in save with quantization";
