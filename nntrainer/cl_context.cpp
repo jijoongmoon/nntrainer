@@ -22,6 +22,7 @@
 #include <compute_ops.h>
 #include <concat_cl.h>
 #include <fc_layer_cl.h>
+#include <geglu_cl_op.h>
 #include <gelu_cl_op.h>
 #include <layer_normalization_layer.h>
 #include <layernorm_cl_op.h>
@@ -29,6 +30,7 @@
 #include <reshape_cl.h>
 #include <rmsnorm_layer_cl.h>
 #include <swiglu_cl.h>
+#include <swiglu_cl_op.h>
 #include <transpose_cl.h>
 
 #include <filesystem>
@@ -185,6 +187,15 @@ void ClContext::add_default_object() {
                     ActivationLayer::type,
                     ml::train::LayerType::LAYER_ACTIVATION);
   }
+
+  // The gated element-wise ops. No layer is registered alongside them: the
+  // layers that consume ComputeOps::geglu / ::swiglu are backend-neutral and
+  // reach them through the tensor, so all this context owes them is the
+  // kernels.
+  if (!registerGeGLUClKernels(*this))
+    ml_logw("failed to register the OpenCL GeGLU kernels");
+  if (!registerSwiGLUClKernels(*this))
+    ml_logw("failed to register the OpenCL SwiGLU kernels");
 }
 
 template <typename T>

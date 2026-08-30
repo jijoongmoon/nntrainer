@@ -32,8 +32,10 @@
 #include <blas_kernels.h>
 #include <common_properties.h> // ActivationType, the act_type int encoding
 #include <compute_ops.h>
+#include <geglu_cl_op.h>
 #include <gelu_cl_op.h>
 #include <layernorm_cl_op.h>
+#include <swiglu_cl_op.h>
 #include <tensor.h>
 
 namespace nntrainer {
@@ -117,6 +119,16 @@ public:
   }
 
   // ── Whole-ops (Tensor level) ──────────────────────────────────
+  // The gated pairs: (gate, up) -> out, element-wise, one kernel each.
+  void geglu(const Tensor &in1, const Tensor &in2, Tensor &out,
+             unsigned int active_rows, unsigned int row_offset) override {
+    nntrainer::geglu_cl_op(in1, in2, out, active_rows, row_offset);
+  }
+  void swiglu(const Tensor &in1, const Tensor &in2, Tensor &out,
+              unsigned int active_rows, unsigned int row_offset) override {
+    nntrainer::swiglu_cl_op(in1, in2, out, active_rows, row_offset);
+  }
+
   // LayerNorm over the last axis. The neutral LayerNormalizationLayer owns
   // the axis contract and only dispatches here when its property matches, so
   // this op never sees a property.
