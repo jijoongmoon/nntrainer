@@ -46,6 +46,11 @@ typedef cl_int(CL_API_CALL *PFN_clGetDeviceInfo)(
   size_t /**< param_value_size */, void * /**< param_value */,
   size_t * /**< param_value_size_ret */);
 
+typedef cl_int(CL_API_CALL *PFN_clGetImageInfo)(
+  cl_mem /**< image */, cl_image_info /**< param_name */,
+  size_t /**< param_value_size */, void * /**< param_value */,
+  size_t * /**< param_value_size_ret */);
+
 typedef cl_context(CL_API_CALL *PFN_clCreateContext)(
   const cl_context_properties * /**< properties */, cl_uint /**< num_devices */,
   const cl_device_id * /**< devices */,
@@ -225,6 +230,7 @@ typedef cl_int(CL_API_CALL *PFN_clWaitForEvents)(cl_uint num_events,
 extern PFN_clGetPlatformIDs clGetPlatformIDs;
 extern PFN_clGetDeviceIDs clGetDeviceIDs;
 extern PFN_clGetDeviceInfo clGetDeviceInfo;
+extern PFN_clGetImageInfo clGetImageInfo;
 extern PFN_clCreateContext clCreateContext;
 extern PFN_clCreateCommandQueue clCreateCommandQueue;
 extern PFN_clCreateBuffer clCreateBuffer;
