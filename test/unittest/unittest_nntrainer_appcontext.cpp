@@ -494,6 +494,65 @@ TEST(EngineRegistryTest, contextDeclaresItsResidencyPlane_p) {
 
   EXPECT_EQ(engine.getRegisteredContext("cpu")->residencyEngine(),
             ml::train::LayerComputeEngine::CPU);
+
+#if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
+  /**
+   * The CPU assertion above also passes against a Context that overrides
+   * nothing, so it cannot see a missing declaration. A non-CPU backend is the
+   * case that pins the contract: if ClContext did not declare its plane, the
+   * host-residency base would stand in and every engine=gpu layer would report
+   * CPU.
+   *
+   * Bring-up is engine-conditional (NNTR_ENGINE), so "gpu" may legitimately be
+   * absent from this process; the assertion is conditional on the context
+   * existing, never on a device being present. residencyEngine() is a
+   * declaration, not a device query.
+   */
+  nntrainer::Context *gpu = nullptr;
+  try {
+    gpu = engine.getRegisteredContext("gpu");
+  } catch (...) {
+    gpu = nullptr;
+  }
+  if (gpu != nullptr) {
+    EXPECT_EQ(gpu->residencyEngine(), ml::train::LayerComputeEngine::GPU);
+    EXPECT_NE(gpu->residencyEngine(),
+              engine.getRegisteredContext("cpu")->residencyEngine());
+  }
+#endif
+}
+
+/**
+ * @brief   MemoryPool asks the allocator whether its memory is SVM rather than
+ *          comparing an allocator name, so both in-tree allocators must answer
+ *          the way the retired name compare did.
+ */
+TEST(EngineRegistryTest, allocatorDeclaresWhetherItIsSVM_p) {
+  nntrainer::MemAllocator host;
+
+  /** a plain host allocation is addressable by the host and by nobody else */
+  EXPECT_TRUE(host.isHostAddressable());
+  EXPECT_FALSE(host.isDeviceVisible());
+  EXPECT_FALSE(host.isSVM());
+
+  /**
+   * The derivation itself, pinned without an OpenCL device: an allocation that
+   * is host-addressable AND device-visible is exactly what the retired
+   * getName() == "gpu-svm" compare used to select, and it is the shape
+   * ClSvmAllocator declares (it overrides isDeviceVisible() to true and
+   * inherits isHostAddressable()). A device-only allocator, which overrides
+   * the other half, must stay out of the OpenCL binding paths.
+   */
+  struct SvmLikeAllocator : public nntrainer::MemAllocator {
+    bool isDeviceVisible() const override { return true; }
+  } svm_like;
+  EXPECT_TRUE(svm_like.isSVM());
+
+  struct DeviceOnlyAllocator : public nntrainer::MemAllocator {
+    bool isHostAddressable() const override { return false; }
+    bool isDeviceVisible() const override { return true; }
+  } device_only;
+  EXPECT_FALSE(device_only.isSVM());
 }
 
 /**
