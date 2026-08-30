@@ -106,6 +106,10 @@ if get_option('enable-opencl')
   endif
   # CPU-vs-OpenCL differential for the fused sigmoid-gated whole-ops.
   test_target += [['unittest_sigmoid_gate_ops_cl', []]]
+  # CPU-vs-OpenCL differential for the embedding pooling/normalize whole-ops.
+  # The backend is selected by NNTR_OPS_BACKEND so the two engines are compared
+  # across separate processes.
+  test_target += [['unittest_embedding_pool_ops', []]]
 endif
 
 if get_option('enable-fp16')
