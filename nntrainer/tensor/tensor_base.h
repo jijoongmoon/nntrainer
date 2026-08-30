@@ -278,6 +278,16 @@ public:
   virtual bool isPackedF16Activation() const { return false; }
 
   /**
+   * @brief Whether pack() has produced a buffer the fp32-activation GEMM can
+   * consume
+   * @note Lets a kernel choose the pre-packed entry point when the weight was
+   * packed after load and the pack-on-the-fly one when it was not, rather than
+   * requiring every caller to have run pack() first. The default is false
+   * because the default getPackedData() hands back the plain data.
+   */
+  virtual bool isPacked() const { return false; }
+
+  /**
    * @brief     i data index
    * @retval    address of ith data
    */

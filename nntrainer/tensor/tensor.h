@@ -627,6 +627,12 @@ public:
   }
 
   /**
+   * @brief     Whether pack() has produced a fp32-activation packed buffer
+   * @note      See TensorBase::isPacked()
+   */
+  bool isPacked() const { return itensor_->isPacked(); }
+
+  /**
    * @brief     i data index
    * @retval    template T pointer (address of ith data)
    */

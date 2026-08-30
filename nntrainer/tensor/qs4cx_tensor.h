@@ -263,6 +263,16 @@ public:
   }
 
   /**
+   * @copydoc TensorBase::isPacked()
+   * @note packed_data holds either pack()'s fp32-activation rhs or
+   * packF16Activation()'s fp16-scale rhs, and the two layouts are not
+   * interchangeable, so the fp16 one must not be reported here.
+   */
+  bool isPacked() const override {
+    return !packed_f16 && packed_data != nullptr;
+  }
+
+  /**
    * @copydoc Tensor::read(std::ifstream &file, size_t, bool)
    * @note When this tensor is flagged on-disk-legacy-QINT4
    *   (setOnDiskLegacyQint4), the record is a legacy QINT4 (u16 header + KAI
