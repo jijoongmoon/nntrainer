@@ -434,6 +434,13 @@ struct V8cWeightEntry {
   cl_mem scale_buf = nullptr;      // [N] fp32 recip-scale (owned)
   cl_mem row_sum_w_int4 = nullptr; // [N] int32 sum_k(int4 w_nk) (owned)
   unsigned int N = 0, K = 0;
+  // Name of the weight this pack was built from. The map is keyed on the
+  // weight's host address, which the allocator may hand to a DIFFERENT weight
+  // after a free; every projection of a given kind has the same (N, K) in a
+  // transformer, so the shape alone cannot tell the two apart and the GEMM
+  // would silently bind the wrong pack. The name carries identity, so it is
+  // what actually validates a hit.
+  std::string name;
   cl_mem weight_image =
     nullptr; // cached image2d view (also released via TensorBacking)
   cl_mem weight_buf = nullptr; // raw backing buffer (buffer-path / Intel NEO)
@@ -630,15 +637,18 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
     auto &cache = v8c_weight_cache();
     auto it = cache.find(key);
     if (it != cache.end()) {
-      // Validate the pointer-keyed hit: a freed/re-used host weight pointer
-      // (e.g. FSU) would otherwise silently return ANOTHER weight's device
-      // pack (wrong N/K backing bound to the GEMM). Rebuild on mismatch.
-      if (it->second.N == N && it->second.K == K)
+      // Validate the pointer-keyed hit. The key is a host address the
+      // allocator can reuse for a different weight once the first is freed,
+      // and identically shaped projections are the rule rather than the
+      // exception, so the shape is not enough to tell one from another --
+      // check the name too, and rebuild when either disagrees.
+      if (it->second.N == N && it->second.K == K &&
+          it->second.name == weight.getName())
         return &it->second;
-      std::fprintf(stderr,
-                   "[v8c] weight-cache shape mismatch for key=%p: cached N=%u "
-                   "K=%u vs requested N=%u K=%u -- rebuilding\n",
-                   key, it->second.N, it->second.K, N, K);
+      ml_logd("[v8c] weight-cache miss on a reused key: cached %s (N=%u K=%u) "
+              "vs requested %s (N=%u K=%u); rebuilding",
+              it->second.name.c_str(), it->second.N, it->second.K,
+              weight.getName().c_str(), N, K);
       cache.erase(it);
     }
   }
@@ -667,6 +677,7 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
   e.row_sum_w_int4 = rsw;
   e.N = N;
   e.K = K;
+  e.name = weight.getName();
   // Raw backing buffer for the NNTR_V8C_BUF path (Intel NEO). Always available
   // (zero-copy); the image2d view below is only used by the image-sampling
   // kernels (Adreno).
@@ -677,10 +688,13 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
   ws.image_channel_type = CL_UNSIGNED_INT32;
   ws.width = K / 32;
   ws.height = N;
-  // [Adreno pitch fix] Row pitch padded to a 256-byte multiple to match the
-  // padded weight backing rows (make_v8c_weight_backing_from_qs4cx) so
-  // image2d-from-buffer creation satisfies CL_DEVICE_IMAGE_PITCH_ALIGNMENT on
-  // Adreno. Intel NEO (no image) keeps K/2. The logical texel width stays K/32.
+  // Row pitch padded to a 64-byte multiple, matching the padded weight backing
+  // rows (make_v8c_weight_backing_from_qs4cx) so image2d-from-buffer creation
+  // satisfies CL_DEVICE_IMAGE_PITCH_ALIGNMENT on the image path. The buffer
+  // path keeps the tight K/2 stride. The logical texel width stays K/32.
+  // 64 bytes assumes the device's pitch alignment is at most 4 pixels at
+  // 16 B/texel; a device reporting more would need this derived from the
+  // queried alignment instead of assumed.
   ws.row_pitch_bytes = ClContext::Global().caps().image_v8c
                          ? (((size_t)K / 2 + 63) / 64) * 64
                          : (size_t)K / 2;

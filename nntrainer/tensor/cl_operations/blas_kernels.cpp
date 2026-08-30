@@ -1436,7 +1436,7 @@ static const char *kV8cBufCompileOpts = "-DV8C_BUFFER_ONLY -cl-std=CL3.0";
 /**
  * @brief [Adreno pitch fix] int4-weight row stride in BYTES. On the ADRENO
  * image path (caps.image_v8c, i.e. non-Intel) the weight backing rows are
- * padded up to a 256-byte multiple so image2d-from-buffer creation
+ * padded up to a 64-byte multiple so image2d-from-buffer creation
  * satisfies CL_DEVICE_IMAGE_PITCH_ALIGNMENT (an unaligned K/2, e.g.
  * a K=192 projection -> 96 B, otherwise fails clCreateImage and
  * mis-routes the FC to the lm-head GEMV). Intel NEO (buffer path) has no
@@ -1957,9 +1957,12 @@ std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
   if (K % 32 != 0)
     throw std::invalid_argument(
       "make_v8c_weight_backing_from_qs4cx: K must be a multiple of 32");
-  if (N % 4 != 0)
+  // Every dispatch site rejects N % 8 before reaching a builder, because the
+  // GEMM stores eight output channels per work-item. Stating the weaker rule
+  // here made two different rules for one constraint; state the real one.
+  if (N % 8 != 0)
     throw std::invalid_argument(
-      "make_v8c_weight_backing_from_qs4cx: N must be a multiple of 4");
+      "make_v8c_weight_backing_from_qs4cx: N must be a multiple of 8");
 
   const size_t plain_row_bytes = ((size_t)K + 1) / 2; // QS4CX nibble stride
   const size_t k_blocks = K / 32;
@@ -1967,7 +1970,7 @@ std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
   // multiple of the device CL_DEVICE_IMAGE_PITCH_ALIGNMENT; on Adreno an
   // unaligned pitch (e.g. a K=192 projection -> K/2=96 B) fails
   // clCreateImage, forcing a wrong fallback (the lm-head GEMV) that corrupts a
-  // normal per-layer FC. Pad each weight row up to a 256-byte multiple so the
+  // normal per-layer FC. Pad each weight row up to a 64-byte multiple so the
   // image always builds and the FC stays on the correct v8c GPU path. The
   // padding bytes are zero and never read (the kernel K-loop uses K/32 texels;
   // only the ROW STRIDE grows -- W_wgt is set to this padded texel stride).
@@ -2118,16 +2121,20 @@ std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
     throw std::runtime_error("make_v8c_weight_backing_from_qs4cx: "
                              "clCreateBuffer (scale) failed: " +
                              std::to_string(err));
-  *out_scale_buf = sb;
-
   // Per-channel int4 row sum: computed in the chunk loop above.
   cl_mem rsw_buf =
     opencl::clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
                            sizeof(int32_t) * N, row_sum_w_int4.data(), &err);
-  if (err != CL_SUCCESS || !rsw_buf)
+  if (err != CL_SUCCESS || !rsw_buf) {
+    // The scale buffer is this function's until both out-parameters are set:
+    // the caller's handler cannot release what it was never handed, so a
+    // throw between the two allocations would leak it.
+    opencl::clReleaseMemObject(sb);
     throw std::runtime_error("make_v8c_weight_backing_from_qs4cx: "
                              "clCreateBuffer (row_sum) failed: " +
                              std::to_string(err));
+  }
+  *out_scale_buf = sb;
   *out_row_sum_w_int4_buf = rsw_buf;
 
   return backing;
@@ -2259,8 +2266,8 @@ std::unique_ptr<tv::TensorBacking> make_v8c_int8_weight_backing(
   unsigned int K, cl_mem *out_scale_buf, cl_mem *out_row_sum_w_buf) {
   if (K % 16 != 0)
     throw std::invalid_argument("make_v8c_int8_weight_backing: K%16!=0");
-  if (N % 4 != 0)
-    throw std::invalid_argument("make_v8c_int8_weight_backing: N%4!=0");
+  if (N % 8 != 0)
+    throw std::invalid_argument("make_v8c_int8_weight_backing: N%8!=0");
 
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
