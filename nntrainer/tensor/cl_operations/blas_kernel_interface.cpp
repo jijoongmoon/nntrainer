@@ -605,11 +605,11 @@ struct V8cScratch {
   // dispatches. It is NOT sufficient across passes: activations live in the
   // tensor pool, whose addresses are recycled every pass, so the same
   // (pointer, shape, dtype) tuple names DIFFERENT data one pass later. The
-  // generation below scopes a hit to the pass that produced it, but only as
-  // far as the pass boundary is detected: the boundary is inferred from
-  // repeated weight dispatch, so it is missed when the first v8c FC of a pass
-  // was not dispatched in the previous one (see the LIMITATION note in
-  // dotCl_v8c).
+  // generation below scopes a hit to the pass that produced it, and a hit is
+  // taken only where the boundary is provably established: the boundary is
+  // inferred from repeated weight dispatch, so a dispatch that cannot have
+  // participated in that inference bypasses the cache and warns once (see the
+  // boundary note in dotCl_v8c).
   unsigned long long pass_gen = 1; /**< current forward-pass generation */
   /** generation whose activation the cached int8 belongs to */
   unsigned long long last_quant_gen = 0;
@@ -1177,39 +1177,71 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
   // graph: every FC weight is dispatched at most once per forward pass, so
   // meeting a weight for the second time in the same generation IS the next
   // pass.
-  // LIMITATION. The generation is bumped only when a weight is met twice in
-  // the SAME generation, so the boundary is seen only if the first v8c FC of
-  // the new pass was ALSO dispatched in the previous pass. When the first v8c
-  // FC of a pass is a weight that was NOT dispatched in the previous pass --
-  // per-token MoE/expert routing, a conditionally skipped layer, a second
-  // graph sharing this process-global scratch, or any first-ever dispatch --
-  // no bump happens, last_quant_gen still equals pass_gen, and the stale
-  // cross-pass hit described above is still taken. This detector therefore
-  // closes the static-graph case the decode loop actually runs (one graph
-  // dispatching the same weights in the same order every pass) and errs safely
-  // in that direction (a weight legitimately dispatched twice in one pass pays
-  // one extra act quant); it does NOT make the cache safe for a graph whose
-  // dispatch set varies per pass. The complete fix bumps the generation at
-  // forward-pass entry, which needs a per-forward seam this backend does not
-  // have today.
+  // The generation is bumped only when a weight is met twice in the SAME
+  // generation, so the boundary is seen only if the first v8c FC of the new
+  // pass was ALSO dispatched in the previous pass. When the first v8c FC of a
+  // pass is a weight that was NOT dispatched in the previous pass -- per-token
+  // MoE/expert routing, a conditionally skipped layer, a second graph sharing
+  // this process-global scratch, or any first-ever dispatch -- no bump
+  // happens and last_quant_gen still equals pass_gen, so the generation alone
+  // would let the stale cross-pass hit through.
+  // That case is therefore not merely noted, it is REFUSED. A dispatch may use
+  // the cache only when it PROVABLY took part in the inference itself, which
+  // is exactly: the weight has a previous generation (it is not a first-ever
+  // dispatch), and that generation is one behind the current one after the
+  // bump above. The two ways to satisfy it are the two shapes the detector
+  // understands:
+  //   - a weight met twice bumps, so its previous generation becomes
+  //     pass_gen - 1 by construction -- the first FC of a steady-state pass;
+  //   - a weight already dispatched in the immediately preceding generation is
+  //     at pass_gen - 1 without a bump -- every later FC of that pass.
+  // Everything else -- a first-ever dispatch, a weight that skipped whole
+  // generations, a weight belonging to a second graph -- fails it, and that
+  // set is precisely the enumeration above. Those dispatches bypass the cache:
+  // the activation is re-quantized, costing one kernel and never a wrong
+  // answer. The cost is bounded and paid where it is owed -- the whole first
+  // forward pass bypasses, since no weight has a previous generation yet, and
+  // from the second pass on a static graph caches exactly as before.
+  // The complete fix bumps the generation at forward-pass entry, which needs a
+  // per-forward seam this backend does not have today; until it exists the
+  // cache is trusted only where it is provably sound.
   // Coupling: pass_gen and last_use_gen are plain fields, safe only because
   // the v8c_cache_mtx() lock_guard taken above spans the rest of dotCl_v8c.
-  // The huge_n lm_head GEMV path returns BEFORE that lock, so its weight never
-  // updates last_use_gen and never takes part in boundary detection.
-  if (w->last_use_gen == sc.pass_gen)
+  const unsigned long long prev_use_gen = w->last_use_gen;
+  if (prev_use_gen != 0 && prev_use_gen == sc.pass_gen)
     ++sc.pass_gen;
   w->last_use_gen = sc.pass_gen;
+  const bool boundary_established =
+    (prev_use_gen != 0 && prev_use_gen + 1 == sc.pass_gen);
 
   // Shared-quant cache. For host/SVM inputs the (data_ptr, shape, dtype)
   // tuple uniquely identifies the activation within one forward pass, so a
   // hit means the same data is already int8-quantized in sc.act_i8 and both
   // the staging copy and the quant kernel can be skipped (the wq/wk/wv and
   // gate/up sibling FCs).
-  const bool quant_cache_hit =
+  const bool quant_tuple_hit =
     sc.last_quant_gen == sc.pass_gen && sc.last_quant_in_ptr != nullptr &&
     sc.last_quant_in_ptr == cur_in_ptr && sc.last_quant_M == M &&
     sc.last_quant_K == K && sc.last_quant_M_pad == M_pad &&
     sc.last_quant_dtype == cur_dtype;
+  const bool quant_cache_hit = quant_tuple_hit && boundary_established;
+  // A bypass during the very first pass is expected (no weight has a previous
+  // generation yet) and costs one quant kernel per FC, once. A bypass after
+  // the detector has fired at least once is the report-worthy case: this
+  // process is running a graph whose dispatch set the heuristic cannot track.
+  if (quant_tuple_hit && !boundary_established && sc.pass_gen > 1) {
+    static bool warned = false;
+    if (!warned) {
+      warned = true;
+      ml_logw("[v8c] shared-quant cache bypassed for %s: this weight did not "
+              "take part in the previous forward pass (expert routing, a "
+              "skipped layer, or a second graph on this process-global "
+              "scratch), so the pass boundary cannot be inferred from weight "
+              "reuse. Correctness is kept by re-quantizing the activation; "
+              "the saved quant kernel is not.",
+              weight.getName().c_str());
+    }
+  }
   const bool skip_upload_and_quant = quant_cache_hit;
 
   // SVM-pool input: the activation lives in GPU-visible SVM (the default
