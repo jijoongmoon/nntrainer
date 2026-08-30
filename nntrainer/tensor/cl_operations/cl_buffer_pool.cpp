@@ -23,9 +23,36 @@ namespace nntrainer {
 
 namespace {
 
-/** @brief the OpenCL context this process' gpu Context owns */
+/**
+ * @brief the OpenCL context this process' gpu Context owns, or nullptr when
+ *        none is registered.
+ *
+ * @details getRegisteredContext() throws when the name is absent, and absent
+ * is reachable: a build with OpenCL compiled in still declines to bring the
+ * backend up when no device answers. That exception would otherwise leave
+ * TensorPool::allocate() -- not an OpenCL call site, and with no reason to
+ * catch it -- and abort a model that only ever wanted the shared plane. A null
+ * answer joins the other "cannot place this on the device" answers below and
+ * leaves the tensor where it already is.
+ *
+ * @note The static_cast is what reaching context_inst_ / command_queue_inst_
+ * costs: they are ClContext members with no accessor on Context, so there is
+ * no virtual seam to go through yet. It is confined to this one function so
+ * that introducing one later is a single edit.
+ *
+ * @return the OpenCL context, or nullptr when the gpu backend is not
+ *         registered in this process
+ */
 ClContext *clContext() {
-  return static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  try {
+    return static_cast<ClContext *>(
+      Engine::Global().getRegisteredContext("gpu"));
+  } catch (const std::exception &e) {
+    ml_logw("ClBufferPool: no OpenCL context is registered (%s); the tensor "
+            "stays on the shared plane",
+            e.what());
+    return nullptr;
+  }
 }
 
 } // namespace
@@ -41,6 +68,7 @@ void ClBufferPool::allocate() {
   const auto &offsets = getMemoryOffset();
   const auto &sizes = getMemorySize();
 
+  std::lock_guard<std::mutex> lk(device_mtx_);
   token_offset_.assign(offsets.begin(), offsets.end());
   offset_size_.clear();
   for (size_t i = 0; i < offsets.size(); ++i) {
@@ -52,6 +80,8 @@ void ClBufferPool::allocate() {
 }
 
 void *ClBufferPool::deviceMemory(unsigned int idx) {
+  std::lock_guard<std::mutex> lk(device_mtx_);
+
   const size_t i = idx - 1;
   if (i >= token_offset_.size())
     return nullptr;
@@ -67,6 +97,9 @@ void *ClBufferPool::deviceMemory(unsigned int idx) {
   const size_t bytes = sit->second;
 
   auto *cc = clContext();
+  if (cc == nullptr)
+    return nullptr;
+
   cl_device_id dev = cc->context_inst_.GetDeviceId();
 
   /** A single allocation larger than the device can hold is not a device
@@ -113,12 +146,15 @@ void *ClBufferPool::deviceMemory(unsigned int idx) {
 }
 
 void ClBufferPool::deallocate() {
-  for (auto &entry : offset_buffer_)
-    if (entry.second != nullptr)
-      opencl::clReleaseMemObject(static_cast<cl_mem>(entry.second));
-  offset_buffer_.clear();
-  offset_size_.clear();
-  token_offset_.clear();
+  {
+    std::lock_guard<std::mutex> lk(device_mtx_);
+    for (auto &entry : offset_buffer_)
+      if (entry.second != nullptr)
+        opencl::clReleaseMemObject(static_cast<cl_mem>(entry.second));
+    offset_buffer_.clear();
+    offset_size_.clear();
+    token_offset_.clear();
+  }
   MemoryPool::deallocate();
 }
 

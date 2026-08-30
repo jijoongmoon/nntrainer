@@ -16,6 +16,7 @@
 #define __CL_BUFFER_POOL_H__
 
 #include <memory>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -56,7 +57,21 @@ public:
     MemoryPool(std::move(allocator)) {}
 
   /**
-   * @brief ClBufferPool destructor.
+   * @brief ClBufferPool destructor. Releases the device buffers.
+   *
+   * @note This deliberately differs from ~ClBufferManager(), which releases
+   *       nothing. That one is a function-local static whose destructor only
+   *       ever runs at process teardown, where calling into a user-mode
+   *       OpenCL driver that has already run its own finalizers has been seen
+   *       to fault. A ClBufferPool is owned by a TensorPool, which is owned by
+   *       a Manager inside a model, so it is destroyed while the model is --
+   *       long before teardown -- and its buffers are per-graph rather than
+   *       process-lifetime. Releasing them is therefore both safe and
+   *       necessary: a process that builds several models in turn would
+   *       otherwise hold every earlier graph's device memory. A TensorPool
+   *       kept alive in a static past the end of main() is the one case where
+   *       this destructor reaches the driver at teardown; own the model, not a
+   *       static handle to it.
    */
   ~ClBufferPool() override;
 
@@ -77,12 +92,20 @@ public:
    * Creates the buffer for the token's planner offset on first request, sized
    * to the largest tensor the planner placed there and zero-filled once, and
    * returns the same handle for every later token at that offset. Returns
-   * nullptr if the device cannot hold it, which keeps the tensor on the shared
-   * plane instead of leaving it half-placed.
+   * nullptr if the device cannot hold it, or if no OpenCL context is
+   * registered, which keeps the tensor on the shared plane instead of leaving
+   * it half-placed.
    */
   void *deviceMemory(unsigned int idx) override;
 
 private:
+  /** Guards the three members below, all of which deviceMemory() fills in
+   *  lazily. Allocation is single-threaded today, but the OpenCL lazy getters
+   *  next door (ClBufferManager) are reachable from a worker thread and are
+   *  locked for it, and one file in this pair silently disagreeing about that
+   *  is how a data race gets written later. The lock is taken once per
+   *  planner offset, never on a kernel path. */
+  std::mutex device_mtx_;
   /** planner offset of each token, indexed by token - 1 */
   std::vector<size_t> token_offset_;
   /** planner offset -> largest tensor the planner placed there */
