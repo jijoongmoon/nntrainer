@@ -160,6 +160,13 @@ if get_option('platform') != 'android' and host_machine.cpu_family() == 'aarch64
 endif
 
 if get_option('enable-fp16')
+   # fp16-impl is read by exactly one branch below, the non-android x86_64 one:
+   # every other arch has a native half type and takes it unconditionally. Say
+   # so rather than let a non-default value be discarded in silence, which
+   # otherwise lets someone believe they produced a wrapper build.
+   if get_option('fp16-impl') != 'auto' and not (arch == 'x86_64' and get_option('platform') != 'android')
+     warning('fp16-impl=@0@ is ignored on this build: the option selects the x86_64 fp16 backing type, and this build uses the native __fp16/_Float16.'.format(get_option('fp16-impl')))
+   endif
    if get_option('platform') == 'android'
      # NDK clang (and non-ARM host compilers used for the meson-built QNN
      # plugin) reject -mfp16-format=ieee; only pass it when supported.
