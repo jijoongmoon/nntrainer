@@ -97,6 +97,10 @@ if get_option('enable-opencl')
   if get_option('enable-fp16')
     test_target += [['unittest_cl_residency', []]]
   endif
+  # CPU-vs-OpenCL differential for the embedding pooling/normalize whole-ops.
+  # The backend is selected by NNTR_OPS_BACKEND so the two engines are compared
+  # across separate processes.
+  test_target += [['unittest_embedding_pool_ops', []]]
 endif
 
 if get_option('enable-fp16')
