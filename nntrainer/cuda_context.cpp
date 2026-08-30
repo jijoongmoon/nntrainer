@@ -94,11 +94,12 @@ void CudaContext::initialize() noexcept {
     // setenv(..., overwrite=0) so an explicit setting from the environment
     // always wins (including "=0", which every consumer treats as off -- see
     // nntr_env_on()).
+    // Only flags this library actually reads are defaulted here. A default for
+    // a flag whose read site lives in a module that does not exist yet would
+    // be a shim nothing consumes; the PR that adds the reader derives the
+    // default at the read site instead.
     setenv("NNTR_CUDA_GEGLU", "1", 0);
-    setenv("NNTR_CUDA_ELTWISE", "1", 0);
-    setenv("NNTR_CUDA_ROPE", "1", 0);
     setenv("NNTR_FC_CUDA_CUBLAS", "1", 0);
-    setenv("NNTR_CUDA_PREWARM", "1", 0);
     setenv("NNTR_CUDA_ATTN", "1", 0);
     setenv("NNTR_CUDA_FLASH_DECODE", "64", 0);
     setenv("NNTR_CUDA_BLOCKQ", "1", 0);
