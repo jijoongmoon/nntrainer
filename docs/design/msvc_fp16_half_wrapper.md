@@ -151,15 +151,24 @@ for a missing piece of a stand-in.
 `std::numeric_limits<Half>` **is** provided, and is the exception to that rule
 for one reason: it is the only member of the set whose absence does not fail to
 compile. The primary template is defined for every type and value-initializes,
-so an unspecialized `Half` would answer `numeric_limits<_FP16>::max() == 0.0`,
-`infinity() == 0.0` and `is_specialized == false` on a wrapper build while the
-identical source answers 65504, inf and true on a native build — a wrong
-numeric result on exactly one platform, from code that compiles clean. The
+so an unspecialized `Half` answers `max() == 0.0`, `infinity() == 0.0` and
+`is_specialized == false` — silently, from code that compiles clean. The
 specialization is written as bit patterns through `Half::from_bits` so that
 every member can be `constexpr` as the standard requires (the converting
-constructor rounds through `float` with a `memcpy` and cannot be), and
-`unittest_half_fp16` compares each member against
-`std::numeric_limits<_Float16>`.
+constructor rounds through `float` with a `memcpy` and cannot be).
+
+One caveat, measured rather than assumed. The native side has the same hole
+today: libstdc++ specializes `numeric_limits` for `_Float16` only from C++23,
+where `__STDCPP_FLOAT16_T__` is defined, and this project builds C++17 (C++20
+on Windows). On GCC 13.3, `-std=c++17` gives `is_specialized == 0` and
+`max() == 0`, while `-std=c++23` gives `1` and `65504`. So
+`std::numeric_limits<_FP16>` is **not** usable on either backing type yet, and
+a call site must not be added on the strength of this specialization alone;
+what it buys is that the wrapper is no longer the half of the pair answering
+zero. `unittest_half_fp16` asserts binary16's real constants directly, and
+compares against `std::numeric_limits<_Float16>` only when that type reports
+itself specialized — so the parity check starts working by itself the day the
+standard level moves.
 
 ### 3.4 Where host half arithmetic actually lives
 
