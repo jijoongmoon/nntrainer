@@ -15,11 +15,20 @@
  * INT4 batch / accel) are overridden with their supports_*() predicates
  * returning true; callers rely on supports_*() to decide whether to use this
  * path or fall back to a CPU ops table — exactly the contract
- * float_tensor.cpp's dispatch sites already follow. The whole-ops a
- * backend-neutral layer calls unconditionally (fc, apply_activation) have no
+ * float_tensor.cpp's dispatch sites already follow.
+ *
+ * The second family is the whole-op table a backend-neutral layer calls
+ * without asking a predicate first: fc, apply_activation, layer_norm,
+ * activation, residual_op, geglu, swiglu and the scopy family. These have no
  * supports_*() escape hatch, so every op a layer registered on the gpu engine
- * reaches must resolve here: the base ComputeOps default throws, and a layer
- * has nowhere to catch that. Those are implemented below.
+ * can reach has to resolve here — the base ComputeOps default throws, and a
+ * layer has nowhere to catch that. The list is closed against the layers this
+ * context registers: FullyConnectedLayerCl (fc, apply_activation,
+ * fc_prebuild_weight), AdditionLayer (residual_op), SwiGLULayer (swiglu),
+ * LayerNormalizationLayer (layer_norm), ActivationLayer (activation), plus
+ * Tensor::copy (scopy). ActivationLayer is the one entry that can still
+ * throw, and only for a mode with no OpenCL kernel: supports_activation() is
+ * the query, and the message names the fix.
  *
  * This file is what unblocks GPU dispatch end-to-end:
  *   ClContext (Engine-registered) -> ContextData -> ClComputeOps
@@ -43,32 +52,6 @@ namespace nntrainer {
 
 class ClComputeOps : public ComputeOps {
 public:
-  /**
-   * @brief Fully connected matmul on the OpenCL GEMM.
-   *
-   * This is the call FullyConnectedLayerCl made directly before the layer
-   * became backend-neutral, so a gpu-engine graph keeps the same kernel and
-   * the same numerics. dotCl() writes the result (it does not accumulate),
-   * which is why no zero-fill precedes it.
-   */
-  void fc(Tensor &input, Tensor &weight, Tensor &output) override {
-    dotCl(input, weight, output);
-  }
-
-  /**
-   * @brief Activation epilogue, run on the host.
-   *
-   * A gpu-engine Tensor is host-allocated (the kernels stage it into device
-   * buffers per call), so the CPU table operates on exactly the same memory
-   * and yields the same values a standalone ActivationLayer would. There is no
-   * whole-op activation kernel yet; this exists so a fused epilogue on the gpu
-   * engine computes rather than throwing, and it can be replaced by a kernel
-   * without touching a caller.
-   */
-  void apply_activation(Tensor &out, int act_type) override {
-    get_cpu_ops()->apply_activation(out, act_type);
-  }
-
   // ── Accelerator-only Q4_0 / INT4 GEMM/GEMV ────────────────
   bool supports_gemm_q4_0_batch_fp32() const override { return true; }
   void gemm_q4_0_batch_fp32(std::vector<void *> matAdata, float *matBdata,
@@ -120,6 +103,26 @@ public:
   }
 
   // ── Whole-ops (Tensor level) ──────────────────────────────────
+  // Fully-connected matmul, for the neutral fully-connected layer: the layer
+  // keeps the weight and bias binding and the shape logic, and only the GEMM
+  // comes here. dotCl picks the dot, GEMV or GEMM kernel from the operand
+  // shapes, exactly as the layer used to do inline. It writes the result
+  // rather than accumulating into it, which is why no zero-fill precedes it.
+  void fc(Tensor &input, Tensor &weight, Tensor &output) override {
+    nntrainer::dotCl(input, weight, output);
+  }
+
+  // The fused activation epilogue, which the fully-connected layer applies to
+  // its own output in place. It runs on the host table: the operand is the
+  // tensor the GEMM just read back, so the CPU table works on exactly the
+  // memory the kernels staged and yields the values a standalone
+  // ActivationLayer would. Unlike ::activation below, this one accepts every
+  // mode, because a fused epilogue has no way to decline one. Replacing it
+  // with a kernel is a residency refinement and touches no caller.
+  void apply_activation(Tensor &out, int act_type) override {
+    get_cpu_ops()->apply_activation(out, act_type);
+  }
+
   // The gated pairs: (gate, up) -> out, element-wise, one kernel each.
   void geglu(const Tensor &in1, const Tensor &in2, Tensor &out,
              unsigned int active_rows, unsigned int row_offset) override {
