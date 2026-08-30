@@ -13,6 +13,7 @@
 #include <fusion_realizer.h>
 
 #include <cstdlib>
+#include <string>
 
 #include <common_properties.h>
 #include <layer_node.h>
@@ -37,6 +38,16 @@ FusionRealizer::realize(const GraphRepresentation &reference) {
     /// only compute layers that own an inline fused-activation epilogue
     if (!istrequal(node->getType(), "fully_connected") &&
         !istrequal(node->getType(), "conv2d"))
+      continue;
+
+    /// a node that already carries a fused epilogue is left alone, as the
+    /// header states. Such a node normally has activation=none and the arm
+    /// below would skip it anyway; this makes code and doc agree for the one
+    /// case they otherwise would not -- a node carrying both properties, where
+    /// overwriting the existing fused_activation would silently change the
+    /// layer's math.
+    const std::string fused = node->getProperty("fused_activation");
+    if (!fused.empty() && !istrequal(fused, "none"))
       continue;
 
     const ActivationType act = node->getActivationType();
