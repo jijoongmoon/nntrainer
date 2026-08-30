@@ -14,6 +14,7 @@
  * creates the OpenCL command queue and context.
  */
 
+#include <activation_layer.h>
 #include <addition_layer_cl.h>
 #include <cl_context.h>
 #include <cl_kernels/cl_kernels.h>
@@ -21,6 +22,9 @@
 #include <compute_ops.h>
 #include <concat_cl.h>
 #include <fc_layer_cl.h>
+#include <gelu_cl_op.h>
+#include <layer_normalization_layer.h>
+#include <layernorm_cl_op.h>
 #include <opencl_context_manager.h>
 #include <reshape_cl.h>
 #include <rmsnorm_layer_cl.h>
@@ -158,6 +162,28 @@ void ClContext::add_default_object() {
     registerFactory(nntrainer::createLayer<TransposeLayerCl>,
                     TransposeLayerCl::type,
                     ml::train::LayerType::LAYER_TRANSPOSE);
+  }
+
+  // LayerNormalization and Activation are the SAME core classes the cpu
+  // context registers, under the same type strings -- there is no
+  // LayerNormLayerCl or ActivationLayerCl. Both dispatch their maths through
+  // the tensor's ComputeOps, so createLayer("layer_normalization",
+  // {engine=gpu}) and createLayer("activation", {activation=gelu,
+  // engine=gpu}) land on ClComputeOps::layer_norm / ::activation. Registration
+  // is gated on the kernels building, so a device that cannot compile them
+  // leaves the type unregistered rather than accepting the layer and throwing
+  // at the first forward. Both keys are explicit: the auto-assigned key is
+  // str_map.size() + 1, which silently collides with an enum key once the
+  // registration list grows.
+  if (registerLayerNormClKernels(*this)) {
+    registerFactory(nntrainer::createLayer<LayerNormalizationLayer>,
+                    LayerNormalizationLayer::type,
+                    ml::train::LayerType::LAYER_LAYER_NORMALIZATION);
+  }
+  if (registerGeluClKernels(*this)) {
+    registerFactory(nntrainer::createLayer<ActivationLayer>,
+                    ActivationLayer::type,
+                    ml::train::LayerType::LAYER_ACTIVATION);
   }
 }
 

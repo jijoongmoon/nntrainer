@@ -3,7 +3,9 @@ cl_op_sources = [
   'blas_kernel_interface.cpp',
   'attention_kernel_interface.cpp',
   'attention_kernels.cpp',
-  'cl_compute_ops.cpp'
+  'cl_compute_ops.cpp',
+  'layernorm_cl_op.cpp',
+  'gelu_cl_op.cpp',
 ]
 
 cl_op_headers = [

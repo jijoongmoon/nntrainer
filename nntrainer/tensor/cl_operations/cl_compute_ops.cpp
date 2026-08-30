@@ -26,9 +26,14 @@
  *   -> nntrainer::gemm_q4_0_async_cl(...) -> OpenCL kernel queue.
  */
 
+#include <stdexcept>
+
 #include <blas_kernel_interface.h>
 #include <blas_kernels.h>
+#include <common_properties.h> // ActivationType, the act_type int encoding
 #include <compute_ops.h>
+#include <gelu_cl_op.h>
+#include <layernorm_cl_op.h>
 #include <tensor.h>
 
 namespace nntrainer {
@@ -109,6 +114,44 @@ public:
                              float *output, unsigned int M, unsigned int N,
                              unsigned int K, unsigned int group_size) override {
     nntrainer::sgemm_int4_cl(input, weight, scale, output, M, N, K, group_size);
+  }
+
+  // ── Whole-ops (Tensor level) ──────────────────────────────────
+  // LayerNorm over the last axis. The neutral LayerNormalizationLayer owns
+  // the axis contract and only dispatches here when its property matches, so
+  // this op never sees a property.
+  void layer_norm(const Tensor &in, Tensor &out, const Tensor &gamma,
+                  const Tensor &beta, float epsilon, unsigned int active_rows,
+                  unsigned int row_offset) override {
+    nntrainer::layernorm_cl_op(in, out, gamma, beta, epsilon, active_rows,
+                               row_offset);
+  }
+
+  // Element-wise activation. Only gelu and tanh_gelu have OpenCL kernels;
+  // every other mode throws rather than quietly running a host loop, because a
+  // tensor on this context may live in device memory the host has unmapped,
+  // where a host loop is not merely slower but wrong. Which mode a backend can
+  // serve is a backend question, so the mapping lives here and not in a Layer.
+  void activation(const Tensor &in, Tensor &out, int act_type,
+                  unsigned int active_rows, unsigned int row_offset) override {
+    switch (static_cast<ActivationType>(act_type)) {
+    case ActivationType::ACT_GELU:
+      nntrainer::gelu_cl_op(in, out, /*mode=*/0, active_rows, row_offset);
+      return;
+    case ActivationType::ACT_TANH_GELU:
+      nntrainer::gelu_cl_op(in, out, /*mode=*/1, active_rows, row_offset);
+      return;
+    default:
+      throw std::invalid_argument(
+        "ClComputeOps::activation: only gelu and tanh_gelu are accelerated on "
+        "this backend; use the cpu engine for the other activations");
+    }
+  }
+
+  bool supports_activation(int act_type) const override {
+    const auto type = static_cast<ActivationType>(act_type);
+    return type == ActivationType::ACT_GELU ||
+           type == ActivationType::ACT_TANH_GELU;
   }
 };
 
