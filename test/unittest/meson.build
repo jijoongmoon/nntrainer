@@ -91,6 +91,7 @@ if get_option('enable-opencl')
   test_target += [['unittest_opencl_kernels_blas', []]]
   test_target += [['unittest_opencl_kernels_int4', []]]
   test_target += [['unittest_opencl_kernels_qk_k', []]]
+  test_target += [['unittest_opencl_kernels_v8c', []]]
   test_target += [['unittest_attention_kernels_cl', []]]
   # The device residency plane places FP16 activations, so the test needs the
   # FP16 tensor type as well as OpenCL.
