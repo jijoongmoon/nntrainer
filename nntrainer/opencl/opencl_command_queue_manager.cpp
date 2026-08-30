@@ -30,21 +30,39 @@ namespace {
  * An in-order queue does not by itself make a coarse-grain shared-memory
  * handoff visible to the next kernel; fine-grain buffer memory is coherent by
  * definition and needs nothing. CL_DEVICE_SVM_FINE_GRAIN_BUFFER is the
- * queryable difference, so the decision is derived rather than configured.
- * It is scoped to Intel, the vendor whose coarse-grain handoff is observably
- * not ordered by the queue alone; elsewhere the flush would only cost
- * throughput. Resolved once per process.
+ * queryable difference, so the decision is derived from that capability and
+ * from nothing else.
+ *
+ * There is deliberately no vendor clause. What is being worked around is a
+ * property of coarse-grain shared memory, which the queue does not order;
+ * scoping the repair to the one device it was first measured on would leave
+ * every other coarse-grain device racing. Adreno is coarse-grain and is not
+ * Intel, and this backend now probes the vendor ICD path specifically to reach
+ * it, so a vendor clause would exclude a primary target of that work from the
+ * fix. "Not observed elsewhere" is an absence of measurement rather than a
+ * distinction a reader can act on, and what it would leave in place is a wrong
+ * result, not a slow one. The cost where the drain was not needed is one
+ * clFinish per dispatch that touched shared memory: throughput, measurable,
+ * and recoverable.
+ *
+ * Both fine-grain capabilities count. A device advertising FINE_GRAIN_SYSTEM
+ * without FINE_GRAIN_BUFFER is coherent just the same, and testing only the
+ * buffer bit would classify it coarse-grain and drain it for nothing.
+ *
+ * Resolved once per process, on the first dispatch rather than at init: the
+ * device info is not populated before then, and a null device_info latches
+ * false for the life of the process.
  */
 bool needsCoarseSVMDrain() {
   static const bool drain = []() {
     const auto *device_info = ContextManager::Global().getDeviceInfo();
     if (!device_info)
       return false;
-    constexpr cl_uint INTEL_VENDOR_ID = 0x8086;
     const cl_device_svm_capabilities svm =
       device_info->getDeviceSVMCapabilities();
-    const bool fine_grain = (svm & CL_DEVICE_SVM_FINE_GRAIN_BUFFER) != 0;
-    return device_info->getDeviceVendorId() == INTEL_VENDOR_ID && !fine_grain;
+    const bool fine_grain = (svm & (CL_DEVICE_SVM_FINE_GRAIN_BUFFER |
+                                    CL_DEVICE_SVM_FINE_GRAIN_SYSTEM)) != 0;
+    return !fine_grain;
   }();
   return drain;
 }
