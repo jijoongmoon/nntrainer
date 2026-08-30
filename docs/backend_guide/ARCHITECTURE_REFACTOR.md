@@ -283,7 +283,7 @@ single-model or model-tuned behaviour.
 | `embedding_normalize_layer`, `embedding_pooling_layer` | **KEEP** | application-specific |
 | `rms_reverse_norm` | **KEEP** | specialized |
 | `causal_conv1d_layer` | **KEEP** | model-specific |
-| mixture-of-experts layers | **KEEP** for now | implementation is model-tuned; promote once parameterized into a general primitive |
+| the mixture-of-experts layers, which live beside their models under `Applications/CausalLM/models/` rather than in `layers/` | **KEEP** for now | each implementation is tuned to its model; promote once parameterized into one general primitive |
 
 **The collapse rule.** Every per-backend fork of a layer — anything under
 `nntrainer/layers/cl_layers/` that shadows a neutral layer, and any `*_gpu` variant of an
