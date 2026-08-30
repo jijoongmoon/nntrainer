@@ -182,6 +182,12 @@ public:
    *        This is the registration facade for vendor add-only backends and
    *        the Application layer.
    *        See docs/backend_guide/ARCHITECTURE_REFACTOR.md §5.
+   * @note  const even though registering mutates something: what it mutates is
+   *        the resolved Context's own factory registry, and an Engine does not
+   *        own the Contexts it hands out (`engines` maps a name to a Context
+   *        the backend keeps alive). This Engine's own state is untouched,
+   *        which is exactly what the qualifier claims — it reads as a query
+   *        because, of this object, it is one.
    *
    * @param engine registered context name ("cpu"/"gpu"/"cuda"/...)
    * @param creator layer creator (createLayer<T> result)
