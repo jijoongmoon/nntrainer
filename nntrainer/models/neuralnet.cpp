@@ -195,6 +195,12 @@ int NeuralNetwork::compile(ExecutionMode mode) {
 
   exec_mode = mode;
 
+  // The decode seam caches the Context it resolved from the graph's engines.
+  // Compiling replaces the graph, so a cached answer from a previous compile
+  // may name a backend this graph does not run on. Drop it and let the next
+  // decode step resolve against the graph that actually exists.
+  decode_ctx_ = nullptr;
+
   std::string loss_type = std::get<props::LossType>(model_props).empty()
                             ? std::string()
                             : std::get<props::LossType>(model_props);
@@ -383,6 +389,10 @@ int NeuralNetwork::reinitialize() {
 
   unsigned int n_layers = (unsigned int)model_graph.size();
 
+  // Same reason as in compile(): reinitialize() re-runs every node's
+  // refinalize(), so the resolved decode Context is stale from here on.
+  decode_ctx_ = nullptr;
+
   ml_logd("reinitializing neural network, layer size: %d", n_layers);
   PROFILE_MEM_ANNOTATE("Reinitialize");
 
@@ -533,6 +543,15 @@ sharedConstTensors Context::runDecode(NeuralNetwork &nn, unsigned int from,
 // the KV and hidden-state handoff crossing backends incoherently. Decide from
 // the authoritative per-layer engine property instead, the same one the graph
 // uses to route each node's context, and never from a hardcoded backend order.
+//
+// "The graph's engine" is a property of the WHOLE graph, so it is read from
+// every node rather than sampled from one. Sampling the first node cannot work:
+// the head of a realistic graph is an Input layer that carries no engine=
+// property at all, so it always answers "cpu" and the seam would resolve to the
+// host on a graph running entirely on an accelerator. The rule is instead: if
+// exactly one non-cpu engine appears among the nodes, that backend drives the
+// step; if the nodes disagree (two accelerators in one graph), no single
+// backend can own the walk and the host does.
 Context *NeuralNetwork::getDecodeContext() {
   if (decode_ctx_ != nullptr)
     return decode_ctx_;
@@ -540,8 +559,21 @@ Context *NeuralNetwork::getDecodeContext() {
     return nullptr;
 
   std::string engine_name = "cpu";
-  if (model_graph.cbegin() != model_graph.cend())
-    engine_name = (*model_graph.cbegin())->getComputeEngineType();
+  for (auto it = model_graph.cbegin(); it != model_graph.cend(); ++it) {
+    const std::string node_engine = (*it)->getComputeEngineType();
+    if (node_engine.empty() || node_engine == "cpu")
+      continue;
+    if (engine_name == "cpu") {
+      engine_name = node_engine;
+    } else if (engine_name != node_engine) {
+      // Two different accelerators in one graph: neither owns the step.
+      ml_logw("graph mixes engine=%s and engine=%s; the decode step stays on "
+              "the host",
+              engine_name.c_str(), node_engine.c_str());
+      engine_name = "cpu";
+      break;
+    }
+  }
 
   for (const std::string &name : {engine_name, std::string("cpu")}) {
     try {
