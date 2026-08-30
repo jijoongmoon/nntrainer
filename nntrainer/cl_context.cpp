@@ -106,7 +106,17 @@ void ClContext::initialize() noexcept {
 
     initBlasClKernels();
     initAttentionClKernels();
-    add_default_object();
+
+    // The allocator and the ops table are installed BEFORE the layer
+    // registrations, not after. add_default_object() throws on a duplicate
+    // registration key, and the catch at the end of this function swallows
+    // that -- so with the old order a single bad key left the context alive
+    // with a null MemAllocator, and the failure surfaced much later as a
+    // segfault in TensorPool's constructor (allocator_->makePool on a null
+    // shared_ptr) for every model on this engine, with nothing in the log to
+    // connect the two. Installing them first bounds the damage of a failed
+    // registration to the layers that did not register.
+    //
     // SVM-backed allocator so MemoryPool buffers are device-visible
     // without an explicit copy. Falls back to host memory inside
     // ClSVMAllocator when the driver lacks SVM support.
@@ -114,12 +124,14 @@ void ClContext::initialize() noexcept {
       std::make_shared<ClSVMAllocator>(opencl::ContextManager::Global()));
 
     // Install the OpenCL ComputeOps subclass so tensors created from
-    // this Context dispatch their accelerator-only ops (Q4_0/INT4
-    // batch & accel GEMM/GEMV) to the existing OpenCL kernels in
-    // cl_operations/blas_kernels.cpp instead of throwing or silently
-    // taking the CPU path. CPU-only ops on a CL-attached tensor still
-    // throw via base default — by design, those stay on a CPU context.
+    // this Context dispatch the whole-op table and the accelerator-only ops
+    // (Q4_0/INT4 batch & accel GEMM/GEMV) to the OpenCL kernels instead of
+    // throwing or silently taking the CPU path. CPU-only ops on a CL-attached
+    // tensor still throw via base default — by design, those stay on a CPU
+    // context.
     getContextData()->setComputeOps(get_cl_ops());
+
+    add_default_object();
 
   } catch (std::exception &e) {
     ml_loge("cl_context: registering layers failed!!, reason: %s", e.what());
@@ -232,7 +244,19 @@ const int ClContext::registerFactory(const FactoryType<T> factory,
     throw std::invalid_argument(ss.str().c_str());
   }
 
-  int assigned_int_key = int_key == -1 ? str_map.size() + 1 : int_key;
+  // An auto-assigned key is str_map.size() + 1, which is not free: an explicit
+  // key taken from ml::train::LayerType sits in the same map, so inserting a
+  // string-keyed factory ahead of the explicit ones shifts every later
+  // auto-key onto one of them. The int_map write then silently replaced a
+  // registration instead of failing, and the type it displaced simply stopped
+  // resolving. Skip past what is taken rather than overwrite it, and keep the
+  // explicit-key branch throwing, which is the caller's own mistake.
+  int assigned_int_key = int_key;
+  if (assigned_int_key == -1) {
+    assigned_int_key = static_cast<int>(str_map.size()) + 1;
+    while (int_map.find(assigned_int_key) != int_map.end())
+      ++assigned_int_key;
+  }
 
   str_map[assigned_key] = factory;
   int_map[assigned_int_key] = assigned_key;
