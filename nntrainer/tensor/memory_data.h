@@ -34,6 +34,15 @@ using MemoryDataValidateCallback = std::function<void(unsigned int)>;
  *   - SVM: shared virtual memory, addressable by both the host and the device.
  *   - GPU_CLMEM: device memory, addressable only by the device. A layer binds
  *     it as a buffer kernel argument; see Tensor::isClMem / Tensor::getClMem.
+ *
+ * @note PUBLIC API SURFACE. This header is installed (nntrainer-dev), and
+ * MemAllocator::supportsResidency() -- also installed -- takes this type, so
+ * it is part of the contract anyone subclassing MemAllocator out of tree
+ * writes against. The values are explicit and must stay so: a client compiled
+ * against one -dev package and linked against a newer library passes these
+ * across the boundary by value, so an enumerator may be appended but never
+ * renumbered or removed. A backend with a plane none of these names describes
+ * adds one at the end rather than reusing one.
  */
 enum class ResidencyClass : unsigned char {
   HOST = 0,      /**< host memory */
