@@ -811,6 +811,12 @@ LayerNode::refinalize(const std::vector<TensorDim> &input_dims) {
   auto context = InitLayerContext(actual_input_dims, out_info,
                                   getInPlaceType() != InPlaceType::NONE,
                                   getName(), scope, max_norm);
+  // This InitLayerContext overload takes no engine argument, so stamp it
+  // before finalize(): the layer requests its outputs inside finalize() and
+  // outSpec() records the residency plane at that moment. Without this the
+  // reinitialize() path stamps CPU on every output of a node that the
+  // finalize() path stamped GPU, and the two disagree on the same graph.
+  context.setComputeEngine(toLayerComputeEngine(compute_engine));
 
   layer->finalize(context);
 
