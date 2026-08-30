@@ -1037,7 +1037,6 @@ Tensor &FloatTensor::dotQs4cx(Tensor const &input, Tensor &output, bool trans,
   defined(__ANDROID__) || defined(__arm__) || defined(_M_ARM) ||               \
   defined(_M_ARM64)
   float *lhs = (float *)getData();
-  char *rhs = input.getPackedData<char>();
   float *out = output.getData<float>();
 
   /**
@@ -1057,7 +1056,23 @@ Tensor &FloatTensor::dotQs4cx(Tensor const &input, Tensor &output, bool trans,
    */
   size_t opt_kernel_idx = (M == 1) ? 2 : 8;
 
-  gemm_qai8dxp_qsi4cxp(M, N, K, lhs, rhs, out, opt_kernel_idx);
+  /**
+   * @note Packing the rhs once after load is a caller-driven optimization
+   * (Tensor::pack(), reached through the layer's pack() hook), not a
+   * precondition of this operator: a QS4CX weight that was only loaded is a
+   * complete operand. Take the pre-packed kernel when the pack is there and
+   * the entry point that packs the rhs itself when it is not, which is what
+   * the x86 branch below already does unconditionally. Both spell the same
+   * ukernel with the same rhs bytes, so only the cost differs.
+   */
+  if (input.isPacked()) {
+    gemm_qai8dxp_qsi4cxp(M, N, K, lhs, input.getPackedData<char>(), out,
+                         opt_kernel_idx);
+  } else {
+    gemm_qai8dxp_qsi4cxp_rhs_unpacked(M, N, K, lhs, input.getData<char>(),
+                                      input.getScale(), out, opt_kernel_idx,
+                                      true);
+  }
 #elif defined(__x86_64__) || defined(__i586__) || defined(_M_X64) ||           \
   defined(_M_IX86)
 
