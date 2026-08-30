@@ -79,8 +79,7 @@ struct DeviceCaps {
                                      this is not a clean query — it is set from
                                      vendor_id at init (Intel NEO's compiler
                                      rejects the integer-coord read_imageui v8c
-                                     kernel ⇒ buffer; Adreno/unknown ⇒ image). The
-                                     V8C_BUF cell of the resolver. */
+                                     kernel ⇒ buffer; Adreno/unknown ⇒ image). */
   bool dpas = false; /**< OpenCL cl_intel_subgroup_matrix_multiply_accumulate
                           — the actual systolic-array/DPAS matrix engine
                           (Xe2/Xe3 "Arc"/"Battlemage" and later). NOT the
@@ -408,7 +407,8 @@ public:
    * @param factory layer creator (createLayer<T> result)
    * @param key string key (empty ⇒ derived from the layer's getType())
    * @param int_key integer key (-1 ⇒ auto-assigned)
-   * @return registered integer key, or -1 if the backend cannot register
+   * @return registered integer key, or -1 if this backend declines to
+   *         register a layer factory
    */
   virtual int registerLayerFactory(PtrFactoryType<nntrainer::Layer>,
                                    const std::string & = "", const int = -1) {
