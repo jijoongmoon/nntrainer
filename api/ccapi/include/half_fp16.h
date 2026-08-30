@@ -415,16 +415,23 @@ static_assert(std::is_standard_layout<Half>::value,
  * @brief std::numeric_limits for the Half stand-in.
  *
  * This is the one place where leaving Half unspecialized would not fail to
- * compile. The primary template is defined for every type: it value-
- * initializes, so on a wrapper build numeric_limits<_FP16>::max() would answer
- * Half() == 0.0, infinity() 0.0, epsilon() 0.0 and is_specialized false, while
- * the identical source on a native _Float16 build answers 65504, inf, 2^-10
- * and true. A wrong numeric answer on exactly one platform, from code that
- * compiles clean, is the failure mode Half exists to prevent -- the mixed
- * compound operators are here precisely so `h += f` rounds once like the
- * native type -- so the limits are provided rather than declared out of scope.
+ * compile the way the deliberately-omitted members do. The primary template is
+ * defined for every type and value-initializes, so numeric_limits<Half>::max()
+ * would silently answer 0.0, infinity() 0.0, epsilon() 0.0 and is_specialized
+ * false. Providing the real values costs a dozen lines and removes a trap that
+ * a reader has no way to see.
  *
- * The values are binary16's, and every member is constexpr as the standard
+ * A caveat worth knowing before comparing the two backing types: the NATIVE
+ * side has the same hole today. libstdc++ specializes numeric_limits for
+ * _Float16 only from C++23, where __STDCPP_FLOAT16_T__ is defined, and this
+ * project builds C++17 (C++20 on Windows). Measured on GCC 13.3: under
+ * -std=c++17, numeric_limits<_Float16>::is_specialized is 0 and max() is 0;
+ * under -std=c++23 it is 1 and 65504. So a numeric_limits<_FP16> call site is
+ * wrong on a native build too, for now -- do not add one on the strength of
+ * this specialization alone. What it buys is that the wrapper is no longer the
+ * half of the pair that answers zero.
+ *
+ * The values are binary16's own, and every member is constexpr as the standard
  * requires, which is why they are written as bit patterns through
  * Half::from_bits rather than as float literals through the rounding
  * constructor.
