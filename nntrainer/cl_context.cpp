@@ -18,6 +18,7 @@
 #include <addition_layer.h>
 #include <attention_kernels.h>
 #include <blas_kernels.h>
+#include <cerrno>
 #include <cl_context.h>
 #include <cl_kernels/cl_kernels.h>
 #include <cl_svm_allocator.h>
@@ -412,6 +413,62 @@ ClContext::registerClKernel(const std::string &kernel_string,
   // every cached lookup, and the attention path takes this route once per
   // kernel per layer.
   const std::string key = kernel_name + compile_options;
+
+  // Kernel ring-rotation: hand out one of K rotating CLONES of each kernel
+  // rather than a single process-global object. Every dispatcher re-binds
+  // arguments on the object this returns, and with a singleton that re-bind
+  // can land on an object whose previous enqueue the driver has not locked
+  // in yet -- a token-altering hazard we have measured on this stack, which
+  // a per-dispatch flush only makes rarer. Rotating guarantees the object
+  // being re-bound is the one enqueued K calls ago. The cost is K-1 extra
+  // clCreateKernel per kernel, which the driver's program cache makes cheap,
+  // and nothing per call. A call site that caches the returned pointer in a
+  // static keeps singleton behaviour; that gap is deliberate and documented
+  // here rather than papered over.
+  //
+  // This is a correctness fix, so it is unconditional and does not sit under
+  // the NNTR_DETERMINISTIC opt-out, which relaxes only the ordering and
+  // reduction-shape half of the determinism contract.
+  // NNTR_CL_KERNEL_RING=K is the explicit diagnostic override; K=1
+  // reproduces the old singleton deliberately, as a bisection aid.
+  {
+    static const int ring_k = []() {
+      const char *r = std::getenv("NNTR_CL_KERNEL_RING");
+      if (r == nullptr)
+        return 8;
+      // strtol, not atoi: atoi maps every non-numeric string to 0 and has no
+      // way to report one, so a typo would silently select the singleton.
+      char *end = nullptr;
+      errno = 0;
+      const long v = std::strtol(r, &end, 10);
+      if (errno != 0 || end == r || *end != '\0' || v < 1 || v > 64) {
+        ml_logw("Ignoring NNTR_CL_KERNEL_RING=%s: expected an integer in "
+                "[1, 64]",
+                r);
+        return 8;
+      }
+      return (int)v;
+    }();
+    if (ring_k > 1) {
+      static std::unordered_map<
+        std::string, std::pair<std::vector<SharedPtrClKernel>, size_t>>
+        ring_map;
+      auto &slot = ring_map[key];
+      auto &clones = slot.first;
+      if ((int)clones.size() < ring_k) {
+        std::string ks = kernel_string, kn = kernel_name, co = compile_options;
+        SharedPtrClKernel kp = std::make_shared<opencl::Kernel>();
+        if (clCreateKernel(ks, kn, co, kp)) {
+          clones.push_back(kp);
+          return clones.back();
+        }
+        // Clone creation failed: fall through to the single-object path.
+      } else {
+        slot.second = (slot.second + 1) % clones.size();
+        return clones[slot.second];
+      }
+    }
+  }
 
   auto it = ocl_kernel_map.find(key);
   if (it != ocl_kernel_map.end())
