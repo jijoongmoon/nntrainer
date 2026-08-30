@@ -14,7 +14,7 @@ endif
 
 # Common Includes Definition
 #
-# The three $(NNTRAINER_ROOT) entries reach headers that libnntrainer keeps
+# The $(NNTRAINER_ROOT) entries reach headers that libnntrainer keeps
 # private and deliberately does not install, so the ndk build has to find them
 # in the nntrainer source dir rather than through the prebuilt include export
 # (the meson leg does not notice because it compiles against nntrainer_inc):
@@ -31,6 +31,12 @@ endif
 #                                 nntrainer::*_cl(...) call site under
 #                                 ../layers; it exists to keep the bypass
 #                                 visible and app-local, never to make it ABI.
+#
+# The layers/llm entry serves the same purpose for <layer_prof.h>, the
+# header-only NNTR_LAYER_PROFILE instrumentation. It is intentionally kept out
+# of nntrainer_headers (it is a development aid, not -devel surface, and
+# installing it would require matching packaging/nntrainer.spec and
+# debian/*.install entries), so the ndk build resolves it from the source tree.
 CAUSALLM_COMMON_INCLUDES := \
     $(LOCAL_PATH)/.. \
     $(LOCAL_PATH)/../layers \
@@ -55,6 +61,7 @@ CAUSALLM_COMMON_INCLUDES := \
     $(NNTRAINER_ROOT)/nntrainer/utils \
     $(NNTRAINER_ROOT)/nntrainer/tensor \
     $(NNTRAINER_ROOT)/nntrainer/tensor/cl_operations \
+    $(NNTRAINER_ROOT)/nntrainer/layers/llm \
 
 # Common compile flags. -std=c++17/-fexceptions/-frtti come from Application.mk
 # (APP_CPPFLAGS); -march and the ABI defines are inherited from the prebuilt
@@ -289,6 +296,7 @@ LOCAL_C_INCLUDES += \
     $(NNTRAINER_ROOT)/nntrainer/utils \
     $(NNTRAINER_ROOT)/nntrainer/tensor \
     $(NNTRAINER_ROOT)/nntrainer/tensor/cl_operations \
+    $(NNTRAINER_ROOT)/nntrainer/layers/llm \
 
 include $(BUILD_EXECUTABLE)
 
