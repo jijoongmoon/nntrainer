@@ -6,6 +6,8 @@ cl_op_sources = [
   'attention_kernels.cpp',
   'clblast_interface.cpp',
   'cl_compute_ops.cpp',
+  'cl_tensor_view.cpp',
+  'cl_tensor_backing_pool.cpp',
   'layernorm_cl_op.cpp',
   'gelu_cl_op.cpp',
   'geglu_cl_op.cpp',
