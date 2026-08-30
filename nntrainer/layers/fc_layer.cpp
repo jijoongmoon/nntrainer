@@ -198,6 +198,8 @@ void FullyConnectedLayer::finalize(InitLayerContext &context) {
   // this FC (fused_activation set), build the SAME ActiFunc the standalone
   // ActivationLayer would use, so the fused forward is value-identical.
   auto &fused_act = std::get<props::FusedActivation>(fc_props);
+  rejectFusedActivationOnTrainingGraph(fused_act, context.getExecutionMode(),
+                                       "FC");
   if (!fused_act.empty() && fused_act.get() != ActivationType::ACT_NONE) {
     if (context.getActivationDataType() == TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
