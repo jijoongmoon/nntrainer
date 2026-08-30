@@ -74,6 +74,10 @@ test_target = [
   ['unittest_base_properties', []],
   ['unittest_common_properties', []],
   ['unittest_nntrainer_tensor_pool', []],
+  # ResidencyPlanner::classify() is a header-only pure function, so its
+  # decision table is covered on every runner rather than only where OpenCL
+  # and a device are available.
+  ['unittest_residency_planner', []],
   ['unittest_nntrainer_lr_scheduler', []],
   ['unittest_nntrainer_save_with_dtype', []],
   ['unittest_safetensors_quantize', []],
