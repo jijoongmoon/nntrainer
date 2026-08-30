@@ -426,13 +426,57 @@ int aminCl(const Tensor &input) {
 namespace nntrainer {
 namespace {
 /**
+ * @brief Sole owner of a cl_mem this translation unit created itself.
+ * @details The v8c weight entry below is destroyed on four different paths --
+ * a duplicate build losing the insertion race, two cache erases, and process
+ * teardown -- and expressing "release these two handles" once per path is what
+ * let two of them drop the buffers on the floor. Ownership lives in the type
+ * instead: the destructor releases, a move transfers, and a copy is
+ * forbidden, so a fifth teardown path cannot reintroduce the leak.
+ */
+class OwnedClMem {
+public:
+  /** @brief Construct an empty handle */
+  OwnedClMem() = default;
+  /** @brief Take ownership of an already-created cl_mem */
+  explicit OwnedClMem(cl_mem mem) : mem_(mem) {}
+  OwnedClMem(const OwnedClMem &) = delete;
+  OwnedClMem &operator=(const OwnedClMem &) = delete;
+  /** @brief Move construct, leaving the source empty */
+  OwnedClMem(OwnedClMem &&rhs) noexcept : mem_(rhs.mem_) { rhs.mem_ = nullptr; }
+  /** @brief Move assign, releasing whatever this handle held */
+  OwnedClMem &operator=(OwnedClMem &&rhs) noexcept {
+    if (this != &rhs) {
+      reset(rhs.mem_);
+      rhs.mem_ = nullptr;
+    }
+    return *this;
+  }
+  /** @brief Release the held object */
+  ~OwnedClMem() { reset(); }
+  /** @brief Release the held object and adopt another */
+  void reset(cl_mem mem = nullptr) {
+    if (mem_)
+      opencl::clReleaseMemObject(mem_);
+    mem_ = mem;
+  }
+  /** @brief The raw handle, for binding as a kernel argument */
+  cl_mem get() const { return mem_; }
+  /** @brief Whether a device object is held */
+  explicit operator bool() const { return mem_ != nullptr; }
+
+private:
+  cl_mem mem_ = nullptr;
+};
+
+/**
  * @brief Cached per-weight GPU residency for the v8c int8xint4 FC path:
  *        the packed int4 backing plus its derived scale / row-sum buffers.
  */
 struct V8cWeightEntry {
   std::unique_ptr<tv::TensorBacking> backing;
-  cl_mem scale_buf = nullptr;      // [N] fp32 recip-scale (owned)
-  cl_mem row_sum_w_int4 = nullptr; // [N] int32 sum_k(int4 w_nk) (owned)
+  OwnedClMem scale_buf;      // [N] fp32 recip-scale (owned)
+  OwnedClMem row_sum_w_int4; // [N] int32 sum_k(int4 w_nk) (owned)
   unsigned int N = 0, K = 0;
   // Name of the weight this pack was built from. The map is keyed on the
   // weight's host address, which the allocator may hand to a DIFFERENT weight
@@ -662,19 +706,26 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
   if (weight.getDataType() != ml::train::TensorDim::DataType::QS4CX)
     return nullptr;
   V8cWeightEntry e;
-  cl_mem sb = nullptr;
-  cl_mem rsw = nullptr;
-  try {
-    const float *fp32_scales = weight.getScale<float>();
-    if (!fp32_scales)
+  {
+    cl_mem sb = nullptr;
+    cl_mem rsw = nullptr;
+    try {
+      const float *fp32_scales = weight.getScale<float>();
+      if (!fp32_scales)
+        return nullptr;
+      e.backing = make_v8c_weight_backing_from_qs4cx(nibbles, fp32_scales, N, K,
+                                                     &sb, &rsw);
+    } catch (...) {
+      // The builder creates the two buffers before the upload that can throw,
+      // so adopt whatever it managed to produce: the entry's destructor is
+      // then what releases them as this failed build unwinds.
+      e.scale_buf.reset(sb);
+      e.row_sum_w_int4.reset(rsw);
       return nullptr;
-    e.backing =
-      make_v8c_weight_backing_from_qs4cx(nibbles, fp32_scales, N, K, &sb, &rsw);
-  } catch (...) {
-    return nullptr;
+    }
+    e.scale_buf.reset(sb);
+    e.row_sum_w_int4.reset(rsw);
   }
-  e.scale_buf = sb;
-  e.row_sum_w_int4 = rsw;
   e.N = N;
   e.K = K;
   e.name = weight.getName();
@@ -753,22 +804,18 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
     if (it != cache.end() && it->second.N == N && it->second.K == K) {
       // A concurrent caller built this weight while we were outside the
       // lock (theoretical: the load-time prebuild fires once per weight).
-      // Keep the first entry; release our duplicate device objects.
-      // scale_buf and row_sum_w_int4 are standalone clCreateBuffer results
-      // this entry owns outright, so they must be released here.
-      // weight_image must NOT be: it is the image2d view returned by
+      // Keep the first entry and drop ours: scale_buf and row_sum_w_int4 are
+      // standalone clCreateBuffer results this entry owns outright, so
+      // OwnedClMem releases them as e goes out of scope here.
+      // weight_image must NOT be released, which is why it is a raw handle
+      // and not an OwnedClMem: it is the image2d view returned by
       // TensorBacking::imageView(), which caches it in image_cache_ and
       // releases every cached view in ~TensorBacking. e.backing's unique_ptr
-      // runs that destructor as e goes out of scope on this path, so
-      // releasing the image here too would drop the refcount twice and free
-      // a live cl_mem (the winning entry's GEMM keeps sampling its own view;
-      // the second release corrupts the driver's object table -- observed
-      // class of failure is a crash or a garbage weight read on the very
-      // next FC).
-      if (e.scale_buf)
-        opencl::clReleaseMemObject(e.scale_buf);
-      if (e.row_sum_w_int4)
-        opencl::clReleaseMemObject(e.row_sum_w_int4);
+      // runs that destructor on this same path, so releasing the image here
+      // too would drop the refcount twice and free a live cl_mem (the winning
+      // entry's GEMM keeps sampling its own view; the second release corrupts
+      // the driver's object table -- observed class of failure is a crash or
+      // a garbage weight read on the very next FC).
       return &it->second;
     }
     if (it != cache.end())
@@ -1073,7 +1120,7 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
       void *logits_host = out_fp16
                             ? static_cast<void *>(output.getData<_FP16>())
                             : static_cast<void *>(output.getData<float>());
-      if (lmhead_int4_v8c_gemv_cl(w->weight_buf, w->scale_buf, act,
+      if (lmhead_int4_v8c_gemv_cl(w->weight_buf, w->scale_buf.get(), act,
                                   /** act_clmem */ false, logits_host, out_fp16,
                                   N, K))
         return true;
@@ -1300,9 +1347,9 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
     // calls to the fast GEMV (M=1 decode) and multi-row calls to the TM=4
     // tiled kernel with the M_valid store guard; consumers only ever read
     // the real M rows.
-    gemm_int8_v8c_cl(gemm_act_arg, gemm_wgt_arg, act_scale_arg, w->scale_buf,
-                     act_rs_arg, act_zp_arg, w->row_sum_w_int4, sc.y_fp16,
-                     M_pad, N, K, M);
+    gemm_int8_v8c_cl(gemm_act_arg, gemm_wgt_arg, act_scale_arg,
+                     w->scale_buf.get(), act_rs_arg, act_zp_arg,
+                     w->row_sum_w_int4.get(), sc.y_fp16, M_pad, N, K, M);
     // NNTR_XE3_FC_SYNC: narrowed coarse-grain-SVM coherence fix. The in-order
     // queue does not give kernel->kernel coarse-grained-SVM coherence on some
     // Intel drivers; the global drain (NNTR_XE3_SYNC, clFinish after EVERY
