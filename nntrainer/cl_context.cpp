@@ -15,7 +15,7 @@
  */
 
 #include <activation_layer.h>
-#include <addition_layer_cl.h>
+#include <addition_layer.h>
 #include <cl_context.h>
 #include <cl_kernels/cl_kernels.h>
 #include <cl_svm_allocator.h>
@@ -29,8 +29,8 @@
 #include <opencl_context_manager.h>
 #include <reshape_cl.h>
 #include <rmsnorm_layer_cl.h>
-#include <swiglu_cl.h>
 #include <swiglu_cl_op.h>
+#include <swiglu_layer.h>
 #include <transpose_cl.h>
 
 #include <filesystem>
@@ -134,14 +134,17 @@ void ClContext::add_default_object() {
   registerFactory(nntrainer::createLayer<FullyConnectedLayerCl>,
                   FullyConnectedLayerCl::type, ml::train::LayerType::LAYER_FC);
 
-  if (AdditionLayerCL::registerClKernels(*this)) {
-    registerFactory(nntrainer::createLayer<AdditionLayerCL>,
-                    AdditionLayerCL::type,
-                    ml::train::LayerType::LAYER_ADDITION);
-  }
+  // The core AdditionLayer is backend-neutral: its per-input copy and add
+  // dispatch through ComputeOps::residual_op, so the residual stream can stay
+  // device-resident without forking the layer. The former AdditionLayerCL is
+  // gone.
+  registerFactory(nntrainer::createLayer<AdditionLayer>, AdditionLayer::type,
+                  ml::train::LayerType::LAYER_ADDITION);
 
-  if (SwiGLULayerCl::registerClKernels(*this)) {
-    registerFactory(nntrainer::createLayer<SwiGLULayerCl>, SwiGLULayerCl::type,
+  // Likewise SwiGLU: one neutral layer dispatching ComputeOps::swiglu, in
+  // place of the former SwiGLULayerCl.
+  if (registerSwiGLUClKernels(*this)) {
+    registerFactory(nntrainer::createLayer<SwiGLULayer>, SwiGLULayer::type,
                     ml::train::LayerType::LAYER_SWIGLU);
   }
 
@@ -188,14 +191,15 @@ void ClContext::add_default_object() {
                     ml::train::LayerType::LAYER_ACTIVATION);
   }
 
-  // The gated element-wise ops. No layer is registered alongside them: the
-  // layers that consume ComputeOps::geglu / ::swiglu are backend-neutral and
-  // reach them through the tensor, so all this context owes them is the
-  // kernels.
+  // GeGLU registers its kernels and no factory. The neutral GeGLULayer is
+  // registered on the application context under a string key only, and it
+  // reaches ComputeOps::geglu through its input tensor, so all this context
+  // owes it is a compiled kernel. Adding a factory here would need an explicit
+  // integer key as well -- the auto-assigned one is str_map.size() + 1 and
+  // collides with an enum key -- so that belongs with the layer's promotion,
+  // not with its kernel.
   if (!registerGeGLUClKernels(*this))
     ml_logw("failed to register the OpenCL GeGLU kernels");
-  if (!registerSwiGLUClKernels(*this))
-    ml_logw("failed to register the OpenCL SwiGLU kernels");
 }
 
 template <typename T>

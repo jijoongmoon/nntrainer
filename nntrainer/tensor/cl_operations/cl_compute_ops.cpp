@@ -26,9 +26,10 @@
  *   -> nntrainer::gemm_q4_0_async_cl(...) -> OpenCL kernel queue.
  */
 
+#include <cstring>
 #include <stdexcept>
 
-#include <blas_kernel_interface.h>
+#include <blas_kernel_interface.h> // add_i_cl, dotCl
 #include <blas_kernels.h>
 #include <common_properties.h> // ActivationType, the act_type int encoding
 #include <compute_ops.h>
@@ -165,6 +166,68 @@ public:
     return type == ActivationType::ACT_GELU ||
            type == ActivationType::ACT_TANH_GELU;
   }
+
+  // One residual-add operand, for the neutral AdditionLayer. FP32 same-size
+  // operands take a host copy/add: the FP32 addition kernel reads its result
+  // back into the caller's pointer, which is the very read into shared memory
+  // that does not land (see the FP32 GEMM read-back), and both operands are
+  // host-addressable here anyway.
+  void residual_op(Tensor &hidden, const Tensor &input,
+                   bool accumulate) override {
+    const auto fp32 = ml::train::TensorDim::DataType::FP32;
+    if (hidden.getDataType() == fp32 && input.getDataType() == fp32 &&
+        hidden.size() == input.size()) {
+      const size_t n = hidden.size();
+      float *out = hidden.getData<float>();
+      const float *in = input.getData<float>();
+      if (!accumulate) {
+        std::memcpy(out, in, n * sizeof(float));
+      } else {
+        for (size_t i = 0; i < n; ++i)
+          out[i] += in[i];
+      }
+      return;
+    }
+
+    if (!accumulate) {
+      hidden.copy(input);
+    } else {
+      nntrainer::add_i_cl(hidden, input);
+    }
+  }
+
+  // Tensor::copy() reaches the table with no supports_*() guard, so without
+  // these a copy of a tensor on this context would throw "not implemented" --
+  // which the residual copy above does on the FP16 path. A host loop is
+  // correct for host pointers and for host-coherent shared memory; moving the
+  // copy onto a kernel is a residency refinement, not a correctness one.
+  void scopy_fp32(const unsigned int N, const float *X, const unsigned int incX,
+                  float *Y, const unsigned int incY) override {
+    for (unsigned int i = 0; i < N; ++i)
+      Y[i * incY] = X[i * incX];
+  }
+
+#ifdef ENABLE_FP16
+  void scopy_fp16(const unsigned int N, const _FP16 *X, const unsigned int incX,
+                  _FP16 *Y, const unsigned int incY) override {
+    for (unsigned int i = 0; i < N; ++i)
+      Y[i * incY] = X[i * incX];
+  }
+  // Mixed precision: an FP32 source feeding an FP16 graph, or an FP16 result
+  // read back as FP32, both route here on this backend.
+  void scopy_fp32_to_fp16(const unsigned int N, const float *X,
+                          const unsigned int incX, _FP16 *Y,
+                          const unsigned int incY) override {
+    for (unsigned int i = 0; i < N; ++i)
+      Y[i * incY] = static_cast<_FP16>(X[i * incX]);
+  }
+  void scopy_fp16_to_fp32(const unsigned int N, const _FP16 *X,
+                          const unsigned int incX, float *Y,
+                          const unsigned int incY) override {
+    for (unsigned int i = 0; i < N; ++i)
+      Y[i * incY] = static_cast<float>(X[i * incX]);
+  }
+#endif
 };
 
 ComputeOps *get_cl_ops() {
