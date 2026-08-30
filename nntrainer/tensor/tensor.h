@@ -614,6 +614,19 @@ public:
   void pack() { itensor_->pack(); }
 
   /**
+   * @brief     Pack the weight data eagerly for the fp16-activation KAI path
+   * @note      See TensorBase::packF16Activation()
+   */
+  void packF16Activation() { itensor_->packF16Activation(); }
+
+  /**
+   * @brief     Whether packF16Activation() has produced a packed buffer
+   */
+  bool isPackedF16Activation() const {
+    return itensor_->isPackedF16Activation();
+  }
+
+  /**
    * @brief     i data index
    * @retval    template T pointer (address of ith data)
    */
@@ -1877,6 +1890,18 @@ public:
    * @param     off FileOffset
    */
   void setFileOffset(size_t file_offset);
+
+  /**
+   * @brief Mark the on-disk bytes as a legacy QINT4 record, so that read()
+   *        transcodes them to QS4CX.
+   */
+  void setOnDiskLegacyQint4(bool v);
+
+  /**
+   * @brief Select the QS4CX record layout: padded when true, trimmed when
+   *        false. @see TensorBase::setQs4cxRecordPadded
+   */
+  void setQs4cxRecordPadded(bool v);
 
   /**
    * @brief     get FileOffset of Tensor
