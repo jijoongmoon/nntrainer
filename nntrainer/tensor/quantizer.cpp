@@ -424,6 +424,9 @@ Tensor QS4CXQuantizer::quantize(const Tensor &input, Tdatatype qtype) {
 
 Tensor &QS4CXQuantizer::quantize(const Tensor &input, Tensor &output,
                                  float *scales, unsigned int *zero_points) {
+  /// @note zero_points is deliberately unread: QS4CX is symmetric and the +8
+  /// bias is part of the nibble encoding, so there is no per-channel zero
+  /// point to honour. @see the @a zero_points note on the declaration.
   NNTR_THROW_IF(input.getDataType() != Tdatatype::FP32, std::invalid_argument)
     << "[QS4CXQuantizer::quantize] Input tensor must be FP32.";
 
@@ -435,6 +438,10 @@ Tensor &QS4CXQuantizer::quantize(const Tensor &input, Tensor &output,
 
   const TensorDim dim = input.getDim();
 
+  /// @note Only height and width are compared here. batch and channel need no
+  /// check because a QS4CX output cannot carry any other value: the
+  /// QS4CX_Tensor constructor rejects batch != 1 or channel != 1 before this
+  /// runs, so the two dimensions are 1 on both sides by construction.
   NNTR_THROW_IF(dim.height() != output.height() ||
                   dim.width() != output.width(),
                 std::invalid_argument)
