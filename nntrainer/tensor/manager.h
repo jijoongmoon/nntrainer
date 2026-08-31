@@ -196,7 +196,7 @@ public:
     if (weight_allocator != nullptr)
       weight_pool.setAllocator(std::move(weight_allocator));
     if (tensor_allocator != nullptr)
-      tensor_pool.setAllocator(std::move(tensor_allocator));
+      tensor_pool.setAllocator(activationAllocator(tensor_allocator));
   }
 
   /**

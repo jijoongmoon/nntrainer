@@ -268,6 +268,16 @@ int NeuralNetwork::compile(ExecutionMode mode) {
   }
 #endif
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  bool has_cuda_engine = false;
+  for (auto &node : graph_representation) {
+    if (node->isComputeEngineCUDA()) {
+      has_cuda_engine = true;
+      break;
+    }
+  }
+#endif
+
   model_graph =
     NetworkGraph(fsu, mode, fsu_path, lookahead, tensor_format, tensor_type);
 
@@ -291,6 +301,22 @@ int NeuralNetwork::compile(ExecutionMode mode) {
   // in and a copy out, whatever the planner decided.
   else if (has_gpu_engine)
     model_graph.setComputeBackend("gpu", "gpu");
+#endif
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // Same argument for a graph with a CUDA layer in it: the CUDA allocator hands
+  // out Unified Memory (cudaMallocManaged), addressable by host and device
+  // alike, which is what lets CudaComputeOps::fc take its device arms at all.
+  // Without this the pools stay on plain host memory, dev_accessible() is false
+  // for input, weight and output, every device arm declines, and the FC falls
+  // to the host Tensor::dot -- which has no QS4CX/int4 implementation, so a
+  // quantized model does not merely run slowly on engine=cuda, it throws
+  // "unsupported datatype" on its first FC.
+  // NNTR_CUDA_UVM_POOL=0 forces the host allocator back (correct, host-only).
+  else if (has_cuda_engine) {
+    const char *uvm = std::getenv("NNTR_CUDA_UVM_POOL");
+    if (!(uvm != nullptr && uvm[0] == '0'))
+      model_graph.setComputeBackend("cuda", "cuda");
+  }
 #endif
 
   // QNN activation tensors are rpcmem-backed and registered with the DSP, so
