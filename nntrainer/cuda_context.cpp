@@ -119,7 +119,17 @@ void CudaContext::initialize() noexcept {
       // touch of managed memory with kernels in flight is an access violation
       // rather than a race, so an integrated or WDDM device keeps the
       // conservative profile.
-      setenv("NNTR_CUDA_ASYNC", "1", 0);
+      // NNTR_DETERMINISTIC keeps the per-op drains: ASYNC removes them and
+      // is the one auto-set lever whose host/device overlap can turn a
+      // knife-edge logit into a run-to-run coin flip. Async stays the
+      // DEFAULT -- it is worth ~+19.5 % prefill on the 1K cell and
+      // ~+5 % on 32K, with byte-identical goldens in both modes -- and
+      // NNTR_DETERMINISTIC=1 is the explicit opt-in to sync submission for a
+      // run that needs the stronger reproducibility guarantee.
+      {
+        const char *det = getenv("NNTR_DETERMINISTIC");
+        setenv("NNTR_CUDA_ASYNC", (det && det[0] == '1') ? "0" : "1", 0);
+      }
       setenv("NNTR_CUDA_GRAPH", "1", 0);
       // The row cap reads "=all" as RAISE, not disable: the device norm kernel
       // synchronizes per call, so on a wide (prefill-shaped) row window the
