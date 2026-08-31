@@ -130,7 +130,17 @@ void CudaContext::initialize() noexcept {
         const char *det = getenv("NNTR_DETERMINISTIC");
         setenv("NNTR_CUDA_ASYNC", (det && det[0] == '1') ? "0" : "1", 0);
       }
-      setenv("NNTR_CUDA_GRAPH", "1", 0);
+      // NNTR_CUDA_GRAPH is deliberately NOT auto-enabled. Capture/replay of a
+      // decode step is only correct with the FEED half wired up: between two
+      // replays of the same captured graph the host has to re-run the nodes
+      // that produce this token's inputs (the embedding gather) so the replay
+      // reads new bytes instead of the ones frozen into the capture. That half
+      // -- NeuralNetwork::setGraphReplayFeedNodes() / setStepFeedOnly() -- has
+      // a writer but no reader in this tree, so an auto-enabled graph replays
+      // the FIRST decode token's activations for every later token: the first
+      // token is right and the rest are fluent nonsense. Leave the lever
+      // opt-in until the feed pass is implemented; the same capture also makes
+      // any in-capture host FC freeze its output.
       // The row cap reads "=all" as RAISE, not disable: the device norm kernel
       // synchronizes per call, so on a wide (prefill-shaped) row window the
       // multi-threaded host loop wins and the default caps the device path at
