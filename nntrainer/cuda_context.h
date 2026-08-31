@@ -193,6 +193,20 @@ public:
   std::string getName() override { return "cuda"; }
 
   /**
+   * @copydoc Context::residencyEngine
+   * @brief The CUDA backend's tensors live on the CUDA residency plane, so
+   *        this context declares CUDA -- the same override ClContext makes for
+   *        GPU. Without it toLayerComputeEngine("cuda") resolves this very
+   *        context and reads the host-residency base, so every engine=cuda
+   *        layer reports a CPU plane and LayerNode::isComputeEngineCUDA() can
+   *        never be true.
+   * @return ml::train::LayerComputeEngine::CUDA
+   */
+  ml::train::LayerComputeEngine residencyEngine() const override {
+    return ml::train::LayerComputeEngine::CUDA;
+  }
+
+  /**
    * @brief Set the Mem Allocator object
    */
   void setMemAllocator(std::shared_ptr<MemAllocator> mem) {
