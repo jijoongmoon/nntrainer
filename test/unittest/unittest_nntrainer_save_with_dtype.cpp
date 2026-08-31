@@ -978,6 +978,109 @@ TEST(SaveWithDtypeInference, save_qs4cx_bias_record_load_p) {
   remove(qs4cx_path.c_str());
 }
 
+#ifdef ENABLE_FP16
+/**
+ * @brief A bias stored next to a quantized weight is FP32 whatever the
+ *        activation dtype is, so an FP16-activation reader must still ask for
+ *        FP32.
+ *
+ *        Layer::save() only quantizes a graph whose weights are all FP32 --
+ *        it throws otherwise -- and the height == 1 carve out then writes the
+ *        bias as it stands. So the bias beside a quantized weight is four
+ *        bytes per element on disk, and no writer in the tree can make it
+ *        anything else. The .bin carries no per-tensor dtype and load() finds
+ *        each record by accumulating getMemoryBytes() over the graph, so a
+ *        reader that asked for the activation dtype instead would size the
+ *        bias at two bytes per element and start the weight after it 2 * N
+ *        bytes early. Two dense layers, so that shift lands on a weight and
+ *        not merely on the file's tail, where it would go unnoticed.
+ */
+TEST(SaveWithDtypeInference, save_q4_0_bias_stays_fp32_under_fp16_act_p) {
+  const unsigned int K = 32; // input width, Q4_0 needs a multiple of 32
+  const unsigned int N = 32; // dense1 units
+  const unsigned int M = 32; // dense2 units
+
+  // A graph whose bias is not FP32 cannot be quantized at all: the writer
+  // refuses it, which is why the on-disk bias is never the activation dtype.
+  {
+    auto nn_a16 = std::make_unique<nntrainer::NeuralNetwork>();
+    nn_a16->addLayer(ml::train::layer::Input(
+      {"name=input", "input_shape=1:1:" + std::to_string(K)}));
+    nn_a16->addLayer(ml::train::layer::FullyConnected(
+      {"name=dense", "unit=" + std::to_string(N)}));
+    nn_a16->setProperty(
+      {"loss=mse", "batch_size=1", "model_tensor_type=FP32-FP16"});
+    ASSERT_EQ(nn_a16->compile(ExecutionMode::INFERENCE), ML_ERROR_NONE);
+    ASSERT_EQ(nn_a16->initialize(ExecutionMode::INFERENCE), ML_ERROR_NONE);
+    EXPECT_THROW(nn_a16->save("test_q4_0_a16.bin",
+                              ModelFormat::MODEL_FORMAT_BIN, DataType::Q4_0),
+                 std::runtime_error);
+    remove("test_q4_0_a16.bin");
+  }
+
+  auto nn_orig = std::make_unique<nntrainer::NeuralNetwork>();
+  nn_orig->addLayer(ml::train::layer::Input(
+    {"name=input", "input_shape=1:1:" + std::to_string(K)}));
+  nn_orig->addLayer(ml::train::layer::FullyConnected(
+    {"name=dense1", "unit=" + std::to_string(N)}));
+  nn_orig->addLayer(ml::train::layer::FullyConnected(
+    {"name=dense2", "unit=" + std::to_string(M)}));
+  nn_orig->setOptimizer(ml::train::optimizer::SGD({"learning_rate=0.1"}));
+  nn_orig->setProperty({"loss=mse", "batch_size=1"});
+  ASSERT_EQ(nn_orig->compile(), ML_ERROR_NONE);
+  ASSERT_EQ(nn_orig->initialize(), ML_ERROR_NONE);
+
+  const std::string path = "test_q4_0_bias_fp32_a16.bin";
+  ASSERT_NO_THROW(
+    nn_orig->save(path, ModelFormat::MODEL_FORMAT_BIN, DataType::Q4_0));
+
+  // Two Q4_0 records of (K * N) / 32 blocks of 18 bytes, each followed by an
+  // FP32 bias, and the trailing training metadata.
+  const std::streamsize body =
+    K * N / 32 * 18 + N * 4 + N * M / 32 * 18 + M * 4;
+  std::ifstream saved(path, std::ios::binary | std::ios::ate);
+  ASSERT_TRUE(saved.is_open());
+  EXPECT_EQ(saved.tellg(), body + TRAIN_METADATA_SIZE);
+  saved.close();
+
+  // Read it back at both activation dtypes. The bias must be FP32 in both, so
+  // both readers walk the same offsets and consume the whole body.
+  for (const char *tensor_type : {"Q4_0-FP32", "Q4_0-FP16"}) {
+    auto nn_q = std::make_unique<nntrainer::NeuralNetwork>();
+    nn_q->addLayer(ml::train::layer::Input(
+      {"name=input", "input_shape=1:1:" + std::to_string(K)}));
+    nn_q->addLayer(ml::train::layer::FullyConnected(
+      {"name=dense1", "unit=" + std::to_string(N)}));
+    nn_q->addLayer(ml::train::layer::FullyConnected(
+      {"name=dense2", "unit=" + std::to_string(M)}));
+    nn_q->setProperty({"loss=mse", "batch_size=1",
+                       std::string("model_tensor_type=") + tensor_type});
+    ASSERT_EQ(nn_q->compile(ExecutionMode::INFERENCE), ML_ERROR_NONE);
+    ASSERT_EQ(nn_q->initialize(ExecutionMode::INFERENCE), ML_ERROR_NONE);
+    ASSERT_NO_THROW(nn_q->load(path, ModelFormat::MODEL_FORMAT_BIN));
+
+    std::streamsize consumed = 0;
+    for (auto &node : nn_q->getFlatGraph()) {
+      for (unsigned int i = 0; i < node->getNumWeights(); ++i) {
+        nntrainer::Tensor &w = node->getWeight(i);
+        if (node->getWeightName(i).find("bias") != std::string::npos) {
+          EXPECT_EQ(w.getDataType(), DataType::FP32)
+            << "bias " << node->getWeightName(i) << " at " << tensor_type;
+          EXPECT_EQ(w.getMemoryBytes(), w.size() * sizeof(float));
+        }
+        consumed += static_cast<std::streamsize>(w.getMemoryBytes());
+      }
+    }
+    EXPECT_EQ(consumed, body)
+      << "the reader walked " << consumed << " bytes of a " << body
+      << "-byte body at " << tensor_type
+      << ": every record after the first bias is read from the wrong offset";
+  }
+
+  remove(path.c_str());
+}
+#endif // ENABLE_FP16
+
 // =============================================================================
 // Main function
 // =============================================================================
