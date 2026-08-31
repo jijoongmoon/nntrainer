@@ -119,16 +119,30 @@ void CudaContext::initialize() noexcept {
       // touch of managed memory with kernels in flight is an access violation
       // rather than a race, so an integrated or WDDM device keeps the
       // conservative profile.
-      // NNTR_DETERMINISTIC keeps the per-op drains: ASYNC removes them and
-      // is the one auto-set lever whose host/device overlap can turn a
-      // knife-edge logit into a run-to-run coin flip. Async stays the
-      // DEFAULT -- it is worth ~+19.5 % prefill on the 1K cell and
-      // ~+5 % on 32K, with byte-identical goldens in both modes -- and
-      // NNTR_DETERMINISTIC=1 is the explicit opt-in to sync submission for a
-      // run that needs the stronger reproducibility guarantee.
+      // Async submission (no per-op drain) is worth roughly +75 % prefill and
+      // +100 % decode on a 1K cell, but it is only COHERENT when no host op
+      // sits in the middle of the device chain: dropping the drains means a
+      // host read of a managed activation races the kernel still writing it,
+      // and concurrentManagedAccess page faults do not order the two.
+      //
+      // What makes it safe is the device-only activation pool
+      // (NNTR_CUDA_DEV_ACT): with activations in real device memory a host
+      // fallback cannot silently engage -- it faults -- so every op is on the
+      // device and one drain per token is enough. That pool's staging half
+      // (the device prefill V-copy, the D2H of the logits row) lives in the
+      // layers this backend is driven by, not in this library, so the pool is
+      // not on by default here and host fallbacks stay reachable.
+      //
+      // So async is auto-enabled only alongside the device-only pool, which
+      // means not by default in this tree. NNTR_CUDA_ASYNC=1 still forces it
+      // on for an A/B, and NNTR_DETERMINISTIC=1 continues to pin drained
+      // submission explicitly.
       {
         const char *det = getenv("NNTR_DETERMINISTIC");
-        setenv("NNTR_CUDA_ASYNC", (det && det[0] == '1') ? "0" : "1", 0);
+        const char *dev_act = getenv("NNTR_CUDA_DEV_ACT");
+        const bool async_ok = dev_act != nullptr && dev_act[0] == '1' &&
+                              !(det != nullptr && det[0] == '1');
+        setenv("NNTR_CUDA_ASYNC", async_ok ? "1" : "0", 0);
       }
       // NNTR_CUDA_GRAPH is deliberately NOT auto-enabled. Capture/replay of a
       // decode step is only correct with the FEED half wired up: between two
