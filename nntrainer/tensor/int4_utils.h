@@ -27,6 +27,19 @@ namespace nntrainer {
  *  - KAI qsi4cxp super-row (nr=4, kr=16, sr=2, idx_variant=2 of the
  *    qai8dxp_qsi4cxp interface). Section A nibble payload only — scales,
  *    sums and bias trailers are reassembled at load time.
+ *
+ * @note These packers restate arithmetic that KleidiAI's own packers under
+ * cpu_backend/arm/kai_interface/kai/pack/ already carry, and they exist
+ * because that directory is Arm-only: cpu_backend/meson.build enters arm/
+ * for arch arm/aarch64/android and nowhere else, while this file compiles on
+ * every target. The consumers that need the layout off Arm -- the x86 CPU
+ * fallback, the CUDA and OpenCL int4 kernels, and the load-time transcode of
+ * a legacy QINT4 record -- have no other source for it. Where a KAI packer
+ * IS reachable it is the one used: QS4CX_Tensor::pack() calls
+ * rhs_pack_qsi4cxp_qs4cxs1s0() through cpu_backend, not anything here. The
+ * one Arm path still assembling its own is the fp16-scale rhs
+ * (QS4CX_Tensor::packF16Activation), because the fp16 QS4CX KleidiAI
+ * interface is not in the tree yet; it moves over with that interface.
  */
 class Int4Utils {
 public:
@@ -38,6 +51,17 @@ public:
 
   /// @brief KAI qsi4cxp constants for matmul_clamp_f32_qai8dxp4x8_qsi4cxp4x8_
   ///        4x4x32_neon_i8mm (idx_variant=2 in cpu_backend wrapper).
+  /// @note These are one micro-kernel variant's packing parameters, spelled
+  ///       out here because the interface that reports them,
+  ///       cpu_backend/arm/kai_interface/kleidiai_interface.h, is Arm-only
+  ///       while this header is included on every target -- and because a
+  ///       record already written to disk is bound to the variant that wrote
+  ///       it, so these also serve as the on-disk contract for the legacy
+  ///       QINT4 container. They are NOT a claim that every kernel packs this
+  ///       way: the fp16 QS4CX kernels use different parameters. Once the
+  ///       fp16 QS4CX KleidiAI interface lands, the runtime paths query the
+  ///       interface for the variant in use and only the legacy container's
+  ///       fixed numbers stay behind.
   static constexpr const size_t KAI_NR = 4;
   static constexpr const size_t KAI_KR = 16;
   static constexpr const size_t KAI_SR = 2;
@@ -190,8 +214,8 @@ public:
    * @brief LOSSLESS inverse of packPlainToSectionA: de-permute a KAI Section A
    *        nibble payload back into plain row-major [rows_count(N)][ceil(K/2)]
    *        nibbles (uint4 = int4+8, no XOR), byte-identical to the plain form
-   *        that produced it. Unlike dequantizeSectionAToFp32 this does NOT
-   *        touch scales or dequantize — it only re-lays-out the int4 nibbles,
+   *        that produced it. It does NOT touch scales or dequantize — it only
+   *        re-lays-out the int4 nibbles,
    *        so a QINT4 (Section A) weight becomes the QS4CX plain nibble layout
    *        with its exact original values preserved (the int4-format
    *        collapse: one in-memory int4 form).
@@ -227,21 +251,6 @@ public:
   static void readLegacyQint4RecordToQs4cx(
     const uint8_t *record, size_t record_bytes, size_t rows_count,
     size_t columns_count, uint8_t *out_plain_nibbles, float *out_fp32_scales);
-
-  /**
-   * @brief Inverse of packPlainToSectionA + dequant: decode a KAI Section A
-   *        nibble payload (+ per-channel fp16 scales) back to a row-major
-   *        [rows_count(N) x columns_count(K)] fp32 weight (out[n*K+k] =
-   *        (int4(n,k)) * scale[n]). Used to transcode a loaded QINT4 weight
-   *        to fp32 so it can be re-quantized into another int4 format (QS4CX).
-   *        rows_count must be a multiple of 4 and columns_count a multiple of
-   *        32 (the Section A packing constraint).
-   * @param out_nk caller-provided buffer of rows_count*columns_count floats
-   */
-  static void dequantizeSectionAToFp32(const uint8_t *section_a,
-                                       const uint16_t *fp16_scales,
-                                       size_t rows_count, size_t columns_count,
-                                       float *out_nk);
 
   /**
    * @brief Convenience: byte size of the KAI Section A nibble payload for
