@@ -14,6 +14,7 @@
  * @todo   check before allocate that finalize is done
  */
 
+#include <cstdlib>
 #include <memory_pool.h>
 #include <nntrainer_log.h>
 #include <residency_planner.h>
@@ -116,6 +117,7 @@ Tensor *TensorPool::view(const std::string &name, const std::string &reference,
      *  the shared plane: the placement has to be one every reader can reach. */
     src_details.all_consumers_device &=
       (consumer_engine == ml::train::LayerComputeEngine::GPU);
+    src_details.view_count++;
   }
 
   /** @note below invalidates spec reference */
@@ -260,6 +262,13 @@ void TensorPool::allocate(bool init) {
     policy.lower_patterns.empty() ? nullptr : policy.lower_patterns.c_str();
   planner.exclude =
     policy.exclude_patterns.empty() ? nullptr : policy.exclude_patterns.c_str();
+  /** NNTR_CLMEM_FANOUT=0 demotes a fan-out tensor off the device plane. The
+   *  default keeps it eligible, so an unset environment classifies exactly as
+   *  before (see SourceDetails::view_count). */
+  planner.allow_fanout = [] {
+    const char *e = std::getenv("NNTR_CLMEM_FANOUT");
+    return !(e != nullptr && e[0] == '0');
+  }();
 
   /** set the pointers using the token for all the tensors */
   for (auto &spec : pool) {
@@ -282,7 +291,7 @@ void TensorPool::allocate(bool init) {
         details->engine, details->all_consumers_device,
         spec.tensor->getDataType() == ml::train::TensorDim::DataType::FP16,
         spec.tensor->getInitializer() != Initializer::NONE,
-        spec.tensor->getName());
+        spec.tensor->getName(), details->view_count);
       /** The allocator has the last word on the class, because a placement
        *  is only available if the memory behind it is. Demote rather than
        *  refuse: the shared plane, and then the host plane, are always

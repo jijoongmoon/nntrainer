@@ -410,6 +410,15 @@ private:
                  can only be placed in device memory when every layer that
                  reads it runs there, otherwise one of them is left reading a
                  plane it cannot address. */
+    unsigned int view_count =
+      0; /**< number of views registered on this source. A FAN-OUT tensor (more
+              than one view chain, i.e. one consumed through the auto-inserted
+              multiout) is the shape a device-plane placement has been seen to
+              corrupt while every single-consumer tensor stayed bit-identical.
+              The planner does not act on this by default; it is the input to
+              ResidencyPlanner::allow_fanout, the lever that restricts the
+              device placement to view_count <= 1 so a device run can bisect
+              the interaction without a rebuild. */
   };
 
   /**
