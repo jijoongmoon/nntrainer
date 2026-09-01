@@ -1034,6 +1034,138 @@ TEST(SaveWithDtypeInference, save_qs4cx_trimmed_stride_tail_boundary_load_p) {
 }
 
 /**
+ * @brief A file that NEITHER stride signal can judge is read at the padded
+ *        stride, and this pins that decision.
+ *
+ *        NeuralNetwork::load() settles the QS4CX record stride from two
+ *        signals, and this shape kills both:
+ *
+ *        - Size. The two totals differ by sum(floor(N_i/2)) over the QS4CX
+ *          records, and save() appends 8 bytes of training metadata after the
+ *          weight body. One 6-channel record puts the gap at 3 bytes, well
+ *          inside that tail, so a trimmed file still reaches the padded total
+ *          and its size says nothing.
+ *        - The record itself. The probe reads the four bytes after the
+ *          nibbles: pad (zero) under the padded layout, the first per-channel
+ *          scale under the trimmed one. floor(N/2) = 3 pad bytes is fewer than
+ *          a float, so there is nothing to read there and the probe declines.
+ *
+ *        The reader then falls back to padded -- the stride every package
+ *        exported before the writer switched holds -- and says so through
+ *        ml_logw. So a padded file of this shape reads correctly, and a
+ *        trimmed one is misread: the nibbles stay in place and the
+ *        per-channel scales slide by floor(N/2) bytes. This test locks both
+ *        halves, the second one deliberately: the record carries no version
+ *        byte, which is the only thing that would settle this outright, and if
+ *        one is ever added it is the second half here that should be flipped.
+ *
+ *        Model: input(1:1:32) -> dense(unit=6, no bias), K even so that the
+ *        two strides differ at all.
+ */
+TEST(SaveWithDtypeInference, save_qs4cx_undecidable_stride_reads_as_padded_p) {
+  const unsigned int K = 32; // input width, even: the two strides differ
+  const unsigned int N = 6;  // units: N < 8, so fewer than 4 pad bytes
+
+  const size_t trimmed_nibbles =
+    nntrainer::QS4CX_Tensor::nibbleBytes(K, N, /*padded=*/false);
+  const size_t padded_nibbles =
+    nntrainer::QS4CX_Tensor::nibbleBytes(K, N, /*padded=*/true);
+  // Both signals are blind exactly here: too few pad bytes for the probe to
+  // read a float out of, and a stride gap the metadata tail swallows whole.
+  ASSERT_LT(padded_nibbles - trimmed_nibbles, sizeof(float));
+  ASSERT_LE(padded_nibbles - trimmed_nibbles,
+            static_cast<size_t>(TRAIN_METADATA_SIZE));
+  ASSERT_GT(padded_nibbles, trimmed_nibbles);
+
+  auto nn_orig = std::make_unique<nntrainer::NeuralNetwork>();
+  nn_orig->addLayer(ml::train::layer::Input(
+    {"name=input", "input_shape=1:1:" + std::to_string(K)}));
+  nn_orig->addLayer(ml::train::layer::FullyConnected(
+    {"name=dense", "unit=" + std::to_string(N), "disable_bias=true"}));
+  nn_orig->setOptimizer(ml::train::optimizer::SGD({"learning_rate=0.1"}));
+  nn_orig->setProperty({"loss=mse", "batch_size=1"});
+  ASSERT_EQ(nn_orig->compile(), ML_ERROR_NONE);
+  ASSERT_EQ(nn_orig->initialize(), ML_ERROR_NONE);
+
+  nntrainer::Tensor input = buildInput(K);
+  nntrainer::Tensor out_orig = runInference(*nn_orig, input);
+
+  std::string padded_path = "test_infer_qs4cx_undecidable_padded.bin";
+  ASSERT_NO_THROW(
+    nn_orig->save(padded_path, ModelFormat::MODEL_FORMAT_BIN, DataType::QS4CX));
+
+  std::ifstream src(padded_path, std::ios::binary);
+  ASSERT_TRUE(src.is_open());
+  std::vector<char> bytes((std::istreambuf_iterator<char>(src)),
+                          std::istreambuf_iterator<char>());
+  src.close();
+  ASSERT_EQ(bytes.size(),
+            nntrainer::QS4CX_Tensor::recordBytes(K, N, /*padded=*/true) +
+              TRAIN_METADATA_SIZE);
+
+  // The same record at the trimmed stride: drop the pad run between the
+  // nibbles and the scales, which is the whole difference between the two.
+  bytes.erase(bytes.begin() + trimmed_nibbles, bytes.begin() + padded_nibbles);
+  std::string trimmed_path = "test_infer_qs4cx_undecidable_trimmed.bin";
+  std::ofstream dst(trimmed_path, std::ios::binary | std::ios::trunc);
+  ASSERT_TRUE(dst.is_open());
+  dst.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+  dst.close();
+  // The trimmed file is still no shorter than the padded total, so the size
+  // cannot rule the padded stride out.
+  ASSERT_GE(bytes.size(),
+            nntrainer::QS4CX_Tensor::recordBytes(K, N, /*padded=*/true));
+
+  float *input_data = input.getData<float>();
+  std::vector<float *> in_raw = {input_data};
+
+  auto load_and_infer = [&](const std::string &path) {
+    auto nn =
+      ml::train::createModel(ml::train::ModelType::NEURAL_NET, {"loss=mse"});
+    nn->addLayer(ml::train::createLayer(
+      "input", {"name=input", "input_shape=1:1:" + std::to_string(K)}));
+    nn->addLayer(ml::train::createLayer(
+      "fully_connected",
+      {"name=dense", "unit=" + std::to_string(N), "disable_bias=true"}));
+    nn->setProperty({"batch_size=1", "model_tensor_type=QS4CX-FP32"});
+    EXPECT_EQ(nn->compile(ExecutionMode::INFERENCE), ML_ERROR_NONE);
+    EXPECT_EQ(nn->initialize(ExecutionMode::INFERENCE), ML_ERROR_NONE);
+    EXPECT_NO_THROW(nn->load(path, ModelFormat::MODEL_FORMAT_BIN));
+    std::vector<float *> answer = nn->inference(1, in_raw);
+    return std::vector<float>(answer[0], answer[0] + N);
+  };
+
+  // Half one: the safe default is the right answer for the file the in-tree
+  // writer emits, which is the case the install base is in.
+  std::vector<float> from_padded = load_and_infer(padded_path);
+  for (unsigned int l = 0; l < N; ++l)
+    EXPECT_NEAR(out_orig.getValue<float>(0, 0, 0, l), from_padded[l], 0.5f)
+      << "the padded file was read at the wrong stride, at output index " << l;
+
+  // Half two: the trimmed file of this shape loads without complaint and is
+  // read at the padded stride anyway, so its numbers are wrong. Pinned on
+  // purpose -- see the comment above this test.
+  //
+  // Asserted against the padded read rather than against a tolerance: the two
+  // files hold the same record, so a reader that got the stride right on both
+  // would have to return the very same floats. It does not, because the second
+  // read takes its scales floor(N/2) bytes early. That is a structural
+  // difference, not a numeric one, so this does not depend on how large the
+  // misread scales happen to come out.
+  std::vector<float> from_trimmed = load_and_infer(trimmed_path);
+  bool differs = false;
+  for (unsigned int l = 0; l < N; ++l)
+    differs = differs || !(from_trimmed[l] == from_padded[l]);
+  EXPECT_TRUE(differs)
+    << "the trimmed file was read at the trimmed stride: the reader has gained "
+       "a signal this test does not know about (a record version byte?), so "
+       "update the expectation here";
+
+  remove(padded_path.c_str());
+  remove(trimmed_path.c_str());
+}
+
+/**
  * @brief A QS4CX save leaves the bias FP32, because that is the type the
  *        reader asks for.
  *
