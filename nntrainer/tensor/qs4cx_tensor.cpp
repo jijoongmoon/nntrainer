@@ -195,8 +195,10 @@ size_t QS4CX_Tensor::size() const {
    * per-channel fp32 scales when K is even. The record carries no version, so
    * a caller that knows a file was written with the padded layout selects it
    * per tensor with setQs4cxRecordPadded(); getScale() and pack() then index
-   * the scales at whichever stride was selected. No in-tree caller sets it
-   * today, so the loader always reads the trimmed layout the writer emits.
+   * the scales at whichever stride was selected. NeuralNetwork::load() is
+   * that caller: it lays the whole file out at the padded stride, then
+   * re-walks at the trimmed one once the file size shows the file fits only
+   * the trimmed total.
    */
   return recordBytes(height(), width(), isQs4cxRecordPadded());
 }

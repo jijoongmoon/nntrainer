@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <future>
 #include <iomanip>
@@ -45,6 +46,7 @@
 #include <ini_interpreter.h>
 #include <ini_wrapper.h>
 #include <input_realizer.h>
+#include <int4_utils.h>
 #include <model_loader.h>
 #include <multiout_realizer.h>
 #include <neuralnet.h>
@@ -55,6 +57,7 @@
 #include <optional>
 #include <previous_input_realizer.h>
 #include <profiler.h>
+#include <qs4cx_tensor.h>
 #include <recurrent_realizer.h>
 #include <remap_realizer.h>
 #include <safetensors_util.h>
@@ -948,36 +951,236 @@ void NeuralNetwork::load(const std::string &file_path,
   size_t start_from = 0;
   std::vector<std::pair<size_t, size_t>> file_offset;
   std::unordered_set<const Tensor *> visited_weights;
-  for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); iter++) {
-    auto weights = (*iter)->getRunContext().getWeights();
-    for (auto weight : weights) {
-      // Shared weights (e.g., TieWordEmbedding) reference the same Tensor
-      // object via requestOrExtend. Calling setFileOffset on the second
-      // occurrence overwrites the correct offset by the first.
-      // Skip duplicates so that:
-      // 1. file_offset is only set once (at the position where save writes)
-      // 2. start_from is only advanced once (matching actual file layout)
-      if (!visited_weights.insert(&weight->getVariableRef()).second) {
-        continue;
+  // A QINT4 record's on-disk size depends on its container: the shared
+  // plain container (qscheme PER_CHANNEL_AFFINE at the record head; the
+  // PR#3978 form) carries fp32 scales plus KAI pad and is NOT the in-memory
+  // Section A size that getMemoryBytes() reports. Peek each QINT4 record's
+  // qscheme so the running offset matches the actual file layout.
+  std::ifstream qint4_peek_stream;
+  bool qint4_peek_tried = false;
+  // A legacy QINT4 model (model_tensor_type "QINT4-*") now builds QS4CX
+  // weights; its int4 records are still the legacy on-disk form (u16 header +
+  // Section A fp16 scales, or plain container) whose size differs from the
+  // QS4CX in-memory getMemoryBytes(). Size them explicitly and flag the
+  // tensors so QS4CX_Tensor::read() transcodes.
+  const std::string model_tensor_type_str =
+    to_string(std::get<props::ModelTensorDataType>(model_flex_props));
+  const bool legacy_int4_model = model_tensor_type_str.rfind("QINT4", 0) == 0;
+  // Whether the running offset below is a faithful model of the file, i.e.
+  // whether every record it accounts for is the size actually on disk. Cleared
+  // by the dtypes for which it is not -- see the validation after the loop.
+  bool exact_record_sizes = true;
+  // What the same walk would total under the OTHER QS4CX record stride, and
+  // whether any weight is a QS4CX record the two strides size differently.
+  // Both feed the per-file stride choice after the walk.
+  size_t alt_total = 0;
+  bool qs4cx_stride_differs = false;
+  // Lay every weight out over the file: these record sizes, accumulated in
+  // order, ARE the offsets. Parameterised by the QS4CX record stride (the file
+  // names neither of the two) and re-runnable, so the other stride can be
+  // tried once the file size says which one the exporter used.
+  auto walk_records = [&](bool qs4cx_padded) {
+    start_from = 0;
+    alt_total = 0;
+    file_offset.clear();
+    visited_weights.clear();
+    exact_record_sizes = true;
+    qs4cx_stride_differs = false;
+    for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); iter++) {
+      auto weights = (*iter)->getRunContext().getWeights();
+      for (auto weight : weights) {
+        // Shared weights (e.g., TieWordEmbedding) reference the same Tensor
+        // object via requestOrExtend. Calling setFileOffset on the second
+        // occurrence overwrites the correct offset by the first.
+        // Skip duplicates so that:
+        // 1. file_offset is only set once (at the position where save writes)
+        // 2. start_from is only advanced once (matching actual file layout)
+        if (!visited_weights.insert(&weight->getVariableRef()).second) {
+          continue;
+        }
+        auto tensor_data_type = weight->getDim().getDataType();
+        // A QS4CX record is read at the stride this walk assumes, and
+        // getMemoryBytes() below reports whichever stride the tensor carries --
+        // so choose before asking. (A legacy QINT4 model's QS4CX weights are
+        // not QS4CX records at all; they keep the default and are sized
+        // explicitly further down.)
+        if (tensor_data_type == TensorDim::DataType::QS4CX &&
+            !legacy_int4_model)
+          weight->getVariableRef().setQs4cxRecordPadded(qs4cx_padded);
+        // by reference: getVariable() hands back a copy, and the record size
+        // has to come from the very tensor the stride was just set on.
+        size_t size = weight->getVariableRef().getMemoryBytes();
+        weight->getVariableRef().setFileOffset(start_from);
+        ///@todo instead of checking the data type,
+        /// we may need to create a common parent class for
+        /// quantized tensors, requiring qparam to be saved
+        /// and creating a common interface to check if qparam is needed
+        /// this kind of type checking should be avoided
+        if (tensor_data_type != TensorDim::DataType::FP32 &&
+            tensor_data_type != TensorDim::DataType::FP16 &&
+            tensor_data_type != TensorDim::DataType::Q6_K &&
+            tensor_data_type != TensorDim::DataType::Q4_0 &&
+            tensor_data_type != TensorDim::DataType::QS4CX) {
+          // for tensor with qparam
+          size += sizeof(uint16_t);
+          // ... but only CharTensor, ShortTensor, Uint4QTensor and BCQTensor
+          // actually override save()/read() to write and consume that byte
+          // pair. Q4_K and the plain UINT8/16/32 tensors have no override, so
+          // their records carry no qparam header and are 2 bytes smaller on
+          // disk than accounted here. UINT4 is ambiguous: with qscheme Q4_Kx8
+          // it materialises as a Q4_K_Tensor and behaves like Q4_K. Track that
+          // so the size check below only speaks where it can be believed.
+          if (tensor_data_type == TensorDim::DataType::Q4_K ||
+              tensor_data_type == TensorDim::DataType::UINT4 ||
+              tensor_data_type == TensorDim::DataType::UINT8 ||
+              tensor_data_type == TensorDim::DataType::UINT16 ||
+              tensor_data_type == TensorDim::DataType::UINT32)
+            exact_record_sizes = false;
+        }
+        if (tensor_data_type == TensorDim::DataType::QINT4) {
+          if (!qint4_peek_tried) {
+            qint4_peek_tried = true;
+            qint4_peek_stream.open((v.size() == 2) ? v[1] : v[0],
+                                   std::ios::in | std::ios::binary);
+          }
+          uint16_t disk_scheme = 0xFFFF;
+          if (qint4_peek_stream.is_open()) {
+            qint4_peek_stream.clear();
+            qint4_peek_stream.seekg(static_cast<std::streamoff>(start_from),
+                                    std::ios::beg);
+            qint4_peek_stream.read(reinterpret_cast<char *>(&disk_scheme),
+                                   sizeof(uint16_t));
+          }
+          if (qint4_peek_stream.is_open() && qint4_peek_stream.good() &&
+              disk_scheme ==
+                static_cast<uint16_t>(QScheme::PER_CHANNEL_AFFINE)) {
+            const TensorDim &d = weight->getDim();
+            size = sizeof(uint16_t) +
+                   Int4Utils::plainRecordPayloadBytes(d.width(), d.height());
+          }
+        }
+        if (legacy_int4_model &&
+            tensor_data_type == TensorDim::DataType::QS4CX) {
+          // Legacy QINT4 record loaded as a QS4CX tensor: the on-disk record
+          // is the legacy form, not the QS4CX in-memory size. Flag the tensor
+          // so read() transcodes, and size by the peeked container.
+          weight->getVariableRef().setOnDiskLegacyQint4(true);
+          if (!qint4_peek_tried) {
+            qint4_peek_tried = true;
+            qint4_peek_stream.open((v.size() == 2) ? v[1] : v[0],
+                                   std::ios::in | std::ios::binary);
+          }
+          uint16_t disk_scheme = 0xFFFF;
+          if (qint4_peek_stream.is_open()) {
+            qint4_peek_stream.clear();
+            qint4_peek_stream.seekg(static_cast<std::streamoff>(start_from),
+                                    std::ios::beg);
+            qint4_peek_stream.read(reinterpret_cast<char *>(&disk_scheme),
+                                   sizeof(uint16_t));
+          }
+          const TensorDim &d = weight->getDim();
+          if (disk_scheme == static_cast<uint16_t>(QScheme::PER_CHANNEL_AFFINE))
+            size = sizeof(uint16_t) +
+                   Int4Utils::plainRecordPayloadBytes(d.width(), d.height());
+          else
+            size = sizeof(uint16_t) +
+                   Int4Utils::kaiNibblePayloadBytes(d.width(), d.height()) +
+                   static_cast<size_t>(d.width()) * sizeof(uint16_t);
+        }
+        // Same record under the other QS4CX stride, so one walk yields both
+        // candidate totals. Every other record is stride-independent.
+        size_t alt_size = size;
+        if (tensor_data_type == TensorDim::DataType::QS4CX &&
+            !legacy_int4_model) {
+          const TensorDim &d = weight->getDim();
+          alt_size =
+            QS4CX_Tensor::recordBytes(d.height(), d.width(), !qs4cx_padded);
+          if (alt_size != size)
+            qs4cx_stride_differs = true;
+        }
+        file_offset.emplace_back(std::make_pair(start_from, size));
+        start_from += size;
+        alt_total += alt_size;
       }
-      size_t size = weight->getVariable().getMemoryBytes();
-      auto tensor_data_type = weight->getDim().getDataType();
-      weight->getVariableRef().setFileOffset(start_from);
-      ///@todo instead of checking the data type,
-      /// we may need to create a common parent class for
-      /// quantized tensors, requiring qparam to be saved
-      /// and creating a common interface to check if qparam is needed
-      /// this kind of type checking should be avoided
-      if (tensor_data_type != TensorDim::DataType::FP32 &&
-          tensor_data_type != TensorDim::DataType::FP16 &&
-          tensor_data_type != TensorDim::DataType::Q6_K &&
-          tensor_data_type != TensorDim::DataType::Q4_0 &&
-          tensor_data_type != TensorDim::DataType::QS4CX) {
-        // for tensor with qparam
-        size += sizeof(uint16_t);
+    }
+  };
+  // Start from the padded stride: it is what every package exported before the
+  // writer switched holds, and it is never the smaller of the two, so the
+  // memory already planned from it stays an upper bound if the file turns out
+  // to be trimmed.
+  walk_records(true);
+
+  // Tell the two QS4CX record strides apart, per FILE. The record has no
+  // version field and the .bin no per-tensor dtype, so nothing in the file
+  // says which stride the exporter used -- but a file is written by one
+  // exporter, and the walk above only adds up to the file's size under that
+  // one stride. So: total_trimmed <= actual < total_padded can only be the
+  // trimmed layout, and anything at or beyond total_padded reads as padded
+  // (which is also what a file with a tail, or one this check cannot judge,
+  // must keep getting). Below total_trimmed neither fits and the check further
+  // down throws, naming both. Mixed-stride files are not representable here
+  // and are not supported.
+  const auto weight_path = (v.size() == 2) ? v[1] : v[0];
+  const size_t total_padded = start_from;
+  const size_t total_trimmed = alt_total;
+  if (format == ml::train::ModelFormat::MODEL_FORMAT_BIN &&
+      qs4cx_stride_differs) {
+    std::error_code ec;
+    const auto file_bytes = std::filesystem::file_size(weight_path, ec);
+    if (!ec) {
+      const size_t actual = static_cast<size_t>(file_bytes);
+      if (total_trimmed <= actual && actual < total_padded) {
+        walk_records(false);
+        ml_logi("weight file '%s' matches the trimmed QS4CX record stride "
+                "(%zu bytes) rather than the padded one (%zu); reading it as "
+                "trimmed",
+                weight_path.c_str(), total_trimmed, total_padded);
       }
-      file_offset.emplace_back(std::make_pair(start_from, size));
-      start_from += size;
+    }
+  }
+
+  // Check the on-disk contract the offsets above assume. The .bin carries no
+  // per-tensor dtype, so a weight's position is nothing but the running sum of
+  // the record sizes just computed: if any layer requests a dtype or stride
+  // other than the one the exporting graph wrote, every following weight is
+  // read at the wrong offset. That surfaces as garbage output or a crash far
+  // from the cause, while the file itself disagrees with the graph by a plain
+  // byte count -- so compare the two and say so here instead.
+  if (format == ml::train::ModelFormat::MODEL_FORMAT_BIN && start_from != 0 &&
+      exec_mode == ExecutionMode::INFERENCE && exact_record_sizes) {
+    std::error_code ec;
+    const auto file_bytes = std::filesystem::file_size(weight_path, ec);
+    // A path this code cannot stat is left to checkedOpenStream below, which
+    // reports a missing/unreadable file far better than a size mismatch would.
+    if (!ec) {
+      const size_t actual = static_cast<size_t>(file_bytes);
+      // Reaching the throw with two QS4CX candidates means both fell short (a
+      // file between them was read as trimmed above), so name both: there is
+      // no single expected size to quote, and the smaller one is the floor.
+      const std::string accounts_for =
+        qs4cx_stride_differs
+          ? std::to_string(total_trimmed) +
+              " bytes with the trimmed QS4CX record stride (" +
+              std::to_string(total_padded) + " with the padded one)"
+          : std::to_string(start_from) + " bytes";
+      const size_t min_total =
+        qs4cx_stride_differs ? total_trimmed : start_from;
+      NNTR_THROW_IF(actual < start_from, std::runtime_error)
+        << "[NeuralNetwork::load] weight file is smaller than this graph "
+           "expects: '"
+        << weight_path << "' holds " << actual << " bytes, but the "
+        << visited_weights.size() << " weights of this graph account for "
+        << accounts_for << " (short by " << (min_total - actual)
+        << "). The model file records no per-tensor dtype, so the first thing "
+           "to suspect is a layer requesting a weight at a different dtype or "
+           "stride than the package was exported with -- that shifts every "
+           "later weight's offset. A truncated or mismatched file does it too.";
+      if (actual > start_from)
+        ml_logw("weight file '%s' is %zu bytes longer than the %zu bytes this "
+                "graph accounts for; reading the leading %zu and ignoring the "
+                "tail",
+                weight_path.c_str(), actual - start_from, start_from,
+                start_from);
     }
   }
 
