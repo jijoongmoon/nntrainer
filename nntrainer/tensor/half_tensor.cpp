@@ -9,20 +9,17 @@
  * @bug		No known bugs except for NYI items
  */
 
-#include <atomic>
 #include <iomanip>
 #include <iostream>
-#include <map>
 #include <mutex>
 #include <numeric>
-#include <thread>
 
 #include <compute_ops.h>
 #include <cpu_backend.h>
 #include <fp16.h>
 #include <half_tensor.h>
-#include <int4_utils.h>
 #include <tensor.h>
+#include <thread_manager.h>
 #include <util_func.h>
 
 namespace nntrainer {
@@ -751,89 +748,81 @@ Tensor &HalfTensor::dot(Tensor const &input, Tensor &output, bool trans,
     // cap. Preferred source of the KAI rhs-packed buffer is the one
     // Transformer::repack_weight() builds at load (packF16Activation, CPU
     // engine); when that did not run (the GPU engines skip the repack loop),
-    // assemble it lazily from the plain QS4CX (nibbles + per-channel fp32
-    // scale) and cache it by weight pointer. Both sources are byte-identical.
+    // the weight packs itself on first use below. Both sources are
+    // byte-identical.
     const unsigned int M = getDim().height();
     const unsigned int K = getDim().width();
     const unsigned int N = output.getDim().width();
+
+    // Both arms below consume the QS4CX record as the canonical [N, K] plain
+    // weight and multiply it as an already-transposed rhs, so there is no
+    // operand left for trans/trans_in to name. They used to be dropped
+    // silently; say so instead.
+    NNTR_THROW_IF(trans || trans_in, std::invalid_argument)
+      << "[HalfTensor::dot] a QS4CX weight cannot be transposed: trans and "
+         "trans_in must both be false";
 #if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) ||              \
   defined(__i386__)
     // x86 reference GEMM: the KAI fp16 micro-kernel is ARM i8mm only and the
     // packed-GEMM fallback is NYI here, so this branch used to kill the
     // process whenever a GPU path declined. Compute directly from the PLAIN
     // nibbles + per-channel fp32 scales in fp32: correct but slow, for
-    // diagnostics and fallback only. Nibble convention (field-validated
-    // against the CUDA kernels reading the SAME bytes): row-major [K,N] linear
-    // index i = k*N + n, byte i/2, EVEN i -> HIGH nibble, signed two's
-    // complement. NOTE the __fallback_matmul_* reference uses even -> LOW plus
-    // an unsigned offset of 8 -- NOT this layout, do not route there.
+    // diagnostics and fallback only.
+    //
+    // Nibble convention -- the one and only in-tree QS4CX plain layout, the
+    // one __fallback_quant_nxk_qs4cx_f32() writes, Int4Utils documents,
+    // packPlainToSectionA() reads on the ARM arm just below, and
+    // FloatTensor::dotQs4cx() hands the fp32 kernels: N rows of ceil(K/2)
+    // bytes, row-major [N, K]; EVEN k in the LOW nibble; each stored uint4 is
+    // int4 + 8. Decoding it any other way and decoding it here must not
+    // disagree, so this loop mirrors the producer term for term.
     if (!input.isPackedF16Activation()) {
       const uint8_t *plain = input.getData<uint8_t>();
       const float *fscale = input.getScale<float>();
       const _FP16 *xact = (const _FP16 *)getData();
       _FP16 *yout = output.getData<_FP16>();
       const size_t Ms = M, Ns = N, Ks = K;
-      const unsigned int nthreads =
-        std::max(1u, std::thread::hardware_concurrency());
-      std::atomic<size_t> next_n{0};
-      const size_t chunk = 256;
-      auto worker = [&]() {
-        for (;;) {
-          const size_t n0 = next_n.fetch_add(chunk);
-          if (n0 >= Ns)
-            return;
-          const size_t n1 = std::min(Ns, n0 + chunk);
-          for (size_t mi = 0; mi < Ms; ++mi) {
-            const _FP16 *xr = xact + mi * Ks;
-            _FP16 *yr = yout + mi * Ns;
-            for (size_t nn = n0; nn < n1; ++nn) {
-              float acc = 0.f;
-              for (size_t kk = 0; kk < Ks; ++kk) {
-                const size_t i = kk * Ns + nn;
-                const uint8_t byte = plain[i >> 1];
-                const int32_t w4 =
-                  (i & 1) ? ((int32_t)(int8_t)(uint8_t)(byte << 4) >> 4)
-                          : ((int32_t)(int8_t)byte >> 4);
-                acc += (float)xr[kk] * (float)w4;
-              }
-              float v = acc * fscale[nn];
-              v = std::min(std::max(v, -65504.f), 65504.f);
-              yr[nn] = (_FP16)v;
-            }
+      const size_t row_bytes = (Ks + 1) / 2;
+      auto &tm = ThreadManager::Global();
+      tm.parallel_for(0, Ns, [&](size_t nn) {
+        const uint8_t *wrow = plain + nn * row_bytes;
+        const float s = fscale[nn];
+        for (size_t mi = 0; mi < Ms; ++mi) {
+          const _FP16 *xr = xact + mi * Ks;
+          _FP16 *yr = yout + mi * Ns;
+          float acc = 0.f;
+          for (size_t kk = 0; kk < Ks; ++kk) {
+            const uint8_t byte = wrow[kk >> 1];
+            const uint8_t u4 = (kk & 1) ? (uint8_t)(byte >> 4) : (byte & 0x0F);
+            acc += (float)xr[kk] * (float)((int32_t)u4 - 8);
           }
+          float v = acc * s;
+          if (beta != 0.0f)
+            v += beta * (float)yr[nn];
+          v = std::min(std::max(v, -65504.f), 65504.f);
+          yr[nn] = (_FP16)v;
         }
-      };
-      std::vector<std::thread> pool;
-      for (unsigned int t = 0; t < nthreads; ++t)
-        pool.emplace_back(worker);
-      for (auto &t : pool)
-        t.join();
+      });
       break;
     }
 #endif
-    const uint8_t *kai_rhs = nullptr;
-    if (input.isPackedF16Activation()) {
-      kai_rhs = input.getPackedData<uint8_t>();
-    } else {
-      const uint8_t *plain = input.getData<uint8_t>();
-      static std::map<const void *, std::vector<uint8_t>> qs4cx_rhs_cache;
-      static std::mutex qs4cx_rhs_mtx;
-      std::lock_guard<std::mutex> lk(qs4cx_rhs_mtx);
-      auto it = qs4cx_rhs_cache.find(plain);
-      if (it == qs4cx_rhs_cache.end()) {
-        std::vector<uint8_t> seca(Int4Utils::kaiNibblePayloadBytes(N, K));
-        Int4Utils::packPlainToSectionA(plain, N, K, seca.data());
-        std::vector<uint16_t> fp16sc(N);
-        const float *fs = input.getScale<float>();
-        for (unsigned int n = 0; n < N; ++n)
-          fp16sc[n] = compute_fp32_to_fp16(fs[n]);
-        std::vector<uint8_t> packed;
-        Int4Utils::assembleKaiRhsPacked(seca.data(), fp16sc.data(), N, K,
-                                        packed);
-        it = qs4cx_rhs_cache.emplace(plain, std::move(packed)).first;
-      }
-      kai_rhs = it->second.data();
+    // The lazily built KAI rhs belongs to the weight, not to a process-wide
+    // table: packF16Activation() stores it in the tensor's own packed_data, so
+    // it is freed with the weight and can never be handed to the next tensor
+    // that happens to reuse the address. It is a cache of bytes the weight
+    // already holds, so filling it in leaves the weight's value unchanged --
+    // hence the const_cast. The lock only serialises that one fill.
+    if (!input.isPackedF16Activation()) {
+      static std::mutex qs4cx_pack_mtx;
+      std::lock_guard<std::mutex> lk(qs4cx_pack_mtx);
+      if (!input.isPackedF16Activation())
+        const_cast<Tensor &>(input).packF16Activation();
+      NNTR_THROW_IF(!input.isPackedF16Activation(), std::runtime_error)
+        << "[HalfTensor::dot] no fp16-activation KAI rhs for this QS4CX "
+           "weight: packF16Activation() builds one only on Arm, and it leaves "
+           "a weight already packed for an fp32 activation alone";
     }
+    const uint8_t *kai_rhs = input.getPackedData<uint8_t>();
     _FP16 *data = (_FP16 *)getData();
     _FP16 *rdata = output.getData<_FP16>();
     const _FP16 lb = static_cast<_FP16>(-65504.0f);
