@@ -599,6 +599,36 @@ TEST(SaveWithDtypeQ4, save_layer_dtype_map_overrides_global_p) {
 }
 
 /**
+ * @brief A QS4CX save refuses a weight its layer indexes by row.
+ *
+ *        QS4CX keeps one scale per width(): the record's N is the weight's
+ *        width and every consumer reads a column as an output channel. An
+ *        embedding weight is a lookup table -- the forward pass slices row
+ *        `token id` out of it -- so its scales belong to height(), and
+ *        quantizing it on the width axis pools unrelated vocabulary entries
+ *        under one scale. The record says nothing about which axis it was
+ *        quantized on, so the mistake would come back as a bad answer rather
+ *        than as an error. Refuse it at the writer instead.
+ */
+TEST(SaveWithDtypeQ4, save_qs4cx_embedding_lut_n) {
+  auto nn = std::make_unique<nntrainer::NeuralNetwork>();
+  nn->addLayer(
+    ml::train::createLayer("input", {"name=input", "input_shape=1:1:4"}));
+  nn->addLayer(ml::train::createLayer("embedding",
+                                      {"name=emb", "in_dim=32", "out_dim=8"}));
+  nn->setOptimizer(ml::train::optimizer::SGD({"learning_rate=0.1"}));
+  nn->setProperty({"loss=mse", "batch_size=1"});
+  ASSERT_EQ(nn->compile(), ML_ERROR_NONE);
+  ASSERT_EQ(nn->initialize(), ML_ERROR_NONE);
+
+  const std::string path = "test_qs4cx_embedding.bin";
+  EXPECT_THROW(nn->save(path, ModelFormat::MODEL_FORMAT_BIN, DataType::QS4CX),
+               std::runtime_error);
+
+  remove(path.c_str());
+}
+
+/**
  * @brief layer_dtype_map can exclude a layer from global Q4_0 by setting FP32.
  *        Verify exact file size.
  *

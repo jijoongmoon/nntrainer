@@ -439,6 +439,22 @@ public:
               if (dim.height() == 1) {
                 weight.save(file);
               } else {
+                // QS4CX keeps one scale per width(): the record's N is the
+                // weight's width and every consumer of it -- the GEMMs and
+                // the packers alike -- reads a column as an output channel.
+                // A weight its own layer indexes by ROW instead needs a scale
+                // per height(), and an embedding LUT is exactly that: the
+                // forward pass slices row `token id` out of it. Quantizing it
+                // on the width axis pools unrelated vocabulary entries into
+                // one scale, and nothing in the record says which axis it was
+                // quantized on, so it reads back as noise rather than as an
+                // error. Refuse it here; a LUT would have to reach the
+                // quantizer transposed, which needs a reader that knows to
+                // transpose it back.
+                NNTR_THROW_IF(getType() == "embedding", std::runtime_error)
+                  << "[Layer::save] cannot quantize '" << getType()
+                  << "' to QS4CX: its weight is a lookup table indexed by row, "
+                     "and QS4CX carries one scale per column";
                 Quantization::createQuantizer(QScheme::QS4CX)
                   ->quantize(weight, dtype)
                   .save(file);
