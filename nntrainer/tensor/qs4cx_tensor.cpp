@@ -174,7 +174,9 @@ void QS4CX_Tensor::packF16Activation() {
 
   packed_data = std::make_unique<uint8_t[]>(packed.size());
   std::memcpy(packed_data.get(), packed.data(), packed.size());
-  packed_f16 = true;
+  // Publish last: a thread that sees this flag through the unlocked check in
+  // HalfTensor::dot must also see the buffer filled above.
+  packed_f16.store(true, std::memory_order_release);
 #else
   // The fp16 KAI micro-kernel is ARM(i8mm)-only; x86 CPU/GPU/CUDA consume the
   // plain QS4CX blob. Leave unpacked so isPackedF16Activation() stays false.
