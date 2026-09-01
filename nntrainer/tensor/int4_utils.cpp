@@ -534,41 +534,6 @@ void Int4Utils::readLegacyQint4RecordToQs4cx(
   }
 }
 
-void Int4Utils::dequantizeSectionAToFp32(const uint8_t *section_a,
-                                         const uint16_t *fp16_scales, size_t N,
-                                         size_t K, float *out_nk) {
-  // Inverse of the Section A super-row packing (mirrors the GPU v8c builder
-  // decode in blas_kernels.cpp): undo the XOR 0x88 + the nr=4 / kr=16 / sr=2
-  // 16-K interleave to recover row-major int4(n,k) = uint4 - 8, then scale.
-  constexpr size_t KAI_KR_BY_SR = 8; // KR/SR
-  const size_t k_blocks = K / 32;
-  const size_t super_row_count = N / KAI_NR;
-  const size_t nibble_bytes_per_super_row = KAI_NR * (K / 2);
-  const size_t KAI_BYTES_PER_KBLK = 2 * KAI_NR * KAI_KR_BY_SR; // 64
-  for (size_t sr = 0; sr < super_row_count; ++sr) {
-    const uint8_t *sr_base = section_a + sr * nibble_bytes_per_super_row;
-    for (size_t nr = 0; nr < KAI_NR; ++nr) {
-      const size_t n = sr * KAI_NR + nr;
-      const float scale = nntrainer::compute_fp16_to_fp32(fp16_scales[n]);
-      float *out_row = out_nk + n * K;
-      for (size_t kblk = 0; kblk < k_blocks; ++kblk) {
-        const uint8_t *blk_a =
-          sr_base + kblk * KAI_BYTES_PER_KBLK + nr * KAI_KR_BY_SR;
-        const uint8_t *blk_b = blk_a + KAI_NR * KAI_KR_BY_SR;
-        const size_t kbase = kblk * 32;
-        for (size_t i = 0; i < KAI_KR_BY_SR; ++i) {
-          const uint8_t ba = (uint8_t)(blk_a[i] ^ 0x88);
-          out_row[kbase + i] = ((int)(ba & 0x0F) - 8) * scale;
-          out_row[kbase + 16 + i] = ((int)((ba >> 4) & 0x0F) - 8) * scale;
-          const uint8_t bb = (uint8_t)(blk_b[i] ^ 0x88);
-          out_row[kbase + 8 + i] = ((int)(bb & 0x0F) - 8) * scale;
-          out_row[kbase + 24 + i] = ((int)((bb >> 4) & 0x0F) - 8) * scale;
-        }
-      }
-    }
-  }
-}
-
 void Int4Utils::quantizeAndPackKai(const float *weights,
                                    const size_t rows_count,
                                    const size_t columns_count,
