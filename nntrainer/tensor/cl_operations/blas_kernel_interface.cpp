@@ -1132,15 +1132,22 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
     if (M == 1 && input.getDataType() == ml::train::TensorDim::DataType::FP16 &&
         (output.getDataType() == ml::train::TensorDim::DataType::FP16 ||
          output.getDataType() == ml::train::TensorDim::DataType::FP32)) {
-      void *act = static_cast<void *>(input.getData<_FP16>());
+      // The activation binds its own residency plane. Hardcoding the
+      // shared-plane pointer here reads a shadow nobody wrote whenever the
+      // planner placed this activation on the device plane, and the GEMV then
+      // produces all-zero logits -- every sampled token becomes the padding
+      // token, from the first decode step on, with every layer before it
+      // bit-correct.
+      void *act = input.isClMem() ? input.getClMem()
+                                  : static_cast<void *>(input.getData<_FP16>());
+      const bool act_clmem = input.isClMem();
       const bool out_fp16 =
         output.getDataType() == ml::train::TensorDim::DataType::FP16;
       void *logits_host = out_fp16
                             ? static_cast<void *>(output.getData<_FP16>())
                             : static_cast<void *>(output.getData<float>());
       if (lmhead_int4_v8c_gemv_cl(w->weight_buf, w->scale_buf.get(), act,
-                                  /** act_clmem */ false, logits_host, out_fp16,
-                                  N, K))
+                                  act_clmem, logits_host, out_fp16, N, K))
         return true;
     }
 #endif
