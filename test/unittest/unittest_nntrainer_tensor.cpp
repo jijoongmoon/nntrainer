@@ -517,7 +517,14 @@ TEST(nntrainer_Tensor, QS4CXQuantizer_02_p) {
   EXPECT_EQ(q.q_scheme(), nntrainer::QScheme::QS4CX);
   EXPECT_EQ(q.height(), K);
   EXPECT_EQ(q.width(), N);
+  // A tensor that has not been through NeuralNetwork::load() carries the
+  // PADDED record stride, which is the default because it is never the smaller
+  // of the two: the allocation planned from it stays an upper bound whichever
+  // stride the file turns out to use. The writer emits the trimmed layout, so
+  // select it explicitly to assert the trimmed record size here.
+  q.setQs4cxRecordPadded(false);
   EXPECT_EQ(q.size(), N * ((K + 1) / 2) + N * sizeof(float));
+  q.setQs4cxRecordPadded(true);
 
   const float *scales = q.getScale<float>();
   // the scales are per output channel, and this input made them differ
