@@ -34,6 +34,7 @@
 #include <swiglu_layer.h>
 #include <transpose_cl.h>
 
+#include <cstdlib>
 #include <filesystem>
 #include <mutex>
 #include <system_error>
@@ -128,6 +129,33 @@ std::vector<std::byte> readBinaryFile(const std::string &path) {
   }
 }
 
+/**
+ * @brief Directory the kernel binary cache lives in.
+ *
+ * NNTR_KERNEL_CACHE_DIR names it outright; with the variable unset or empty,
+ * Program::DEFAULT_KERNEL_PATH stands, which is the configured path already
+ * resolved under the user's own cache directory on every platform that has
+ * one.
+ *
+ * The override is the integration point for an embedder that knows its own
+ * private storage and cannot rely on either -- an Android application passing
+ * Context.getCacheDir() is the case that motivates it, since the per-user
+ * resolution deliberately does not apply there and the configured path stays
+ * relative to a working directory the library does not choose.
+ *
+ * Program::DEFAULT_KERNEL_PATH is still READ when the override points
+ * somewhere else, so setting it does not orphan a cache that is already there;
+ * new entries go only to the resolved directory.
+ */
+static const std::string &kernelCacheDir() {
+  static const std::string dir = []() -> std::string {
+    if (const char *e = std::getenv("NNTR_KERNEL_CACHE_DIR"); e && *e)
+      return std::string(e);
+    return opencl::Program::DEFAULT_KERNEL_PATH;
+  }();
+  return dir;
+}
+
 bool writeBinaryFile(const std::string &path,
                      const std::vector<std::byte> &data) {
   std::ofstream fs(path, std::ios::out | std::ios::binary);
@@ -155,16 +183,13 @@ void ClContext::initialize() noexcept {
       // function, leaving a context that registers no layer and hands out no
       // allocator.
       std::error_code ec;
-      std::filesystem::create_directories(opencl::Program::DEFAULT_KERNEL_PATH,
-                                          ec);
+      std::filesystem::create_directories(kernelCacheDir(), ec);
       if (ec) {
         ml_logw("Could not create the kernel cache directory %s (%s); "
                 "compiling kernels from source without caching them",
-                opencl::Program::DEFAULT_KERNEL_PATH.c_str(),
-                ec.message().c_str());
+                kernelCacheDir().c_str(), ec.message().c_str());
       } else {
-        kernel_cache_usable =
-          kernelCacheDirIsPrivate(opencl::Program::DEFAULT_KERNEL_PATH);
+        kernel_cache_usable = kernelCacheDirIsPrivate(kernelCacheDir());
       }
     }
 
@@ -478,14 +503,23 @@ bool ClContext::clCreateKernel(std::string &kernel_string,
   // binary built for another device to clCreateProgramWithBinary.
   static const std::string device_sig =
     opencl::ContextManager::Global().GetDeviceSignature();
-  std::string binary_file_path =
-    opencl::Program::DEFAULT_KERNEL_PATH + "/" +
+  const std::string binary_file_name =
     std::to_string(program.GetKernelHash(kernel_string,
                                          compile_options + "|" + device_sig)) +
     ".cl.bin";
+  const std::string binary_file_path =
+    kernelCacheDir() + "/" + binary_file_name;
   auto binary_data = (KERNEL_CACHE_ENABLED && kernel_cache_usable)
                        ? readBinaryFile(binary_file_path)
                        : std::vector<std::byte>();
+  if (KERNEL_CACHE_ENABLED && kernel_cache_usable && binary_data.empty() &&
+      kernelCacheDir() != opencl::Program::DEFAULT_KERNEL_PATH) {
+    // Fall back to the legacy working-directory location so a cache written
+    // before the directory was resolvable is still used (read-only: new
+    // entries go to the resolved directory).
+    binary_data = readBinaryFile(opencl::Program::DEFAULT_KERNEL_PATH + "/" +
+                                 binary_file_name);
+  }
 
   bool loaded_from_binary = false;
   if (KERNEL_CACHE_ENABLED && kernel_cache_usable && !binary_data.empty()) {
