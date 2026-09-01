@@ -226,6 +226,39 @@ bool cuda_fc_qs4cx_prewarm(const unsigned char *plain_w, unsigned int N,
                            unsigned int K);
 
 /**
+ * @brief [wprefetch] Migrate a QS4CX weight's plain payload (+ its fp32 scale
+ *        tail) to the device. With the derived dp4a/cuBLAS caches
+ *        device-resident and the fp16 scales converted, the GPU path never
+ *        host-reads these pages again -- keeping them host-resident only
+ *        inflates RSS. Managed pages live in exactly one place, so prefetching
+ *        them off the host IS the host-RSS release. A later host touch just
+ *        migrates the pages back; correctness is unaffected. Discrete GPUs
+ *        only (integrated has one physical pool), and VRAM must fit pool +
+ *        derived caches or UVM eviction churns. Enqueued async on the backend
+ *        stream, so GPU-prewarm repack kernels queued after it read
+ *        post-migration pages.
+ *
+ * @param plain_w plain QS4CX nibble payload = weight.getData()
+ * @param N,K     FC weight dims (N output channels, K input)
+ * @return true if the migration was enqueued
+ */
+bool cuda_fc_qs4cx_prefetch_weight(const unsigned char *plain_w, unsigned int N,
+                                   unsigned int K);
+
+/**
+ * @brief [wprefetch] Build this weight's derived device caches WITHOUT the
+ *        host-side repack, for the case where the plain payload has just been
+ *        migrated to VRAM: the CPU prewarm would fault every one of those
+ *        pages straight back to the host and undo the migration.
+ *
+ * @param plain_w plain QS4CX nibble payload = weight.getData()
+ * @param N,K     FC weight dims (N output channels, K input)
+ * @return true if every cache this configuration needs now exists
+ */
+bool cuda_fc_qs4cx_prewarm_gpu(const unsigned char *plain_w, unsigned int N,
+                               unsigned int K);
+
+/**
  * @brief True when the dp4a derived cache exists for this
  *        plain pointer -- dispatch may then treat the pointer as a pure key
  *        (no device access, no staging needed).

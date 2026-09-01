@@ -1775,6 +1775,57 @@ bool cuda_fc_qs4cx_prewarm(const unsigned char *plain_w, unsigned int N,
   return true;
 }
 
+// [wprefetch] Migrate a QS4CX weight's plain payload (+ its fp32 scale tail)
+// to the device. See the header for why this IS the host-RSS release for
+// managed pages, and why it is discrete-only.
+bool cuda_fc_qs4cx_prefetch_weight(const unsigned char *plain_w, unsigned int N,
+                                   unsigned int K) {
+  if (plain_w == nullptr || N == 0 || K == 0)
+    return false;
+  if (ContextManager::Global().isIntegrated())
+    return false;
+  cudaPointerAttributes attr{};
+  if (cudaPointerGetAttributes(&attr, plain_w) != cudaSuccess ||
+      attr.type != cudaMemoryTypeManaged) {
+    // Not managed: there is nothing to migrate, and clearing the sticky error
+    // keeps the next real CUDA call from inheriting it.
+    cudaGetLastError();
+    return false;
+  }
+  int dev = 0;
+  if (cudaGetDevice(&dev) != cudaSuccess) {
+    cudaGetLastError();
+    return false;
+  }
+  const size_t bytes = (size_t)N * ((K + 1u) / 2u) + (size_t)N * sizeof(float);
+  cudaMemLocation loc{};
+  loc.type = cudaMemLocationTypeDevice;
+  loc.id = dev;
+  if (cudaMemPrefetchAsync(plain_w, bytes, loc, /*flags=*/0,
+                           StreamManager::Global().GetStream()) !=
+      cudaSuccess) {
+    cudaGetLastError();
+    return false;
+  }
+  return true;
+}
+
+// [wprefetch] Derived-cache build with no host repack -- the companion to the
+// migration above.
+bool cuda_fc_qs4cx_prewarm_gpu(const unsigned char *plain_w, unsigned int N,
+                               unsigned int K) {
+  if (plain_w == nullptr || N == 0 || K == 0)
+    return true;
+  std::lock_guard<std::mutex> lk(g_dp4a_mtx);
+  if (!ensure_dp4a_cache_locked(plain_w, N, K))
+    return false;
+  static const char *_cb = std::getenv("NNTR_FC_CUDA_CUBLAS");
+  if (_cb && _cb[0] != '0' && !i8_jit_on() &&
+      !ensure_i8_cache_locked(plain_w, N, K))
+    return false;
+  return true;
+}
+
 // True when the dp4a derived cache for this plain pointer
 // already exists -- the dispatch then only needs the pointer VALUE as a key,
 // so a host-heap (non-device-accessible) payload is fine and the host->device
