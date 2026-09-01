@@ -290,7 +290,8 @@ sgemm_cl_internal(ClContext::SharedPtrClKernel kernel, bool TransA, bool TransB,
 template <typename T = float>
 inline static void
 addition_cl_internal(ClContext::SharedPtrClKernel kernel, const T *input,
-                     T *res, unsigned int size_input, unsigned int size_res) {
+                     T *res, unsigned int size_input, unsigned int size_res,
+                     bool use_svm = false) {
   bool result = false;
 
   auto *blas_cc =
@@ -300,28 +301,50 @@ addition_cl_internal(ClContext::SharedPtrClKernel kernel, const T *input,
   size_t dim1_size = sizeof(T) * size_input;
   size_t dim2_size = sizeof(T) * size_res;
 
-  result = clbuffInstance.getInBufferA()->WriteDataRegion(
-    blas_cc->command_queue_inst_, dim1_size, input);
-  if (!result) {
-    return;
-  }
+  if (use_svm) {
+    // SVM-direct: input and res are device-visible pointers, so accumulate in
+    // place (res += input) with no host round trip. Coarse-grain SVM needs the
+    // coherence stated explicitly: release the host mappings so the device
+    // sees the current contents -- res was just written by the copy of the
+    // first addend -- and re-map res after the dispatch for the host reader.
+    //
+    // Without this the pair below stages both operands through the shared
+    // buffers by reading them as plain host pointers, which on a coarse-grain
+    // device is a stale view of a buffer the GPU has been writing: the
+    // accumulate is computed on the wrong bytes and then written back over the
+    // right ones. Measured on the 1K cell: the residual add kept only its
+    // first operand, so the whole attention contribution vanished from every
+    // decoder block.
+    blas_cc->command_queue_inst_.enqueueSVMUnmap(const_cast<T *>(input));
+    blas_cc->command_queue_inst_.enqueueSVMUnmap(res);
+    if (!kernel->SetKernelSVMArguments(0, input))
+      return;
+    if (!kernel->SetKernelSVMArguments(1, res))
+      return;
+  } else {
+    result = clbuffInstance.getInBufferA()->WriteDataRegion(
+      blas_cc->command_queue_inst_, dim1_size, input);
+    if (!result) {
+      return;
+    }
 
-  result = clbuffInstance.getOutBufferA()->WriteDataRegion(
-    blas_cc->command_queue_inst_, dim2_size, res);
-  if (!result) {
-    return;
-  }
+    result = clbuffInstance.getOutBufferA()->WriteDataRegion(
+      blas_cc->command_queue_inst_, dim2_size, res);
+    if (!result) {
+      return;
+    }
 
-  result = kernel->SetKernelArguments(0, clbuffInstance.getInBufferA(),
-                                      sizeof(cl_mem));
-  if (!result) {
-    return;
-  }
+    result = kernel->SetKernelArguments(0, clbuffInstance.getInBufferA(),
+                                        sizeof(cl_mem));
+    if (!result) {
+      return;
+    }
 
-  result = kernel->SetKernelArguments(1, clbuffInstance.getOutBufferA(),
-                                      sizeof(cl_mem));
-  if (!result) {
-    return;
+    result = kernel->SetKernelArguments(1, clbuffInstance.getOutBufferA(),
+                                        sizeof(cl_mem));
+    if (!result) {
+      return;
+    }
   }
 
   result = kernel->SetKernelArguments(2, &size_input, sizeof(int));
@@ -343,11 +366,18 @@ addition_cl_internal(ClContext::SharedPtrClKernel kernel, const T *input,
     return;
   }
 
-  result = clbuffInstance.getOutBufferA()->ReadDataRegion(
-    blas_cc->command_queue_inst_, dim2_size, res);
+  if (!use_svm) {
+    result = clbuffInstance.getOutBufferA()->ReadDataRegion(
+      blas_cc->command_queue_inst_, dim2_size, res);
 
-  if (!result) {
-    return;
+    if (!result) {
+      return;
+    }
+  } else {
+    // Re-map the in-place result so the host sees the values the device wrote.
+    // Deliberately BLOCKING: an async map here measured a few percent faster
+    // and corrupted the output.
+    blas_cc->command_queue_inst_.enqueueSVMMap(res, dim2_size, true);
   }
 }
 
