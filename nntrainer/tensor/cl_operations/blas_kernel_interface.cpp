@@ -987,17 +987,38 @@ __kernel void v8c_copy_f2f(__global const float *in, __global float *out,
 )CL";
 
 // Write the fp16 GEMM result (y_fp16, device cl_mem, n = M*N valid elements)
-// directly into the GPU-resident SVM output, converting to fp32 when needed.
-// Coarse-grained SVM coherence: unmap the output before the kernel (GPU owns
-// it), re-map after (host / next layer can read it).
+// directly into the output the planner placed, converting to fp32 when needed.
+// Two destinations, one per residency plane: the device sub-buffer when
+// out_clmem is given, the shared SVM pointer otherwise. On the shared plane
+// coarse-grained SVM coherence applies -- unmap the output before the kernel
+// (GPU owns it), re-map after (host / next layer can read it).
 static void v8c_write_output_resident(cl_mem y_fp16, Tensor &output,
-                                      unsigned int n, bool out_fp16) {
+                                      unsigned int n, bool out_fp16,
+                                      void *out_clmem = nullptr) {
   auto *cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
   auto kp = cc->registerClKernel(v8c_util_kernels,
                                  out_fp16 ? "v8c_copy_h2h" : "v8c_cvt_h2f");
   if (!kp)
     return;
+
+  // Device-plane destination: write the planner sub-buffer with THIS KERNEL
+  // (a cl_mem argument) rather than a buffer copy -- the blit engine is not
+  // reliably ordered against compute kernels on this driver without a drain,
+  // while kernel->kernel ordering is. No SVM maps on this path: nothing on it
+  // is host-visible.
+  if (out_clmem != nullptr) {
+    cl_mem oh = static_cast<cl_mem>(out_clmem);
+    int ni2 = (int)n;
+    if (!kp->SetKernelArguments(0, &y_fp16, sizeof(cl_mem)) ||
+        !kp->SetKernelArguments(1, &oh, sizeof(cl_mem)) ||
+        !kp->SetKernelArguments(2, &ni2, sizeof(int)))
+      return;
+    const int gws2[3] = {(int)(((size_t)n + 63) / 64 * 64), 1, 1};
+    const int lws2[3] = {64, 1, 1};
+    cc->command_queue_inst_.DispatchCommand(kp, gws2, lws2);
+    return;
+  }
   void *out_svm = output.getData<uint8_t>();
   int ni = (int)n;
   cc->command_queue_inst_.enqueueSVMUnmap(out_svm);
@@ -1167,7 +1188,26 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
 
   const int cur_dtype =
     (input.getDataType() == ml::train::TensorDim::DataType::FP16) ? 1 : 0;
-  const void *cur_in_ptr = static_cast<const void *>(input.getData<uint8_t>());
+  // Device-plane input. Its ResidencyClass is GPU_CLMEM, so by construction
+  // its producer wrote the planner sub-buffer -- getData() is a shadow nobody
+  // filled. Read it device-direct (a device->device copy into sc.act_in) with
+  // no SVM map.
+  //
+  // The placement IS the gate; there is deliberately no second one. An
+  // allocator with no device plane, a pool that could not hand out a device
+  // buffer, or a planner demotion all leave isClMem() false and this path
+  // unused, so the operand always binds the plane the planner recorded.
+  // Ordering is the command queue's: it is created in-order, so this copy is
+  // ordered after the producer's write.
+  const bool device_clmem_in = input.getMemoryData() &&
+                               input.getMemoryData()->isClMem() &&
+                               input.getMemoryData()->deviceMem() != nullptr;
+  cl_mem clmem_in = device_clmem_in
+                      ? static_cast<cl_mem>(input.getMemoryData()->deviceMem())
+                      : nullptr;
+  const void *cur_in_ptr =
+    device_clmem_in ? static_cast<const void *>(clmem_in)
+                    : static_cast<const void *>(input.getData<uint8_t>());
 
   // [pass boundary] The shared-quant cache below is keyed on the input
   // ADDRESS, and activation addresses come from the tensor pool, which
@@ -1250,7 +1290,8 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
   // SVM-pool input: the activation lives in GPU-visible SVM (the default
   // allocator for GPU graphs), so stage it with a device-side copy kernel
   // instead of a host upload.
-  const bool in_svm = input.getMemoryData() && input.getMemoryData()->isSVM();
+  const bool in_svm =
+    !device_clmem_in && input.getMemoryData() && input.getMemoryData()->isSVM();
 
   // Select this call's per-fanout activation slot. On a quant-cache HIT
   // (wk/wv after wq -- same input) reuse the slot that already holds the
@@ -1304,7 +1345,24 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
     return false;
 
   if (!skip_upload_and_quant) {
-    if (in_svm) {
+    if (device_clmem_in) {
+      // Device->device: the same copy kernel, both arguments bound as buffers.
+      auto *cc_in =
+        static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+      auto kcp = cc_in->registerClKernel(
+        v8c_util_kernels, cur_dtype == 1 ? "v8c_copy_h2h" : "v8c_copy_f2f");
+      if (!kcp)
+        return false;
+      int nin = (int)((size_t)M * K);
+      if (!kcp->SetKernelArguments(0, &clmem_in, sizeof(cl_mem)) ||
+          !kcp->SetKernelArguments(1, &sc.act_in, sizeof(cl_mem)) ||
+          !kcp->SetKernelArguments(2, &nin, sizeof(int)))
+        return false;
+      const int gws_in[3] = {(int)(((size_t)nin + 63) / 64 * 64), 1, 1};
+      const int lws_in[3] = {64, 1, 1};
+      if (!cc_in->command_queue_inst_.DispatchCommand(kcp, gws_in, lws_in))
+        return false;
+    } else if (in_svm) {
       // GPU copy of the SVM-resident activation into sc.act_in -- no host
       // upload. Downstream quant/image/GEMM see the same sc.act_in either way.
       v8c_copy_svm_to_clmem(cur_in_ptr, sc.act_in,
@@ -1439,11 +1497,22 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
     // the fp16 GEMM result written on the GPU -- plain copy for fp16,
     // cvt_h2f for fp32 -- with no host readback; otherwise read back the
     // valid M rows and convert on the host.
+    // Device-plane output: the fp16 result goes into the planner sub-buffer
+    // its consumers bind. Writing the shared-plane shadow instead leaves those
+    // consumers reading a buffer nothing filled.
+    const bool out_clmem =
+      output.getMemoryData() && output.getMemoryData()->isClMem() &&
+      output.getMemoryData()->deviceMem() != nullptr &&
+      output.getDataType() == ml::train::TensorDim::DataType::FP16;
     const bool out_resident =
-      output.getMemoryData() && output.getMemoryData()->isSVM() &&
+      !out_clmem && output.getMemoryData() && output.getMemoryData()->isSVM() &&
       (output.getDataType() == ml::train::TensorDim::DataType::FP32 ||
        output.getDataType() == ml::train::TensorDim::DataType::FP16);
-    if (out_resident) {
+    if (out_clmem) {
+      v8c_write_output_resident(
+        sc.y_fp16, output, (unsigned int)((size_t)M * N), true,
+        static_cast<void *>(output.getMemoryData()->deviceMem()));
+    } else if (out_resident) {
       v8c_write_output_resident(
         sc.y_fp16, output, (unsigned int)((size_t)M * N),
         output.getDataType() == ml::train::TensorDim::DataType::FP16);
