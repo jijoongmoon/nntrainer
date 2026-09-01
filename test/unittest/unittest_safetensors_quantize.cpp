@@ -25,6 +25,7 @@
 #include <model.h>
 #include <neuralnet.h>
 #include <optimizer.h>
+#include <qs4cx_tensor.h>
 #include <quantizer.h>
 #include <safetensors_util.h>
 #include <tensor.h>
@@ -283,9 +284,16 @@ TEST(SafetensorsQuant, qs4cx_payload_matches_bin_p) {
   EXPECT_EQ(q->nntr_shape[2], W);
   EXPECT_EQ(q->nntr_shape[3], U);
 
-  // A QS4CX record is U rows of ceil(W/2) nibble bytes plus U float scales.
+  // A QS4CX record is U rows of ceil(W/2) nibble bytes plus U float scales,
+  // written at the stride the tensor carries. A tensor that has not been
+  // through NeuralNetwork::load() carries the PADDED default -- the layout
+  // that keeps floor(U/2) unused bytes between the nibbles and the scale tail
+  // -- because padded is never the smaller of the two and so bounds the
+  // allocation whichever stride a file turns out to use. Derive the
+  // expectation from the same helper the writer sizes with rather than
+  // restating one of the two formulas.
   const size_t expected_bytes =
-    static_cast<size_t>(U) * ((W + 1) / 2) + static_cast<size_t>(U) * 4;
+    nntrainer::QS4CX_Tensor::recordBytes(W, U, /*padded=*/true);
   EXPECT_EQ(q->offset_end - q->offset_start, expected_bytes);
 
   // The bias (height == 1) is not quantized, so it stays FP32 next to it.
