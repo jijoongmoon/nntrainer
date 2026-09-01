@@ -1005,9 +1005,8 @@ void sgemv_cl(const float *matAdata, const float *vecXdata, float *vecYdata,
       blas_cc->registerClKernel(sgemv_no_trans_kernel, "sgemv_cl_noTrans");
   }
 
-  if (!kernel_sgemv_ptr) {
-    return;
-  }
+  NNTR_CL_BLAS_REQUIRE(kernel_sgemv_ptr, "sgemv_cl<fp32>", "kernel register",
+                       dim1, dim2, lda);
 
   sgemv_cl_internal<float>(kernel_sgemv_ptr, matAdata, vecXdata, vecYdata, dim1,
                            dim2, lda, out_svm);
@@ -1052,9 +1051,8 @@ void sgemm_cl(bool TransA, bool TransB, const float *A, const float *B,
 
   ClContext::SharedPtrClKernel kernel_sgemm_ptr =
     blas_cc->registerClKernel(sgemm_cl_kernel_, kernel_func_);
-  if (!kernel_sgemm_ptr) {
-    return;
-  }
+  NNTR_CL_BLAS_REQUIRE(kernel_sgemm_ptr, "sgemm_cl<fp32>", "kernel register", M,
+                       N, K);
 
   sgemm_cl_internal<float>(kernel_sgemm_ptr, TransA, TransB, A, B, C, M, N, K,
                            lda, ldb, ldc, out_svm);
