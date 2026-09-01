@@ -503,6 +503,18 @@ public:
     void *user_data = nullptr) override;
 
   /**
+   * @copydoc ml::train::Model::setWeightLoadHook
+   */
+  void setWeightLoadHook(
+    std::function<void(ml::train::Layer & /**< layer */,
+                       RunLayerContext & /**< rc */, void *user_data)>
+      fn,
+    void *user_data = nullptr) override {
+    weight_load_hook = std::move(fn);
+    weight_load_hook_data = user_data;
+  }
+
+  /**
    * @copydoc ml::train::Model::getTensor(const std::string &)
    */
   Tensor *getTensor(const std::string &name) override {
@@ -717,6 +729,13 @@ private:
   FlexiblePropTypes model_flex_props; /**< model train props */
   std::string load_path; /**< path to load weights when initialize  */
   int model_file_fd = -1;
+
+  /** per-node weight-load completion hook (see setWeightLoadHook). Set before
+   *  load, read by the positional loader's workers under a serializing mutex;
+   *  never mutated while a load is in flight. */
+  std::function<void(ml::train::Layer &, RunLayerContext &, void *)>
+    weight_load_hook;
+  void *weight_load_hook_data = nullptr;
 
   /**
    * @brief   Print Options when printing layer info

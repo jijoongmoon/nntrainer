@@ -34,6 +34,7 @@
 #include <fstream>
 #include <future>
 #include <iomanip>
+#include <mutex>
 #include <sstream>
 #include <thread>
 
@@ -1172,6 +1173,12 @@ void NeuralNetwork::load(const std::string &file_path,
 
       std::atomic<size_t> next_load_index{0};
 
+      // Serializes weight_load_hook invocations across the load workers: the
+      // hook body may run parallel_for derives and device uploads of its own,
+      // and the interleave's win is overlapping THAT work with the other
+      // workers' file reads -- not running several hook bodies at once.
+      std::mutex load_hook_mtx;
+
       auto load_worker = [&]() {
         for (size_t idx =
                next_load_index.fetch_add(1, std::memory_order_relaxed);
@@ -1254,6 +1261,28 @@ void NeuralNetwork::load(const std::string &file_path,
             }
           }
 #endif
+
+          // [load-drop interleave] this node's weight bytes (payload + any
+          // trailing scales) are fully materialized in their final tensor
+          // storage -- on BOTH the stream and the mmap arm above: hand the
+          // node to the registered per-weight hook NOW, so derived-cache
+          // builds and plain-payload drops overlap the other workers' reads
+          // instead of waiting for the join. Failures are contained -- the
+          // application's post-load sweep is the fallback for anything the
+          // hook missed.
+          if (weight_load_hook) {
+            std::lock_guard<std::mutex> hook_lk(load_hook_mtx);
+            try {
+              weight_load_hook(*node, node->getRunContext(),
+                               weight_load_hook_data);
+            } catch (const std::exception &e) {
+              ml_logw("weight-load hook failed on node %s: %s",
+                      node->getName().c_str(), e.what());
+            } catch (...) {
+              ml_logw("weight-load hook failed on node %s (non-std exception)",
+                      node->getName().c_str());
+            }
+          }
         }
       };
 
