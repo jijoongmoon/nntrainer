@@ -1275,6 +1275,64 @@ TEST(blas_kernels, addition_i_fp16) {
   EXPECT_IN_RANGE(mseError, 0, epsilon);
   EXPECT_IN_RANGE((float)cosSim, 0.99, 1);
 }
+
+/**
+ * @brief The FP16 scalar multiply on the shared plane: both operands are SVM,
+ *        the kernel scales every element, and the map the call leaves behind
+ *        is what makes the result readable on the host.
+ */
+TEST(blas_kernels, scalar_mul_cl_fp16_shared_plane) {
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+
+  constexpr unsigned int n = 512;
+  constexpr float scalar = 0.375f;
+  const size_t bytes = n * sizeof(_FP16);
+
+  auto *in_svm = static_cast<_FP16 *>(allocateSVM(bytes));
+  auto *out_svm = static_cast<_FP16 *>(allocateSVM(bytes));
+  ASSERT_NE(in_svm, nullptr);
+  ASSERT_NE(out_svm, nullptr);
+
+  // Host writes through a map, exactly as a host-side producer would; the
+  // call itself owns the unmap, so the test must not take it away.
+  blas_cc->command_queue_inst_.enqueueSVMMap(in_svm, bytes, false);
+  blas_cc->command_queue_inst_.enqueueSVMMap(out_svm, bytes, false);
+  std::vector<float> expected(n);
+  for (unsigned int i = 0; i < n; ++i) {
+    const float v = 0.5f + 0.01f * static_cast<float>(i % 97);
+    in_svm[i] = static_cast<_FP16>(v);
+    out_svm[i] = static_cast<_FP16>(-1.0f);
+    expected[i] = static_cast<float>(static_cast<_FP16>(v)) * scalar;
+  }
+
+  scalar_mul_cl_fp16(in_svm, out_svm, scalar, n, /*use_svm=*/true);
+
+  const float epsilon = 1e-2f;
+  for (unsigned int i = 0; i < n; ++i)
+    EXPECT_NEAR(static_cast<float>(out_svm[i]), expected[i], epsilon);
+
+  freeSVM(out_svm);
+  freeSVM(in_svm);
+}
+
+/**
+ * @brief A host pointer is not a kernel operand, so the call is refused
+ *        instead of dispatching with its two buffer arguments never bound.
+ *        The destination has to come back untouched -- a partial dispatch
+ *        would be a driver error report on a kernel that is fine.
+ */
+TEST(blas_kernels, scalar_mul_cl_fp16_refuses_host_only_operands) {
+  constexpr unsigned int n = 64;
+
+  std::vector<_FP16> input(n, static_cast<_FP16>(2.0f));
+  std::vector<_FP16> output(n, static_cast<_FP16>(-1.0f));
+
+  scalar_mul_cl_fp16(input.data(), output.data(), 3.0f, n, /*use_svm=*/false);
+
+  for (unsigned int i = 0; i < n; ++i)
+    EXPECT_FLOAT_EQ(static_cast<float>(output[i]), -1.0f);
+}
 #endif
 
 GTEST_API_ int main(int argc, char **argv) {
