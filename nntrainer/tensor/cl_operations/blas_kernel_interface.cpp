@@ -1287,6 +1287,21 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
   }
   const bool skip_upload_and_quant = quant_cache_hit;
 
+  // [Lever 1] NNTR_FC_QUANT_DIRECT: on the cl_mem residency edge, quantize the
+  // producer's (rmsnorm) cl_mem output IN PLACE, skipping the cl_mem ->
+  // sc.act_in staging copy (the v8c_copy_h2h kernel) and the padded-row zero
+  // write. The act-quant kernel reads exactly M real rows from clmem_in
+  // (bounded by its own row guard), so there is no OOB on the M-row producer
+  // buffer. Safe because GEMM output rows are independent: the padded
+  // act_i8/scale/zp/rs rows [M, M_pad) are left stale and feed only the padded
+  // GEMM output rows, which no consumer reads. Default ON; =0 opts out.
+  static const bool fc_quant_direct = []() {
+    const char *e = std::getenv("NNTR_FC_QUANT_DIRECT");
+    return !e || e[0] != '0';
+  }();
+  const bool quant_direct_clmem = fc_quant_direct && device_clmem_in &&
+                                  !skip_upload_and_quant && clmem_in != nullptr;
+
   // SVM-pool input: the activation lives in GPU-visible SVM (the default
   // allocator for GPU graphs), so stage it with a device-side copy kernel
   // instead of a host upload.
@@ -1337,15 +1352,17 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
   if (fc_flush_mode == 2 && !skip_upload_and_quant)
     opencl::clFlush(q);
 
-  // act_in is consumed only by the staging copies below; cache hits never
-  // touch it.
-  if (!skip_upload_and_quant &&
+  // act_in is consumed only by the staging copies below; the direct path and
+  // an act-cache hit never touch it.
+  if (!skip_upload_and_quant && !quant_direct_clmem &&
       !v8c_ensure_buf(ctx, &sc.act_in, &sc.act_in_bytes,
                       (size_t)M_pad * K * act_elem, CL_MEM_READ_ONLY))
     return false;
 
   if (!skip_upload_and_quant) {
-    if (device_clmem_in) {
+    if (quant_direct_clmem) {
+      // [Lever 1] nothing to stage: the act-quant below reads clmem_in.
+    } else if (device_clmem_in) {
       // Device->device: the same copy kernel, both arguments bound as buffers.
       auto *cc_in =
         static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
@@ -1373,7 +1390,7 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
                                        nullptr, nullptr) != CL_SUCCESS)
         return false;
     }
-    if (M_pad > M) {
+    if (M_pad > M && !quant_direct_clmem) {
       // Zero-fill the padded rows so the act-quant kernel sees deterministic
       // values (per-row amax -> 0 -> scale defaults to 1, q=0, row_sum=0;
       // padded rows produce zero output).
@@ -1391,12 +1408,17 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
     // Padded rows map to (scale=1, zp=0, q=0, row_sum=0), so they contribute
     // zero in the GEMM and don't pollute valid rows. Skipped on cache hit.
     if (!skip_upload_and_quant) {
+      // [Lever 1] quant the producer cl_mem (M real rows) directly when
+      // quant_direct_clmem; otherwise the staged sc.act_in (M_pad rows,
+      // including the zero pad).
+      cl_mem quant_src = quant_direct_clmem ? clmem_in : sc.act_in;
+      const unsigned int quant_rows = quant_direct_clmem ? M : M_pad;
       if (input.getDataType() == ml::train::TensorDim::DataType::FP16)
-        quantize_act_v8c_fp16_cl(sc.act_in, act_i8_arg, act_scale_arg,
-                                 act_zp_arg, act_rs_arg, M_pad, K);
+        quantize_act_v8c_fp16_cl(quant_src, act_i8_arg, act_scale_arg,
+                                 act_zp_arg, act_rs_arg, quant_rows, K);
       else
-        quantize_act_v8c_fp32_cl(sc.act_in, act_i8_arg, act_scale_arg,
-                                 act_zp_arg, act_rs_arg, M_pad, K);
+        quantize_act_v8c_fp32_cl(quant_src, act_i8_arg, act_scale_arg,
+                                 act_zp_arg, act_rs_arg, quant_rows, K);
       // Update cache key only after a successful quant. Record WHICH slot now
       // holds this input's int8 so a subsequent cache hit (wk/wv) reads the
       // right per-fanout buffer, not whatever the ring last pointed at, and
@@ -1450,12 +1472,38 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
       act_image = sc.act_image[act_slot];
     }
 
+    // Direct output (kernel-store, no copy): when the FC output is a
+    // GPU_CLMEM-resident FP16 tensor, point the GEMM's Y straight at its
+    // planner sub-buffer and let the TM=4 kernel's M_valid store guard bound
+    // the write, eliminating the separate v8c_copy_h2h writer kernel (measured
+    // 46 ms GPU + 182 enqueues per 1K prefill on the reference). Same
+    // kernel->kernel ordering the copy writer relied on. NNTR_V8C_DIRECT_OUT=0
+    // opts out.
+    //
+    // This tree carries none of the reference's y_fp16 debug consumers
+    // (NNTR_CLMEM_PROBE / _DUALOUT / _OUTCHECK / _OUTBAR / NNTR_V8C_TRACE were
+    // stripped as instrumentation), so the reference's y_dbg_consumer veto has
+    // nothing to veto here and is not reproduced.
+    const bool out_clmem =
+      output.getMemoryData() && output.getMemoryData()->isClMem() &&
+      output.getMemoryData()->deviceMem() != nullptr &&
+      output.getDataType() == ml::train::TensorDim::DataType::FP16;
+    static const bool direct_out_enabled = []() {
+      const char *e = std::getenv("NNTR_V8C_DIRECT_OUT");
+      return !(e && e[0] == '0');
+    }();
+    const bool direct_out = direct_out_enabled && out_clmem;
+
     // v8c GEMM -- run on padded M_pad rows, but only the valid M rows reach
-    // the caller.
-    if (!v8c_ensure_buf(ctx, &sc.y_fp16, &sc.y_fp16_bytes,
-                        sizeof(uint16_t) * (size_t)M_pad * N,
-                        CL_MEM_READ_WRITE))
+    // the caller. y_fp16 only backs the NON-direct output paths; under
+    // direct_out the GEMM stores into the planner buffer itself.
+    if (!direct_out && !v8c_ensure_buf(ctx, &sc.y_fp16, &sc.y_fp16_bytes,
+                                       sizeof(uint16_t) * (size_t)M_pad * N,
+                                       CL_MEM_READ_WRITE))
       return false;
+    cl_mem gemm_y_arg =
+      direct_out ? static_cast<cl_mem>(output.getMemoryData()->deviceMem())
+                 : sc.y_fp16;
     cl_mem gemm_act_arg = use_buf ? act_i8_arg : act_image;
     cl_mem gemm_wgt_arg = use_buf ? w->weight_buf : w->weight_image;
     // M_valid = the REAL row count, always: the kernel routes single-row
@@ -1464,7 +1512,7 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
     // the real M rows.
     gemm_int8_v8c_cl(gemm_act_arg, gemm_wgt_arg, act_scale_arg,
                      w->scale_buf.get(), act_rs_arg, act_zp_arg,
-                     w->row_sum_w_int4.get(), sc.y_fp16, M_pad, N, K, M);
+                     w->row_sum_w_int4.get(), gemm_y_arg, M_pad, N, K, M);
     // NNTR_XE3_FC_SYNC: narrowed coarse-grain-SVM coherence fix. The in-order
     // queue does not give kernel->kernel coarse-grained-SVM coherence on some
     // Intel drivers; the global drain (NNTR_XE3_SYNC, clFinish after EVERY
@@ -1500,15 +1548,13 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
     // Device-plane output: the fp16 result goes into the planner sub-buffer
     // its consumers bind. Writing the shared-plane shadow instead leaves those
     // consumers reading a buffer nothing filled.
-    const bool out_clmem =
-      output.getMemoryData() && output.getMemoryData()->isClMem() &&
-      output.getMemoryData()->deviceMem() != nullptr &&
-      output.getDataType() == ml::train::TensorDim::DataType::FP16;
     const bool out_resident =
       !out_clmem && output.getMemoryData() && output.getMemoryData()->isSVM() &&
       (output.getDataType() == ml::train::TensorDim::DataType::FP32 ||
        output.getDataType() == ml::train::TensorDim::DataType::FP16);
-    if (out_clmem) {
+    if (direct_out) {
+      // The GEMM already stored into the planner sub-buffer: nothing to copy.
+    } else if (out_clmem) {
       v8c_write_output_resident(
         sc.y_fp16, output, (unsigned int)((size_t)M * N), true,
         static_cast<void *>(output.getMemoryData()->deviceMem()));
