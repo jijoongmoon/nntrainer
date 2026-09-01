@@ -37,6 +37,10 @@
 #include <sstream>
 #include <thread>
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_fc_qs4cx.h> // [wprefetch] cuda_fc_qs4cx_prefetch_weight
+#endif
+
 #include <activation_realizer.h>
 #include <adamw.h>
 #include <common_properties.h>
@@ -1137,6 +1141,31 @@ void NeuralNetwork::load(const std::string &file_path,
       const size_t num_load_threads =
         std::min<size_t>(num_load_nodes, MAX_LOAD_THREADS);
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+      // [wprefetch level 2] NNTR_CUDA_WPREFETCH>=2 on a cuda graph: migrate
+      // each QS4CX weight's plain payload to the device AS IT IS READ, so the
+      // FC bytes never accumulate in host RSS during the load. Opt-in and
+      // default-off: the migration only has anything to move when the payload
+      // is in managed memory, and cuda_fc_qs4cx_prefetch_weight declines
+      // otherwise. The engine gate keeps this off OpenCL/CPU runs of a
+      // dual-enabled binary, where a stray CUDA call would create a CUDA
+      // context. Scale conversion at the first forward briefly faults the
+      // small fp32-scale tail back -- expected, and tiny.
+      bool cuda_wprefetch_load = false;
+      {
+        static const int _wpf = []() {
+          const char *e = std::getenv("NNTR_CUDA_WPREFETCH");
+          return e ? atoi(e) : 0;
+        }();
+        if (_wpf >= 2)
+          for (auto &n : load_nodes)
+            if (n->isComputeEngineCUDA()) {
+              cuda_wprefetch_load = true;
+              break;
+            }
+      }
+#endif
+
       std::atomic<size_t> next_load_index{0};
 
       auto load_worker = [&]() {
@@ -1210,6 +1239,17 @@ void NeuralNetwork::load(const std::string &file_path,
             ::munmap(mmap_ptr, f_size);
 #endif
           }
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+          if (cuda_wprefetch_load) {
+            for (unsigned int wi = 0; wi < node->getNumWeights(); ++wi) {
+              nntrainer::Tensor &wt = node->getWeight(wi);
+              if (wt.getDataType() == ml::train::TensorDim::DataType::QS4CX)
+                (void)nntrainer::cuda::cuda_fc_qs4cx_prefetch_weight(
+                  wt.getData<uint8_t>(), wt.width(), wt.height());
+            }
+          }
+#endif
         }
       };
 
