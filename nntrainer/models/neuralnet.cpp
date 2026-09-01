@@ -938,6 +938,48 @@ void NeuralNetwork::save(
   }
 }
 
+/**
+ * @brief Whether the QS4CX record at @a offset was written at the trimmed
+ *        stride, read off the record itself rather than off the file's size.
+ * @param path weight file to peek into
+ * @param offset start of the record in @a path
+ * @param K record height (input channels)
+ * @param N record width (output channels, one fp32 scale each)
+ * @return true when the record is trimmed, false when it is padded or when
+ *         this record cannot say
+ *
+ * The two strides differ only by the floor(N/2) pad bytes the padded layout
+ * keeps between a record's nibbles and its scales. The writer never touches
+ * that pad -- QS4CX_Tensor zero-fills the record and the quantiser writes
+ * strictly inside the N * ceil(K/2) nibbles -- so under the padded layout the
+ * bytes right after the nibbles are zero, while under the trimmed layout they
+ * are the first per-channel scale, which is a strictly positive finite
+ * reciprocal and never zero. Reading four bytes there therefore tells the two
+ * apart outright, with no dependency on what save() appended after the weight
+ * body. Fewer than four pad bytes (N < 8) leaves the probe reading the low
+ * bytes of a real scale under the padded layout too, which can pass for a
+ * float of its own; it declines to answer there.
+ */
+static bool qs4cxRecordReadsAsTrimmed(const std::string &path, size_t offset,
+                                      size_t K, size_t N) {
+  const size_t trimmed_nibbles = QS4CX_Tensor::nibbleBytes(K, N, false);
+  const size_t padded_nibbles = QS4CX_Tensor::nibbleBytes(K, N, true);
+  if (padded_nibbles - trimmed_nibbles < sizeof(float))
+    return false;
+
+  std::ifstream probe_file(path, std::ios::in | std::ios::binary);
+  if (!probe_file.is_open())
+    return false;
+  probe_file.seekg(static_cast<std::streamoff>(offset + trimmed_nibbles),
+                   std::ios::beg);
+  float probe = 0.0f;
+  probe_file.read(reinterpret_cast<char *>(&probe), sizeof(probe));
+  if (!probe_file)
+    return false;
+
+  return std::isnormal(probe) && probe > 0.0f;
+}
+
 void NeuralNetwork::load(const std::string &file_path,
                          ml::train::ModelFormat format) {
   /// @todo this switch case should be delegating the function call only. It's
@@ -975,6 +1017,14 @@ void NeuralNetwork::load(const std::string &file_path,
   // Both feed the per-file stride choice after the walk.
   size_t alt_total = 0;
   bool qs4cx_stride_differs = false;
+  // Where the file's first QS4CX record starts, and its shape. Every record
+  // ahead of it is stride-independent, so this offset is the same under either
+  // walk -- which makes it the one QS4CX record that can be read straight out
+  // of the file to settle the stride.
+  bool first_qs4cx_found = false;
+  size_t first_qs4cx_offset = 0;
+  size_t first_qs4cx_height = 0;
+  size_t first_qs4cx_width = 0;
   // Lay every weight out over the file: these record sizes, accumulated in
   // order, ARE the offsets. Parameterised by the QS4CX record stride (the file
   // names neither of the two) and re-runnable, so the other stride can be
@@ -986,6 +1036,7 @@ void NeuralNetwork::load(const std::string &file_path,
     visited_weights.clear();
     exact_record_sizes = true;
     qs4cx_stride_differs = false;
+    first_qs4cx_found = false;
     for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); iter++) {
       auto weights = (*iter)->getRunContext().getWeights();
       for (auto weight : weights) {
@@ -1097,6 +1148,12 @@ void NeuralNetwork::load(const std::string &file_path,
             QS4CX_Tensor::recordBytes(d.height(), d.width(), !qs4cx_padded);
           if (alt_size != size)
             qs4cx_stride_differs = true;
+          if (!first_qs4cx_found) {
+            first_qs4cx_found = true;
+            first_qs4cx_offset = start_from;
+            first_qs4cx_height = d.height();
+            first_qs4cx_width = d.width();
+          }
         }
         file_offset.emplace_back(std::make_pair(start_from, size));
         start_from += size;
@@ -1113,13 +1170,23 @@ void NeuralNetwork::load(const std::string &file_path,
   // Tell the two QS4CX record strides apart, per FILE. The record has no
   // version field and the .bin no per-tensor dtype, so nothing in the file
   // says which stride the exporter used -- but a file is written by one
-  // exporter, and the walk above only adds up to the file's size under that
-  // one stride. So: total_trimmed <= actual < total_padded can only be the
-  // trimmed layout, and anything at or beyond total_padded reads as padded
-  // (which is also what a file with a tail, or one this check cannot judge,
-  // must keep getting). Below total_trimmed neither fits and the check further
-  // down throws, naming both. Mixed-stride files are not representable here
-  // and are not supported.
+  // exporter, so one stride holds throughout. Mixed-stride files are not
+  // representable here and are not supported: a file that pairs records from
+  // two exporters is read wholly at whichever stride wins below, and every
+  // record written at the other one is misread. Two signals settle it:
+  //
+  //  - Size, when it can speak. total_trimmed <= actual < total_padded can
+  //    only be the trimmed layout, because no tail makes a padded file that
+  //    short.
+  //  - The first record's own bytes, when size cannot. save() appends a tail
+  //    after the weight body (the adam optimiser block, then 8 bytes of
+  //    training metadata), and the two totals differ by only sum(floor(N/2))
+  //    -- 8 bytes already for a single 16-channel weight -- so a trimmed file
+  //    with a tail that long reaches total_padded and its size stops meaning
+  //    anything. qs4cxRecordReadsAsTrimmed() reads the record instead, which
+  //    the tail cannot touch.
+  //
+  // Anything neither signal can judge keeps reading as padded, as before.
   const auto weight_path = (v.size() == 2) ? v[1] : v[0];
   const size_t total_padded = start_from;
   const size_t total_trimmed = alt_total;
@@ -1129,7 +1196,12 @@ void NeuralNetwork::load(const std::string &file_path,
     const auto file_bytes = std::filesystem::file_size(weight_path, ec);
     if (!ec) {
       const size_t actual = static_cast<size_t>(file_bytes);
-      if (total_trimmed <= actual && actual < total_padded) {
+      const bool trimmed =
+        (total_trimmed <= actual && actual < total_padded) ||
+        (total_padded <= actual && first_qs4cx_found &&
+         qs4cxRecordReadsAsTrimmed(weight_path, first_qs4cx_offset,
+                                   first_qs4cx_height, first_qs4cx_width));
+      if (trimmed) {
         walk_records(false);
         ml_logi("weight file '%s' matches the trimmed QS4CX record stride "
                 "(%zu bytes) rather than the padded one (%zu); reading it as "
@@ -1445,6 +1517,25 @@ void NeuralNetwork::load(const std::string &file_path,
           continue;
         const size_t file_off = data_base + it->second.first;
         weight->getVariableRef().setFileOffset(file_off);
+
+        // Resolve the QS4CX record stride from the header, which is the one
+        // place a stride is written down: the .bin has to infer it from the
+        // whole file's size because a record names neither of the two, but a
+        // safetensors entry carries this tensor's own byte extent. So no
+        // inference and no per-file assumption here -- ask the record that was
+        // actually written. A weight whose extent matches neither stride is
+        // left alone; the read below reports it far better than a guess would.
+        if (weight->getDim().getDataType() == TensorDim::DataType::QS4CX &&
+            !legacy_int4_model) {
+          const TensorDim &d = weight->getDim();
+          const size_t declared = it->second.second;
+          if (declared ==
+              QS4CX_Tensor::recordBytes(d.height(), d.width(), false))
+            weight->getVariableRef().setQs4cxRecordPadded(false);
+          else if (declared ==
+                   QS4CX_Tensor::recordBytes(d.height(), d.width(), true))
+            weight->getVariableRef().setQs4cxRecordPadded(true);
+        }
       }
     }
 
