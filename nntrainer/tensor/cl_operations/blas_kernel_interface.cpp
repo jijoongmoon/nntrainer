@@ -244,7 +244,17 @@ void add_i_cl(Tensor &result, Tensor const &input) {
       _FP16 *data_res = result.getData<_FP16>();
       const _FP16 *data_input = input.getData<_FP16>();
 
-      addition_cl(data_input, data_res, size_input, size_res);
+      // Bind the device pointers directly (SVM-direct, in-place accumulate)
+      // when BOTH tensors are device-visible; otherwise fall back to the host
+      // round trip. This is what keeps the residual stream on the device --
+      // and on a coarse-grain device it is not an optimisation but a
+      // correctness requirement, because the host round trip reads a
+      // shared-plane view the device has been writing.
+      const bool use_svm =
+        result.getMemoryData() && result.getMemoryData()->isSVM() &&
+        input.getMemoryData() && input.getMemoryData()->isSVM();
+
+      addition_cl(data_input, data_res, size_input, size_res, use_svm);
 
 #else
       throw std::invalid_argument("Error: enable-fp16 is not enabled");
