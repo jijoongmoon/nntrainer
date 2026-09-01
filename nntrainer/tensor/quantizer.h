@@ -416,6 +416,15 @@ private:
  * would use for an unquantized weight.
  * @note Only 2-D tensors (batch == 1, channel == 1) can be quantized, as that
  * is what QS4CX_Tensor holds.
+ * @note The channel axis is width(), always: one scale covers one column of
+ * the (K, N) input. That is what a GEMM weight wants, and the record carries
+ * no field to say otherwise -- so a tensor whose consumer indexes ROWS, an
+ * embedding lookup table being the case in this tree, is not quantizable as
+ * it stands: its scales belong to height(), and pooling a row-indexed table
+ * by column mixes unrelated entries under one scale. Such a tensor would have
+ * to reach this quantizer transposed, with a reader that transposes it back.
+ * Layer::save() refuses the case rather than write a record that reads as
+ * noise.
  */
 class QS4CXQuantizer : public UniformQuantizer {
 public:
