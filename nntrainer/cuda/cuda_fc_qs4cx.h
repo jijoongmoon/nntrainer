@@ -57,6 +57,24 @@ bool cuda_fc_qs4cx_scales_to_uvm_fp32(const float *fp32_scales, unsigned int N,
                                       bool source_readable = true);
 
 /**
+ * @brief True when this plain QS4CX payload's pages have been discarded by the
+ *        [pool-bypass] drop, so its bytes -- the fp32 scale tail included --
+ *        may no longer be dereferenced (they read back as zeros, not a fault).
+ */
+bool cuda_fc_qs4cx_plain_dropped(const unsigned char *plain_w);
+
+/**
+ * @brief [pool-bypass] Drop the plain payload's fully-owned pages once every
+ *        derived device cache exists (the forward only key-compares the
+ *        pointer). Meaningful with NNTR_QS4CX_HEAP_BYPASS (heap pages);
+ *        harmless EINVAL no-op on managed/pool memory. Refuses when
+ *        NNTR_FC_CUDA_DP4A=0 (the naive path reads the payload). x86 only.
+ * @return true if pages were dropped
+ */
+bool cuda_fc_qs4cx_drop_plain_pages(const unsigned char *plain_w,
+                                    unsigned int N, unsigned int K);
+
+/**
  * @brief fp-ACTIVATION int4 GEMV for the huge-N decode lm_head (M == 1).
  *
  * Reads the fp16 activation DIRECTLY -- no int8 activation quant -- against the

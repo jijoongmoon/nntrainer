@@ -1995,6 +1995,86 @@ static inline bool lmhead_fpact_on() {
   return v;
 }
 
+namespace {
+// [pool-bypass] Addresses whose plain payload has been discarded. A dropped
+// private anonymous mapping reads back as ZERO pages rather than faulting, so
+// a consumer that still dereferences the bytes would silently compute against
+// zeros; the mark lets it refuse instead. Only the fp32 scale builder consults
+// it today -- the QS4CX fp32 scale tail shares the payload's allocation, so
+// the drop takes it too.
+std::unordered_set<const void *> g_dropped_plain;
+std::mutex g_dropped_mtx;
+
+void mark_plain_dropped(const unsigned char *plain_w) {
+  std::lock_guard<std::mutex> lk(g_dropped_mtx);
+  g_dropped_plain.insert(plain_w);
+}
+} // namespace
+
+bool cuda_fc_qs4cx_plain_dropped(const unsigned char *plain_w) {
+  if (plain_w == nullptr)
+    return false;
+  std::lock_guard<std::mutex> lk(g_dropped_mtx);
+  return g_dropped_plain.count(plain_w) != 0;
+}
+
+// [pool-bypass] Drop the plain payload's fully-owned pages after every derived
+// device cache (dp4a packed + cuBLAS int8 + fp16 scales) exists -- the CUDA
+// forward then only compares the pointer VALUE as a cache key, never
+// dereferencing the bytes. Only meaningful when the payload is ordinary heap
+// (NNTR_QS4CX_HEAP_BYPASS): madvise on a managed/UVM pool page fails EINVAL
+// harmlessly. Refuses to run when the naive diagnostic path is selected
+// (NNTR_FC_CUDA_DP4A=0 reads the plain payload per call). Inward page
+// alignment protects neighboring heap metadata. x86-only like the bypass.
+bool cuda_fc_qs4cx_drop_plain_pages(const unsigned char *plain_w,
+                                    unsigned int N, unsigned int K) {
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) ||             \
+  defined(_M_IX86)
+  if (plain_w == nullptr || N == 0 || K == 0)
+    return false;
+  static const bool naive = []() {
+    const char *e = std::getenv("NNTR_FC_CUDA_DP4A");
+    return e != nullptr && e[0] == '0';
+  }();
+  if (naive)
+    return false;
+  const size_t payload =
+    (size_t)N * (((size_t)K + 1) / 2) + (size_t)N * sizeof(float);
+  const size_t page = 4096;
+  uintptr_t lo = ((uintptr_t)plain_w + page - 1) & ~(page - 1);
+  uintptr_t hi = ((uintptr_t)plain_w + payload) & ~(page - 1);
+  if (hi <= lo)
+    return false;
+#if defined(_WIN32)
+  if (DiscardVirtualMemory((void *)lo, (SIZE_T)(hi - lo)) != ERROR_SUCCESS)
+    return false;
+  mark_plain_dropped(plain_w);
+  return true;
+#else
+  const int rc = ::madvise((void *)lo, (size_t)(hi - lo), MADV_DONTNEED);
+  {
+    // The drop is invisible in a run log (same outputs, same caches -- only the
+    // RSS timeline differs), which makes "is it actually running?" unanswerable
+    // without this. Failures always; per-weight success only under the trace
+    // flag, since a full model emits 400+ of these.
+    static const bool mem_trace = std::getenv("NNTR_MEM_TRACE") != nullptr;
+    if (rc != 0 || mem_trace)
+      std::fprintf(stderr, "[cuda] DROP_PLAIN N=%u K=%u bytes=%zu rc=%d\n", N,
+                   K, (size_t)(hi - lo), rc);
+  }
+  if (rc != 0)
+    return false;
+  mark_plain_dropped(plain_w);
+  return true;
+#endif
+#else
+  (void)plain_w;
+  (void)N;
+  (void)K;
+  return false;
+#endif
+}
+
 bool cuda_fc_qs4cx_fpact_gemv_fp16(const unsigned short *Xh,
                                    const unsigned char *plain_w,
                                    const float *scales_fp32, unsigned short *Yh,
@@ -2004,10 +2084,13 @@ bool cuda_fc_qs4cx_fpact_gemv_fp16(const unsigned short *Xh,
   if (N == 0 || K == 0 || Xh == nullptr || plain_w == nullptr ||
       scales_fp32 == nullptr || Yh == nullptr)
     return false;
-  // Normally built at load time by the prewarm; this is the lazy fallback for
-  // a run that did not prewarm.
+  // Built at load time by the prewarm (before the payload -- scale tail
+  // included -- may be discarded); this is the lazy fallback for runs that do
+  // not prewarm. Refusing rather than reading discarded pages keeps a dropped
+  // payload a FALLBACK to dp4a instead of all-zero logits.
   const float *sc = nullptr;
-  if (!cuda_fc_qs4cx_scales_to_uvm_fp32(scales_fp32, N, &sc, true))
+  if (!cuda_fc_qs4cx_scales_to_uvm_fp32(scales_fp32, N, &sc,
+                                        !cuda_fc_qs4cx_plain_dropped(plain_w)))
     return false;
   auto kg = CudaContext::Global().registerCudaKernel(FC_QS4CX_DP4A_SRC,
                                                      "fpact_gemv_i4_h");
