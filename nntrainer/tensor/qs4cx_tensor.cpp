@@ -8,6 +8,8 @@
  * @bug		No known bugs except for NYI items
  */
 
+#include <env_compat.h>
+
 #include <cpu_backend.h>
 #include <qs4cx_tensor.h>
 #include <tensor.h>
@@ -55,6 +57,60 @@ void readLegacyQint4ToQs4cx(
                                           out_nibbles, out_scales);
 }
 
+/**
+ * @brief Is this process's QS4CX payload allocation load-destined, i.e. may
+ *   allocate() hand back UNINITIALIZED memory?
+ *
+ * NNTR_QS4CX_HEAP_BYPASS is exactly the "self-owned weight payload about to be
+ * filled from the model file" signal: Manager::requestWeights only takes the
+ * bypass branch (weight_pool.request(UNMANAGED) + var->allocate()) under it,
+ * and every QS4CX tensor reached that way is a weight (the only other producer
+ * is the offline quantize tool, which never sets this env). Both zero passes
+ * allocate() used to do -- `new uint8_t[size()]{}` and initialize()->setZero()
+ * -- are dead stores there: the payload is subsequently overwritten IN FULL,
+ * either by TensorBase::read (bytes() == size() for QS4CX) or by copy_qs4cx.
+ *
+ * The win is not the two arena writes alone. Zeroing a fresh allocation FAULTS
+ * EVERY PAGE RESIDENT at graph-build time, so the whole plain weight set is in
+ * host RSS before the loader has read a single byte -- which puts the process'
+ * residency high-water mark BEFORE the load, where no load-time or post-load
+ * page drop can reach it. Leaving the allocation untouched moves each payload's
+ * first touch to the read() that fills it, so a per-weight drop that runs
+ * during the load actually bounds the peak instead of trimming a peak that has
+ * already happened.
+ *
+ * TRIPWIRE. "Uninitialized is safe" holds only while EVERY reader of this
+ * payload writes all size() bytes. That is true of TensorBase::read and
+ * copy_qs4cx. It is NOT true of a partial transcode, so both read() overloads
+ * setZero() first. Any future partial writer must do the same.
+ *
+ * Escape hatch: NNTR_QS4CX_ALLOC_ZERO=1 restores the old double zero-fill.
+ */
+bool qs4cxAllocUninitialized() {
+  static const bool v = nntr_env_on("NNTR_QS4CX_HEAP_BYPASS") &&
+                        !nntr_env_on("NNTR_QS4CX_ALLOC_ZERO");
+  return v;
+}
+
+/**
+ * @brief NNTR_QS4CX_ALLOC_POISON=1: fill a load-destined payload with 0x55
+ *   instead of leaving it untouched. DIAGNOSTIC ONLY -- it reintroduces the
+ *   full-arena write (and its page faults), so it is the opposite of what the
+ *   uninitialized path is for.
+ *
+ * This is the discriminator that makes the tripwire testable. A large
+ * `new uint8_t[]` is served by mmap, whose pages read back as ZERO, so a
+ * passing run with the zero-fill removed proves nothing on its own -- an
+ * unwritten byte would still read 0 and still match the old behaviour. Poison
+ * it with a value the loader can never leave behind and re-run: identical
+ * generated text is then positive evidence that no reader consumes a byte the
+ * loader did not write.
+ */
+void qs4cxPoisonIfRequested(uint8_t *p, size_t n) {
+  static const bool poison = nntr_env_on("NNTR_QS4CX_ALLOC_POISON");
+  if (poison)
+    std::memset(p, 0x55, n);
+}
 } // namespace
 
 QS4CX_Tensor::QS4CX_Tensor(std::string name_, Tformat fm) :
@@ -90,14 +146,26 @@ void QS4CX_Tensor::allocate() {
   } else {
     MemoryData *mem_data;
 
-    mem_data = new MemoryData((void *)(new uint8_t[size()]{}));
+    // [pool-bypass] Load-destined payload: allocate UNINITIALIZED and skip
+    // initialize(). See qs4cxAllocUninitialized() for why both zero passes are
+    // dead stores, and why the page faults they force are the thing that
+    // matters -- they are not saved, they MOVE to the read() that fills the
+    // buffer, which is what lets a load-time drop bound the residency peak.
+    const bool uninit = qs4cxAllocUninitialized();
+    mem_data = new MemoryData(uninit ? (void *)(new uint8_t[size()])
+                                     : (void *)(new uint8_t[size()]{}));
     data = std::shared_ptr<MemoryData>(mem_data, [](auto *mem_data) {
       delete[] mem_data->template getAddr<uint8_t>();
       delete mem_data;
     });
 
     offset = 0;
-    initialize();
+    if (uninit) {
+      qs4cxPoisonIfRequested(mem_data->getAddr<uint8_t>(), size());
+      putData(); // keep the MemoryData invalidate hook firing as before
+    } else {
+      initialize();
+    }
   }
 }
 
