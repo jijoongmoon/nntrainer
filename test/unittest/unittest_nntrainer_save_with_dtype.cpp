@@ -22,6 +22,7 @@
 #include <model.h>
 #include <neuralnet.h>
 #include <optimizer.h>
+#include <qs4cx_tensor.h>
 #include <tensor.h>
 #include <tensor_dim.h>
 
@@ -821,19 +822,22 @@ TEST(SaveWithDtypeInference, save_partial_q4_load_inference_compare_p) {
  *        the original FP32 model.
  *
  *        The QS4CX record carries no version and the .bin no per-tensor dtype,
- *        so the reader tells the trimmed record stride (N * ceil(K/2) nibbles
- *        + N fp32 scales, what the writer emits) from the padded one
- *        (N * (K + 1) / 2 nibbles, floor(N/2) of them pad) by which of the two
- *        totals the file size fits. This locks both halves: the file must have
- *        the trimmed size, and reading it back must land the per-channel
- *        scales where the GEMM looks for them -- a stride mix-up reads the
- *        scales out of the nibbles and the output is nowhere near.
+ *        so nothing in the file names its stride: the reader tells the padded
+ *        record stride (N * (K + 1) / 2 nibbles, floor(N/2) of them pad, + N
+ *        fp32 scales) from the trimmed one (N * ceil(K/2) nibbles + the same
+ *        scales) by which of the two totals the file size fits. A tensor that
+ *        has not been through NeuralNetwork::load() carries the padded
+ *        default, so that is the stride the writer emits here. This locks both
+ *        halves: the file must have exactly the size the writer's stride
+ *        gives, and reading it back must land the per-channel scales where the
+ *        GEMM looks for them -- a stride mix-up reads the scales out of the
+ *        nibbles and the output is nowhere near.
  *
  *        Model: input(1:1:32) -> dense(unit=32, no bias), so the file holds
  *        exactly one QS4CX record, with an even K where the two strides differ
  *        (they coincide for odd K).
  */
-TEST(SaveWithDtypeInference, save_qs4cx_trimmed_record_load_p) {
+TEST(SaveWithDtypeInference, save_qs4cx_record_stride_load_p) {
   const unsigned int K = 32; // input width, even: the two strides differ here
   const unsigned int N = 32; // units
 
@@ -855,13 +859,17 @@ TEST(SaveWithDtypeInference, save_qs4cx_trimmed_record_load_p) {
     nn_orig->save(qs4cx_path, ModelFormat::MODEL_FORMAT_BIN, DataType::QS4CX));
 
   const std::streamsize trimmed =
-    N * ((K + 1) / 2) + N * 4 + TRAIN_METADATA_SIZE;
-  const std::streamsize padded = N * (K + 1) / 2 + N * 4 + TRAIN_METADATA_SIZE;
+    nntrainer::QS4CX_Tensor::recordBytes(K, N, /*padded=*/false) +
+    TRAIN_METADATA_SIZE;
+  const std::streamsize padded =
+    nntrainer::QS4CX_Tensor::recordBytes(K, N, /*padded=*/true) +
+    TRAIN_METADATA_SIZE;
+  // K is even here, so the two strides really are distinguishable.
   ASSERT_NE(trimmed, padded);
 
   std::ifstream qs4cx_file(qs4cx_path, std::ios::binary | std::ios::ate);
   ASSERT_TRUE(qs4cx_file.is_open());
-  EXPECT_EQ(qs4cx_file.tellg(), trimmed);
+  EXPECT_EQ(qs4cx_file.tellg(), padded);
   qs4cx_file.close();
 
   auto nn_qs4cx =
@@ -930,8 +938,11 @@ TEST(SaveWithDtypeInference, save_qs4cx_bias_record_load_p) {
   ASSERT_NO_THROW(
     nn_orig->save(qs4cx_path, ModelFormat::MODEL_FORMAT_BIN, DataType::QS4CX));
 
-  // The weight (K, N) is a QS4CX record; the bias (1, N) stays N floats.
-  const std::streamsize weight_record = N * ((K + 1) / 2) + N * 4;
+  // The weight (K, N) is a QS4CX record at the stride the tensor carries --
+  // the padded default, since nothing has resolved a file for it yet; the
+  // bias (1, N) stays N floats.
+  const std::streamsize weight_record =
+    nntrainer::QS4CX_Tensor::recordBytes(K, N, /*padded=*/true);
   const std::streamsize bias_record = N * 4;
 
   std::ifstream qs4cx_file(qs4cx_path, std::ios::binary | std::ios::ate);
