@@ -9,6 +9,9 @@
  */
 
 #include <env_compat.h>
+#if defined(_WIN32)
+#include <windows.h> // VirtualAlloc/VirtualFree for the pool-bypass payload
+#endif
 
 #include <cpu_backend.h>
 #include <qs4cx_tensor.h>
@@ -145,6 +148,41 @@ void QS4CX_Tensor::allocate() {
     allocateSrcTensor();
   } else {
     MemoryData *mem_data;
+
+#if defined(_WIN32) && (defined(_M_X64) || defined(_M_IX86))
+    // [pool-bypass] Under the heap bypass, back the payload with VirtualAlloc
+    // instead of the CRT heap: VirtualFree(MEM_DECOMMIT) -- the only Windows
+    // primitive that actually RELEASES commit charge while keeping the address
+    // reservation (the derived-cache key) valid -- is legal only on
+    // VirtualAlloc regions; running it on HeapAlloc pages corrupts the heap.
+    // DiscardVirtualMemory (residency only) works on either. The deleter
+    // releases the whole reservation.
+    if (nntr_env_on("NNTR_QS4CX_HEAP_BYPASS")) {
+      void *va =
+        VirtualAlloc(nullptr, size(), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+      if (va != nullptr) {
+        mem_data = new MemoryData(va);
+        data = std::shared_ptr<MemoryData>(mem_data, [](auto *md) {
+          VirtualFree(md->template getAddr<uint8_t>(), 0, MEM_RELEASE);
+          delete md;
+        });
+        offset = 0;
+        // MEM_COMMIT pages are zero by the Win32 contract and the payload is
+        // overwritten in full by the loader, so initialize()'s setZero() is a
+        // dead store that only faults the whole region resident. putData()
+        // still runs, so the MemoryData invalidate hook fires exactly as
+        // before.
+        if (qs4cxAllocUninitialized()) {
+          qs4cxPoisonIfRequested(mem_data->getAddr<uint8_t>(), size());
+          putData();
+        } else {
+          initialize();
+        }
+        return;
+      }
+      // fall through to the CRT heap on VirtualAlloc failure
+    }
+#endif
 
     // [pool-bypass] Load-destined payload: allocate UNINITIALIZED and skip
     // initialize(). See qs4cxAllocUninitialized() for why both zero passes are
