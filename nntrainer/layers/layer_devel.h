@@ -354,6 +354,21 @@ public:
   virtual bool supportBackwarding() const = 0;
 
   /**
+   * @brief  check whether this layer indexes one of its weights by ROW
+   * @note   A per-channel-quantized record such as QS4CX carries one scale per
+   * COLUMN of the weight, because every consumer of it -- the GEMMs and the
+   * packers alike -- reads a column as an output channel. A layer that instead
+   * slices a whole ROW out of its weight (a lookup table indexed by token id,
+   * say) pools unrelated rows into one scale when it is quantized on the column
+   * axis, and nothing in the record says which axis it was quantized on, so it
+   * reads back as noise rather than as an error. Layers whose weight is used
+   * that way answer true here and save() refuses to quantize them; it is a
+   * property of how a layer uses its weight, not of its name.
+   * @return true if a weight of this layer is indexed by row, else false
+   */
+  virtual bool hasRowIndexedWeight() const { return false; }
+
+  /**
    * @brief     save layer Weight & Bias data from file
    * @param file output file stream
    * @param run_context run context for the layer
@@ -450,8 +465,10 @@ public:
                 // quantized on, so it reads back as noise rather than as an
                 // error. Refuse it here; a LUT would have to reach the
                 // quantizer transposed, which needs a reader that knows to
-                // transpose it back.
-                NNTR_THROW_IF(getType() == "embedding", std::runtime_error)
+                // transpose it back. The layer answers for itself -- see
+                // hasRowIndexedWeight() -- rather than being named here, so an
+                // out-of-tree LUT layer can opt in too.
+                NNTR_THROW_IF(hasRowIndexedWeight(), std::runtime_error)
                   << "[Layer::save] cannot quantize '" << getType()
                   << "' to QS4CX: its weight is a lookup table indexed by row, "
                      "and QS4CX carries one scale per column";
