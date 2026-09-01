@@ -37,6 +37,10 @@
 #include <sstream>
 #include <thread>
 
+#if defined(__GLIBC__) && !defined(_WIN32)
+#include <malloc.h> // malloc_trim: return the loader's freed transients to the OS
+#endif
+
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
 #include <cuda_fc_qs4cx.h> // [wprefetch] cuda_fc_qs4cx_prefetch_weight
 #endif
@@ -1268,6 +1272,24 @@ void NeuralNetwork::load(const std::string &file_path,
       // a pending rewrite off-thread, so writing the pack costs the load
       // nothing. The writer is joined at exit.
       v8c_pack::load_complete();
+#endif
+
+#if defined(__GLIBC__) && !defined(_WIN32)
+      // Give the loader's freed transients (staging vectors, per-chunk derive
+      // buffers) back to the OS: glibc keeps brk/arena tops cached after
+      // free(), so they stay in this process's RSS until a trim. One call, at
+      // the end of the positional load -- past the worker join above, and past
+      // any per-weight cache build that ran inside the load, so the trim sees
+      // everything the load transiently allocated. Opt out with
+      // NNTR_MALLOC_TRIM=0.
+      {
+        static const bool malloc_trim_on = []() {
+          const char *e = std::getenv("NNTR_MALLOC_TRIM");
+          return !(e != nullptr && e[0] == '0');
+        }();
+        if (malloc_trim_on)
+          ::malloc_trim(0);
+      }
 #endif
 
     } else {
