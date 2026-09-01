@@ -717,14 +717,14 @@ public:
    *        (u16 qscheme header + KAI Section A / plain container) that must be
    *        transcoded losslessly to the canonical QS4CX in-memory layout on
    *        read.
-   * @note  Nothing in tree sets this yet. A record carries no version, so the
-   *        model-loading path cannot tell a legacy one from a canonical one
-   *        and always takes the canonical branch. This is the hook for a
-   *        caller that does know which it holds -- an exporter-aware tool, or
-   *        a loader later taught the distinction. Until such a caller exists
-   *        the legacy branch is reached only by constructing the tensor and
-   *        setting the flag by hand, which is what the cpu_backend unit test
-   *        does.
+   * @note  A record carries no version, so nothing in the bytes tells a
+   *        legacy record from a canonical one. NeuralNetwork::load() sets
+   *        this from the model's own declared type: a "QINT4-*"
+   *        model_tensor_type package whose weights are built as QS4CX holds
+   *        legacy records by construction. A package that declares QS4CX
+   *        keeps the canonical branch. The flag stays public so an
+   *        exporter-aware tool can set it directly, which is also how the
+   *        cpu_backend unit test reaches the legacy branch.
    */
   void setOnDiskLegacyQint4(bool v) { on_disk_legacy_qint4_ = v; }
 
@@ -741,11 +741,13 @@ public:
    *        left to right. It picks the stride at which QS4CX_Tensor::size()
    *        and getScale() place the scales, so it must be set before the
    *        record is read. No effect on any other tensor type.
-   * @note  Nothing in tree sets this yet, so the trimmed default -- what the
-   *        writer emits -- is the only stride the loader uses. It is the hook
-   *        for a caller that has established a given file was written with the
-   *        padded layout, for instance by finding the file size fits only the
-   *        padded total.
+   * @note  NeuralNetwork::load() sets this per weight FILE. Nothing in the
+   *        file names its stride, so load() lays every record out at the
+   *        padded stride first and re-walks at the trimmed one only when the
+   *        file size fits the trimmed total and not the padded one. The
+   *        default is padded because padded is never the SMALLER of the two,
+   *        so an unresolved default can only over-size a record, never shift
+   *        the ones after it.
    */
   void setQs4cxRecordPadded(bool v) { qs4cx_record_padded_ = v; }
 
@@ -985,8 +987,13 @@ protected:
   bool on_disk_legacy_qint4_ =
     false; /**< on-disk bytes are a legacy QINT4 record to transcode to QS4CX */
   bool qs4cx_record_padded_ =
-    false; /**< QS4CX record uses the padded stride (see setQs4cxRecordPadded)
-            */
+    true; /**< QS4CX record keeps the padded stride (see
+             setQs4cxRecordPadded). Padded is the default because it is never
+             the SMALLER of the two strides: NeuralNetwork::load() starts its
+             record walk here and re-walks with the trimmed stride only once
+             the file size proves the file is trimmed, so an unresolved
+             default can never under-size a record and shift every later
+             weight's offset. */
 
   /**<
    * When using shared_data with tensor, this stores the ptr of the source
