@@ -16,6 +16,8 @@
 #include "opencl_context_manager.h"
 #include "opencl_loader.h"
 
+#include <cstdlib>
+
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 
@@ -51,17 +53,40 @@ namespace {
  *
  * Resolved once per process, on the first dispatch rather than at init: the
  * device info is not populated before then, and a null device_info latches
- * false for the life of the process.
+ * false for the life of the process. NNTR_XE3_SYNC overrides the whole
+ * derivation, and is read before it, so that case is recoverable without a
+ * rebuild.
  */
 bool needsCoarseSVMDrain() {
   static const bool drain = []() {
+    // NNTR_XE3_SYNC: explicit override, consulted FIRST. The capability
+    // derivation below is the right default, but it can only speak once the
+    // device has been probed -- and this predicate resolves ONCE. A dispatch
+    // that beats the device info into existence latches "no drain" for the
+    // life of the process, silently, and a coarse-grain device then reads a
+    // buffer the GPU has not finished writing. The override exists precisely
+    // for that case, so it must not depend on the thing it works around.
+    if (const char *e = std::getenv("NNTR_XE3_SYNC")) {
+      const bool on = std::atoi(e) != 0;
+      ml_logi("NNTR_XE3_SYNC=%s overrides the shared-memory drain: %s", e,
+              on ? "on" : "off");
+      return on;
+    }
     const auto *device_info = ContextManager::Global().getDeviceInfo();
-    if (!device_info)
+    if (!device_info) {
+      // Fail safe to off, but say so: this disables a coherence drain, which
+      // is not something to discover from wrong output.
+      ml_logw("No device info when resolving the shared-memory drain; it is "
+              "off for this process. Set NNTR_XE3_SYNC=1 if the GPU output "
+              "races.");
       return false;
+    }
     const cl_device_svm_capabilities svm =
       device_info->getDeviceSVMCapabilities();
     const bool fine_grain = (svm & (CL_DEVICE_SVM_FINE_GRAIN_BUFFER |
                                     CL_DEVICE_SVM_FINE_GRAIN_SYSTEM)) != 0;
+    ml_logd("SVM capabilities 0x%x (fine grain %d): shared-memory drain %s",
+            (unsigned)svm, (int)fine_grain, fine_grain ? "off" : "on");
     return !fine_grain;
   }();
   return drain;
