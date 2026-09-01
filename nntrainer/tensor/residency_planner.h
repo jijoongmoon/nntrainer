@@ -49,6 +49,12 @@ struct ResidencyPlanner {
   const char *lower = nullptr;
   /** patterns kept off the device plane (application policy) */
   const char *exclude = nullptr;
+  /** a fan-out tensor stays eligible for the device plane (NNTR_CLMEM_FANOUT=0
+   *  clears it). True by default, so the classification is unchanged; clearing
+   *  it is the A/B lever for the case where a tensor read through more than
+   *  one view chain corrupts on the device plane while every single-consumer
+   *  tensor stays bit-identical. */
+  bool allow_fanout = true;
 
   /**
    * @brief Classify one tensor's static residency class.
@@ -58,11 +64,15 @@ struct ResidencyPlanner {
    * @param needs_host_init the tensor declares an Initializer, so its bytes
    *        are written on the host plane before the first kernel runs
    * @param name tensor name, matched against the declared boundaries
+   * @param view_count number of views registered on this tensor; read only
+   *        when allow_fanout is cleared. Defaults to 0 so a caller that does
+   *        not track fan-out gets the unrestricted classification.
    * @return the static ResidencyClass
    */
   ResidencyClass classify(ml::train::LayerComputeEngine engine,
                           bool all_consumers_device, bool is_fp16,
-                          bool needs_host_init, const std::string &name) const {
+                          bool needs_host_init, const std::string &name,
+                          unsigned int view_count = 0) const {
     /** A host-only allocator has one plane and nothing to decide. */
     if (!device_backed)
       return ResidencyClass::HOST;
@@ -107,6 +117,21 @@ struct ResidencyPlanner {
      *  initialisation. The shared plane honours both: the bytes the
      *  initializer wrote ARE the bytes the device reads. */
     if (cls == ResidencyClass::GPU_CLMEM && needs_host_init)
+      cls = ResidencyClass::SVM;
+
+    /** Fan-out demotion (NNTR_CLMEM_FANOUT=0). A tensor read through more than
+     *  one view chain -- the shape an auto-inserted multiout produces -- has
+     *  been seen to corrupt on the device plane while every single-consumer
+     *  tensor stayed bit-identical. This restricts the device placement to the
+     *  single-consumer partition. The demotion is OFF by default, so the
+     *  classification is unchanged unless the lever is set; it exists so a
+     *  device run that disagrees with its own reference can bisect this
+     *  without a rebuild. A declared boundary is exempt either way: there the
+     *  copy IS the coherence point, so the hazard does not arise. */
+    const bool at_boundary =
+      nameMatchesAny(name, raise) || nameMatchesAny(name, lower);
+    if (cls == ResidencyClass::GPU_CLMEM && !allow_fanout && !at_boundary &&
+        view_count > 1)
       cls = ResidencyClass::SVM;
 
     return cls;

@@ -60,7 +60,38 @@ ClContext *clContext() {
 ClBufferPool::~ClBufferPool() { ClBufferPool::deallocate(); }
 
 void ClBufferPool::allocate() {
-  MemoryPool::allocate();
+  /** The base MemoryPool::allocate() requests ONE contiguous clSVMAlloc of the
+   *  whole plane. When that plane exceeds CL_DEVICE_MAX_MEM_ALLOC_SIZE,
+   *  clSVMAlloc returns null and ClSVMAllocator falls back to plain host
+   *  memory -- which the device cannot use as SVM at all: map/unmap return
+   *  CL_INVALID_VALUE and every kernel reads zeros. The fallback is silent by
+   *  design (correctness over speed for a host-only run), so on a GPU run it
+   *  surfaces only as output collapsing to a single repeated token.
+   *
+   *  The per-offset cl_mem buffers below already dodge this cap; the SVM plane
+   *  has to as well. Above the cap, take the per-offset (shared-objects)
+   *  allocateFSU() path so every SVM buffer is a single tensor wide -- far
+   *  under the cap -- and stays REAL SVM. A plane under the cap keeps the
+   *  single-buffer path and is byte-identical to before.
+   *
+   *  A process with no registered gpu Context reports no cap and keeps the
+   *  single-buffer path, which is the same answer it gave before: on such a
+   *  run the SVM allocator is already the host fallback and there is nothing
+   *  to protect. */
+  cl_ulong plane_cap = 0;
+  if (auto *cc = clContext())
+    opencl::clGetDeviceInfo(cc->context_inst_.GetDeviceId(),
+                            CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof(plane_cap),
+                            &plane_cap, nullptr);
+  if (plane_cap > 0 && static_cast<cl_ulong>(size()) > plane_cap) {
+    ml_logi("ClBufferPool: the %.1f MB SVM plane exceeds the device maximum "
+            "allocation %.1f MB; allocating it per offset (shared objects) so "
+            "every buffer stays real SVM",
+            size() / 1048576.0, plane_cap / 1048576.0);
+    MemoryPool::allocateFSU();
+  } else {
+    MemoryPool::allocate();
+  }
 
   /** Record where the planner put each token. Tokens that share an offset have
    *  disjoint lifetimes, so one buffer sized to the largest of them backs all
