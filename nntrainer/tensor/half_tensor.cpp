@@ -812,6 +812,12 @@ Tensor &HalfTensor::dot(Tensor const &input, Tensor &output, bool trans,
     // that happens to reuse the address. It is a cache of bytes the weight
     // already holds, so filling it in leaves the weight's value unchanged --
     // hence the const_cast. The lock only serialises that one fill.
+    //
+    // The unlocked check below is a double-checked lock, so it needs the flag
+    // it reads to be synchronised: QS4CX_Tensor::packed_f16 is an
+    // std::atomic<bool> stored with release after packed_data is filled and
+    // loaded with acquire here, which is what keeps a thread from seeing the
+    // flag ahead of the bytes it names.
     if (!input.isPackedF16Activation()) {
       static std::mutex qs4cx_pack_mtx;
       std::lock_guard<std::mutex> lk(qs4cx_pack_mtx);

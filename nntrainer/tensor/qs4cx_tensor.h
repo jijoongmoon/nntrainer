@@ -12,6 +12,8 @@
 #define __QS4CX_TENSOR_H__
 #ifdef __cplusplus
 
+#include <atomic>
+
 #include <quantizer.h>
 #include <tensor_base.h>
 
@@ -259,7 +261,7 @@ public:
    * @copydoc TensorBase::isPackedF16Activation()
    */
   bool isPackedF16Activation() const override {
-    return packed_f16 && packed_data != nullptr;
+    return packed_f16.load(std::memory_order_acquire) && packed_data != nullptr;
   }
 
   /**
@@ -269,7 +271,8 @@ public:
    * interchangeable, so the fp16 one must not be reported here.
    */
   bool isPacked() const override {
-    return !packed_f16 && packed_data != nullptr;
+    return !packed_f16.load(std::memory_order_acquire) &&
+           packed_data != nullptr;
   }
 
   /**
@@ -310,8 +313,16 @@ private:
   bool isValid() const override { return true; }
 
   std::unique_ptr<uint8_t[]> packed_data = nullptr;
-  bool packed_f16 = false; /**< packed_data holds the fp16-activation KAI rhs
-                              (packF16Activation), not pack()'s fp32 layout */
+  /**
+   * @brief packed_data holds the fp16-activation KAI rhs (packF16Activation),
+   * not pack()'s fp32 layout
+   * @note Atomic because HalfTensor::dot's QS4CX case reads it outside the lock
+   * that serialises the lazy fill (a double-checked lock). packF16Activation()
+   * publishes it with release AFTER filling packed_data, and
+   * isPackedF16Activation() acquires it before looking at packed_data, so a
+   * thread that sees the flag set also sees the buffer it names.
+   */
+  std::atomic<bool> packed_f16 = {false};
 };
 
 } // namespace nntrainer
