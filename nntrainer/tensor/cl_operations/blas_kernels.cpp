@@ -1737,11 +1737,38 @@ void gemm_int8_v8c_v_ohwi_cl(cl_mem act_image, cl_mem weight_image,
                                              nullptr, 0, nullptr, nullptr);
 }
 
+// Workgroup width for the runtime-sized act-quant kernel
+// (v8c_act_quant_f16_parx). One workgroup handles one row, so at M=1 -- every
+// decode step -- the entire dispatch is that one group and its width is the
+// only parallelism there is; 64 lanes leave eleven of the device's twelve
+// compute units idle and make the kernel pure load latency. At M >= 8 there
+// are already enough groups to fill the device and a wider group only adds
+// reduction depth, so the width drops back to 64 there. Output is identical at
+// either width (see the kernel's comment). NNTR_V8C_QUANT_LWS pins it.
+static size_t v8c_quant_lws_for(unsigned int M) {
+  static const int forced = []() {
+    const char *e = std::getenv("NNTR_V8C_QUANT_LWS");
+    if (e == nullptr)
+      return 0;
+    const int v = std::atoi(e);
+    // Power of two in [64, 256]: the tree reduction halves, and the kernel's
+    // local arrays are sized for 256.
+    if (v != 64 && v != 128 && v != 256) {
+      ml_logw("Ignoring NNTR_V8C_QUANT_LWS=%s: expected 64, 128 or 256", e);
+      return 0;
+    }
+    return v;
+  }();
+  if (forced != 0)
+    return (size_t)forced;
+  return M >= 8 ? (size_t)64 : (size_t)256;
+}
+
 static void quantize_act_v8c_cl_impl(cl_mem act_in, cl_mem out_int8,
                                      cl_mem out_scale, cl_mem out_zp,
                                      cl_mem out_row_sum, unsigned int M,
                                      unsigned int K, const char *kernel_name,
-                                     bool parallel) {
+                                     bool parallel, size_t lws_override = 0) {
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
   // The act-quant kernels are image-free, but they live in the same program
@@ -1773,8 +1800,8 @@ static void quantize_act_v8c_cl_impl(cl_mem act_in, cl_mem out_int8,
     throw std::runtime_error("v8c quant arg 6");
 
   if (parallel) {
-    // _par variant: one workgroup (LWS=64) per row. gws = M * 64.
-    constexpr size_t LWS = 64;
+    // _par variant: one workgroup per row. gws = M * LWS.
+    const size_t LWS = lws_override != 0 ? lws_override : 64;
     std::array<size_t, 3> gws = {(size_t)M * LWS, 1, 1};
     std::array<size_t, 3> lws = {LWS, 1, 1};
     blas_cc->command_queue_inst_.enqueueKernel(kp->GetKernel(), 1, gws.data(),
@@ -1793,6 +1820,12 @@ void quantize_act_v8c_fp16_cl(cl_mem act_fp16, cl_mem out_int8,
   // The _par variant requires K % LWS == 0 (LWS=64). Qwen3 hidden dims
   // (1024/2048/3072/etc.) all satisfy this; smaller K paths fall back.
   const bool can_par = (K % 64 == 0);
+  const size_t lws = can_par ? v8c_quant_lws_for(M) : 0;
+  if (can_par && lws != 64) {
+    quantize_act_v8c_cl_impl(act_fp16, out_int8, out_scale, out_zp, out_row_sum,
+                             M, K, "v8c_act_quant_f16_parx", true, lws);
+    return;
+  }
   quantize_act_v8c_cl_impl(
     act_fp16, out_int8, out_scale, out_zp, out_row_sum, M, K,
     can_par ? "v8c_act_quant_f16_par" : "v8c_act_quant_f16", can_par);
