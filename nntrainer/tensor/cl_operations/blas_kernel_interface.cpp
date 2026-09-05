@@ -611,6 +611,26 @@ struct V8cScratch {
   int last_quant_slot = 0; /**< slot whose int8 the cache hit refers to */
   /** dispatch seq at which the cached int8 was produced (device-plane reuse) */
   unsigned long long last_quant_seq = 0;
+
+  // [norm->FC quant handoff] A fused norm (rmsnorm_cl_fp16_coop_q) fills one
+  // of these slots with the quantisation of the row it just wrote, and
+  // publishes which device buffer that row lives in. An FC whose input IS
+  // that buffer then skips its own quant kernel.
+  //
+  // The key is NOT the handle alone -- a pooled sub-buffer handle does not
+  // identify a tensor on this backend, which is the KV-sharing defect above.
+  // It is (handle, shape, and the dispatch write log saying nothing has
+  // written that handle since). The last clause is what makes it sound: if
+  // the bytes at the handle are still the bytes the norm wrote, the FC's own
+  // quantiser would read exactly those bytes and produce exactly this result,
+  // whichever tensor the graph thinks the handle belongs to.
+  const void *nq_site = nullptr; /**< norm site that published the handoff */
+  void *nq_src = nullptr;        /**< device buffer the fused norm wrote */
+  unsigned long long nq_seq = 0; /**< dispatch seq right after that norm */
+  unsigned int nq_rows = 0;
+  unsigned int nq_K = 0;
+  int nq_slot = -1; /**< ring slot holding the handoff int8, -1 = none */
+  int nq_pending_slot = -1; /**< reserved by Begin, published by Commit */
 };
 
 static V8cScratch &v8c_scratch() {
@@ -618,21 +638,34 @@ static V8cScratch &v8c_scratch() {
   return s;
 }
 
-// Shared-quant accounting. Whether a sibling FC may reuse a fanout's
-// quantisation hinges on a window of the dispatch write log staying clean, and
-// whether a given graph keeps it clean is not something to guess at --
-// NNTR_FUSE_STATS=1 prints the tally at exit so a decline can be attributed
-// instead of assumed.
+// Fusion accounting. The two quant-elision paths (a norm that emitted the
+// quantisation, and a sibling FC reusing a fanout's quantisation) both hinge
+// on a window of the dispatch write log staying clean, and whether a given
+// graph keeps it clean is not something to guess at -- NNTR_FUSE_STATS=1
+// prints the tally at exit so a decline can be attributed instead of assumed.
 struct V8cFuseStats {
   unsigned long long share_hit = 0; /**< FCs served by a sibling's quant */
   unsigned long long quant = 0;     /**< FCs that ran their own quant */
   unsigned long long dirty = 0; /**< sibling reuses the write log ruled out */
+  unsigned long long norm_published = 0; /**< fused norms that committed */
+  unsigned long long nq_hit = 0;         /**< FCs served by a fused norm */
+  // Why a norm-fed FC did NOT take the handoff -- the four ways it can miss,
+  // so a decline is attributable instead of guessed at.
+  unsigned long long nq_none = 0;  /**< no handoff outstanding */
+  unsigned long long nq_other = 0; /**< outstanding, but for another buffer */
+  unsigned long long nq_shape = 0; /**< same buffer, different rows/K/scratch */
+  unsigned long long nq_dirty = 0; /**< same buffer and shape, log says dirty */
   ~V8cFuseStats() {
     if (std::getenv("NNTR_FUSE_STATS") == nullptr)
       return;
     ml_logi("[v8c fuse] quant elided: sibling=%llu  quant kernels run=%llu  "
             "write-log declines=%llu",
             share_hit, quant, dirty);
+    ml_logi("[v8c fuse] norms published=%llu  quant elided by a norm=%llu",
+            norm_published, nq_hit);
+    ml_logi("[v8c fuse] handoff misses: none=%llu other-buffer=%llu "
+            "shape=%llu dirty=%llu",
+            nq_none, nq_other, nq_shape, nq_dirty);
   }
 };
 
@@ -731,7 +764,23 @@ static int v8c_ring_advance(V8cScratch &sc) {
     sc.last_quant_in_ptr = nullptr;
     sc.last_quant_seq = 0;
   }
+  // The same rule for the norm->FC handoff: from here on that slot's int8
+  // belongs to a different activation.
+  if (sc.nq_slot == sc.ring_pos) {
+    sc.nq_slot = -1;
+    sc.nq_src = nullptr;
+  }
+  if (sc.nq_pending_slot == sc.ring_pos)
+    sc.nq_pending_slot = -1;
   return sc.ring_pos;
+}
+
+static bool v8c_norm_quant_enabled() {
+  static const bool on = []() {
+    const char *e = std::getenv("NNTR_FUSE_NORM_QUANT");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  return on;
 }
 
 // Get or build the cached v8c weight backing for a given int4 (QS4CX) weight.
@@ -1113,6 +1162,94 @@ static inline float v8c_h2f(uint16_t h) {
   return f;
 }
 } // anonymous namespace
+
+// Public symbols: the norm->FC quant handoff is reached from the rmsnorm
+// dispatcher in blas_kernels_fp16.cpp, so it cannot live in the anonymous
+// namespace above with the scratch it operates on.
+// Per-norm-site record of whether anything ever claimed its quantisation.
+//
+// The fusion is speculative -- the norm cannot know its consumer -- and in a
+// real decoder most norms are NOT read by an FC (a post-attention or post-FFN
+// norm feeds the residual join). Quantising for them is pure loss: measured on
+// the gemma4 decode cell, 122 of the 227 norms a token ran published a
+// quantisation nobody took, and their share of the extra GPU time exceeded the
+// dispatch floor the 105 productive ones removed. So a site that has published
+// several times and never once been collected stops fusing.
+//
+// The site key is the gamma pointer: a model weight, unique per norm layer and
+// stable for the process, which is exactly the identity wanted here (the
+// output buffer is pooled and would not be).
+struct NormSite {
+  unsigned int published = 0;
+  unsigned int claimed = 0;
+};
+
+static std::unordered_map<const void *, NormSite> &v8c_norm_sites() {
+  static std::unordered_map<const void *, NormSite> m;
+  return m;
+}
+
+// How many unclaimed publications a site gets before it is written off. Small:
+// the decision is stable after the first token, and a site that is productive
+// is claimed on its very first publication.
+static constexpr unsigned int kNormSiteStrikes = 4;
+
+bool v8cNormQuantBegin(const void *site, unsigned int rows, unsigned int K,
+                       void **act_i8, void **act_scale, void **act_zp,
+                       void **act_rs) {
+  if (!v8c_norm_quant_enabled() || rows == 0 || K == 0)
+    return false;
+  auto *cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  if (cc == nullptr)
+    return false;
+  cl_context ctx = cc->context_inst_.GetContext();
+  std::lock_guard<std::mutex> slock(v8c_cache_mtx());
+  NormSite &ns = v8c_norm_sites()[site];
+  if (ns.claimed == 0 && ns.published >= kNormSiteStrikes)
+    return false;
+  V8cScratch &sc = v8c_scratch();
+  const unsigned int M_pad = v8c_m_pad_for(rows);
+  const int slot = v8c_ring_advance(sc);
+  if (!v8c_ensure_buf(ctx, &sc.act_i8[slot], &sc.act_i8_bytes[slot],
+                      (size_t)M_pad * K, CL_MEM_READ_WRITE) ||
+      !v8c_ensure_buf(ctx, &sc.act_scale[slot], &sc.act_scale_bytes[slot],
+                      sizeof(float) * M_pad, CL_MEM_READ_WRITE) ||
+      !v8c_ensure_buf(ctx, &sc.act_rs[slot], &sc.act_rs_bytes[slot],
+                      sizeof(int) * M_pad, CL_MEM_READ_WRITE) ||
+      !v8c_ensure_buf(ctx, &sc.act_zp[slot], &sc.act_zp_bytes[slot],
+                      sizeof(int) * M_pad, CL_MEM_READ_WRITE))
+    return false;
+  sc.nq_pending_slot = slot;
+  sc.nq_site = site;
+  ++ns.published;
+  *act_i8 = sc.act_i8[slot];
+  *act_scale = sc.act_scale[slot];
+  *act_zp = sc.act_zp[slot];
+  *act_rs = sc.act_rs[slot];
+  return true;
+}
+
+void v8cNormQuantCommit(void *src_clmem, unsigned int rows, unsigned int K) {
+  ++v8c_fuse_stats().norm_published;
+  std::lock_guard<std::mutex> slock(v8c_cache_mtx());
+  V8cScratch &sc = v8c_scratch();
+  if (sc.nq_pending_slot < 0 || src_clmem == nullptr)
+    return;
+  sc.nq_slot = sc.nq_pending_slot;
+  sc.nq_pending_slot = -1;
+  sc.nq_src = src_clmem;
+  sc.nq_rows = rows;
+  sc.nq_K = K;
+  // Sampled AFTER the dispatch: the window the write log has to be clean over
+  // starts at the norm itself.
+  sc.nq_seq = opencl::Kernel::dispatchSeq();
+}
+
+void v8cNormQuantAbort() {
+  std::lock_guard<std::mutex> slock(v8c_cache_mtx());
+  v8c_scratch().nq_pending_slot = -1;
+}
 
 // Eager v8c weight build (see header). Moves the lazy per-weight nibble
 // permute + upload out of the first timed prefill: the CL FC layer calls this
