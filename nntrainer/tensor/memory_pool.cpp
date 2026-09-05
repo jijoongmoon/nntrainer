@@ -208,6 +208,20 @@ void MemoryPool::allocateFSU() {
   int i = 0;
   for (auto &s : memory_offset) {
     size_t current_size = memory_size.at(i);
+    /** An offset a second plane owns outright gets no shared slice at all --
+     *  see sharedSliceNeeded(). The token's shared pointer stays null, which
+     *  is the truthful value for bytes that exist only on the other plane;
+     *  reading it is a bug this makes loud instead of silently serving a
+     *  never-written slice. Recorded in offset_ptr so the aliasing tokens at
+     *  the same offset take the same answer. */
+    if (!sharedSliceNeeded(s)) {
+      memory_ptrs.push_back(nullptr);
+      offset_ptr[s] = nullptr;
+      allocated_size[s] = current_size;
+      offset_indices[s].push_back(i);
+      i++;
+      continue;
+    }
     auto it = offset_ptr.find(s);
     if (it == offset_ptr.end()) {
       void *ptr = nullptr;

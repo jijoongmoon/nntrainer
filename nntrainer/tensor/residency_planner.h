@@ -97,8 +97,21 @@ struct ResidencyPlanner {
     return cls;
   }
 
-private:
-  /** comma-separated substring match against a declared pattern list. */
+  /**
+   * @brief comma-separated substring match against a declared pattern list.
+   *
+   * @details Substring, not glob and not regex: a pattern "fc" matches every
+   * tensor whose name contains those two characters, "fc1" and "fc12" among
+   * them. A comma always separates, so a pattern cannot contain one. That is
+   * deliberately the least machinery that expresses a boundary, and it is the
+   * matcher an application has to write its patterns against -- pick a prefix
+   * the model's naming makes unambiguous ("cache_" rather than "c"). Empty
+   * tokens are ignored, so a trailing or doubled comma is harmless.
+   *
+   * @param name tensor name to test
+   * @param list comma-separated pattern list, or nullptr for "no patterns"
+   * @return true if any non-empty pattern occurs in @a name
+   */
   static bool nameMatchesAny(const std::string &name, const char *list) {
     if (list == nullptr)
       return false;

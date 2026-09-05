@@ -16,7 +16,9 @@
 #define __CL_BUFFER_POOL_H__
 
 #include <memory>
+#include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <mem_allocator.h>
@@ -72,6 +74,17 @@ public:
   void deallocate() override;
 
   /**
+   * @copydoc MemoryPool::noteDeviceOnlyTokens
+   *
+   * Remembers the planner's answer so allocate() can leave the shared slice
+   * unallocated for the offsets the device plane is about to own. An offset
+   * qualifies only when EVERY token the planner put there is device-only:
+   * tokens at one offset alias one region, so one host-addressable tensor
+   * among them means the region has to exist on the shared plane too.
+   */
+  void noteDeviceOnlyTokens(const std::vector<unsigned int> &tokens) override;
+
+  /**
    * @copydoc MemoryPool::deviceMemory
    *
    * Creates the buffer for the token's planner offset on first request, sized
@@ -83,6 +96,13 @@ public:
   void *deviceMemory(unsigned int idx) override;
 
 private:
+  /** Guards the members below, all of which deviceMemory() fills in lazily.
+   *  Allocation is single-threaded today, but the OpenCL lazy getters next
+   *  door (ClBufferManager) are reachable from a worker thread and are locked
+   *  for it, and one file in this pair silently disagreeing about that is how
+   *  a data race gets written later. The lock is taken once per planner
+   *  offset, never on a kernel path. */
+  std::mutex device_mtx_;
   /** planner offset of each token, indexed by token - 1 */
   std::vector<size_t> token_offset_;
   /** planner offset -> largest tensor the planner placed there */
@@ -90,6 +110,37 @@ private:
   /** planner offset -> the one device cl_mem backing it (held as void* so the
    *  header stays free of the OpenCL types) */
   std::unordered_map<size_t, void *> offset_buffer_;
+  /** offsets whose device buffer allocate() created up front and whose shared
+   *  slice it therefore skipped. Only offsets in here answer false to
+   *  sharedSliceNeeded(); an offset whose device buffer failed to materialise
+   *  is not in here and keeps its shared slice. */
+  std::unordered_set<size_t> shared_slice_skipped_;
+  /** tokens the residency planner told us it will place on the device plane,
+   *  recorded by noteDeviceOnlyTokens() before allocate() runs */
+  std::vector<unsigned int> device_only_tokens_;
+
+  /**
+   * @copydoc MemoryPool::sharedSliceNeeded
+   *
+   * False exactly for the offsets in shared_slice_skipped_.
+   */
+  bool sharedSliceNeeded(size_t offset) const override;
+
+  /**
+   * @brief Fill token_offset_ / offset_size_ from the planner's layout.
+   * @details Split out of allocate() because the skip decision needs the
+   * offset map BEFORE the shared plane is allocated, while the original call
+   * site needed it after. Idempotent.
+   */
+  void recordPlannerLayout();
+
+  /**
+   * @brief Create the device buffer for one planner offset, or return nullptr.
+   * @param offset planner offset
+   * @return the cl_mem, or nullptr when the device cannot back it
+   * @note Caller holds device_mtx_.
+   */
+  void *createDeviceBufferLocked(size_t offset);
 };
 
 } // namespace nntrainer
