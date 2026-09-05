@@ -245,7 +245,6 @@ void TensorPool::setBatchSize(const std::string &name, unsigned int batch) {
 void TensorPool::allocate(bool init) {
   if (minMemoryRequirement() == 0)
     return;
-  mem_pool->allocate();
 
   /** Configure the residency planner for this pool. What the allocator can
    *  produce decides what placements are available at all; the application's
@@ -269,6 +268,43 @@ void TensorPool::allocate(bool init) {
     const char *e = std::getenv("NNTR_CLMEM_FANOUT");
     return !(e != nullptr && e[0] == '0');
   }();
+
+  /** Tell the pool which tokens will live on its device plane and nowhere
+   *  else, BEFORE it allocates -- a pool with two planes can then leave the
+   *  shared slice unallocated for them instead of holding every device tensor
+   *  twice. The classification below is the same call the bind loop makes; it
+   *  reads only dtype, engine, consumers, initializer and name, none of which
+   *  need memory to exist, so asking early costs a second pass over the specs
+   *  and changes no answer.
+   *
+   *  A declared raise/lower boundary is excluded even though it classifies
+   *  GPU_CLMEM: those are exactly the tensors whose host side IS written (a
+   *  raise uploads it, a lower reads back into it), so their shared slice is
+   *  live memory, not a duplicate. */
+  {
+    std::vector<unsigned int> device_only;
+    for (auto &spec : pool) {
+      auto details = std::get_if<SourceDetails>(&spec.details);
+      if (!details || details->token == 0)
+        continue;
+      const std::string &nm = spec.tensor->getName();
+      if (ResidencyPlanner::nameMatchesAny(nm, planner.raise) ||
+          ResidencyPlanner::nameMatchesAny(nm, planner.lower))
+        continue;
+      ResidencyClass cls = planner.classify(
+        details->engine, details->all_consumers_device,
+        spec.tensor->getDataType() == ml::train::TensorDim::DataType::FP16,
+        spec.tensor->getInitializer() != Initializer::NONE, nm,
+        details->view_count);
+      if (allocator_ && !allocator_->supportsResidency(cls))
+        continue;
+      if (cls == ResidencyClass::GPU_CLMEM)
+        device_only.push_back(details->token);
+    }
+    mem_pool->noteDeviceOnlyTokens(device_only);
+  }
+
+  mem_pool->allocate();
 
   /** set the pointers using the token for all the tensors */
   for (auto &spec : pool) {

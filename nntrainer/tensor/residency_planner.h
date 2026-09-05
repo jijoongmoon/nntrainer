@@ -137,7 +137,6 @@ struct ResidencyPlanner {
     return cls;
   }
 
-private:
   /**
    * @brief comma-separated substring match against a declared pattern list.
    *

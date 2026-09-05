@@ -230,9 +230,19 @@ void multiplyCl(Tensor &input, float const &value) {
 
 void add_i_cl(Tensor &result, Tensor const &input) {
 
-  NNTR_THROW_IF(input.getData() == nullptr, std::invalid_argument)
+  // "Not allocated" means on NEITHER plane. A tensor the planner put on the
+  // device plane has no shared-plane pointer to offer once the pool stops
+  // creating a shadow for it, and a null getData() there is the correct
+  // answer, not a missing allocation -- the bytes are in the cl_mem.
+  const auto unallocated = [](const Tensor &t) {
+    if (t.getData() != nullptr)
+      return false;
+    auto md = t.getMemoryData();
+    return !(md && md->isClMem() && md->deviceMem() != nullptr);
+  };
+  NNTR_THROW_IF(unallocated(input), std::invalid_argument)
     << input.getName() << " is not allocated";
-  NNTR_THROW_IF(result.getData() == nullptr, std::invalid_argument)
+  NNTR_THROW_IF(unallocated(result), std::invalid_argument)
     << result.getName() << " is not allocated";
 
   // Broadcasting done for the case where batch size vary for both inputs
