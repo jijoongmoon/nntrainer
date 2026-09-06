@@ -1032,6 +1032,77 @@ __kernel void v8c_gemm_int8_int4_m1_buf(
 // int32 dp4a accumulation is order-independent and the per-column float
 // epilogue is unchanged. Reads the image2d kernels' BACKING buffers (the
 // wrapper queries CL_IMAGE_BUFFER), so no new weight copies exist.
+// The body is shared by the two instantiations below and parameterised on the
+// number of K-lanes per column (KL); the work-group is 8*KL, one 8-wide n-tile
+// either way. KL is the only thing that changes: the n-tile, the LDS act
+// staging and the epilogue are identical, and `acc` is an int32, so the
+// partition of the K range across lanes and the shape of the reduction tree
+// cannot change the sum -- integer addition is exactly associative. Both
+// instantiations are therefore bit-identical to each other and to the m1
+// kernels.
+#define V8C_GEMV_COOP_BODY(KL, LWSZ)                                           \
+  const int t = get_local_id(0);                                               \
+  const int jc = t / (KL); /* column lane within the 8-wide n-tile */          \
+  const int kl = t % (KL); /* K interleave lane */                             \
+  const int n = get_group_id(0) * 8 + jc;                                      \
+  const int K32 = K >> 5;                                                      \
+  __local uint4 axl[768];                                                      \
+  const int K16 = K >> 4;                                                      \
+  for (int i = t; i < K16; i += (LWSZ))                                        \
+    axl[i] = Xbuf[i];                                                          \
+  barrier(CLK_LOCAL_MEM_FENCE);                                                \
+  __global const uint4 *wrow = Wbuf + (long)n * W_wgt;                         \
+  int acc = 0;                                                                 \
+  for (int k32 = kl; k32 < K32; k32 += (KL)) {                                 \
+    const uint4 a_lo = axl[2 * k32];                                           \
+    const uint4 a_hi = axl[2 * k32 + 1];                                       \
+    const uint4 w = wrow[k32];                                                 \
+    const uint M4 = 0x0F0F0F0Fu;                                               \
+    acc += dot_4x8packed_su_int(a_lo.x, w.x & M4) +                            \
+           dot_4x8packed_su_int(a_lo.y, (w.x >> 4) & M4) +                     \
+           dot_4x8packed_su_int(a_lo.z, w.y & M4) +                            \
+           dot_4x8packed_su_int(a_lo.w, (w.y >> 4) & M4) +                     \
+           dot_4x8packed_su_int(a_hi.x, w.z & M4) +                            \
+           dot_4x8packed_su_int(a_hi.y, (w.z >> 4) & M4) +                     \
+           dot_4x8packed_su_int(a_hi.z, w.w & M4) +                            \
+           dot_4x8packed_su_int(a_hi.w, (w.w >> 4) & M4);                      \
+  }                                                                            \
+  __local int red[(LWSZ)];                                                     \
+  red[t] = acc;                                                                \
+  barrier(CLK_LOCAL_MEM_FENCE);                                                \
+  for (int off = (KL) >> 1; off > 0; off >>= 1) {                              \
+    if (kl < off)                                                              \
+      red[t] += red[t + off];                                                  \
+    barrier(CLK_LOCAL_MEM_FENCE);                                              \
+  }                                                                            \
+  if (kl == 0) {                                                               \
+    const int nn = get_group_id(0) * 8 + jc;                                   \
+    const int corrected =                                                      \
+      red[t] - 8 * row_sum_act[0] - zp_act[0] * row_sum_w_int4[nn];            \
+    Y[nn] = (half)((float)corrected * scale_act[0] * scale_wgt[nn]);           \
+  }
+
+// ML Drift reaudit (decode, 2026-06-12): cooperative M=1 GEMV. The m1
+// kernels above give each WI a serial K-loop over an 8-column tile, so total
+// parallelism is N/8 work-items — at N=2304 that is ~4.5 waves on the whole
+// GPU and the load latency cannot be hidden (12-22 GB/s effective; the
+// decode FC stream is ~977 MB/token = the whole decode budget). Here a
+// workgroup covers one 8-column tile with a KL-way K-split per column
+// (LDS tree reduce), so parallelism scales to N*KL and the uint4 buffer loads
+// stream at memory rate. Output is BIT-IDENTICAL to the m1 kernels: the
+// int32 dp4a accumulation is order-independent and the per-column float
+// epilogue is unchanged. Reads the image2d kernels' BACKING buffers (the
+// wrapper queries CL_IMAGE_BUFFER), so no new weight copies exist.
+//
+// Coalescing: the KL K-lanes of one column read CONSECUTIVE uint4s each step
+// (k32 = base + lane -> 16*KL B contiguous per column per step). The first cut
+// used contiguous per-lane K-slices instead, which scattered a wave's 16 B
+// loads across ~9 KB and burned 4x cache-line over-fetch (26 GB/s effective);
+// this mapping is the q6k_gemv lesson applied.
+//
+// K cap: the act row is staged in a 768-uint4 LDS array (12 KB); K <= 12288 is
+// guaranteed by the host-side dispatch guard. 12288 covers Gemma4's
+// double-wide-MLP FFN-down (K=12288).
 __kernel void v8c_gemv_int8_int4_coop(
     __global const uint4 *Xbuf,             // act row 0, K/16 uint4
     __global const uint4 *Wbuf,             // weight row n at n*W_wgt uint4
@@ -1043,58 +1114,30 @@ __kernel void v8c_gemv_int8_int4_coop(
     __global       half   *Y,
     const int N, const int K,
     const int W_wgt) {                       // weight row stride in uint4 (K/32)
-  const int t = get_local_id(0); // 0..63
-  // Coalesced mapping: the 8 K-lanes of one column read CONSECUTIVE uint4s
-  // each step (k32 = base + lane -> 128 B contiguous per column per step).
-  // The first cut used contiguous per-lane K-slices instead, which scattered
-  // a wave's 16 B loads across ~9 KB and burned 4x cache-line over-fetch
-  // (26 GB/s effective); this mapping is the q6k_gemv lesson applied.
-  const int jc = t >> 3;         // column lane within the 8-wide n-tile
-  const int kl = t & 7;          // K interleave lane
-  const int n = get_group_id(0) * 8 + jc;
-  const int K32 = K >> 5;
-  // Stage the act row in LDS once per workgroup: the 8 column lanes
-  // otherwise each load the SAME act uint4s (2 of 3 load issues were
-  // redundant act traffic). 64 WIs load it coalesced; K <= 12288 is
-  // guaranteed by the host-side dispatch guard (768 uint4 = 12 KB LDS).
-  // 12288 covers Gemma4's double-wide-MLP FFN-down (K=12288) which previously
-  // exceeded the 10240 cap and fell to the ~15x slower m1 GEMM at decode.
-  __local uint4 axl[768];
-  const int K16 = K >> 4;
-  for (int i = t; i < K16; i += 64)
-    axl[i] = Xbuf[i];
-  barrier(CLK_LOCAL_MEM_FENCE);
-  __global const uint4 *wrow = Wbuf + (long)n * W_wgt;
-  int acc = 0;
-  for (int k32 = kl; k32 < K32; k32 += 8) {
-    const uint4 a_lo = axl[2 * k32];
-    const uint4 a_hi = axl[2 * k32 + 1];
-    const uint4 w = wrow[k32];
-    const uint M4 = 0x0F0F0F0Fu;
-    acc += dot_4x8packed_su_int(a_lo.x,  w.x        & M4)
-         + dot_4x8packed_su_int(a_lo.y, (w.x >> 4)  & M4)
-         + dot_4x8packed_su_int(a_lo.z,  w.y        & M4)
-         + dot_4x8packed_su_int(a_lo.w, (w.y >> 4)  & M4)
-         + dot_4x8packed_su_int(a_hi.x,  w.z        & M4)
-         + dot_4x8packed_su_int(a_hi.y, (w.z >> 4)  & M4)
-         + dot_4x8packed_su_int(a_hi.z,  w.w        & M4)
-         + dot_4x8packed_su_int(a_hi.w, (w.w >> 4)  & M4);
-  }
-  __local int red[64];
-  red[t] = acc;
-  barrier(CLK_LOCAL_MEM_FENCE);
-  // Per-column reduce over the 8 K-lanes (column jc partials live at
-  // red[8*jc .. 8*jc+7]).
-  for (int off = 4; off > 0; off >>= 1) {
-    if (kl < off) red[t] += red[t + off];
-    barrier(CLK_LOCAL_MEM_FENCE);
-  }
-  if (kl == 0) {
-    const int nn = get_group_id(0) * 8 + jc;
-    const int corrected =
-      red[t] - 8 * row_sum_act[0] - zp_act[0] * row_sum_w_int4[nn];
-    Y[nn] = (half)((float)corrected * scale_act[0] * scale_wgt[nn]);
-  }
+  V8C_GEMV_COOP_BODY(8, 64)
+}
+
+// 16 K-lanes per column, work-group 128. SAME 8-wide n-tile and SAME staged
+// act row as the 64-lane kernel above -- only the lane count differs, so it
+// moves exactly the same bytes and is bit-identical. Measured on the handset
+// (offline GEMV probe, best of 9): gate/up N=12288 K=1536 0.137 -> 0.131 ms
+// (-4.4 %), double-wide FFN-down N=1536 K=12288 0.163 -> 0.146 ms (-10.4 %),
+// output byte-identical on both shapes. Widening the n-tile INSTEAD (NC=16/32
+// with fewer work-groups, which is what the act-staging byte count argues for)
+// is neutral to harmful on this device: the staging is cache-served, and fewer
+// fatter work-groups under-fill the 12 CUs.
+__kernel void v8c_gemv_int8_int4_coop_kl16(
+    __global const uint4 *Xbuf,
+    __global const uint4 *Wbuf,
+    __global const float  *scale_act,
+    __global const float  *scale_wgt,
+    __global const int    *row_sum_act,
+    __global const int    *zp_act,
+    __global const int    *row_sum_w_int4,
+    __global       half   *Y,
+    const int N, const int K,
+    const int W_wgt) {
+  V8C_GEMV_COOP_BODY(16, 128)
 }
 
 __kernel void v8c_gemm_int8_int4_v_ohwi_buf(

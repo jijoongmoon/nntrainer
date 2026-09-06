@@ -1566,8 +1566,20 @@ void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
                              nullptr);
     }
     if (wbuf != nullptr && abuf != nullptr) {
+      // K-lanes per column. 16 (work-group 128) is the measured default:
+      // an offline GEMV probe gives -4.4 % on the gate/up shape and -10.4 %
+      // on the double-wide FFN-down shape against the 8-lane, 64-wide kernel,
+      // with byte-identical output. NNTR_FC_GEMV_KL=8 is the in-binary control
+      // arm; any other value falls back to 8.
+      static const int gemv_kl = []() {
+        const char *e = getenv("NNTR_FC_GEMV_KL");
+        return (e && atoi(e) == 8) ? 8 : 16;
+      }();
+      const bool kl16 = (gemv_kl == 16);
       ClContext::SharedPtrClKernel ck = blas_cc->registerClKernel(
-        int8_int4_gemm_v8c_kernel, "v8c_gemv_int8_int4_coop", copts);
+        int8_int4_gemm_v8c_kernel,
+        kl16 ? "v8c_gemv_int8_int4_coop_kl16" : "v8c_gemv_int8_int4_coop",
+        copts);
       if (ck) {
         int Ni = (int)N, Ki = (int)K, Ww = (int)v8c_wrow_texels(K);
         int a = 0;
@@ -1584,8 +1596,9 @@ void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
           ck->SetKernelArguments(a++, &Ki, sizeof(int)) &&
           ck->SetKernelArguments(a++, &Ww, sizeof(int));
         if (ok) {
-          std::array<size_t, 3> gws = {(size_t)(N / 8) * 64, 1, 1};
-          std::array<size_t, 3> lws = {64, 1, 1};
+          const size_t wg = kl16 ? 128 : 64;
+          std::array<size_t, 3> gws = {(size_t)(N / 8) * wg, 1, 1};
+          std::array<size_t, 3> lws = {wg, 1, 1};
           blas_cc->command_queue_inst_.enqueueKernel(
             ck->GetKernel(), 1, gws.data(), lws.data(), 0, nullptr, nullptr);
           return;
