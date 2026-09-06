@@ -17,11 +17,13 @@
 #include "cl_tensor_view.h"
 #include "util_func.h"
 #include <array>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <fp16.h>
 #include <opencl_loader.h>
+#include <string>
 
 namespace nntrainer {
 
@@ -2578,6 +2580,94 @@ __kernel void lmhead_int4_v8c_gemv(__global const uchar *W,    // [N][K/2] nibbl
 }
 )CL";
 
+// N-tiled form of the kernel above: one work-group computes NR consecutive
+// output rows instead of one.
+//
+// Why. The kernel above loads 768 B of packed int4 weight per row and, for the
+// same row, K*2 = 3072 B of fp16 activation -- so activation loads are FOUR
+// TIMES the weight loads, and every one of the 262144 work-groups re-reads the
+// same 3 KiB activation row. Measured on an Adreno 840, bandwidth probe:
+//
+//   raw stream of the weight rows, no unpack, no act   2.76 ms  67.9 GiB/s
+//   + int4 unpack, activation replaced by a constant   3.69 ms
+//   the shipped kernel                                 6.47 ms  29.0 GiB/s
+//
+// i.e. of the 6.47 ms, 2.76 ms is the irreducible 192 MiB weight stream at the
+// device's measured ceiling, ~0.9 ms is the unpack, and ~2.8 ms is activation
+// traffic that carries no information -- 768 MiB of L1/L2 re-reads of one 3 KiB
+// row. Hoisting the activation load out of the row loop divides that by NR.
+//
+// Bit-exactness is by construction, not by tolerance. Lane t still owns kblock
+// t of every row it computes, the per-lane float accumulation visits the same
+// kblocks in the same order, and the 64-lane LDS tree reduction is unchanged --
+// so each row's float sum is folded in exactly the order the kernel above folds
+// it. Only the assignment of rows to work-groups changes. Measured: the two
+// kernels' 262144 fp16 logits are byte-identical at NR = 2, 4, 6, 8, 10, 12, 16
+// and 32, and NR = 8 is the optimum (3.39 ms, -47.7 %).
+static const std::string lmhead_int4_v8c_nr_kernel = R"CL(
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+#ifndef NR
+#define NR 8
+#endif
+__kernel void lmhead_int4_v8c_gemv_nr(__global const uchar *W,   // [N][K/2]
+                                      __global const half *x,     // [K] fp16
+                                      __global const float *scale,// [N] fp32
+                                      __global half *logits,      // [N]
+                                      const int N, const int K) {
+  const int row0 = (int)get_group_id(0) * NR;
+  const int t = get_local_id(0); // 0..63
+  const int kblocks = K >> 5;
+  const size_t rb = (size_t)(K >> 1);
+  float sum[NR];
+#pragma unroll
+  for (int r = 0; r < NR; ++r) sum[r] = 0.0f;
+  for (int kb = t; kb < kblocks; kb += 64) {
+    __global const half *xb = x + (kb << 5);
+    for (int c = 0; c < 4; ++c) {
+      // The one load that NR rows now share.
+      const float8 a = convert_float8(vload8(0, xb + (c << 3)));
+#pragma unroll
+      for (int r = 0; r < NR; ++r) {
+        __global const uchar *blk = W + (size_t)(row0 + r) * rb + (kb << 4);
+        const uchar4 by = vload4(0, blk + (c << 2));
+        const float4 lo = convert_float4(convert_int4(by & (uchar4)0x0F) - 8);
+        const float4 hi = convert_float4(convert_int4(by >> (uchar4)4) - 8);
+        sum[r] += dot(a.lo, lo) + dot(a.hi, hi);
+      }
+    }
+  }
+  __local float red[NR][64];
+#pragma unroll
+  for (int r = 0; r < NR; ++r) red[r][t] = sum[r];
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (int off = 32; off > 0; off >>= 1) {
+    if (t < off) {
+#pragma unroll
+      for (int r = 0; r < NR; ++r) red[r][t] += red[r][t + off];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  if (t < NR) logits[row0 + t] = (half)(red[t][0] * scale[row0 + t]);
+}
+)CL";
+
+// Rows per work-group for the lm_head GEMV. 8 is the measured optimum on
+// Adreno 840; 1 selects the untiled kernel above, which is the control arm.
+static int lmhead_nr_rows() {
+  static const int nr = []() {
+    const char *e = std::getenv("NNTR_LMHEAD_NR");
+    if (e == nullptr)
+      return 8;
+    char *end = nullptr;
+    errno = 0;
+    const long v = std::strtol(e, &end, 10);
+    if (errno != 0 || end == e || *end != 0 || v < 1 || v > 32)
+      return 8;
+    return (int)v;
+  }();
+  return nr;
+}
+
 bool lmhead_int4_v8c_gemv_cl(void *w_buf_clmem, void *scale_buf_clmem,
                              void *act, bool act_is_clmem, void *logits_host,
                              bool out_fp16, unsigned int N, unsigned int K) {
@@ -2593,8 +2683,19 @@ bool lmhead_int4_v8c_gemv_cl(void *w_buf_clmem, void *scale_buf_clmem,
   if (!ctx || !q)
     return false;
 
+  // The N-tiled kernel is taken only when it divides the row count exactly.
+  // A remainder would need an in-kernel row guard, and a guard inside the
+  // unrolled row loop is exactly what stops the compiler unrolling it -- so
+  // rather than pay for the general case, fall back to the untiled kernel,
+  // which is bit-identical anyway.
+  const int nr = lmhead_nr_rows();
+  const bool tiled = nr > 1 && (N % (unsigned)nr) == 0;
   ClContext::SharedPtrClKernel kp =
-    blas_cc->registerClKernel(lmhead_int4_v8c_kernel, "lmhead_int4_v8c_gemv");
+    tiled ? blas_cc->registerClKernel(lmhead_int4_v8c_nr_kernel,
+                                      "lmhead_int4_v8c_gemv_nr",
+                                      "-DNR=" + std::to_string(nr))
+          : blas_cc->registerClKernel(lmhead_int4_v8c_kernel,
+                                      "lmhead_int4_v8c_gemv");
   if (!kp) {
     static int logged = 0;
     if (!logged++)
@@ -2637,7 +2738,8 @@ bool lmhead_int4_v8c_gemv_cl(void *w_buf_clmem, void *scale_buf_clmem,
   if (!ok)
     return false;
 
-  const int work_groups_count[3] = {(int)N * 64, 1, 1};
+  const int work_groups_count[3] = {(int)(N / (unsigned)(tiled ? nr : 1)) * 64,
+                                    1, 1};
   const int work_group_size[3] = {64, 1, 1};
   static const bool tprof = std::getenv("NNTR_LMHEAD_TPROF") != nullptr;
   const auto t0 = std::chrono::steady_clock::now();
