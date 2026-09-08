@@ -662,6 +662,47 @@ static bool v8c_ensure_buf(cl_context ctx, cl_mem *buf, size_t *cap,
   return true;
 }
 
+/**
+ * @brief NNTR_V8C_MPAD_ALL=1 -- pad EVERY multi-row v8c call to the 64-row
+ *        alignment, not only the ones that already reach 64 rows.
+ *
+ * @details DIAGNOSTIC, default OFF: it was measured and it is NOT a fix.
+ *
+ * The 64 in the rule below is the one number in the prefill path that matches
+ * a separately recorded chunked-prefill defect -- a prefill whose LAST
+ * chunk is under 64 rows answers wrongly (tails of 4 and 11 break; 395, 445
+ * and 523 are golden, at 4, 5, 6 and 8 chunks alike). The alignment exists so
+ * that gws_y = M_pad / V8C_TM is a multiple of 16 and the tuned 4x16
+ * work-group divides the grid; below 64 rows select2dLws() fails and the GEMM
+ * runs with a NULL (driver-chosen) work-group, which the dispatch site calls
+ * "a measured performance cliff ... not a correctness issue".
+ *
+ * That claim survives the test. Forcing the 64-row padding for every
+ * multi-row call -- so the tuned work-group is always used -- CHANGES the
+ * wrong answer but does not fix it (3 595 tokens at init_seq_len 512:
+ * 1 377 B either way), and the kernel says why: v8c_gemm_int8_int4 has no
+ * local memory, no barrier and no sub-group op, and guards its stores with
+ * `if (m0 + i >= M_valid) continue`, so it cannot depend on the work-group
+ * shape. Keep this arm because it isolates M_pad from everything else that
+ * moves with the chunk split; do not mistake it for the cause.
+ *
+ * Decode (M == 1) is excluded whatever the setting: padding a single row to 64
+ * is a 64x FC blow-up, and M=1 takes the m1/GEMV kernel anyway.
+ *
+ * @param M real row count
+ * @return the padded row count the scratch buffers and the grid both use
+ */
+static unsigned int v8c_m_pad_for(unsigned int M) {
+  constexpr unsigned int V8C_TM = 4, V8C_MPAD_ALIGN = 64;
+  static const bool pad_all = [] {
+    const char *e = std::getenv("NNTR_V8C_MPAD_ALL");
+    return e != nullptr && e[0] == '1';
+  }();
+  const unsigned int eff =
+    (M >= V8C_MPAD_ALIGN || (pad_all && M > 1)) ? V8C_MPAD_ALIGN : V8C_TM;
+  return (M + eff - 1) / eff * eff;
+}
+
 // Get or build the cached v8c weight backing for a given int4 (QS4CX) weight.
 // Returns nullptr if shape unsupported (caller falls back).
 static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
@@ -1108,14 +1149,14 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
   // by default. Padded rows are computed but never stored (M-valid store
   // guard in the kernel), so output is bit-identical. The alignment is fixed
   // rather than tunable: it is derived from the work-group above, not swept.
-  // Only applied for prefill-sized M (M >= align): decode (M=1) must never pad
-  // to 64 (that would be a 64x FC blow-up) -- guarded by eff_align below.
-  constexpr unsigned int V8C_MPAD_ALIGN = 64;
-  static_assert(V8C_MPAD_ALIGN % V8C_TM == 0,
+  // Decode (M == 1) must never pad to 64 (a 64x FC blow-up); every other row
+  // count does, which is what NNTR_V8C_MPAD_ALL settles -- see v8c_m_pad_for().
+  // One rule, one place: that function is also what the scratch buffers are
+  // sized with, so the grid must not compute its own answer. (It used to, and
+  // the two agreed only by repeating the same literal.)
+  const unsigned int M_pad = v8c_m_pad_for(M);
+  static_assert(64u % V8C_TM == 0,
                 "M_pad alignment must stay a multiple of the kernel tile");
-  const unsigned int eff_align =
-    (M >= V8C_MPAD_ALIGN) ? V8C_MPAD_ALIGN : V8C_TM;
-  const unsigned int M_pad = (M + eff_align - 1) / eff_align * eff_align;
 
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
