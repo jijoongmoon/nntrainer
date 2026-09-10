@@ -485,6 +485,25 @@ public:
   virtual void fc_prebuild_weight(Tensor &weight) { (void)weight; }
 
   /**
+   * @brief Same one-time weight transform, but reading the weight's payload
+   *        from @p src rather than from the tensor.
+   *
+   * @details The zero-copy weight load: the layer hands the weight file's
+   * mapping to the backend so the payload is never copied into host memory at
+   * all. Default declines, and a caller that gets false must read the payload
+   * the ordinary way before using the weight.
+   *
+   * @param[in] weight the weight tensor (identity, shape and scales)
+   * @param[in] src    the weight's payload bytes in the file mapping
+   * @return true when the backend built its weight from @p src
+   */
+  virtual bool fc_prebuild_weight_from(Tensor &weight, const void *src) {
+    (void)weight;
+    (void)src;
+    return false;
+  }
+
+  /**
    * @brief Fused activation epilogue: apply an element-wise activation in
    *        place on a compute layer's output, after GEMM+bias. This is the
    *        in-place special case of activation(): one tensor, whole tensor, so
