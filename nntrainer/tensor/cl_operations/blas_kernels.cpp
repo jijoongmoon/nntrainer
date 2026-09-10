@@ -17,6 +17,7 @@
 #include "cl_tensor_view.h"
 #include "util_func.h"
 #include "v8c_pack_cache.h"
+#include <load_trace.h>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -2259,8 +2260,12 @@ std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
   cl_mem_flags wflags = CL_MEM_READ_ONLY;
   if (hostptr)
     wflags |= CL_MEM_ALLOC_HOST_PTR;
-  cl_mem w_buf =
-    opencl::clCreateBuffer(ctx, wflags, total_bytes, nullptr, &err);
+  cl_mem w_buf = nullptr;
+  {
+    nntrainer::load_trace::Scope _lt(nntrainer::load_trace::WBUF_CREATE);
+    _lt.bytes(total_bytes);
+    w_buf = opencl::clCreateBuffer(ctx, wflags, total_bytes, nullptr, &err);
+  }
   if (err != CL_SUCCESS || !w_buf)
     throw std::runtime_error("make_v8c_weight_backing_from_qs4cx: "
                              "clCreateBuffer (weight) failed: " +
@@ -2280,20 +2285,31 @@ std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
   // with one of the same size and timestamp cannot serve a stale pack. It is
   // sampled, so it costs a fixed ~192 KB of hashing whether the lookup hits
   // or misses.
-  const uint64_t src_fnv =
-    (cache_name != nullptr)
-      ? v8c_pack::source_fingerprint(plain_nibbles, (size_t)N * plain_row_bytes)
-      : 0;
+  uint64_t src_fnv = 0;
+  {
+    nntrainer::load_trace::Scope _lt(nntrainer::load_trace::FINGERPRINT);
+    src_fnv = (cache_name != nullptr)
+                ? v8c_pack::source_fingerprint(plain_nibbles,
+                                               (size_t)N * plain_row_bytes)
+                : 0;
+  }
   bool from_cache = false;
   if (!hostptr && cache_name != nullptr) {
     v8c_pack::Hit hit;
-    if (v8c_pack::lookup(cache_name, N, K, v8c_row_bytes, total_bytes, src_fnv,
-                         hit)) {
+    bool _lt_hit = false;
+    {
+      nntrainer::load_trace::Scope _lt(nntrainer::load_trace::LOOKUP);
+      _lt_hit = v8c_pack::lookup(cache_name, N, K, v8c_row_bytes, total_bytes,
+                                 src_fnv, hit);
+    }
+    if (_lt_hit) {
       constexpr size_t UP_CHUNK = 64u << 20;
       cl_int werr = CL_SUCCESS;
       for (size_t off = 0; off < total_bytes && werr == CL_SUCCESS;
            off += UP_CHUNK) {
         const size_t len = std::min(UP_CHUNK, total_bytes - off);
+        nntrainer::load_trace::Scope _ltu(nntrainer::load_trace::HIT_UPLOAD);
+        _ltu.bytes(len);
         werr = opencl::clEnqueueWriteBuffer(
           cq, w_buf, CL_TRUE, off, len, hit.payload + off, 0, nullptr, nullptr);
         v8c_pack::Hit consumed;
@@ -2438,10 +2454,19 @@ std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
             break;
           const size_t n0 = ci * chunk_rows;
           const size_t nrows = std::min(chunk_rows, (size_t)N - n0);
-          std::memset(staging.data(), 0, nrows * v8c_row_bytes);
-          pack_rows(n0, nrows, staging.data());
-          v8c_pack::record_write(pack_rec.rw, n0 * v8c_row_bytes,
-                                 staging.data(), nrows * v8c_row_bytes);
+          {
+            nntrainer::load_trace::Scope _lt(nntrainer::load_trace::PERMUTE);
+            _lt.bytes(nrows * v8c_row_bytes);
+            std::memset(staging.data(), 0, nrows * v8c_row_bytes);
+            pack_rows(n0, nrows, staging.data());
+          }
+          {
+            nntrainer::load_trace::Scope _lt(nntrainer::load_trace::PACK_WRITE);
+            v8c_pack::record_write(pack_rec.rw, n0 * v8c_row_bytes,
+                                   staging.data(), nrows * v8c_row_bytes);
+          }
+          nntrainer::load_trace::Scope _ltu(nntrainer::load_trace::MISS_UPLOAD);
+          _ltu.bytes(nrows * v8c_row_bytes);
           const cl_int werr = opencl::clEnqueueWriteBuffer(
             cq, w_buf, CL_TRUE, n0 * v8c_row_bytes, nrows * v8c_row_bytes,
             staging.data(), 0, nullptr, nullptr);
@@ -2482,12 +2507,22 @@ std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
         dst = packed.data();
         std::memset(dst, 0, nrows * v8c_row_bytes); // padding stays 0
       }
-      pack_rows(n0, nrows, dst);
-      v8c_pack::record_write(pack_rec.rw, n0 * v8c_row_bytes, dst,
-                             nrows * v8c_row_bytes);
+      {
+        nntrainer::load_trace::Scope _lt(nntrainer::load_trace::PERMUTE);
+        _lt.bytes(nrows * v8c_row_bytes);
+        pack_rows(n0, nrows, dst);
+      }
+      {
+        nntrainer::load_trace::Scope _lt(nntrainer::load_trace::PACK_WRITE);
+        v8c_pack::record_write(pack_rec.rw, n0 * v8c_row_bytes, dst,
+                               nrows * v8c_row_bytes);
+      }
       if (!hostptr) {
         if (upload_async) {
           cl_event ev = nullptr;
+          nntrainer::load_trace::Scope _ltu(
+            nntrainer::load_trace::MISS_UPLOAD);
+          _ltu.bytes(nrows * v8c_row_bytes);
           const cl_int werr = opencl::clEnqueueWriteBuffer(
             cq, w_buf, CL_FALSE, n0 * v8c_row_bytes, nrows * v8c_row_bytes,
             chunk_staging.data(), 0, nullptr, &ev);
@@ -2499,6 +2534,9 @@ std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
           }
           v8c_push_pending(ev, std::move(chunk_staging));
         } else {
+          nntrainer::load_trace::Scope _ltu(
+            nntrainer::load_trace::MISS_UPLOAD);
+          _ltu.bytes(nrows * v8c_row_bytes);
           const cl_int werr = opencl::clEnqueueWriteBuffer(
             cq, w_buf, CL_TRUE, n0 * v8c_row_bytes, nrows * v8c_row_bytes,
             packed.data(), 0, nullptr, nullptr);
@@ -2528,6 +2566,7 @@ std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
   // Derive finished: append the row sums, checksum the record and index it.
   // A no-op when the guard holds no writer; commit_record owns the handle.
   if (pack_rec.rw) {
+    nntrainer::load_trace::Scope _lt(nntrainer::load_trace::PACK_WRITE);
     v8c_pack::commit_record(pack_rec.rw, row_sum_w_int4.data(), N);
     pack_rec.rw = nullptr;
   }
@@ -2537,6 +2576,7 @@ std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
     /** owned */ true);
 
   // Per-channel scale: QS4CX stores fp32 directly (no fp16->fp32 promotion).
+  nntrainer::load_trace::Scope _lt_aux(nntrainer::load_trace::AUX_CREATE);
   cl_mem sb =
     opencl::clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
                            sizeof(float) * N, (void *)fp32_scales, &err);

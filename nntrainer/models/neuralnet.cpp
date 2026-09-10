@@ -46,6 +46,7 @@
 
 #if !defined(_WIN32)
 #include <fcntl.h> // posix_fadvise: drop the weight file's page cache after the load
+#include <load_trace.h>
 #endif
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
 #include <cuda_fc_qs4cx.h> // [wprefetch] cuda_fc_qs4cx_prefetch_weight
@@ -1065,6 +1066,11 @@ void NeuralNetwork::load(const std::string &file_path,
   /// @todo this switch case should be delegating the function call only. It's
   /// not delegating for now as required logics are manageable for now.
 
+  /* [load-trace] The record walk below is the one single-threaded stretch
+     ahead of the worker fan-out; time it separately so a slow header parse
+     cannot hide inside the load's wall clock. */
+  const auto _lt_load_t0 = std::chrono::steady_clock::now();
+
   bool fsu_mode = std::get<props::Fsu>(model_flex_props);
 
   const std::regex reg_("\\s*\\;\\s*");
@@ -1106,6 +1112,12 @@ void NeuralNetwork::load(const std::string &file_path,
     }
   }
 
+  nntrainer::load_trace::add(
+    nntrainer::load_trace::PRESCAN,
+    (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now() - _lt_load_t0)
+      .count());
+
   if (exec_mode == ExecutionMode::INFERENCE && fsu_mode) {
     model_graph.setFsuWeightPath((v.size() == 2) ? v[1] : v[0]);
     model_graph.setWeightOffset(file_offset);
@@ -1140,7 +1152,10 @@ void NeuralNetwork::load(const std::string &file_path,
       // file identity (size and modification time). Either maps a pack the
       // load workers below can consume, or arms a one-time rewrite. A no-op
       // when the cache is opted out of, and on every non-OpenCL build.
-      v8c_pack::set_source(f_path.c_str());
+      {
+        nntrainer::load_trace::Scope _lt(nntrainer::load_trace::PACK_OPEN);
+        v8c_pack::set_source(f_path.c_str());
+      }
 #endif
 
       // Load weights with bounded thread number not to exceed mmap limits
@@ -1252,20 +1267,24 @@ void NeuralNetwork::load(const std::string &file_path,
             CloseHandle(hFile);
 #else
             // POSIX: map per-task, advise kernel, drop pages, unmap
-            int fd = ::open(f_path.c_str(), O_RDONLY);
-            NNTR_THROW_IF((fd == -1), std::invalid_argument)
-              << "Cannot open file : " << f_path;
+            size_t f_size = 0;
+            void *mmap_ptr = nullptr;
+            {
+              nntrainer::load_trace::Scope _lt(nntrainer::load_trace::MAP);
+              int fd = ::open(f_path.c_str(), O_RDONLY);
+              NNTR_THROW_IF((fd == -1), std::invalid_argument)
+                << "Cannot open file : " << f_path;
 
-            struct stat st {};
-            NNTR_THROW_IF((::fstat(fd, &st) == -1), std::invalid_argument)
-              << "Cannot get file info (fstat): " << f_path;
+              struct stat st {};
+              NNTR_THROW_IF((::fstat(fd, &st) == -1), std::invalid_argument)
+                << "Cannot get file info (fstat): " << f_path;
 
-            size_t f_size = static_cast<size_t>(st.st_size);
-            void *mmap_ptr =
-              ::mmap(nullptr, f_size, PROT_READ, MAP_PRIVATE, fd, 0);
-            ::close(fd); // fd not needed after mmap
-            NNTR_THROW_IF((mmap_ptr == MAP_FAILED), std::runtime_error)
-              << "mmap failed";
+              f_size = static_cast<size_t>(st.st_size);
+              mmap_ptr = ::mmap(nullptr, f_size, PROT_READ, MAP_PRIVATE, fd, 0);
+              ::close(fd); // fd not needed after mmap
+              NNTR_THROW_IF((mmap_ptr == MAP_FAILED), std::runtime_error)
+                << "mmap failed";
+            }
 
             // A node's weights are one contiguous run and the nodes are
             // handed out by an atomic counter, so this walks the file front to
@@ -1278,7 +1297,10 @@ void NeuralNetwork::load(const std::string &file_path,
             // 176 MB/s, on a device that reads the same file at 2.2-2.5 GB/s.
             // SEQUENTIAL restores the readahead window and adds drop-behind,
             // which also bounds the page-cache footprint of the load.
-            (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_SEQUENTIAL);
+            {
+              nntrainer::load_trace::Scope _lt(nntrainer::load_trace::MADV);
+              (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_SEQUENTIAL);
+            }
 
             // Publish the mapping to the reaper for the duration of the read.
             if (reap_ms > 0) {
@@ -1287,8 +1309,13 @@ void NeuralNetwork::load(const std::string &file_path,
             }
 
             char *view = static_cast<char *>(mmap_ptr);
-            node->read(view, false, exec_mode, fsu_mode,
-                       std::numeric_limits<size_t>::max(), true, model_file_fd);
+            {
+              nntrainer::load_trace::Scope _lt(
+                nntrainer::load_trace::NODE_READ);
+              node->read(view, false, exec_mode, fsu_mode,
+                         std::numeric_limits<size_t>::max(), true,
+                         model_file_fd);
+            }
 
             // Retract it BEFORE the unmap below, so the reaper can never
             // advise a region this worker has already given back.
@@ -1308,9 +1335,12 @@ void NeuralNetwork::load(const std::string &file_path,
             // drop to actually happen. The mapping is read-only MAP_PRIVATE,
             // so dropped pages simply re-fault from the page cache if touched
             // again: bytes read are identical either way.
-            (void)::madvise(mmap_ptr, f_size, MADV_DONTNEED);
+            {
+              nntrainer::load_trace::Scope _lt(nntrainer::load_trace::DROP);
+              (void)::madvise(mmap_ptr, f_size, MADV_DONTNEED);
 
-            ::munmap(mmap_ptr, f_size);
+              ::munmap(mmap_ptr, f_size);
+            }
 #endif
           }
 
@@ -1363,6 +1393,7 @@ void NeuralNetwork::load(const std::string &file_path,
           }
         });
 #endif
+      const auto _lt_fanout_t0 = std::chrono::steady_clock::now();
       for (size_t t = 0; t < num_load_threads; ++t) {
         threads.emplace_back(load_worker);
       }
@@ -1370,6 +1401,11 @@ void NeuralNetwork::load(const std::string &file_path,
         if (t.joinable())
           t.join();
       }
+      nntrainer::load_trace::add(
+        nntrainer::load_trace::WALL,
+        (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - _lt_fanout_t0)
+          .count());
 #if !defined(_WIN32)
       reap_stop.store(true, std::memory_order_relaxed);
       if (reaper.joinable())
@@ -1435,6 +1471,8 @@ void NeuralNetwork::load(const std::string &file_path,
           ::malloc_trim(0);
       }
 #endif
+
+      nntrainer::load_trace::dump("model->load_weight");
 
     } else {
       for (auto iter = model_graph.cbegin(); iter != model_graph.cend();
