@@ -29,7 +29,17 @@
  * file and the first launch rewrites it (temp file + fsync + atomic rename,
  * finalized on a background thread that is exit-joined). NNTR_V8C_PACK_CACHE=0
  * opts out; NNTR_V8C_PACK_CACHE_MIN_MB (default 64) bounds which weights are
- * cached so the disk cost stays at the few giant packs unless asked for.
+ * WRITTEN into a pack, so a first launch's disk and derive cost stays at the
+ * few giant weights unless asked for. It does NOT bound what is READ: a record
+ * that is in the pack is used whatever its size, because its disk cost has
+ * already been paid and index membership is the tighter test. That is what
+ * makes a PRE-PACKED model worth shipping -- build the pack once with
+ * NNTR_V8C_PACK_CACHE_MIN_MB=0 and every later launch takes the hit path for
+ * every weight with no environment set at all.
+ * NNTR_V8C_PACK_SRC_FP=0 drops the per-record source fingerprint (see
+ * src_fp_enabled in the .cpp): identity then rests on the pack header's
+ * (size, mtime-ns) alone, which is what decides whether a fully pre-packed
+ * load is cheaper than deriving. Default ON.
  * POSIX-only (no-op stubs elsewhere).
  */
 
@@ -92,6 +102,28 @@ bool lookup(const char *name, unsigned int N, unsigned int K, size_t row_bytes,
  *        (both ends plus interior pages), so it costs nothing on a hit.
  */
 uint64_t source_fingerprint(const void *data, size_t len);
+
+/**
+ * @brief Whether a source fingerprint is worth computing for this weight.
+ *
+ * @details source_fingerprint() samples ~192 KB spread across the payload, and
+ * on a zero-copy load that payload is the weight FILE's mapping -- so the
+ * sampling faults pages in a scattered pattern before anything else has
+ * touched them. It is wasted whenever neither side of the cache can use the
+ * answer: begin_record() declines below NNTR_V8C_PACK_CACHE_MIN_MB, and a
+ * mapped pack that holds no record for this name and shape cannot match one
+ * either. Ask first, hash second.
+ *
+ * @param[in] name        stable weight identity (the tensor name)
+ * @param[in] N           output channels
+ * @param[in] K           input channels
+ * @param[in] row_bytes   packed row stride
+ * @param[in] payload_len packed payload length in bytes
+ * @return true when lookup() could match a record, or begin_record() could
+ *         write one
+ */
+bool fingerprint_needed(const char *name, unsigned int N, unsigned int K,
+                        size_t row_bytes, size_t payload_len);
 
 /**
  * @brief Drop the (clean, file-backed) payload pages of a consumed hit.

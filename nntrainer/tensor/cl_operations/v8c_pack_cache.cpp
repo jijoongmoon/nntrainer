@@ -103,6 +103,27 @@ uint64_t sample_fnv(const uint8_t *p, size_t len) {
   return fnv1a64(p + len - kEnd, kEnd, h);
 }
 
+// The per-record SOURCE fingerprint is the cache's second line of identity,
+// behind the pack header's (src_size, src_mtime_ns): it is what stops a weight
+// file replaced IN PLACE with one of the same size and timestamp from being
+// served a stale pack. It costs a ~192 KB scattered sample of the source
+// payload PER RECORD, and on a fully pre-packed model that is the only reason
+// the weight file's payload is touched at all -- 276 scattered first touches of
+// a 1.09 GiB mapping, measured at 1.3-1.8 s of worker-busy time on an Adreno
+// 840 handset. NNTR_V8C_PACK_SRC_FP=0 trades that guard for the load time:
+// identity then rests on the header alone, which is size + nanosecond mtime.
+// Both sides honour it, so a pack written with it off (records carrying a zero
+// fingerprint) is simply a miss for a default reader -- it degrades to a
+// derive, never to a wrong weight. Default ON; this is a measurement lever and
+// a deployment choice for an immutable, checksummed model tree, not a default.
+bool src_fp_enabled() {
+  static const bool on = []() {
+    const char *e = std::getenv("NNTR_V8C_PACK_SRC_FP");
+    return !(e && e[0] == '0');
+  }();
+  return on;
+}
+
 bool cache_enabled() {
   static const bool on = []() {
     const char *e = std::getenv("NNTR_V8C_PACK_CACHE");
@@ -111,7 +132,15 @@ bool cache_enabled() {
   return on;
 }
 
-size_t min_payload_bytes() {
+// Size floor for WRITING a record. It bounds what a first launch spends disk
+// and derive-time teeing on; it deliberately does NOT bound what a later
+// launch may READ. A record that is already in a pack has had its disk cost
+// paid, and declining to use it because a floor happens to be set higher today
+// than when the pack was written is throwing the cache away for nothing --
+// which is exactly what a pre-packed model (built once with
+// NNTR_V8C_PACK_CACHE_MIN_MB=0) needs not to happen. The read sides gate on
+// index membership instead, which is the tighter test anyway.
+size_t min_write_payload_bytes() {
   static const size_t v = []() -> size_t {
     const char *e = std::getenv("NNTR_V8C_PACK_CACHE_MIN_MB");
     return (size_t)(e ? atol(e) : 64) << 20;
@@ -329,17 +358,59 @@ uint64_t source_fingerprint(const void *data, size_t len) {
   return sample_fnv(static_cast<const uint8_t *>(data), len);
 }
 
+bool fingerprint_needed(const char *name, unsigned int N, unsigned int K,
+                        size_t row_bytes, size_t payload_len) {
+  // NNTR_V8C_PACK_FP_GATE=0 answers yes to everything, i.e. restores the
+  // unconditional fingerprint exactly. It is the A/B arm for this gate, and
+  // the escape hatch if a future pack ever wants a fingerprint for a record
+  // the index cannot predict.
+  static const bool gate_on = []() {
+    const char *e = std::getenv("NNTR_V8C_PACK_FP_GATE");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  if (!cache_enabled() || !name || !*name)
+    return false;
+  // Asked for explicitly: no fingerprint is computed on either side, so none
+  // is worth computing here either. This wins over the FP_GATE=0 arm, which
+  // exists to restore the UNCONDITIONAL hash.
+  if (!src_fp_enabled())
+    return false;
+  if (!gate_on)
+    return true;
+  Manager &m = mgr();
+  std::lock_guard<std::mutex> lock(m.mtx);
+  // Write side: every record this run will actually tee gets one -- and only
+  // those, which is where the write floor applies.
+  if (m.write_armed && !m.write_failed)
+    return payload_len >= min_write_payload_bytes();
+  if (!m.pack_valid)
+    return false;
+  // Read side: only a record that already agrees on identity and geometry can
+  // go on to be validated by the fingerprint. Everything else is a miss with
+  // or without it.
+  const uint64_t nh = fnv1a64(name, std::strlen(name));
+  for (const auto &r : m.index)
+    if (r.name_fnv == nh && r.N == N && r.K == K && r.row_bytes == row_bytes &&
+        r.payload_len == payload_len)
+      return true;
+  return false;
+}
+
 bool lookup(const char *name, unsigned int N, unsigned int K, size_t row_bytes,
             size_t payload_len, uint64_t src_fnv, Hit &out) {
   if (!cache_enabled() || !name || !*name)
     return false;
   Manager &m = mgr();
-  if (!m.pack_valid || payload_len < min_payload_bytes())
+  // No size floor on the read side: the gate is whether the pack HOLDS this
+  // record (the loop below), not how big it is. See min_write_payload_bytes().
+  if (!m.pack_valid)
     return false;
   const uint64_t nh = fnv1a64(name, std::strlen(name));
   for (const auto &r : m.index) {
     if (r.name_fnv != nh || r.N != N || r.K != K || r.row_bytes != row_bytes ||
-        r.payload_len != payload_len || r.src_sample_fnv != src_fnv)
+        r.payload_len != payload_len)
+      continue;
+    if (src_fp_enabled() && r.src_sample_fnv != src_fnv)
       continue;
     if (r.rowsum_len != (uint64_t)N * sizeof(int32_t))
       return false;
@@ -375,7 +446,7 @@ RecordWriter *begin_record(const char *name, unsigned int N, unsigned int K,
                            uint64_t src_fnv) {
   if (!cache_enabled() || !name || !*name)
     return nullptr;
-  if (payload_len < min_payload_bytes())
+  if (payload_len < min_write_payload_bytes())
     return nullptr;
   Manager &m = mgr();
   std::lock_guard<std::mutex> lock(m.mtx);
@@ -628,6 +699,10 @@ bool lookup(const char *, unsigned int, unsigned int, size_t, size_t, uint64_t,
   return false;
 }
 uint64_t source_fingerprint(const void *, size_t) { return 0; }
+bool fingerprint_needed(const char *, unsigned int, unsigned int, size_t,
+                        size_t) {
+  return false;
+}
 void payload_consumed(const Hit &) {}
 RecordWriter *begin_record(const char *, unsigned int, unsigned int, size_t,
                            size_t, uint64_t) {
