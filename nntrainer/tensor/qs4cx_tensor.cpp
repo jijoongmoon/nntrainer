@@ -384,6 +384,22 @@ void QS4CX_Tensor::read(ReadSource src, size_t start_offset,
   if (start_offset == std::numeric_limits<size_t>::max())
     start_offset = file_offset;
   if (!isOnDiskLegacyQint4()) {
+    if (isQs4cxScaleOnlyRead()) {
+      // [zero-copy weight load] The caller is going to build this weight's
+      // device backing straight from the file mapping, so the nibble half of
+      // the record is never read out of this tensor and copying it here is a
+      // whole second plane of the model for nothing. Take only the scale
+      // tail, which is a few KiB and IS read from here (the device scale
+      // buffer is built from it). The record is [nibbles][N fp32 scales], so
+      // the tail starts at the same offset getScale() indexes.
+      const size_t nib = nibbleBytes(height(), width(), isQs4cxRecordPadded());
+      const size_t scale_bytes = (size_t)width() * sizeof(float);
+      checkedRead(src, (char *)getScale(), (std::streamsize)scale_bytes,
+                  "[QS4CX_Tensor::read] scale tail read failed",
+                  start_offset + nib, read_from_offset);
+      putData();
+      return;
+    }
     TensorBase::read(src, start_offset, read_from_offset);
     return;
   }

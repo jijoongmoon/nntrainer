@@ -143,5 +143,27 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output);
  */
 bool dotCl_v8c_prebuild_weight(const Tensor &weight);
 
+/**
+ * @brief Eager v8c weight build whose nibbles come from @p src_nibbles rather
+ *        than from the tensor's own storage.
+ *
+ * @details The zero-copy weight load: the loader hands the weight file's
+ * mapping straight to the device build, so the plain payload is never copied
+ * into the tensor at all. The tensor is still the cache identity (its address
+ * is the key) and still owns the per-channel scales, which the caller has
+ * read; only the nibbles are read from @p src_nibbles.
+ *
+ * On success the tensor's payload holds nothing meaningful and must not be
+ * read by a host consumer -- the same contract the post-build DROP_PLAIN
+ * release establishes, which is why this path is tied to that lever. On
+ * failure nothing has changed and the caller must read the payload.
+ *
+ * @param[in] weight the QS4CX weight tensor (identity + scales)
+ * @param[in] src_nibbles N*ceil(K/2) plain nibble bytes for this weight
+ * @return true when the device backing was built from @p src_nibbles
+ */
+bool dotCl_v8c_prebuild_weight_from(const Tensor &weight,
+                                    const void *src_nibbles);
+
 } // namespace nntrainer
 #endif /* __BLAS_KERNEL_INTERFACE_H__ */

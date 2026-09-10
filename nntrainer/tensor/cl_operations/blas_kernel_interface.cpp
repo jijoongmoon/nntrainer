@@ -617,7 +617,8 @@ static bool v8c_ensure_buf(cl_context ctx, cl_mem *buf, size_t *cap,
 // Get or build the cached v8c weight backing for a given int4 (QS4CX) weight.
 // Returns nullptr if shape unsupported (caller falls back).
 static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
-                                               unsigned int K, unsigned int N) {
+                                               unsigned int K, unsigned int N,
+                                               const uint8_t *nib_override) {
   if (K % 32 != 0 || N % 8 != 0)
     return nullptr;
   const void *key = weight.getData<uint8_t>();
@@ -653,7 +654,13 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
       cache.erase(it);
     }
   }
-  const uint8_t *nibbles = weight.getData<uint8_t>();
+  // [zero-copy weight load] nib_override is the weight file's mapping: the
+  // plain payload was never copied into this tensor, so the build reads the
+  // file instead. The cache identity above stays the tensor address either
+  // way -- the mapping is per-node and transient, and would be a key that
+  // dangles the moment the loader unmaps it.
+  const uint8_t *nibbles =
+    (nib_override != nullptr) ? nib_override : weight.getData<uint8_t>();
   if (!nibbles)
     return nullptr;
   // int4 weights are QS4CX: row-major plain nibbles (uint4 = int4+8, no XOR) +
@@ -816,7 +823,57 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
       // be the default until that fallback rejects a dropped weight.
       return false;
     }();
-    if (drop_plain) {
+    // Announce the resolved decision once. The drop is otherwise invisible in
+    // a run log -- same outputs, same caches, only the residency differs --
+    // which makes "was it actually on?" unanswerable after the fact.
+    static const bool announced = [&]() {
+      ml_logi("[v8c] DROP_PLAIN %s (NNTR_V8C_DROP_PLAIN)",
+              drop_plain
+                ? "ON: the plain QS4CX payload is released after the repack"
+                : "OFF: the plain QS4CX payload stays resident");
+      return true;
+    }();
+    (void)announced;
+#if !defined(ENABLE_FP16)
+    // An imageless weight (N above the image2d height cap -- the untied int4
+    // lm_head) has no image GEMM, and its only other route is the fp16
+    // activation GEMV below, which this build does not contain. dotCl_v8c
+    // therefore returns false for it unconditionally and the host GEMM IS the
+    // path, not a fallback. Keep its payload.
+    const bool droppable = !inserted.first->second.imageless;
+#else
+    const bool droppable = true;
+#endif
+    // [zero-copy weight load] When the nibbles came from the mapping there is
+    // no nibble payload to release -- the tensor's payload half was never
+    // filled, so its pages are exactly as unreadable as a released payload
+    // and no host consumer may touch them. The SCALE tail, though, WAS
+    // written, so release that.
+    if (nib_override != nullptr) {
+      const uint8_t *host = weight.getData<uint8_t>();
+      if (host != nullptr) {
+        const size_t payload = (size_t)N * (((size_t)K + 1) / 2) // nibbles
+                               + (size_t)N * sizeof(float);      // fp32 scales
+        // The nibble half was never written, but the SCALE tail was -- the
+        // device scale buffer above is built from it -- and it is dead the
+        // moment that buffer exists. Release it the same way the copy path
+        // releases its payload, so the two paths leave the same residency and
+        // a zero-copy load is not quietly the more expensive one at rest
+        // (measured: 40 kB per weight, 2.4 MiB over gemma4 E2B). Same INWARD
+        // page alignment, same DONTNEED -- the difference is only that here
+        // there is far less to release.
+        const size_t page = 4096;
+        uintptr_t lo = ((uintptr_t)host + page - 1) & ~(page - 1);
+        uintptr_t hi = ((uintptr_t)host + payload) & ~(page - 1);
+        if (hi > lo) {
+#if defined(_WIN32)
+          (void)DiscardVirtualMemory((void *)lo, (SIZE_T)(hi - lo));
+#else
+          (void)::madvise((void *)lo, (size_t)(hi - lo), MADV_DONTNEED);
+#endif
+        }
+      }
+    } else if (drop_plain && droppable) {
       const size_t payload = (size_t)N * (((size_t)K + 1) / 2) // nibbles
                              + (size_t)N * sizeof(float);      // fp32 scales
       const size_t page = 4096;
@@ -919,7 +976,26 @@ bool dotCl_v8c_prebuild_weight(const Tensor &weight) {
   const unsigned int K = weight.height();
   if (N == 0 || K == 0 || N % 8 != 0 || K % 32 != 0)
     return false;
-  return v8c_get_or_build_weight(weight, K, N) != nullptr;
+  return v8c_get_or_build_weight(weight, K, N, nullptr) != nullptr;
+}
+
+bool dotCl_v8c_prebuild_weight_from(const Tensor &weight,
+                                    const void *src_nibbles) {
+  if (src_nibbles == nullptr)
+    return false;
+  if (!v8c_env_enabled())
+    return false;
+  nntrainer::load_trace::Scope _lt(nntrainer::load_trace::PREBUILD);
+  v8c_flush_pending_uploads();
+  if (weight.getDataType() != ml::train::TensorDim::DataType::QS4CX)
+    return false;
+  const unsigned int N = weight.width();
+  const unsigned int K = weight.height();
+  if (N == 0 || K == 0 || N % 8 != 0 || K % 32 != 0)
+    return false;
+  return v8c_get_or_build_weight(weight, K, N,
+                                 static_cast<const uint8_t *>(src_nibbles)) !=
+         nullptr;
 }
 
 // fp16 GEMM output -> output tensor, written on the GPU (residency: no host
@@ -1063,7 +1139,7 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
   cl_context ctx = blas_cc->context_inst_.GetContext();
   cl_command_queue q = blas_cc->command_queue_inst_.GetCommandQueue();
 
-  V8cWeightEntry *w = v8c_get_or_build_weight(weight, K, N);
+  V8cWeightEntry *w = v8c_get_or_build_weight(weight, K, N, nullptr);
   if (!w)
     return false;
 

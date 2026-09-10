@@ -750,6 +750,29 @@ public:
   void setQs4cxRecordPadded(bool v) { qs4cx_record_padded_ = v; }
 
   /**
+   * @brief Read only this QS4CX record's per-channel scale tail, leaving the
+   *        nibble payload in the tensor untouched.
+   *
+   * @details Set by a loader that is going to consume the nibbles straight
+   * from the weight file's mapping (the GPU v8c build) and will therefore
+   * never read them out of this tensor. The payload copy is the largest
+   * single cost of a model load -- a whole second plane of every FC weight,
+   * memcpy'd into freshly faulted anonymous pages -- and it is dead the
+   * moment the device backing exists. The scales are NOT skipped: they are
+   * a few KiB and the device scale buffer is built from them.
+   *
+   * @note The caller owns the consequence: a tensor read this way holds
+   * whatever its allocation happened to hold in the payload half, so no host
+   * consumer may read it afterwards.
+   */
+  void setQs4cxScaleOnlyRead(bool v) { qs4cx_scale_only_read_ = v; }
+
+  /**
+   * @brief Whether read() skips this tensor's QS4CX nibble payload.
+   */
+  bool isQs4cxScaleOnlyRead() const { return qs4cx_scale_only_read_; }
+
+  /**
    * @brief Whether this tensor uses the padded QS4CX record layout.
    */
   bool isQs4cxRecordPadded() const { return qs4cx_record_padded_; }
@@ -987,6 +1010,9 @@ protected:
   bool qs4cx_record_padded_ =
     false; /**< QS4CX record uses the padded stride (see setQs4cxRecordPadded)
             */
+  bool qs4cx_scale_only_read_ =
+    false; /**< read() copies only this QS4CX record's scale tail (see
+              setQs4cxScaleOnlyRead) */
 
   /**<
    * When using shared_data with tensor, this stores the ptr of the source

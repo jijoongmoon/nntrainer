@@ -1634,6 +1634,14 @@ void Tensor::setOnDiskLegacyQint4(bool v) { itensor_->setOnDiskLegacyQint4(v); }
 
 void Tensor::setQs4cxRecordPadded(bool v) { itensor_->setQs4cxRecordPadded(v); }
 
+void Tensor::setQs4cxScaleOnlyRead(bool v) {
+  itensor_->setQs4cxScaleOnlyRead(v);
+}
+
+bool Tensor::isQs4cxScaleOnlyRead() const {
+  return itensor_->isQs4cxScaleOnlyRead();
+}
+
 void Tensor::setFileOffset(const size_t file_offset) {
   itensor_->setFileOffset(file_offset);
 }

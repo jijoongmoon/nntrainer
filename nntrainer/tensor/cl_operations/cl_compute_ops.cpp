@@ -160,6 +160,12 @@ public:
     nntrainer::dotCl_v8c_prebuild_weight(weight);
   }
 
+  // Same build, sourcing the nibbles from the loader's file mapping so the
+  // plain payload is never copied into the tensor (see the header).
+  bool fc_prebuild_weight_from(Tensor &weight, const void *src) override {
+    return nntrainer::dotCl_v8c_prebuild_weight_from(weight, src);
+  }
+
   // The fused activation epilogue, which the fully-connected layer applies to
   // its own output in place. It runs on the host table: the operand is the
   // tensor the GEMM just read back, so the CPU table works on exactly the

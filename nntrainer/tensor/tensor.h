@@ -1911,6 +1911,17 @@ public:
   void setQs4cxRecordPadded(bool v);
 
   /**
+   * @brief Read only the per-channel scale tail of this QS4CX record.
+   *        @see TensorBase::setQs4cxScaleOnlyRead
+   */
+  void setQs4cxScaleOnlyRead(bool v);
+
+  /**
+   * @brief Whether read() skips this tensor's QS4CX nibble payload.
+   */
+  bool isQs4cxScaleOnlyRead() const;
+
+  /**
    * @brief     get FileOffset of Tensor
    * @return    size_t fileOffset
    */

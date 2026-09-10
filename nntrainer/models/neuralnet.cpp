@@ -99,6 +99,9 @@ namespace v8c_pack {
 void set_source(const char *model_bin_path);
 void load_complete();
 } // namespace v8c_pack
+// Submit-and-go upload staging queued by the v8c weight build
+// (tensor/cl_operations/blas_kernels.h). Declared here for the same reason.
+void v8c_flush_pending_uploads();
 #endif
 
 namespace {
@@ -1417,6 +1420,18 @@ void NeuralNetwork::load(const std::string &file_path,
       // a pending rewrite off-thread, so writing the pack costs the load
       // nothing. The writer is joined at exit.
       v8c_pack::load_complete();
+
+      // The v8c build hands each non-blocking chunk upload's host staging to
+      // a registry that the NEXT prebuild drains -- so the last builds of the
+      // load are never drained by anything, and their staging stays resident
+      // for the life of the process. Measured on an Adreno 840 handset with
+      // gemma4 E2B: five 9.0 MiB staging vectors, 45.0 MiB, still fully
+      // resident in the middle of decode and visible in smaps as
+      // `[anon:scudo:secondary]` blocks of exactly N x v8c_row_bytes. Drain
+      // them here, where the load -- and therefore every prebuild -- is over.
+      // Waiting is free at this point: the uploads were enqueued on an
+      // in-order queue long ago and completed while the rest of the load ran.
+      v8c_flush_pending_uploads();
 #endif
 
 #if !defined(_WIN32)
