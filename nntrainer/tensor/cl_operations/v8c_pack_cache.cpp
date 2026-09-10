@@ -264,8 +264,18 @@ bool try_open_pack(Manager &m, const std::string &path) {
   m.pack_valid = true;
   // Kick readahead for the payloads: the giant builds run first in the load
   // (largest-first hand-out), so cold-page faults would sit on the critical
-  // path otherwise.
-  (void)::posix_madvise(p, len, POSIX_MADV_WILLNEED);
+  // path otherwise. It is a WHOLE-FILE prefetch, so it also decides how much
+  // of the pack is resident at once -- NNTR_V8C_PACK_RA=0 takes the arm where
+  // each record faults its own pages instead, trading a colder load for a
+  // smaller page-cache footprint.
+  {
+    static const bool pack_ra = []() {
+      const char *e = std::getenv("NNTR_V8C_PACK_RA");
+      return !(e != nullptr && e[0] == '0');
+    }();
+    if (pack_ra)
+      (void)::posix_madvise(p, len, POSIX_MADV_WILLNEED);
+  }
   return true;
 }
 
@@ -504,6 +514,41 @@ void abort_record(RecordWriter *rw) {
 void load_complete() {
   Manager &m = mgr();
   std::lock_guard<std::mutex> lock(m.mtx);
+
+  // [page cache] Every record this load was going to consume has been
+  // consumed. payload_consumed() already dropped each hit's own pages, but
+  // the mapping's index, its unconsumed records and -- on a hit -- the
+  // whole-file readahead this pack asked for at map time are still resident,
+  // and the file's page cache is still holding the bytes underneath them.
+  // Drop both. The mapping itself stays valid: a late lookup (the
+  // application's post-load sweep) still finds its record, it just re-faults
+  // the pages it reads, which is bytes-identical and rare by construction.
+  //
+  // OFF by default, and the measurement is why. What it buys is 8.0 MiB of
+  // RssFile peak and about 200 MB of `Cached` returned to the system -- and
+  // `MemAvailable` does not move for it, because clean page cache was already
+  // counted as available. What it costs is the next load of the same pack: in
+  // the V2 bundle's interleaved cell, where a 2.5 GB LiteRT container is
+  // mapped between our runs, init ran 1 310 ms against the 793 ms of a build
+  // without this lane, and turning off L4 (the loader's resident-window
+  // reaper) accounted for only 136 ms of that. On the owner's ordering -- a
+  // 500 ms init target ahead of a page-cache figure that is not resident
+  // memory -- 8 MiB is not worth a re-faulted 202 MB pack.
+  //
+  // NNTR_V8C_PACK_DROP=1 asks for it, which is the right arm for a one-shot
+  // process on a memory-tight system that will not load this pack again.
+  {
+    static const bool pack_drop = []() {
+      const char *e = std::getenv("NNTR_V8C_PACK_DROP");
+      return (e != nullptr && e[0] == '1');
+    }();
+    if (pack_drop && m.map != nullptr && m.map != MAP_FAILED && m.map_len > 0) {
+      (void)::madvise(m.map, m.map_len, MADV_DONTNEED);
+      if (m.map_fd >= 0)
+        (void)::posix_fadvise(m.map_fd, 0, 0, POSIX_FADV_DONTNEED);
+    }
+  }
+
   if (m.tmp_fd < 0)
     return;
   if (m.write_failed || m.pending.empty()) {

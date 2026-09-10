@@ -31,6 +31,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <chrono>
+#include <filesystem>
 #include <fstream>
 #include <future>
 #include <iomanip>
@@ -42,6 +44,9 @@
 #include <malloc.h> // malloc_trim: return the loader's freed transients to the OS
 #endif
 
+#if !defined(_WIN32)
+#include <fcntl.h> // posix_fadvise: drop the weight file's page cache after the load
+#endif
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
 #include <cuda_fc_qs4cx.h> // [wprefetch] cuda_fc_qs4cx_prefetch_weight
 #endif
@@ -1173,6 +1178,33 @@ void NeuralNetwork::load(const std::string &file_path,
 
       std::atomic<size_t> next_load_index{0};
 
+#if !defined(_WIN32)
+      // [page cache] Load-mapping reaper. Each worker maps the WHOLE weight
+      // file and drops it only when its node is done, so at any instant the
+      // resident file pages are (workers) x (one node's weights) -- measured
+      // on gemma4 E2B / Adreno 840 as ~190 MiB of the 1 520 MiB RssFile peak,
+      // and the peak is the load, not the steady state.
+      //
+      // The drop is nearly free here and that is the point: the mapping is
+      // read-only MAP_PRIVATE, so MADV_DONTNEED only tears down THIS process's
+      // PTEs. The bytes stay in the page cache, so a page the reader still
+      // wants comes back as a MINOR fault, not a trip to flash. Reaping every
+      // few milliseconds therefore bounds the resident window without turning
+      // the streaming read back into the fault-per-page disaster
+      // POSIX_MADV_RANDOM used to make of it.
+      //
+      // NNTR_LOAD_REAP_MS sets the period; 0 turns the reaper off and restores
+      // the previous drop-at-node-end behaviour exactly.
+      static const int reap_ms = []() {
+        const char *e = std::getenv("NNTR_LOAD_REAP_MS");
+        const int v = (e != nullptr) ? std::atoi(e) : 20;
+        return (v > 0) ? v : 0;
+      }();
+      std::mutex reap_mtx;
+      std::vector<std::pair<void *, size_t>> reap_live;
+      std::atomic<bool> reap_stop{false};
+#endif
+
       // Serializes weight_load_hook invocations across the load workers: the
       // hook body may run parallel_for derives and device uploads of its own,
       // and the interleave's win is overlapping THAT work with the other
@@ -1235,17 +1267,48 @@ void NeuralNetwork::load(const std::string &file_path,
             NNTR_THROW_IF((mmap_ptr == MAP_FAILED), std::runtime_error)
               << "mmap failed";
 
-            // Hint: many model loads touch scattered regions -> RANDOM helps
-            // reduce readahead
-            (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_RANDOM);
+            // A node's weights are one contiguous run and the nodes are
+            // handed out by an atomic counter, so this walks the file front to
+            // back -- it is a streaming read, not a scattered one. RANDOM was
+            // the advice here, and it turns off BOTH kernel readahead AND
+            // fault-around, which makes every 4 KiB page its own synchronous
+            // flash trip at queue depth 1. Measured on Adreno 840 with a
+            // 3.17 GiB weight file: 830 803 major faults for 830 767 file
+            // pages (every page faulted exactly once, nothing re-read) moving
+            // 176 MB/s, on a device that reads the same file at 2.2-2.5 GB/s.
+            // SEQUENTIAL restores the readahead window and adds drop-behind,
+            // which also bounds the page-cache footprint of the load.
+            (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_SEQUENTIAL);
+
+            // Publish the mapping to the reaper for the duration of the read.
+            if (reap_ms > 0) {
+              std::lock_guard<std::mutex> reap_lk(reap_mtx);
+              reap_live.emplace_back(mmap_ptr, f_size);
+            }
 
             char *view = static_cast<char *>(mmap_ptr);
             node->read(view, false, exec_mode, fsu_mode,
                        std::numeric_limits<size_t>::max(), true, model_file_fd);
 
-            // Early drop: pages no longer needed; helps lower peak RSS during
-            // overlap
-            (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_DONTNEED);
+            // Retract it BEFORE the unmap below, so the reaper can never
+            // advise a region this worker has already given back.
+            if (reap_ms > 0) {
+              std::lock_guard<std::mutex> reap_lk(reap_mtx);
+              for (auto it = reap_live.begin(); it != reap_live.end(); ++it)
+                if (it->first == mmap_ptr) {
+                  reap_live.erase(it);
+                  break;
+                }
+            }
+
+            // Early drop: pages no longer needed; bounds peak RSS during the
+            // overlap. NOTE posix_madvise(POSIX_MADV_DONTNEED) is a documented
+            // NO-OP in glibc -- it validates its arguments and returns 0
+            // without freeing a page -- so the raw madvise is required for the
+            // drop to actually happen. The mapping is read-only MAP_PRIVATE,
+            // so dropped pages simply re-fault from the page cache if touched
+            // again: bytes read are identical either way.
+            (void)::madvise(mmap_ptr, f_size, MADV_DONTNEED);
 
             ::munmap(mmap_ptr, f_size);
 #endif
@@ -1288,6 +1351,18 @@ void NeuralNetwork::load(const std::string &file_path,
 
       std::vector<std::thread> threads;
       threads.reserve(num_load_threads);
+#if !defined(_WIN32)
+      std::thread reaper;
+      if (reap_ms > 0)
+        reaper = std::thread([&]() {
+          while (!reap_stop.load(std::memory_order_relaxed)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(reap_ms));
+            std::lock_guard<std::mutex> reap_lk(reap_mtx);
+            for (auto &e : reap_live)
+              (void)::madvise(e.first, e.second, MADV_DONTNEED);
+          }
+        });
+#endif
       for (size_t t = 0; t < num_load_threads; ++t) {
         threads.emplace_back(load_worker);
       }
@@ -1295,12 +1370,52 @@ void NeuralNetwork::load(const std::string &file_path,
         if (t.joinable())
           t.join();
       }
+#if !defined(_WIN32)
+      reap_stop.store(true, std::memory_order_relaxed);
+      if (reaper.joinable())
+        reaper.join();
+#endif
 
 #if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
       // Every load-time weight pack has committed its record by now: finalize
       // a pending rewrite off-thread, so writing the pack costs the load
       // nothing. The writer is joined at exit.
       v8c_pack::load_complete();
+#endif
+
+#if !defined(_WIN32)
+      // [page cache] The per-node madvise(MADV_DONTNEED) above drops this
+      // process's PTEs; it does not touch the SYSTEM page cache the read
+      // filled. A 1.09 GiB weight pack therefore leaves 1.09 GiB of `Cached`
+      // behind for the rest of the process, and the load also evicted whatever
+      // was there before it. posix_fadvise(DONTNEED) hands those clean pages
+      // back to the free list now that every weight is materialized in its
+      // tensor storage.
+      //
+      // It is non-destructive by construction -- the pages are clean and
+      // file-backed, so any later reader (an FSU/slim tensor's on-demand mmap
+      // through this same fd) re-reads identical bytes, it just pays the trip.
+      // FSU is excluded anyway, since there the file IS the weight store.
+      //
+      // MEASURED AND NOT ADOPTED AS A DEFAULT (Adreno 840, gemma4 E2B):
+      // it returns 1.09 GiB of `Cached` and moves nothing a
+      // caller can spend. VmHWM, RssFile peak and the MemAvailable drawdown
+      // are all unchanged -- 1 772.8 / 1 525.3 / 1 749.9 MiB against the
+      // control's 1 771.3 / 1 523.9 / 1 763.6 -- because clean page cache
+      // already counts as available memory. What it does change is the next
+      // load of the same pack, which is now cold: init 1 237 ms median
+      // against the control's 788 ms. So it is OFF unless
+      // NNTR_LOAD_FADV_DROP=1 asks for it, which is the right arm for a
+      // one-shot process on a memory-tight system that will not load the same
+      // model again.
+      {
+        static const bool fadv_drop = []() {
+          const char *e = std::getenv("NNTR_LOAD_FADV_DROP");
+          return (e != nullptr && e[0] == '1');
+        }();
+        if (fadv_drop && !fsu_mode && model_file_fd >= 0)
+          (void)::posix_fadvise(model_file_fd, 0, 0, POSIX_FADV_DONTNEED);
+      }
 #endif
 
 #if defined(__GLIBC__) && !defined(_WIN32)
@@ -1518,7 +1633,10 @@ void NeuralNetwork::load(const std::string &file_path,
             NNTR_THROW_IF((mmap_ptr == MAP_FAILED), std::runtime_error)
               << "mmap failed for safetensors file: " << f_path;
 
-            (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_RANDOM);
+            // Streaming read, not a scattered one -- see the sibling site
+            // in the positional .bin arm above for the fault census that
+            // retired POSIX_MADV_RANDOM here.
+            (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_SEQUENTIAL);
 
             char *view = static_cast<char *>(mmap_ptr);
             node->read(view, false, exec_mode, fsu_mode,
