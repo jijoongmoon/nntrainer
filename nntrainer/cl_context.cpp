@@ -20,6 +20,7 @@
 #include <blas_kernels.h>
 #include <cerrno>
 #include <cl_context.h>
+#include <load_trace.h>
 #include <cl_kernels/cl_kernels.h>
 #include <cl_svm_allocator.h>
 #include <compute_ops.h>
@@ -87,9 +88,15 @@ bool writeBinaryFile(const std::string &path,
 
 void ClContext::initialize() noexcept {
   try {
-    if (!clInit()) {
-      ml_loge("Error: ClContext::initialize() failed");
-      return;
+    {
+      // Platform + device enumeration, cl_context and the command queue. It
+      // is the first thing a GPU run pays and, unlike everything after it,
+      // there is no cache that can make it cheaper.
+      nntrainer::load_trace::Scope _lt(nntrainer::load_trace::CTX_CREATE);
+      if (!clInit()) {
+        ml_loge("Error: ClContext::initialize() failed");
+        return;
+      }
     }
 
     // Probe the device's capabilities once, here, where the device has just
@@ -162,8 +169,14 @@ void ClContext::initialize() noexcept {
       }
     }
 
-    initBlasClKernels();
-    initAttentionClKernels();
+    {
+      nntrainer::load_trace::Scope _lt(nntrainer::load_trace::KRN_BLAS);
+      initBlasClKernels();
+    }
+    {
+      nntrainer::load_trace::Scope _lt(nntrainer::load_trace::KRN_ATTN);
+      initAttentionClKernels();
+    }
 
     // The allocator and the ops table are installed BEFORE the layer
     // registrations, not after. add_default_object() throws on a duplicate
@@ -513,8 +526,10 @@ bool ClContext::clCreateKernel(std::string &kernel_string,
   {
     std::lock_guard<std::mutex> lk(program_cache_mtx);
     auto it = program_cache.find(pc_key);
-    if (it != program_cache.end())
+    if (it != program_cache.end()) {
+      nntrainer::load_trace::Scope _lt(nntrainer::load_trace::KRN_OBJ);
       return kernel_ptr_->CreateKernelFromProgram(it->second, kernel_name);
+    }
   }
 
   // On-disk kernel binary cache. The key folds in the per-kernel
@@ -529,17 +544,25 @@ bool ClContext::clCreateKernel(std::string &kernel_string,
     std::to_string(program.GetKernelHash(kernel_string,
                                          compile_options + "|" + device_sig)) +
     ".cl.bin";
-  auto binary_data = KERNEL_CACHE_ENABLED ? readBinaryFile(binary_file_path)
-                                          : std::vector<std::byte>();
+  std::vector<std::byte> binary_data;
+  if (KERNEL_CACHE_ENABLED) {
+    nntrainer::load_trace::Scope _lt(nntrainer::load_trace::KRN_BIN_READ);
+    binary_data = readBinaryFile(binary_file_path);
+    _lt.bytes(binary_data.size());
+  }
 
   bool loaded_from_binary = false;
   if (KERNEL_CACHE_ENABLED && !binary_data.empty()) {
     ml_logi("Using cached version of kernel: %s at path %s",
             kernel_name.c_str(), binary_file_path.c_str());
-    loaded_from_binary = program.CreateCLProgramWithBinary(
-      opencl::ContextManager::Global().GetContext(),
-      opencl::ContextManager::Global().GetDeviceId(), binary_data,
-      binary_file_path, "");
+    {
+      nntrainer::load_trace::Scope _lt(nntrainer::load_trace::KRN_PROG_BIN);
+      _lt.bytes(binary_data.size());
+      loaded_from_binary = program.CreateCLProgramWithBinary(
+        opencl::ContextManager::Global().GetContext(),
+        opencl::ContextManager::Global().GetDeviceId(), binary_data,
+        binary_file_path, "");
+    }
     if (!loaded_from_binary)
       ml_logw("Cached kernel binary %s was rejected; recompiling from source",
               binary_file_path.c_str());
@@ -550,10 +573,13 @@ bool ClContext::clCreateKernel(std::string &kernel_string,
   } else {
     ml_logi("Binary for kernel %s not found, compiling from source...",
             kernel_name.c_str());
-    result =
-      program.CreateCLProgram(opencl::ContextManager::Global().GetContext(),
-                              opencl::ContextManager::Global().GetDeviceId(),
-                              kernel_string, compile_options);
+    {
+      nntrainer::load_trace::Scope _lt(nntrainer::load_trace::KRN_PROG_SRC);
+      result =
+        program.CreateCLProgram(opencl::ContextManager::Global().GetContext(),
+                                opencl::ContextManager::Global().GetDeviceId(),
+                                kernel_string, compile_options);
+    }
 
     if (KERNEL_CACHE_ENABLED && result) {
       // Best-effort cache write: the freshly compiled program is already
@@ -580,7 +606,10 @@ bool ClContext::clCreateKernel(std::string &kernel_string,
     program_cache.emplace(pc_key, program);
   }
 
-  result = kernel_ptr_->CreateKernelFromProgram(program, kernel_name);
+  {
+    nntrainer::load_trace::Scope _lt(nntrainer::load_trace::KRN_OBJ);
+    result = kernel_ptr_->CreateKernelFromProgram(program, kernel_name);
+  }
 
   return result;
 }

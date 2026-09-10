@@ -52,6 +52,17 @@ enum Slot {
   DROP,         /**< madvise(DONTNEED) + munmap at the end of a node */
   T_GETDATA,    /**< Tensor::getData(): commit/validate the tensor storage */
   T_COPY,       /**< the payload memcpy from the mapping into that storage */
+  CTX_CREATE,   /**< OpenCL platform/device/context/queue bring-up */
+  KRN_BLAS,     /**< ClContext::initBlasClKernels */
+  KRN_ATTN,     /**< ClContext::initAttentionClKernels (incl. the prewarms) */
+  KRN_BIN_READ, /**< reading one kernel binary out of the on-disk cache */
+  KRN_PROG_BIN, /**< clCreateProgramWithBinary + clBuildProgram */
+  KRN_PROG_SRC, /**< clCreateProgramWithSource + clBuildProgram */
+  KRN_OBJ,      /**< clCreateKernel off an already-built program */
+  G_ADD,        /**< ccapi Model::compile: addLayer over the symbolic graph */
+  G_COMPILE,    /**< NeuralNetwork::compile: graph realization */
+  G_INIT,       /**< NeuralNetwork::initialize: the graph's own realization */
+  G_ALLOC,      /**< NeuralNetwork::allocate: the tensor pools */
   WALL,         /**< wall clock of the worker fan-out (main thread) */
   N_SLOTS
 };
@@ -62,12 +73,19 @@ inline const char *slot_name(int s) {
     "prebuild",    "fingerprint", "lookup",     "hit_upload", "wbuf_create",
     "permute",     "pack_write", "miss_upload", "aux_create", "aux_sub",
     "aux_stage",   "image_view", "drop",        "t_getdata",  "t_copy",
+    "ctx_create",  "krn_blas",   "krn_attn",    "krn_bin_read", "krn_prog_bin",
+    "krn_prog_src", "krn_obj",   "g_add",       "g_compile",  "g_init",
+    "g_alloc",
     "wall"};
   return (s >= 0 && s < N_SLOTS) ? n[s] : "?";
 }
 
 inline bool on() {
-  static const bool v = std::getenv("NNTR_LOAD_TRACE") != nullptr;
+  // NNTR_INIT_TRACE turns it on too: the slots below the load are init phases
+  // (context bring-up, kernel programs, graph compile) and the init dissection
+  // asks for them by that name.
+  static const bool v = std::getenv("NNTR_LOAD_TRACE") != nullptr ||
+                        std::getenv("NNTR_INIT_TRACE") != nullptr;
   return v;
 }
 
