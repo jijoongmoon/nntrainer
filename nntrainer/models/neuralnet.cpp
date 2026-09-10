@@ -102,6 +102,8 @@ void load_complete();
 // Submit-and-go upload staging queued by the v8c weight build
 // (tensor/cl_operations/blas_kernels.h). Declared here for the same reason.
 void v8c_flush_pending_uploads();
+void v8c_flush_aux_arena();
+void v8c_open_aux_arena();
 #endif
 
 namespace {
@@ -1159,6 +1161,11 @@ void NeuralNetwork::load(const std::string &file_path,
         nntrainer::load_trace::Scope _lt(nntrainer::load_trace::PACK_OPEN);
         v8c_pack::set_source(f_path.c_str());
       }
+      // Open the shared device arena the per-weight scale/row-sum pairs are
+      // carved from. It stays open until the flush at the end of this load,
+      // which is the only thing that guarantees a staged chunk reaches the
+      // device; outside that window every carve writes itself.
+      v8c_open_aux_arena();
 #endif
 
       // Load weights with bounded thread number not to exceed mmap limits
@@ -1432,6 +1439,14 @@ void NeuralNetwork::load(const std::string &file_path,
       // Waiting is free at this point: the uploads were enqueued on an
       // in-order queue long ago and completed while the rest of the load ran.
       v8c_flush_pending_uploads();
+
+      // The per-weight scale/row-sum pairs are carved out of a shared device
+      // arena and staged host-side while the load runs, so the model's aux
+      // plane costs a handful of transfers instead of one per weight. Write
+      // the chunk still open and seal the arena: after this a weight built
+      // lazily at its first dispatch writes its own pair, so nothing can read
+      // an aux buffer whose bytes have not landed.
+      v8c_flush_aux_arena();
 #endif
 
 #if !defined(_WIN32)

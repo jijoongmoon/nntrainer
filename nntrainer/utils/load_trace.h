@@ -46,6 +46,8 @@ enum Slot {
   PACK_WRITE,   /**< tee of a derived chunk into the pack temp file */
   MISS_UPLOAD,  /**< cache miss: clEnqueueWriteBuffer of a derived chunk */
   AUX_CREATE,   /**< scale + row-sum device buffers */
+  AUX_SUB,      /**< of which: the two clCreateSubBuffer calls (arena arm) */
+  AUX_STAGE,    /**< of which: the arena reservation + the pair's host copy */
   IMAGE_VIEW,   /**< image2d-from-buffer view creation */
   DROP,         /**< madvise(DONTNEED) + munmap at the end of a node */
   T_GETDATA,    /**< Tensor::getData(): commit/validate the tensor storage */
@@ -58,8 +60,9 @@ inline const char *slot_name(int s) {
   static const char *n[N_SLOTS] = {
     "prescan",     "pack_open",  "map",         "madvise",    "node_read",
     "prebuild",    "fingerprint", "lookup",     "hit_upload", "wbuf_create",
-    "permute",     "pack_write", "miss_upload", "aux_create", "image_view",
-    "drop",        "t_getdata",  "t_copy",      "wall"};
+    "permute",     "pack_write", "miss_upload", "aux_create", "aux_sub",
+    "aux_stage",   "image_view", "drop",        "t_getdata",  "t_copy",
+    "wall"};
   return (s >= 0 && s < N_SLOTS) ? n[s] : "?";
 }
 

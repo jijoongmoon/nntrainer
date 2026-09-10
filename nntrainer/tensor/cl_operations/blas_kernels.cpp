@@ -2192,6 +2192,228 @@ void v8c_push_pending(cl_event ev, std::vector<uint8_t> &&staging) {
 
 } // namespace
 
+/* ---------------------------------------------------------------------------
+ * [L4] One arena for the v8c aux buffers.
+ *
+ * Every QS4CX weight gets two tiny device buffers -- a per-output-channel fp32
+ * scale and a per-output-channel int32 row sum, 4N bytes each -- and they were
+ * two clCreateBuffer(COPY_HOST_PTR) calls per weight. On a gemma4 E2B load
+ * that is 554 driver allocations for ~11 MiB of payload, and on the pre-packed
+ * arm they cost 1 206 busy ms: once the CPU permute is gone, eight loader
+ * workers arrive at the CL allocator together and the allocator, not the file
+ * and not the GPU, is what the load waits on.
+ *
+ * A sub-buffer allocates nothing -- it is a window on a parent buffer -- so the
+ * pair for every weight is carved out of a few megabyte-scale arenas instead,
+ * and the two host->device copies COPY_HOST_PTR used to make become one
+ * clEnqueueWriteBuffer over the pair's contiguous span. The pair is placed with
+ * the scale first, padded up to the device's sub-buffer origin granularity
+ * (CL_DEVICE_MEM_BASE_ADDR_ALIGN, 128 B on this device), then the row sum, so
+ * both origins are legal and one write covers both.
+ *
+ * The arena is a bump allocator and never reclaims. That is the right shape
+ * here: these buffers are keyed into the v8c weight cache and live as long as
+ * the process, so there is nothing to reclaim. The one exception -- a weight
+ * cache entry evicted because its pointer key was reused -- leaks its slot,
+ * bounded by 8 B per output channel of the weights that lose the race, and the
+ * old path leaked the allocation itself in exactly the same case.
+ *
+ * NNTR_V8C_AUX_ARENA=0 restores a private buffer per aux in the same binary;
+ * NNTR_V8C_AUX_ARENA_MB sets the chunk size. Anything the device refuses --
+ * the arena allocation, the sub-buffer, the write -- falls through to the
+ * private buffers for that weight alone, so the lever degrades one weight at a
+ * time rather than all at once.
+ * ------------------------------------------------------------------------ */
+namespace {
+
+bool v8c_aux_arena_on() {
+  static const bool on = []() {
+    const char *e = std::getenv("NNTR_V8C_AUX_ARENA");
+    return !(e && e[0] == '0'); // default ON; =0 restores a buffer per aux
+  }();
+  return on;
+}
+
+/**
+ * @brief Arena chunk size, MiB (NNTR_V8C_AUX_ARENA_MB).
+ *
+ * @details A bump allocator's chunk is also its slack: gemma4 E2B's aux plane
+ * is 9.2 MiB, which is two 8 MiB chunks (16 MiB of device buffer) or three
+ * 4 MiB ones (12). Measured interleaved, three cells each: kgsl-delta honest
+ * footprint 1 543.8 -> 1 539.8 MiB, with init 775 vs 779 ms and the golden
+ * unchanged -- i.e. the whole difference is the slack and none of it is time,
+ * so 4 is the default. Smaller still would trade real transfers for it: each
+ * retired chunk is one clEnqueueWriteBuffer.
+ */
+size_t v8c_aux_chunk_bytes() {
+  static const size_t b = []() -> size_t {
+    const char *e = std::getenv("NNTR_V8C_AUX_ARENA_MB");
+    const long mb = (e && e[0]) ? std::atol(e) : 4;
+    return (size_t)(mb > 0 ? mb : 4) << 20;
+  }();
+  return b;
+}
+
+/**
+ * @brief One arena chunk: a device buffer, how much of it is carved, and the
+ *        host image of the carved part until it is written.
+ *
+ * @details Measured: with the pair merely CARVED instead of allocated, the aux
+ * phase went 1 206 -> 752 busy ms, and what is left is not allocation at all --
+ * it is 277 clEnqueueWriteBuffer calls of ~20 KB each, 2.7 ms apiece, because
+ * eight loader workers enqueue onto ONE in-order queue while the same queue is
+ * carrying the 1.09 GiB of weight uploads. So the copy is staged host-side and
+ * the chunk is written ONCE, when it fills or when the load ends: ~4 enqueues
+ * for the whole model instead of 277.
+ */
+struct V8cAuxChunk {
+  cl_mem base = nullptr;
+  size_t span = 0;
+  size_t used = 0;
+  std::vector<uint8_t> staging; /**< host image of [0, used); empty once written */
+};
+
+std::mutex &v8c_aux_mtx() {
+  static std::mutex m;
+  return m;
+}
+std::vector<V8cAuxChunk> &v8c_aux_chunks() {
+  static std::vector<V8cAuxChunk> v;
+  return v;
+}
+
+/**
+ * @brief Has the load-end flush run?
+ *
+ * @details Deferral is only sound while a load is open, because the load's end
+ * is the only thing that guarantees a flush. So the arena starts SEALED and
+ * v8c_open_aux_arena() unseals it for the duration of a load: while it is open
+ * a carve writes into the chunk's host staging and the chunk is enqueued as
+ * one transfer, and once it is sealed again a carve -- a weight built lazily
+ * at its first dispatch, or one built by a caller that never loads a model at
+ * all -- writes itself immediately. That is what makes the deferral safe
+ * without a check on any dispatch path: nothing can read an aux buffer that a
+ * flush has not already written.
+ */
+std::atomic<bool> v8c_aux_sealed{true};
+
+/** @brief Enqueue one chunk's staged bytes and release the staging. */
+void v8c_aux_write_chunk_locked(V8cAuxChunk &c, cl_command_queue cq) {
+  if (c.staging.empty() || c.used == 0)
+    return;
+  const cl_int werr = opencl::clEnqueueWriteBuffer(
+    cq, c.base, CL_TRUE, 0, c.used, c.staging.data(), 0, nullptr, nullptr);
+  if (werr != CL_SUCCESS)
+    ml_loge("[v8c] aux arena chunk write of %.2f MiB failed with %d; the "
+            "weights carved from it will read zeros",
+            c.used / 1048576.0, werr);
+  std::vector<uint8_t>().swap(c.staging);
+}
+
+/**
+ * @brief The sub-buffer origin granularity the device demands, in bytes.
+ *
+ * @details CL_DEVICE_MEM_BASE_ADDR_ALIGN is reported in BITS. A device that
+ * declines to answer, or answers with something that is not a power of two,
+ * gets 128 B -- this device's value, and coarse enough to be safe on anything
+ * that would have answered.
+ */
+size_t v8c_aux_align(cl_device_id dev) {
+  static const size_t a = [dev]() -> size_t {
+    cl_uint bits = 0;
+    opencl::clGetDeviceInfo(dev, CL_DEVICE_MEM_BASE_ADDR_ALIGN, sizeof(bits),
+                            &bits, nullptr);
+    size_t bytes = bits ? (size_t)bits / 8u : 0u;
+    if (bytes == 0 || (bytes & (bytes - 1)) != 0 || bytes < 128u)
+      bytes = 128u;
+    return bytes;
+  }();
+  return a;
+}
+
+/**
+ * @brief Reserve `bytes` of arena and say where it landed.
+ *
+ * @param[out] parent the arena chunk holding the reservation
+ * @param[out] origin its byte offset in that chunk, aligned
+ * @return false when the device refused a new chunk; the caller then takes
+ *         private buffers for this weight.
+ */
+bool v8c_aux_reserve(cl_context ctx, cl_command_queue cq, size_t bytes,
+                     size_t align, const void *scale_src, size_t scale_bytes,
+                     size_t rowsum_at, const void *rowsum_src,
+                     size_t rowsum_bytes, cl_mem *parent, size_t *origin,
+                     bool *staged) {
+  const size_t need = ((bytes + align - 1) / align) * align;
+  const bool defer = !v8c_aux_sealed.load(std::memory_order_acquire);
+  std::lock_guard<std::mutex> lock(v8c_aux_mtx());
+  auto &chunks = v8c_aux_chunks();
+  if (chunks.empty() || chunks.back().used + need > chunks.back().span) {
+    // The chunk being retired is written out here rather than at the end of
+    // the load, so only ONE chunk's host image is ever live.
+    if (!chunks.empty())
+      v8c_aux_write_chunk_locked(chunks.back(), cq);
+    const size_t span = std::max(v8c_aux_chunk_bytes(), need);
+    cl_int err = CL_SUCCESS;
+    cl_mem base =
+      opencl::clCreateBuffer(ctx, CL_MEM_READ_ONLY, span, nullptr, &err);
+    if (err != CL_SUCCESS || base == nullptr) {
+      ml_logw("[v8c] aux arena chunk of %.1f MiB failed with %d; this weight "
+              "takes private aux buffers",
+              span / 1048576.0, err);
+      return false;
+    }
+    chunks.push_back(V8cAuxChunk{base, span, 0, {}});
+  }
+  V8cAuxChunk &c = chunks.back();
+  *parent = c.base;
+  *origin = c.used;
+  *staged = false;
+  if (defer) {
+    if (c.staging.empty())
+      c.staging.assign(c.span, 0);
+    // The copy happens HERE, under the arena lock, not through a pointer
+    // handed back to the caller: a chunk retires -- and its host image is
+    // written and released -- under this same lock, so a copy still in flight
+    // outside it would be racing a swap. It is 0.7 ms for the whole model, so
+    // holding the lock across it costs nothing worth the hazard.
+    std::memcpy(c.staging.data() + c.used, scale_src, scale_bytes);
+    std::memcpy(c.staging.data() + c.used + rowsum_at, rowsum_src,
+                rowsum_bytes);
+    *staged = true;
+  }
+  c.used += need;
+  return true;
+}
+
+} // namespace
+
+void v8c_open_aux_arena() {
+  v8c_aux_sealed.store(false, std::memory_order_release);
+}
+
+void v8c_flush_aux_arena() {
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  cl_command_queue cq = blas_cc->command_queue_inst_.GetCommandQueue();
+  size_t chunks = 0, carved = 0;
+  {
+    std::lock_guard<std::mutex> lock(v8c_aux_mtx());
+    for (auto &c : v8c_aux_chunks()) {
+      v8c_aux_write_chunk_locked(c, cq);
+      ++chunks;
+      carved += c.used;
+    }
+    // Set INSIDE the lock, so a carve racing this flush either staged its
+    // bytes before the write above (and is covered by it) or sees the seal and
+    // writes itself.
+    v8c_aux_sealed.store(true, std::memory_order_release);
+  }
+  if (chunks != 0)
+    ml_logd("[v8c] aux arena: %zu chunk(s), %.2f MiB carved", chunks,
+            carved / 1048576.0);
+}
+
 void v8c_flush_pending_uploads() {
   if (v8c_pending_bytes.load(std::memory_order_relaxed) == 0)
     return;
@@ -2581,27 +2803,107 @@ std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
     ctx, w_buf, tv::Encoding::INT4_OFFSET, tv::Layout::ROW_MAJOR, total_bytes,
     /** owned */ true);
 
-  // Per-channel scale: QS4CX stores fp32 directly (no fp16->fp32 promotion).
+  // Per-channel scale (QS4CX stores fp32 directly, no fp16->fp32 promotion)
+  // and per-channel int4 row sum, computed in the chunk loop above. Both are
+  // 4N bytes and both are carved out of the shared aux arena when it is on --
+  // see the arena's comment for why 554 allocations of ~20 KB were the load's
+  // largest remaining item once the CPU permute was gone.
   nntrainer::load_trace::Scope _lt_aux(nntrainer::load_trace::AUX_CREATE);
-  cl_mem sb =
-    opencl::clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                           sizeof(float) * N, (void *)fp32_scales, &err);
-  if (err != CL_SUCCESS || !sb)
-    throw std::runtime_error("make_v8c_weight_backing_from_qs4cx: "
-                             "clCreateBuffer (scale) failed: " +
-                             std::to_string(err));
-  // Per-channel int4 row sum: computed in the chunk loop above.
-  cl_mem rsw_buf =
-    opencl::clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                           sizeof(int32_t) * N, row_sum_w_int4.data(), &err);
-  if (err != CL_SUCCESS || !rsw_buf) {
-    // The scale buffer is this function's until both out-parameters are set:
-    // the caller's handler cannot release what it was never handed, so a
-    // throw between the two allocations would leak it.
-    opencl::clReleaseMemObject(sb);
-    throw std::runtime_error("make_v8c_weight_backing_from_qs4cx: "
-                             "clCreateBuffer (row_sum) failed: " +
-                             std::to_string(err));
+  const size_t sc_bytes = sizeof(float) * (size_t)N;
+  const size_t rs_bytes = sizeof(int32_t) * (size_t)N;
+  cl_mem sb = nullptr;
+  cl_mem rsw_buf = nullptr;
+
+  if (v8c_aux_arena_on()) {
+    const size_t align = v8c_aux_align(blas_cc->context_inst_.GetDeviceId());
+    const size_t sc_pad = ((sc_bytes + align - 1) / align) * align;
+    const size_t pair = sc_pad + rs_bytes;
+    cl_mem parent = nullptr;
+    size_t origin = 0;
+    bool staged = false;
+    bool reserved = false;
+    {
+      nntrainer::load_trace::Scope _lt_st(nntrainer::load_trace::AUX_STAGE);
+      _lt_st.bytes(pair);
+      reserved = v8c_aux_reserve(ctx, cq, pair, align, fp32_scales, sc_bytes,
+                                 sc_pad, row_sum_w_int4.data(), rs_bytes,
+                                 &parent, &origin, &staged);
+    }
+    if (reserved) {
+      cl_buffer_region sc_reg{origin, sc_bytes};
+      cl_buffer_region rs_reg{origin + sc_pad, rs_bytes};
+      cl_int serr = CL_SUCCESS;
+      cl_mem s_sub = nullptr;
+      cl_mem r_sub = nullptr;
+      {
+        nntrainer::load_trace::Scope _lt_sub(nntrainer::load_trace::AUX_SUB);
+        s_sub = opencl::clCreateSubBuffer(parent, CL_MEM_READ_ONLY,
+                                           CL_BUFFER_CREATE_TYPE_REGION,
+                                           &sc_reg, &serr);
+        if (serr == CL_SUCCESS && s_sub != nullptr)
+          r_sub = opencl::clCreateSubBuffer(parent, CL_MEM_READ_ONLY,
+                                             CL_BUFFER_CREATE_TYPE_REGION,
+                                             &rs_reg, &serr);
+      }
+      if (serr == CL_SUCCESS && s_sub != nullptr && r_sub != nullptr) {
+        // Scale first, then the row sum at the next legal origin. The gap
+        // between them is padding no kernel reads; it exists so both origins
+        // satisfy CL_DEVICE_MEM_BASE_ADDR_ALIGN and the pair is contiguous.
+        if (staged) {
+          // Deferred: the reservation already copied the pair into the chunk's
+          // host image, and the chunk carries it to its one transfer.
+          sb = s_sub;
+          rsw_buf = r_sub;
+        } else {
+          // Sealed (a weight built after the load): no later flush to join, so
+          // this pair pays its own enqueue.
+          std::vector<uint8_t> staging(pair, 0);
+          std::memcpy(staging.data(), fp32_scales, sc_bytes);
+          std::memcpy(staging.data() + sc_pad, row_sum_w_int4.data(), rs_bytes);
+          const cl_int werr = opencl::clEnqueueWriteBuffer(
+            cq, parent, CL_TRUE, origin, pair, staging.data(), 0, nullptr,
+            nullptr);
+          if (werr == CL_SUCCESS) {
+            sb = s_sub;
+            rsw_buf = r_sub;
+          }
+        }
+      }
+      if (sb == nullptr) {
+        // The reservation stays spent -- a bump allocator has no way to hand
+        // it back -- and this weight falls through to private buffers below.
+        if (r_sub)
+          opencl::clReleaseMemObject(r_sub);
+        if (s_sub)
+          opencl::clReleaseMemObject(s_sub);
+        ml_logw("[v8c] aux sub-buffer/upload declined (%d); this weight takes "
+                "private aux buffers",
+                serr);
+      }
+    }
+  }
+
+  if (sb == nullptr) {
+    sb = opencl::clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                 sc_bytes, (void *)fp32_scales, &err);
+    if (err != CL_SUCCESS || !sb)
+      throw std::runtime_error("make_v8c_weight_backing_from_qs4cx: "
+                               "clCreateBuffer (scale) failed: " +
+                               std::to_string(err));
+  }
+  if (rsw_buf == nullptr) {
+    rsw_buf =
+      opencl::clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                              rs_bytes, row_sum_w_int4.data(), &err);
+    if (err != CL_SUCCESS || !rsw_buf) {
+      // The scale buffer is this function's until both out-parameters are set:
+      // the caller's handler cannot release what it was never handed, so a
+      // throw between the two allocations would leak it.
+      opencl::clReleaseMemObject(sb);
+      throw std::runtime_error("make_v8c_weight_backing_from_qs4cx: "
+                               "clCreateBuffer (row_sum) failed: " +
+                               std::to_string(err));
+    }
   }
   *out_scale_buf = sb;
   *out_row_sum_w_int4_buf = rsw_buf;

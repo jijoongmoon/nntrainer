@@ -493,6 +493,31 @@ std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
 void v8c_flush_pending_uploads();
 
 /**
+ * @brief Write out the v8c aux arena and seal it.
+ *
+ * @details The per-weight scale/row-sum pairs are carved out of a few shared
+ * device buffers and staged host-side during the load, so the model's ~11 MiB
+ * of aux costs a handful of transfers rather than one per weight. Call this
+ * where the load is over: it enqueues whatever chunk is still open and marks
+ * the arena sealed, after which any weight built later (a lazy first-dispatch
+ * build) writes its own pair immediately. Inert when the arena is off or
+ * nothing was carved.
+ */
+void v8c_flush_aux_arena();
+
+/**
+ * @brief Open the v8c aux arena for the duration of a weight load.
+ *
+ * @details The arena stages a carve host-side and lets the chunk carry it in
+ * one transfer, which is only sound while something is guaranteed to flush the
+ * chunk afterwards -- and that something is the end of the load. Call this
+ * where a load begins; call v8c_flush_aux_arena() where it ends. Outside that
+ * window the arena is sealed and every carve writes itself, so a caller that
+ * builds a weight without loading a model still gets bytes on the device.
+ */
+void v8c_open_aux_arena();
+
+/**
  * @brief 8/4/4 paper attention path: int8(act) × int8(weight) channel-wise
  * GEMM. Signature mirrors gemm_int8_v8c_cl (row_sum_act ignored). Weight image
  *        must be the plain row-major int8 view (width K/16). Dispatches the
