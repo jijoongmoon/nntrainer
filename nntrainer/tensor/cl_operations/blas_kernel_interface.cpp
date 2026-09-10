@@ -25,6 +25,7 @@
 #include <sys/mman.h> // madvise(MADV_DONTNEED)
 #endif
 #include <blas_kernels.h>
+#include <load_trace.h>
 #include <nntrainer_error.h>
 #include <opencl_loader.h>
 
@@ -858,6 +859,7 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
   // false there, so the view is built.
   if (!v8c_buffer_path() && !e.imageless) {
     try {
+      nntrainer::load_trace::Scope _lt(nntrainer::load_trace::IMAGE_VIEW);
       e.weight_image = e.backing->imageView(ws);
       ml_logd("[v8c] image view built for %s: N=%u K=%u pitch=%zu",
               weight.getName().c_str(), N, K, ws.row_pitch_bytes);
@@ -1029,6 +1031,10 @@ static inline float v8c_h2f(uint16_t h) {
 bool dotCl_v8c_prebuild_weight(const Tensor &weight) {
   if (!v8c_env_enabled())
     return false;
+  /* [load-trace] Everything this call does is charged to the loader worker
+     that read the weight, so it is the part of NODE_READ that is GPU work
+     rather than file work. */
+  nntrainer::load_trace::Scope _lt(nntrainer::load_trace::PREBUILD);
   // Reclaim any submit-and-go upload staging from the load phase (memory
   // hygiene only — the in-order queue already sequences those writes ahead
   // of this GEMM). Relaxed-atomic no-op after the first forward.

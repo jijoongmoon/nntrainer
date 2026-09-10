@@ -10,6 +10,7 @@
  */
 
 #include <tensor.h>
+#include <load_trace.h>
 #include <tensor_base.h>
 
 namespace nntrainer {
@@ -93,8 +94,20 @@ void TensorBase::read(ReadSource src, size_t start_offset,
     << "read size: " << bytes()
     << " is too big. It cannot be represented by std::streamsize";
 
-  checkedRead(src, (char *)getData(), sz, "[Tensor::read] operation failed",
-              start_offset, read_from_offset);
+  /* [load-trace] Split the two halves of a weight read: committing the
+     tensor's own storage (which faults and zero-fills fresh anonymous pages)
+     and the copy out of the file mapping into it. */
+  char *dst = nullptr;
+  {
+    nntrainer::load_trace::Scope _lt(nntrainer::load_trace::T_GETDATA);
+    dst = (char *)getData();
+  }
+  {
+    nntrainer::load_trace::Scope _lt(nntrainer::load_trace::T_COPY);
+    _lt.bytes((uint64_t)sz);
+    checkedRead(src, dst, sz, "[Tensor::read] operation failed", start_offset,
+                read_from_offset);
+  }
   putData();
 }
 
