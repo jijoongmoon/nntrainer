@@ -1209,82 +1209,32 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
     device_clmem_in ? static_cast<const void *>(clmem_in)
                     : static_cast<const void *>(input.getData<uint8_t>());
 
-  // [pass boundary] The shared-quant cache below is keyed on the input
-  // ADDRESS, and activation addresses come from the tensor pool, which
-  // recycles them every forward pass. Pointer identity therefore only proves
-  // data identity WITHIN one pass; one pass later the same (pointer, M, K,
-  // M_pad, dtype) tuple names a freshly written activation while the cached
-  // int8 still holds the previous pass's values, and the GEMM would multiply
-  // the stale quant with no error and no log.
-  // The boundary is INFERRED here instead of being plumbed down from the model
-  // graph: every FC weight is dispatched at most once per forward pass, so
-  // meeting a weight for the second time in the same generation IS the next
-  // pass.
-  // The generation is bumped only when a weight is met twice in the SAME
-  // generation, so the boundary is seen only if the first v8c FC of the new
-  // pass was ALSO dispatched in the previous pass. When the first v8c FC of a
-  // pass is a weight that was NOT dispatched in the previous pass -- per-token
-  // MoE/expert routing, a conditionally skipped layer, a second graph sharing
-  // this process-global scratch, or any first-ever dispatch -- no bump
-  // happens and last_quant_gen still equals pass_gen, so the generation alone
-  // would let the stale cross-pass hit through.
-  // That case is therefore not merely noted, it is REFUSED. A dispatch may use
-  // the cache only when it PROVABLY took part in the inference itself, which
-  // is exactly: the weight has a previous generation (it is not a first-ever
-  // dispatch), and that generation is one behind the current one after the
-  // bump above. The two ways to satisfy it are the two shapes the detector
-  // understands:
-  //   - a weight met twice bumps, so its previous generation becomes
-  //     pass_gen - 1 by construction -- the first FC of a steady-state pass;
-  //   - a weight already dispatched in the immediately preceding generation is
-  //     at pass_gen - 1 without a bump -- every later FC of that pass.
-  // Everything else -- a first-ever dispatch, a weight that skipped whole
-  // generations, a weight belonging to a second graph -- fails it, and that
-  // set is precisely the enumeration above. Those dispatches bypass the cache:
-  // the activation is re-quantized, costing one kernel and never a wrong
-  // answer. The cost is bounded and paid where it is owed -- the whole first
-  // forward pass bypasses, since no weight has a previous generation yet, and
-  // from the second pass on a static graph caches exactly as before.
-  // The complete fix bumps the generation at forward-pass entry, which needs a
-  // per-forward seam this backend does not have today; until it exists the
-  // cache is trusted only where it is provably sound.
-  // Coupling: pass_gen and last_use_gen are plain fields, safe only because
-  // the v8c_cache_mtx() lock_guard taken above spans the rest of dotCl_v8c.
-  const unsigned long long prev_use_gen = w->last_use_gen;
-  if (prev_use_gen != 0 && prev_use_gen == sc.pass_gen)
-    ++sc.pass_gen;
-  w->last_use_gen = sc.pass_gen;
-  const bool boundary_established =
-    (prev_use_gen != 0 && prev_use_gen + 1 == sc.pass_gen);
-
-  // Shared-quant cache. For host/SVM inputs the (data_ptr, shape, dtype)
-  // tuple uniquely identifies the activation within one forward pass, so a
-  // hit means the same data is already int8-quantized in sc.act_i8 and both
-  // the staging copy and the quant kernel can be skipped (the wq/wk/wv and
-  // gate/up sibling FCs).
-  const bool quant_tuple_hit =
-    sc.last_quant_gen == sc.pass_gen && sc.last_quant_in_ptr != nullptr &&
-    sc.last_quant_in_ptr == cur_in_ptr && sc.last_quant_M == M &&
-    sc.last_quant_K == K && sc.last_quant_M_pad == M_pad &&
-    sc.last_quant_dtype == cur_dtype;
-  const bool quant_cache_hit = quant_tuple_hit && boundary_established;
-  // A bypass during the very first pass is expected (no weight has a previous
-  // generation yet) and costs one quant kernel per FC, once. A bypass after
-  // the detector has fired at least once is the report-worthy case: this
-  // process is running a graph whose dispatch set the heuristic cannot track.
-  if (quant_tuple_hit && !boundary_established && sc.pass_gen > 1) {
-    static bool warned = false;
-    if (!warned) {
-      warned = true;
-      ml_logw("[v8c] shared-quant cache bypassed for %s: this weight did not "
-              "take part in the previous forward pass (expert routing, a "
-              "skipped layer, or a second graph on this process-global "
-              "scratch), so the pass boundary cannot be inferred from weight "
-              "reuse. Correctness is kept by re-quantizing the activation; "
-              "the saved quant kernel is not.",
-              weight.getName().c_str());
-    }
-  }
+  // Shared-quant cache: REFUSED, because its key cannot tell two activations
+  // apart.
+  //
+  // The cache skipped the staging copy and the activation-quant kernel when a
+  // call arrived with the same (input data pointer, M, K, M_pad, dtype) as the
+  // previous one, on the assumption that an activation ADDRESS identifies its
+  // contents for the length of one forward pass -- so the wq/wk/wv and
+  // gate/up siblings, which really do share one activation, quantize it once.
+  //
+  // The assumption does not hold. The tensor pool recycles an activation slot
+  // as soon as its last reader has run, WITHIN the same pass, so two
+  // consecutive quantized GEMMs can be handed the same address holding
+  // different data. The second one then multiplies the first one's int8 with
+  // no error and no log: the output is plausible, wrong, and the error grows
+  // with depth.
+  //
+  // A graph with KV-shared decoder blocks meets this on every shared block --
+  // the per-block "kv" normalization writes its output into the slot the
+  // preceding projection's input has just vacated, so each shared block's K
+  // and V projections consumed the preceding block's activation.
+  //
+  // Re-quantizing always costs one quant kernel per call that used to hit and
+  // is always correct. Restoring the fast path needs a key that names the
+  // PRODUCER of the activation, or an invalidation hooked to every write into
+  // the activation plane; the address on its own cannot carry either.
+  const bool quant_cache_hit = false;
   const bool skip_upload_and_quant = quant_cache_hit;
 
   // [Lever 1] NNTR_FC_QUANT_DIRECT: on the cl_mem residency edge, quantize the
