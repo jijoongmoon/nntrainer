@@ -2285,13 +2285,19 @@ std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
   // with one of the same size and timestamp cannot serve a stale pack. It is
   // sampled, so it costs a fixed ~192 KB of hashing whether the lookup hits
   // or misses.
+  // Ask the cache whether either side can use a fingerprint before paying for
+  // one: for a weight this run will not tee (below NNTR_V8C_PACK_CACHE_MIN_MB
+  // on a rewrite) and for a weight the mapped pack holds no record for, the
+  // answer is dead and the ~192 KB of scattered sampling is pure load-time
+  // cost -- which on the zero-copy path is a scattered first touch of the
+  // weight file itself.
   uint64_t src_fnv = 0;
-  {
+  if (cache_name != nullptr &&
+      v8c_pack::fingerprint_needed(cache_name, N, K, v8c_row_bytes,
+                                   total_bytes)) {
     nntrainer::load_trace::Scope _lt(nntrainer::load_trace::FINGERPRINT);
-    src_fnv = (cache_name != nullptr)
-                ? v8c_pack::source_fingerprint(plain_nibbles,
-                                               (size_t)N * plain_row_bytes)
-                : 0;
+    src_fnv =
+      v8c_pack::source_fingerprint(plain_nibbles, (size_t)N * plain_row_bytes);
   }
   bool from_cache = false;
   if (!hostptr && cache_name != nullptr) {
