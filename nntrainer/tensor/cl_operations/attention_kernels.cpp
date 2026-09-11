@@ -393,8 +393,32 @@ bool two_conv_attention_prefill_f16_cl(
 // indexed at absolute position (start_pos + row). in/out may alias (in-place Q)
 // or differ (rotate-and-scatter K into its cache slice).
 // =============================================================================
+/**
+ * @brief Compile options for rope_inplace_kernel.
+ * @details NNTR_ROPE_TAIL_FIX=0 restores the pre-fix rotation rule (precision
+ * chosen from the chunk's M alone). Read once; the string is part of the
+ * program cache key, so the two arms never share a compiled binary.
+ * @return "" for the default, or the -D that selects the old rule
+ */
+static const std::string &ropeCopts() {
+  static const std::string opts = [] {
+    const char *e = std::getenv("NNTR_ROPE_TAIL_FIX");
+    return (e != nullptr && e[0] == '0')
+             ? std::string("-DROPE_TAIL_CONSISTENT=0")
+             : std::string();
+  }();
+  return opts;
+}
+
 static const std::string rope_inplace_kernel = R"CL(
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
+// 1 (default) = the fp32/fp16 rotation choice is a property of the SEQUENCE,
+// so a continuation chunk matches the chunks before it; 0 = the old rule,
+// chosen from this chunk's M alone. Set from NNTR_ROPE_TAIL_FIX; see the
+// branch below.
+#ifndef ROPE_TAIL_CONSISTENT
+#define ROPE_TAIL_CONSISTENT 1
+#endif
 __kernel void rope_inplace_f16(__global const half *in,
                                __global       half *out,
                                __global const half *cos_lut,
@@ -423,7 +447,24 @@ __kernel void rope_inplace_f16(__global const half *in,
   // For a large prefill (M >= 32) the half rotation is kept: it is ~6% faster on
   // the big RoPE and the model-agnostic threshold avoids a head_dim hack. Store
   // is always FP16 (the activation dtype). See reference_working_run_combos.
-  if (M < 32) {
+  //
+  // ...but M is the CHUNK's row count, not the sequence's, and a chunked
+  // prefill is one sequence. Choosing the precision from M alone rotates the
+  // LAST chunk of a long prompt in fp32 while every earlier chunk was rotated
+  // in fp16, whenever that chunk happens to be shorter than 32 rows -- so the
+  // K cache the decode steps then read is internally inconsistent across a
+  // boundary a few rows before the first generated token. Measured
+  // on a 3 595-token prompt, tails of 4, 11 and 18
+  // rows all answer wrongly and tails of 32, 395, 445 and 523 are golden --
+  // the threshold in the data is this 32, exactly.
+  //
+  // rope_tail_consistent (NNTR_ROPE_TAIL_FIX=0 restores the old rule) makes
+  // the choice a property of the SEQUENCE instead: fp32 for decode (M == 1,
+  // unchanged) and for a genuinely short prompt (a first chunk, start_pos == 0,
+  // unchanged), fp16 for a CONTINUATION chunk whatever its size -- which is
+  // what every earlier chunk of that same prefill used. Large prefill chunks
+  // are unchanged either way.
+  if (M == 1 || (M < 32 && (ROPE_TAIL_CONSISTENT == 0 || start_pos == 0))) {
     float cf = (float)c, sf = (float)s, lof = (float)lo, hif = (float)hi;
     out[write_off + row + k]          = (half)(lof * cf - hif * sf);
     out[write_off + row + k + half_d] = (half)(hif * cf + lof * sf);
@@ -571,8 +612,8 @@ bool rope_inplace_f16_cl(const uint16_t *in, uint16_t *out,
   cl_context ctx = blas_cc->context_inst_.GetContextNoRetain();
   cl_command_queue q = blas_cc->command_queue_inst_.GetCommandQueue();
 
-  ClContext::SharedPtrClKernel kp =
-    blas_cc->registerClKernel(rope_inplace_kernel, "rope_inplace_f16");
+  ClContext::SharedPtrClKernel kp = blas_cc->registerClKernel(
+    rope_inplace_kernel, "rope_inplace_f16", ropeCopts());
   if (!kp)
     return false;
 
@@ -730,7 +771,7 @@ bool rope_inplace_f16_cl(const uint16_t *in, uint16_t *out,
 void attention_prewarm_programs(ClContext &cc) {
   // rope_inplace_kernel also hosts scatter_copy_f16 / k_scatter_ohwi /
   // v_scatter_ohwi_t; one registration builds the shared program.
-  cc.registerClKernel(rope_inplace_kernel, "rope_inplace_f16");
+  cc.registerClKernel(rope_inplace_kernel, "rope_inplace_f16", ropeCopts());
 }
 
 bool ensure_cl_stage_buf(void **buf, size_t *cap, size_t bytes) {
@@ -750,8 +791,8 @@ bool gpu_copy_f16_cl(const uint16_t *in, uint16_t *out, unsigned int N,
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
   cl_context ctx = blas_cc->context_inst_.GetContextNoRetain();
   cl_command_queue q = blas_cc->command_queue_inst_.GetCommandQueue();
-  ClContext::SharedPtrClKernel kp =
-    blas_cc->registerClKernel(rope_inplace_kernel, "scatter_copy_f16");
+  ClContext::SharedPtrClKernel kp = blas_cc->registerClKernel(
+    rope_inplace_kernel, "scatter_copy_f16", ropeCopts());
   if (!kp)
     return false;
 
@@ -840,8 +881,8 @@ bool gpu_copy_f16_row_cl(const uint16_t *in, uint16_t *out_base, unsigned int N,
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
   cl_command_queue q = blas_cc->command_queue_inst_.GetCommandQueue();
-  ClContext::SharedPtrClKernel kp =
-    blas_cc->registerClKernel(rope_inplace_kernel, "scatter_copy_f16_row");
+  ClContext::SharedPtrClKernel kp = blas_cc->registerClKernel(
+    rope_inplace_kernel, "scatter_copy_f16_row", ropeCopts());
   if (!kp)
     return false;
   bool okb = true;
@@ -1012,8 +1053,8 @@ bool k_scatter_ohwi_cl(const uint16_t *src_svm, cl_mem dst_buf, unsigned int M,
     return false;
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
-  ClContext::SharedPtrClKernel kp =
-    blas_cc->registerClKernel(rope_inplace_kernel, "k_scatter_ohwi");
+  ClContext::SharedPtrClKernel kp = blas_cc->registerClKernel(
+    rope_inplace_kernel, "k_scatter_ohwi", ropeCopts());
   if (!kp)
     return false;
   int Mi = (int)M, hKVi = (int)num_heads_KV, di = (int)head_dim,
@@ -1053,8 +1094,8 @@ bool v_scatter_ohwi_t_cl(const uint16_t *src_svm, cl_mem dst_buf,
     return false;
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
-  ClContext::SharedPtrClKernel kp =
-    blas_cc->registerClKernel(rope_inplace_kernel, "v_scatter_ohwi_t");
+  ClContext::SharedPtrClKernel kp = blas_cc->registerClKernel(
+    rope_inplace_kernel, "v_scatter_ohwi_t", ropeCopts());
   if (!kp)
     return false;
   int Mi = (int)M, hKVi = (int)num_heads_KV, di = (int)head_dim,
@@ -1099,7 +1140,7 @@ static bool kv_gather_dispatch(const char *kname, cl_mem src_buf,
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
   ClContext::SharedPtrClKernel kp =
-    blas_cc->registerClKernel(rope_inplace_kernel, kname);
+    blas_cc->registerClKernel(rope_inplace_kernel, kname, ropeCopts());
   if (!kp)
     return false;
   int Mi = (int)M, hKVi = (int)num_heads_KV, di = (int)head_dim,
