@@ -903,7 +903,8 @@ __kernel void sv_matmul_f16_ohwi_img(
   __read_only image2d_t V_img, // see comment above
   __global half *O,            // [M, HD_Q] fp16, row-major
   const int M, const int N_kv, const int d, const int HD_Q, const int S_max,
-  const int gqa, const int causal) {
+  const int gqa, const int causal,
+  const int local_window) { // >0: keys n with n+W <= q_pos are already 0
   // Tiled over the output d/x axis: each WI computes TDX=8 consecutive
   // output channels x0..x0+7. The scores chunk depends only on (m, n_tex),
   // NOT on x, so it is loaded ONCE per n_tex and reused across all 8 x's —
@@ -930,11 +931,25 @@ __kernel void sv_matmul_f16_ohwi_img(
   // scores the QK mask already zeroed, so a non-causal call simply keeps the
   // full range.
   int N_kv_tex = (N_kv + 7) >> 3;
+  int n_tex0 = 0;
   if (causal) {
     const int q_off = N_kv - M;
     const int N_kv_tex_causal = ((q_off + m) >> 3) + 1;
     if (N_kv_tex_causal < N_kv_tex)
       N_kv_tex = N_kv_tex_causal;
+    // Sliding-window LOWER bound, the mirror of qk_matmul_f16_ohwi_img's
+    // whole-tile skip. qk writes -INFINITY for every key with
+    // n + local_window <= q_pos, and softmax_row_f16 turns those into
+    // EXACTLY +0.0, so the skipped texels contribute dot(0,v)+dot(0,v) = +0.0
+    // to an accumulator that starts at +0.0f: dropping them is the additive
+    // identity, not a tolerance, and the surviving additions keep their order.
+    if (local_window > 0) {
+      const int n_first = q_off + m - local_window + 1;
+      if (n_first > 0)
+        n_tex0 = n_first >> 3;
+      if (n_tex0 > N_kv_tex)
+        n_tex0 = N_kv_tex;
+    }
   }
 
   float acc[8];
@@ -942,7 +957,7 @@ __kernel void sv_matmul_f16_ohwi_img(
   for (int t = 0; t < 8; t++)
     acc[t] = 0.0f;
 
-  for (int n_tex = 0; n_tex < N_kv_tex; n_tex++) {
+  for (int n_tex = n_tex0; n_tex < N_kv_tex; n_tex++) {
     const int n0 = n_tex * 8;
     half8 s_pack;
     if (n0 + 8 <= N_kv) {
@@ -983,7 +998,8 @@ __kernel void sv_matmul_f16_ohwi_img_tm2(__global const half *scores,
                                          __global half *O, const int M,
                                          const int N_kv, const int d,
                                          const int HD_Q, const int S_max,
-                                         const int gqa, const int causal) {
+                                         const int gqa, const int causal,
+                                         const int local_window) {
   const int x0 = get_global_id(0) * 8;
   const int m0 = get_global_id(1) * 2;
   const int head_q = get_global_id(2);
@@ -1001,12 +1017,25 @@ __kernel void sv_matmul_f16_ohwi_img_tm2(__global const half *scores,
   // sits at N-1 and must sum ALL keys, not just V[0..7]. See the non-tm2
   // kernel; a non-causal call keeps the full range.
   int N_kv_tex = (N_kv + 7) >> 3;
+  int n_tex0 = 0;
   if (causal) {
     const int q_off = N_kv - M;
     const int cap_m = has1 ? m1 : m0;
     const int N_kv_tex_causal = ((q_off + cap_m) >> 3) + 1;
     if (N_kv_tex_causal < N_kv_tex)
       N_kv_tex = N_kv_tex_causal;
+    // Sliding-window LOWER bound (see sv_matmul_f16_ohwi_img above). This WI
+    // owns rows m0 and m1=m0+1; m0 has the SMALLER absolute query position and
+    // therefore the smaller window floor, so bounding on m0 is the safe (and
+    // for m1 merely conservative) choice — the extra texels m1 does not need
+    // are exactly the +0.0 ones it would have skipped.
+    if (local_window > 0) {
+      const int n_first = q_off + m0 - local_window + 1;
+      if (n_first > 0)
+        n_tex0 = n_first >> 3;
+      if (n_tex0 > N_kv_tex)
+        n_tex0 = N_kv_tex;
+    }
   }
 
   float acc0[8], acc1[8];
@@ -1016,7 +1045,7 @@ __kernel void sv_matmul_f16_ohwi_img_tm2(__global const half *scores,
     acc1[t] = 0.0f;
   }
 
-  for (int n_tex = 0; n_tex < N_kv_tex; n_tex++) {
+  for (int n_tex = n_tex0; n_tex < N_kv_tex; n_tex++) {
     const int n0 = n_tex * 8;
     half8 s0, s1;
     if (n0 + 8 <= N_kv) {
