@@ -2019,7 +2019,7 @@ make_v8c_weight_backing(const uint8_t *osv32_packed,
 
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
-  cl_context ctx = blas_cc->context_inst_.GetContext(); // OpenCL context handle
+  cl_context ctx = blas_cc->context_inst_.GetContextNoRetain(); // OpenCL context handle
 
   // 1) Walk osv32 row by row, dequantize → re-quantize per-channel (paper §4.2)
   //    Pack into row-major v8c layout: per row N, K/2 bytes; per K-block of 32
@@ -2239,7 +2239,7 @@ std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
 
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
-  cl_context ctx = blas_cc->context_inst_.GetContext();
+  cl_context ctx = blas_cc->context_inst_.GetContextNoRetain();
 
   cl_int err = CL_SUCCESS;
   // [peak-chunk] The old path built a FULL host mirror then COPY_HOST_PTR'd
@@ -2694,7 +2694,7 @@ std::unique_ptr<tv::TensorBacking> make_v8c_int8_weight_backing(
 
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
-  cl_context ctx = blas_cc->context_inst_.GetContext();
+  cl_context ctx = blas_cc->context_inst_.GetContextNoRetain();
   const size_t nbytes = (size_t)N * K; // 1 byte/int8 weight, plain row-major
 
   cl_int err = CL_SUCCESS;
@@ -2820,7 +2820,7 @@ bool lmhead_gemv_q6_k_cl(const void *w_q6k_host, const float *act_f32_host,
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
   if (!blas_cc)
     return false;
-  cl_context ctx = blas_cc->context_inst_.GetContext();
+  cl_context ctx = blas_cc->context_inst_.GetContextNoRetain();
   cl_command_queue q = blas_cc->command_queue_inst_.GetCommandQueue();
   if (!ctx || !q)
     return false;
@@ -2996,7 +2996,7 @@ bool lmhead_int4_v8c_gemv_cl(void *w_buf_clmem, void *scale_buf_clmem,
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
   if (!blas_cc)
     return false;
-  cl_context ctx = blas_cc->context_inst_.GetContext();
+  cl_context ctx = blas_cc->context_inst_.GetContextNoRetain();
   cl_command_queue q = blas_cc->command_queue_inst_.GetCommandQueue();
   if (!ctx || !q)
     return false;
@@ -3150,7 +3150,7 @@ bool lmhead_gemv_fp32w_cl(const void *w_fp32_host, const void *act_fp16_host,
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
   if (!blas_cc)
     return false;
-  cl_context ctx = blas_cc->context_inst_.GetContext();
+  cl_context ctx = blas_cc->context_inst_.GetContextNoRetain();
   cl_command_queue q = blas_cc->command_queue_inst_.GetCommandQueue();
   if (!ctx || !q)
     return false;

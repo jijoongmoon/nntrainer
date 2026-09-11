@@ -1054,7 +1054,7 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
 
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
-  cl_context ctx = blas_cc->context_inst_.GetContext();
+  cl_context ctx = blas_cc->context_inst_.GetContextNoRetain();
   cl_command_queue q = blas_cc->command_queue_inst_.GetCommandQueue();
 
   V8cWeightEntry *w = v8c_get_or_build_weight(weight, K, N);

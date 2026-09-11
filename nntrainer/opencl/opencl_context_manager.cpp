@@ -75,6 +75,18 @@ const cl_context &ContextManager::GetContext() {
   return context_;
 }
 
+const cl_context &ContextManager::GetContextNoRetain() {
+  // NNTR_CL_CTX_RETAIN=1 restores the retaining accessor everywhere, so the
+  // same binary can be its own control arm.
+  static const bool retain = []() {
+    const char *e = std::getenv("NNTR_CL_CTX_RETAIN");
+    return e != nullptr && e[0] == '1';
+  }();
+  if (context_ != nullptr && !retain)
+    return context_;
+  return GetContext();
+}
+
 void ContextManager::ReleaseContext() {
   if (context_) {
     // decrements the context reference count
