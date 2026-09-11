@@ -320,7 +320,6 @@ void clBumpHandleEpoch() {
   g_handle_epoch.fetch_add(1, std::memory_order_relaxed);
 }
 
-
 // ---------------------------------------------------------------------------
 // GPU memory ledger (NNTR_GPU_MEM_ACCT).
 //
@@ -331,10 +330,10 @@ void clBumpHandleEpoch() {
 namespace {
 
 struct AcctTagStat {
-  size_t live = 0;    ///< bytes currently outstanding
-  size_t peak = 0;    ///< high-water of `live`
-  size_t cum = 0;     ///< bytes ever requested (grow-only caches show here)
-  unsigned n = 0;     ///< allocations
+  size_t live = 0;     ///< bytes currently outstanding
+  size_t peak = 0;     ///< high-water of `live`
+  size_t cum = 0;      ///< bytes ever requested (grow-only caches show here)
+  unsigned n = 0;      ///< allocations
   unsigned n_view = 0; ///< of which views (sub-buffers, image-from-buffer)
   unsigned n_free = 0;
 };
@@ -361,6 +360,7 @@ public:
   void note(const char *kind, const void *handle, size_t bytes, bool view) {
     if (!enabled_ || handle == nullptr)
       return;
+    view = view || viewDepth() > 0;
     const std::string tag = std::string(kind) + "|" + currentTag();
     std::lock_guard<std::mutex> lk(m_);
     auto &st = tags_[tag];
@@ -395,6 +395,14 @@ public:
     if (enabled_)
       stack().push_back(tag);
   }
+  void pushView() {
+    if (enabled_)
+      ++viewDepth();
+  }
+  void popView() {
+    if (enabled_ && viewDepth() > 0)
+      --viewDepth();
+  }
   void pop() {
     if (enabled_ && !stack().empty())
       stack().pop_back();
@@ -416,12 +424,11 @@ public:
     });
     std::fprintf(stderr, "[gpumem] ==== %s ==== live %.1f MiB, peak %.1f MiB\n",
                  phase, live / 1048576.0, peak / 1048576.0);
-    std::fprintf(stderr,
-                 "[gpumem] %-38s %10s %10s %10s %6s %6s %6s\n", "kind|tag",
-                 "live_MiB", "peak_MiB", "cum_MiB", "n", "views", "freed");
+    std::fprintf(stderr, "[gpumem] %-38s %10s %10s %10s %6s %6s %6s\n",
+                 "kind|tag", "live_MiB", "peak_MiB", "cum_MiB", "n", "views",
+                 "freed");
     for (const auto &r : rows)
-      std::fprintf(stderr,
-                   "[gpumem] %-38s %10.2f %10.2f %10.2f %6u %6u %6u\n",
+      std::fprintf(stderr, "[gpumem] %-38s %10.2f %10.2f %10.2f %6u %6u %6u\n",
                    r.first.c_str(), r.second.live / 1048576.0,
                    r.second.peak / 1048576.0, r.second.cum / 1048576.0,
                    r.second.n, r.second.n_view, r.second.n_free);
@@ -437,6 +444,16 @@ private:
   static std::vector<const char *> &stack() {
     static thread_local std::vector<const char *> s;
     return s;
+  }
+  /** Depth of nested "this allocation is a VIEW" scopes on this thread.
+   *  A view allocates no memory of its own -- a sub-buffer, an image over a
+   *  buffer, or a CL_MEM_USE_HOST_PTR buffer over memory that is already
+   *  allocated and already counted. Counting its bytes again would make the
+   *  ledger disagree with the driver by exactly the amount the aliasing saves,
+   *  and the app's Peak Mem is computed FROM this ledger. */
+  static int &viewDepth() {
+    static thread_local int d = 0;
+    return d;
   }
   static std::string currentTag() {
     const auto &s = stack();
@@ -459,6 +476,8 @@ const bool g_acct_on = MemAcct::get().enabled();
 bool clMemAcctOn() { return g_acct_on; }
 void clMemAcctPush(const char *tag) { MemAcct::get().push(tag); }
 void clMemAcctPop() { MemAcct::get().pop(); }
+void clMemAcctPushView() { MemAcct::get().pushView(); }
+void clMemAcctPopView() { MemAcct::get().popView(); }
 void clMemAcctDump(const char *phase) { MemAcct::get().dump(phase); }
 
 cl_int clReleaseMemObjectT(cl_mem memobj) {
@@ -509,7 +528,8 @@ cl_mem clCreateImageT(cl_context context, cl_mem_flags flags,
     const bool view = desc != nullptr && desc->buffer != nullptr;
     size_t bytes = 0;
     if (!view && desc != nullptr)
-      bytes = desc->image_row_pitch * (desc->image_height ? desc->image_height : 1);
+      bytes =
+        desc->image_row_pitch * (desc->image_height ? desc->image_height : 1);
     MemAcct::get().note("img", m, bytes, view);
   }
   return m;
