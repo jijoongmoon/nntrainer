@@ -442,6 +442,16 @@ bool CommandQueueManager::DispatchCommand(
 
   cl_kernel kernel_ = kernel.GetKernel();
 
+  // The risk condition, asked per dispatch. If any shared-memory pointer bound
+  // for this dispatch lands inside a plane an earlier undrained dispatch wrote,
+  // that write has to be made visible BEFORE this one is enqueued, not after:
+  // the consumer is the reader. On a hit the whole queue drains, which retires
+  // every outstanding plane, so the set is cleared inside the call. Asked
+  // unconditionally so the per-dispatch bound-pointer list is consumed even
+  // when the set is empty.
+  if (Kernel::takeDispatchSvmHazard())
+    clFinish(command_queue_);
+
   // returns NULL with error code if fails
   const int error_code =
     clEnqueueNDRangeKernel(command_queue_, kernel_, 3, nullptr, global, local,
@@ -458,8 +468,10 @@ bool CommandQueueManager::DispatchCommand(
     return false;
   }
 
-  if (touched_svm && needsCoarseSVMDrain())
+  if (touched_svm && needsCoarseSVMDrain()) {
     clFinish(command_queue_);
+    Kernel::clearUndrainedSvmPlanes();
+  }
 
   return true;
 }
@@ -485,6 +497,16 @@ bool CommandQueueManager::DispatchCommand(
 
   cl_kernel kernel_ = kernel_ptr->GetKernel();
 
+  // The risk condition, asked per dispatch. If any shared-memory pointer bound
+  // for this dispatch lands inside a plane an earlier undrained dispatch wrote,
+  // that write has to be made visible BEFORE this one is enqueued, not after:
+  // the consumer is the reader. On a hit the whole queue drains, which retires
+  // every outstanding plane, so the set is cleared inside the call. Asked
+  // unconditionally so the per-dispatch bound-pointer list is consumed even
+  // when the set is empty.
+  if (Kernel::takeDispatchSvmHazard())
+    clFinish(command_queue_);
+
   // returns NULL with error code if fails
   const int error_code =
     clEnqueueNDRangeKernel(command_queue_, kernel_, 3, nullptr, global, local,
@@ -501,8 +523,10 @@ bool CommandQueueManager::DispatchCommand(
     return false;
   }
 
-  if (touched_svm && needsCoarseSVMDrain())
+  if (touched_svm && needsCoarseSVMDrain()) {
     clFinish(command_queue_);
+    Kernel::clearUndrainedSvmPlanes();
+  }
 
   return true;
 }
@@ -514,6 +538,16 @@ void CommandQueueManager::enqueueKernel(const cl_kernel kernel,
                                         cl_uint num_events_in_wait_list,
                                         const cl_event *event_wait_list,
                                         cl_event *event) {
+
+  // The risk condition, asked per dispatch. If any shared-memory pointer bound
+  // for this dispatch lands inside a plane an earlier undrained dispatch wrote,
+  // that write has to be made visible BEFORE this one is enqueued, not after:
+  // the consumer is the reader. On a hit the whole queue drains, which retires
+  // every outstanding plane, so the set is cleared inside the call. Asked
+  // unconditionally so the per-dispatch bound-pointer list is consumed even
+  // when the set is empty.
+  if (Kernel::takeDispatchSvmHazard())
+    clFinish(command_queue_);
 
   const auto error_code = clEnqueueNDRangeKernel(
     command_queue_, kernel, work_dim, nullptr, global_work_size,
@@ -530,8 +564,10 @@ void CommandQueueManager::enqueueKernel(const cl_kernel kernel,
   // The attention and rotary-embedding kernels come through here rather than
   // DispatchCommand, and they are the shared-memory producers and consumers,
   // so the flush that keeps their handoff coherent has to live here too.
-  if (touched_svm && needsCoarseSVMDrain())
+  if (touched_svm && needsCoarseSVMDrain()) {
     clFinish(command_queue_);
+    Kernel::clearUndrainedSvmPlanes();
+  }
 }
 
 } // namespace nntrainer::opencl
