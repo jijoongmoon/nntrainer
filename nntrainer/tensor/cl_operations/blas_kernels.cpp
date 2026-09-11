@@ -24,8 +24,8 @@
 #include <cstdlib>
 #include <fp16.h>
 #include <opencl_loader.h>
-#include <unordered_map>
 #include <thread>
+#include <unordered_map>
 
 namespace nntrainer {
 
@@ -34,12 +34,12 @@ namespace nntrainer {
  *
  * The coop GEMV reads its operands through the images' backing buffers, and it
  * asked the driver for both of them on every call -- ~543 clGetImageInfo per
- * decode token on an Adreno 840 decode cell, for an answer that is a property of
- * the image object and cannot change while that object lives. The map keys on
- * the image handle and is dropped whole whenever any memory object is created
- * (opencl::clHandleEpoch), which is the only way a live handle value can come
- * to name a different object; steady-state decode creates none, so the map is
- * filled once and read thereafter.
+ * decode token on an Adreno 840 decode cell, for an answer that is a property
+ * of the image object and cannot change while that object lives. The map keys
+ * on the image handle and is dropped whole whenever any memory object is
+ * created (opencl::clHandleEpoch), which is the only way a live handle value
+ * can come to name a different object; steady-state decode creates none, so the
+ * map is filled once and read thereafter.
  */
 static cl_mem v8c_image_backing(cl_mem image) {
   static std::unordered_map<cl_mem, cl_mem> cache;
@@ -70,7 +70,6 @@ static cl_mem v8c_image_backing(cl_mem image) {
   cache.emplace(image, buf);
   return buf;
 }
-
 
 void gemv_int4_async_cl(std::vector<void *> weights,
                         std::vector<uint16_t *> scales, uint16_t *input,
@@ -2061,7 +2060,8 @@ make_v8c_weight_backing(const uint8_t *osv32_packed,
 
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
-  cl_context ctx = blas_cc->context_inst_.GetContextNoRetain(); // OpenCL context handle
+  cl_context ctx =
+    blas_cc->context_inst_.GetContextNoRetain(); // OpenCL context handle
 
   // 1) Walk osv32 row by row, dequantize → re-quantize per-channel (paper §4.2)
   //    Pack into row-major v8c layout: per row N, K/2 bytes; per K-block of 32
@@ -2117,7 +2117,7 @@ make_v8c_weight_backing(const uint8_t *osv32_packed,
   cl_int err = CL_SUCCESS;
   cl_mem w_buf =
     opencl::clCreateBufferT(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                           packed.size(), packed.data(), &err);
+                            packed.size(), packed.data(), &err);
   if (err != CL_SUCCESS || !w_buf)
     throw std::runtime_error("make_v8c_weight_backing: clCreateBuffer (weight) "
                              "failed: " +
@@ -2129,7 +2129,7 @@ make_v8c_weight_backing(const uint8_t *osv32_packed,
   // 3) Upload per-channel scale buffer.
   cl_mem sb =
     opencl::clCreateBufferT(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                           sizeof(float) * N, per_channel_scale.data(), &err);
+                            sizeof(float) * N, per_channel_scale.data(), &err);
   if (err != CL_SUCCESS || !sb)
     throw std::runtime_error("make_v8c_weight_backing: clCreateBuffer (scale) "
                              "failed: " +
@@ -2581,7 +2581,7 @@ std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
   // Per-channel scale: QS4CX stores fp32 directly (no fp16->fp32 promotion).
   cl_mem sb =
     opencl::clCreateBufferT(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                           sizeof(float) * N, (void *)fp32_scales, &err);
+                            sizeof(float) * N, (void *)fp32_scales, &err);
   if (err != CL_SUCCESS || !sb)
     throw std::runtime_error("make_v8c_weight_backing_from_qs4cx: "
                              "clCreateBuffer (scale) failed: " +
@@ -2589,7 +2589,7 @@ std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
   // Per-channel int4 row sum: computed in the chunk loop above.
   cl_mem rsw_buf =
     opencl::clCreateBufferT(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                           sizeof(int32_t) * N, row_sum_w_int4.data(), &err);
+                            sizeof(int32_t) * N, row_sum_w_int4.data(), &err);
   if (err != CL_SUCCESS || !rsw_buf) {
     // The scale buffer is this function's until both out-parameters are set:
     // the caller's handler cannot release what it was never handed, so a
@@ -2741,8 +2741,8 @@ std::unique_ptr<tv::TensorBacking> make_v8c_int8_weight_backing(
 
   cl_int err = CL_SUCCESS;
   cl_mem w_buf =
-    opencl::clCreateBufferT(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, nbytes,
-                           const_cast<int8_t *>(int8_weights), &err);
+    opencl::clCreateBufferT(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                            nbytes, const_cast<int8_t *>(int8_weights), &err);
   if (err != CL_SUCCESS || !w_buf)
     throw std::runtime_error(
       "make_v8c_int8_weight_backing: clCreateBuffer (weight) failed: " +
@@ -2756,7 +2756,7 @@ std::unique_ptr<tv::TensorBacking> make_v8c_int8_weight_backing(
     per_channel_scale[n] = compute_fp16_to_fp32(fp16_scales[n]);
   cl_mem sb =
     opencl::clCreateBufferT(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                           sizeof(float) * N, per_channel_scale.data(), &err);
+                            sizeof(float) * N, per_channel_scale.data(), &err);
   if (err != CL_SUCCESS || !sb)
     throw std::runtime_error(
       "make_v8c_int8_weight_backing: clCreateBuffer (scale) failed");
@@ -2772,7 +2772,7 @@ std::unique_ptr<tv::TensorBacking> make_v8c_int8_weight_backing(
   }
   cl_mem rb =
     opencl::clCreateBufferT(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                           sizeof(int32_t) * N, row_sum_w.data(), &err);
+                            sizeof(int32_t) * N, row_sum_w.data(), &err);
   if (err != CL_SUCCESS || !rb)
     throw std::runtime_error("make_v8c_int8_weight_backing: "
                              "clCreateBuffer (row_sum_w) failed");
@@ -2880,8 +2880,9 @@ bool lmhead_gemv_q6_k_cl(const void *w_q6k_host, const float *act_f32_host,
   const size_t w_bytes = (size_t)vocab * nb * 210;
   cl_int err = CL_SUCCESS;
   if (e.w == nullptr) {
-    e.w = opencl::clCreateBufferT(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                                 w_bytes, const_cast<void *>(w_q6k_host), &err);
+    e.w =
+      opencl::clCreateBufferT(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                              w_bytes, const_cast<void *>(w_q6k_host), &err);
     if (err != CL_SUCCESS || !e.w) {
       std::fprintf(stderr, "[lmhead-q6k] weight clCreateBuffer(%zu B) err=%d\n",
                    w_bytes, err);
@@ -2889,9 +2890,9 @@ bool lmhead_gemv_q6_k_cl(const void *w_q6k_host, const float *act_f32_host,
       return false;
     }
     e.x = opencl::clCreateBufferT(ctx, CL_MEM_READ_ONLY, sizeof(float) * hidden,
-                                 nullptr, &err);
+                                  nullptr, &err);
     e.out = opencl::clCreateBufferT(ctx, CL_MEM_WRITE_ONLY,
-                                   sizeof(float) * vocab, nullptr, &err);
+                                    sizeof(float) * vocab, nullptr, &err);
     if (!e.x || !e.out) {
       std::fprintf(stderr, "[lmhead-q6k] act/out clCreateBuffer err=%d\n", err);
       if (e.w)
@@ -3212,7 +3213,7 @@ bool lmhead_gemv_fp32w_cl(const void *w_fp32_host, const void *act_fp16_host,
   if (e.w == nullptr) {
     e.w =
       opencl::clCreateBufferT(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                             w_bytes, const_cast<void *>(w_fp32_host), &err);
+                              w_bytes, const_cast<void *>(w_fp32_host), &err);
     if (err != CL_SUCCESS || !e.w) {
       std::fprintf(stderr,
                    "[lmhead-fp32w] weight clCreateBuffer(%zu B) err=%d\n",
@@ -3221,9 +3222,9 @@ bool lmhead_gemv_fp32w_cl(const void *w_fp32_host, const void *act_fp16_host,
       return false;
     }
     e.x = opencl::clCreateBufferT(ctx, CL_MEM_READ_ONLY,
-                                 sizeof(uint16_t) * hidden, nullptr, &err);
+                                  sizeof(uint16_t) * hidden, nullptr, &err);
     e.out = opencl::clCreateBufferT(ctx, CL_MEM_WRITE_ONLY,
-                                   sizeof(float) * vocab, nullptr, &err);
+                                    sizeof(float) * vocab, nullptr, &err);
     if (!e.x || !e.out) {
       std::fprintf(stderr, "[lmhead-fp32w] act/out clCreateBuffer err=%d\n",
                    err);

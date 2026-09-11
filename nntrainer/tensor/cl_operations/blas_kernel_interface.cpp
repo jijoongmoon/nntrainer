@@ -1305,8 +1305,7 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
         const char *e = std::getenv("NNTR_V8C_ACT_VIEW_SET");
         return !(e != nullptr && e[0] == '0');
       }();
-      const int cap =
-        view_set ? V8cScratch::kActViewsPerSlot : 1;
+      const int cap = view_set ? V8cScratch::kActViewsPerSlot : 1;
       auto &views = sc.act_views[act_slot];
       int hit = -1, free_slot = -1, victim = 0;
       for (int i = 0; i < cap; ++i) {

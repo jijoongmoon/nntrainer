@@ -85,7 +85,7 @@ void *ClBufferPool::deviceMemory(unsigned int idx) {
 
   cl_int err = CL_SUCCESS;
   cl_mem buf = opencl::clCreateBufferT(cc->context_inst_.GetContext(),
-                                      CL_MEM_READ_WRITE, bytes, nullptr, &err);
+                                       CL_MEM_READ_WRITE, bytes, nullptr, &err);
   if (err != CL_SUCCESS || buf == nullptr) {
     ml_logw("ClBufferPool: clCreateBuffer for %zu bytes failed with %d; the "
             "tensor stays on the shared plane",
