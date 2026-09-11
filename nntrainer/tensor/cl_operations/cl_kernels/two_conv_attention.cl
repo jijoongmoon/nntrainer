@@ -187,6 +187,89 @@ __kernel void qk_matmul_f16_ohwi(
   }
 }
 
+#ifndef SOFTMAX_LWS
+#define SOFTMAX_LWS 64
+#endif
+
+// =============================================================
+// THE SCORE-BAND CONTRACT
+//
+// The three attention kernels (qk / softmax / sv) share the [H,M,N_kv] scores
+// scratch.  Row m of head h holds the query at ABSOLUTE position
+// q_pos = q_off + m, q_off = N_kv - M, and the mask says key n is VISIBLE iff
+//
+//     q_pos - W < n <= q_pos          (W = local_window; W == 0 => no floor)
+//
+// i.e. the row's valid cells are  [max(0, q_pos+1-W), q_pos].
+//
+// sv_matmul_f16_ohwi_img_tm2 does NOT read exactly that set.  It reads whole
+// 8-half texels, and one WI owns the ROW PAIR (m0 = m & ~1, m1 = m0+1):
+// its lower texel bound comes from m0 (the smaller floor) and its upper texel
+// bound from m1 (the larger cap).  So the cells sv actually loads for row m are
+//
+//     [ 8*floor(max(0, q_off+mlo+1-W)/8), min(N_kv, 8*(((q_off+mhi)>>3)+1)) )
+//     with mlo = m & ~1, mhi = min(M-1, mlo+1)
+//
+// which is WIDER than row m's own valid set on both sides.  Every cell in that
+// widening must therefore hold the +0.0 that softmax produces from the
+// -INFINITY qk wrote -- never a raw -INFINITY, or sv accumulates dot(-inf, V).
+// That is exactly what the reverted per-row attempt (softmax_row_win_f16, a per-ROW band)
+// got wrong: it left the pair widening at -INFINITY.
+//
+// tca_score_band() below is the single definition of that band.  It is
+// widened once more, down to a multiple of SOFTMAX_LWS(=64), so that the
+// banded softmax keeps the baseline's  n == tid (mod 64)  work-item mapping
+// and therefore its exact fp32 partial-sum grouping -- the dropped terms are
+// -INFINITY (no effect on fmax) and exp()==+0.0 (no effect on the sum), so the
+// banded softmax is BIT-IDENTICAL to the full-row one, not an approximation.
+//
+// Producer/consumer, top to bottom:
+//   qk    writes  [band_lo(tile), band_hi(tile))   for its TM_QK rows
+//   soft  reads   [band_lo(pair), band_hi(pair))   \subseteq the qk band
+//   sv    reads   [tex_lo(pair),  band_hi(pair))   \subseteq the softmax band
+// so nothing is ever read that qk did not write, and nothing sv reads escapes
+// softmax's normalisation.
+//
+// `pair_lo`/`pair_hi` are the first/last query row that must share the band:
+//   softmax: (m & ~1, min(M-1, (m&~1)+1))     -- the sv WI's row pair
+//   qk     : (m0, min(M-1, m0+TM_QK-1))       -- the qk WI's row tile
+//              (a superset of both pairs it covers)
+// `align_lo` = 64 keeps the softmax work-item mapping; qk passes it too so its
+// written band covers what softmax reads.
+// =============================================================
+static inline void tca_score_band(const int M, const int N_kv, const int causal,
+                                  const int local_window, const int pair_lo,
+                                  const int pair_hi, const int align_lo,
+                                  int *n_lo, int *n_hi) {
+  int lo = 0;
+  int hi = N_kv;
+  if (causal) {
+    const int q_off = N_kv - M;
+    int tex_hi = (N_kv + 7) >> 3;
+    const int tex_hi_causal = ((q_off + pair_hi) >> 3) + 1;
+    if (tex_hi_causal < tex_hi)
+      tex_hi = tex_hi_causal;
+    if (local_window > 0) {
+      const int n_first = q_off + pair_lo - local_window + 1;
+      int t0 = 0;
+      if (n_first > 0)
+        t0 = n_first >> 3;
+      if (t0 > tex_hi)
+        t0 = tex_hi;
+      lo = t0 << 3;
+      if (align_lo > 1)
+        lo = lo & ~(align_lo - 1);
+    }
+    hi = tex_hi << 3;
+    if (hi > N_kv)
+      hi = N_kv;
+  }
+  if (lo > hi)
+    lo = hi;
+  *n_lo = lo;
+  *n_hi = hi;
+}
+
 // =============================================================
 // qk_matmul_f16_ohwi_img — paper §3.7/§3.8 K via image2d.
 // K image layout: width = d_h/8 texels (8 halves per texel along d),
@@ -338,6 +421,162 @@ __kernel void qk_matmul_f16_ohwi_img(
     }
   }
 }
+
+// Banded twin of qk_matmul_f16_ohwi_img: identical arithmetic, but the n
+// grid is launched over each m-tile's score band instead of the whole N_kv
+// row (gws.x = the widest band over all m-tiles; n0 = band_lo(m0) + gid0*TN_QK).
+__kernel void qk_matmul_f16_ohwi_img_band(
+  __global const half *Q,      // [M, HD_Q] fp16, row-major
+  __read_only image2d_t K_img, // see comment above
+  __global half *scores,       // [H, M, N_kv] fp16, row-major
+  const int M, const int N_kv, const int d, const int HD_Q, const int S_max,
+  const int gqa, const int causal, const float scale,
+  const float softcap,      // Gemma2-style: >0 => cap*tanh(s/cap)
+  const int local_window) { // >0: mask keys n with n+W <= q_pos
+  const int m0 = get_global_id(1) * TM_QK;
+  const int head_q = get_global_id(2);
+  const int head_kv = head_q / gqa;
+
+  if (m0 >= M)
+    return;
+
+  // Banded launch: gws.x counts n-tiles inside THIS m-tile's band, not inside
+  // the whole N_kv row. The band is the union over the TM_QK rows this WI owns
+  // of what softmax_row_band_f16 will read (see tca_score_band above), so
+  // every cell any consumer touches is written here, and nothing else is.
+  // Cells >= band_hi are the causal upper triangle and cells < band_lo are
+  // below every row's window floor: the unbanded kernel wrote -INFINITY over
+  // them, this one simply does not write them and no one reads them.
+  int band_lo, band_hi;
+  {
+    const int mlast = (m0 + TM_QK - 1 < M - 1) ? (m0 + TM_QK - 1) : (M - 1);
+    tca_score_band(M, N_kv, causal, local_window, m0, mlast, SOFTMAX_LWS,
+                   &band_lo, &band_hi);
+  }
+  const int n0 = band_lo + (int)get_global_id(0) * TN_QK;
+  if (n0 >= band_hi || n0 >= N_kv)
+    return;
+
+  // Causal mask uses the query's ABSOLUTE position. Query row m holds the last
+  // M positions of the N_kv context, so its absolute position is (N_kv-M)+m.
+  // For prefill M==N_kv (q_off=0, the old `n > m`); for decode M=1, N_kv=N the
+  // single query sits at N-1 and must see ALL keys (q_off=N-1). Without this
+  // the decode query masks every key but n0=0 -> garbage.
+  const int q_off = N_kv - M;
+
+  // Causal whole-tile skip: if the smallest key index in this tile (n0)
+  // exceeds the largest query absolute index (q_off+m0+TM_QK-1), every element
+  // is masked. Write -INF and skip the d-reduction — ~half the tiles for a
+  // square causal prefill (q_off=0).
+  if (causal && n0 > q_off + m0 + (TM_QK - 1)) {
+    const long sb = (long)head_q * (long)M * (long)N_kv;
+#pragma unroll
+    for (int i = 0; i < TM_QK; i++) {
+      const int m = m0 + i;
+      if (m >= M)
+        continue;
+#pragma unroll
+      for (int j = 0; j < TN_QK; j++) {
+        const int n = n0 + j;
+        if (n < N_kv)
+          scores[sb + (long)m * N_kv + n] = (half)(-INFINITY);
+      }
+    }
+    return;
+  }
+
+  // Sliding-window whole-tile skip (mirror of the causal skip above): every
+  // element is below the window when even the tile's LARGEST key index with
+  // its SMALLEST query index satisfies n + W <= q_off + m (larger m only
+  // masks more keys).
+  if (causal && local_window > 0 &&
+      (n0 + TN_QK - 1) + local_window <= q_off + m0) {
+    const long sb = (long)head_q * (long)M * (long)N_kv;
+#pragma unroll
+    for (int i = 0; i < TM_QK; i++) {
+      const int m = m0 + i;
+      if (m >= M)
+        continue;
+#pragma unroll
+      for (int j = 0; j < TN_QK; j++) {
+        const int n = n0 + j;
+        if (n < N_kv)
+          scores[sb + (long)m * N_kv + n] = (half)(-INFINITY);
+      }
+    }
+    return;
+  }
+
+  float acc[TM_QK][TN_QK];
+#pragma unroll
+  for (int i = 0; i < TM_QK; i++)
+#pragma unroll
+    for (int j = 0; j < TN_QK; j++)
+      acc[i][j] = 0.0f;
+
+  const sampler_t smp =
+    CLK_NORMALIZED_COORDS_FALSE | CLK_ADDRESS_CLAMP | CLK_FILTER_NEAREST;
+  const int d_tex_count = d >> 3;
+  const int k_row_base = head_kv * S_max;
+
+  for (int dt = 0; dt < d_tex_count; dt++) {
+    half8 q_pack[TM_QK];
+    half8 k_pack[TN_QK];
+#pragma unroll
+    for (int i = 0; i < TM_QK; i++) {
+      const int m = m0 + i;
+      if (m < M) {
+        const long off = (long)m * HD_Q + (long)head_q * d + (long)dt * 8;
+        q_pack[i] = vload8(0, Q + off);
+      } else {
+        q_pack[i] = (half8)((half)0.0h);
+      }
+    }
+#pragma unroll
+    for (int j = 0; j < TN_QK; j++) {
+      const int n = n0 + j;
+      const int ny = (n < N_kv) ? n : 0;
+      const uint4 vv = read_imageui(K_img, smp, (int2)(dt, k_row_base + ny));
+      const half8 hp = as_half8(vv);
+      k_pack[j] = (n < N_kv) ? hp : (half8)((half)0.0h);
+    }
+#pragma unroll
+    for (int i = 0; i < TM_QK; i++) {
+      const float4 qlo = convert_float4(q_pack[i].s0123);
+      const float4 qhi = convert_float4(q_pack[i].s4567);
+#pragma unroll
+      for (int j = 0; j < TN_QK; j++) {
+        const float4 klo = convert_float4(k_pack[j].s0123);
+        const float4 khi = convert_float4(k_pack[j].s4567);
+        acc[i][j] += dot(qlo, klo) + dot(qhi, khi);
+      }
+    }
+  }
+
+  const long score_base = (long)head_q * (long)M * (long)N_kv;
+#pragma unroll
+  for (int i = 0; i < TM_QK; i++) {
+    const int m = m0 + i;
+    if (m >= M)
+      continue;
+#pragma unroll
+    for (int j = 0; j < TN_QK; j++) {
+      const int n = n0 + j;
+      if (n >= N_kv)
+        continue;
+      float v = acc[i][j] * scale;
+      if (softcap > 0.0f)
+        v = softcap * tanh(v / softcap); // Gemma2-style score cap
+      // Causal upper bound + sliding-window lower bound (flash formula:
+      // key n is visible iff q_pos-W < n <= q_pos; W=0 means no window).
+      if (causal && (n > q_off + m ||
+                     (local_window > 0 && n + local_window <= q_off + m)))
+        v = -INFINITY;
+      scores[score_base + (long)m * N_kv + n] = (half)v;
+    }
+  }
+}
+
 #endif // TCA_BUFFER_ONLY (qk_matmul_f16_ohwi_img)
 
 // =============================================================
@@ -346,9 +585,6 @@ __kernel void qk_matmul_f16_ohwi_img(
 //   reductions: max, then exp + sum, then inverse-multiply.
 // gws = (LWS, M, H), LWS = SOFTMAX_LWS.
 // =============================================================
-#ifndef SOFTMAX_LWS
-#define SOFTMAX_LWS 64
-#endif
 
 __attribute__((reqd_work_group_size(SOFTMAX_LWS, 1, 1))) __kernel void
 softmax_row_f16(__global half *scores, // [H, M, N_kv]
@@ -402,6 +638,89 @@ softmax_row_f16(__global half *scores, // [H, M, N_kv]
     row[n] = (half)((float)row[n] * inv);
   }
 }
+
+// =============================================================
+// softmax_row_band_f16 — the same three-pass row softmax, restricted to the
+// score band of tca_score_band() (see the contract block above).
+//
+// band_mode 1 (the fix): pair band + 64-aligned floor. The dropped cells hold
+//   the -INFINITY qk wrote, so they change neither fmax nor the fp32 sum
+//   (exp(-inf - max) == +0.0), and because the floor is a multiple of
+//   SOFTMAX_LWS every work-item keeps the baseline's  n == tid (mod 64)
+//   assignment -> the partial sums are bit-identical, not merely close.
+//   Everything sv_matmul_f16_ohwi_img_tm2 loads is inside this band.
+//
+// band_mode 2 (diagnostic only, reproduces the reverted per-row attempt): per-ROW band, no
+//   64 alignment. This is the arithmetic that broke the golden — it leaves the
+//   row-pair widening sv reads at raw -INFINITY. Kept so the failure is
+//   reproducible on demand (NNTR_ATTN_BAND=2) rather than asserted.
+//
+// gws = (LWS, M, H), LWS = SOFTMAX_LWS.
+// =============================================================
+__attribute__((reqd_work_group_size(SOFTMAX_LWS, 1, 1))) __kernel void
+softmax_row_band_f16(__global half *scores, // [H, M, N_kv]
+                     const int M, const int N_kv, const int causal,
+                     const int local_window, const int band_mode) {
+  const int tid = get_local_id(0);
+  const int m = get_group_id(1);
+  const int h = get_group_id(2);
+  if (m >= M)
+    return;
+
+  __global half *row = scores + (long)h * (long)M * N_kv + (long)m * N_kv;
+
+  int n_lo, n_hi;
+  if (band_mode == 2) {
+    tca_score_band(M, N_kv, causal, local_window, m, m, 1, &n_lo, &n_hi);
+  } else {
+    const int mlo = m & ~1;
+    const int mhi = (mlo + 1 < M) ? (mlo + 1) : (M - 1);
+    tca_score_band(M, N_kv, causal, local_window, mlo, mhi, SOFTMAX_LWS, &n_lo,
+                   &n_hi);
+  }
+
+  __local float lscratch[SOFTMAX_LWS];
+
+  // Pass 1: per-WI partial max.
+  float pmax = -INFINITY;
+  for (int n = n_lo + tid; n < n_hi; n += SOFTMAX_LWS) {
+    float v = (float)row[n];
+    pmax = fmax(pmax, v);
+  }
+  lscratch[tid] = pmax;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (int s = SOFTMAX_LWS / 2; s > 0; s >>= 1) {
+    if (tid < s)
+      lscratch[tid] = fmax(lscratch[tid], lscratch[tid + s]);
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  const float row_max = lscratch[0];
+  barrier(CLK_LOCAL_MEM_FENCE);
+
+  // Pass 2: per-WI exp(x - max) + partial sum. Stash exp() back to row.
+  float psum = 0.0f;
+  for (int n = n_lo + tid; n < n_hi; n += SOFTMAX_LWS) {
+    float e = (row_max == -INFINITY) ? 0.0f : exp((float)row[n] - row_max);
+    row[n] = (half)e;
+    psum += e;
+  }
+  lscratch[tid] = psum;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (int s = SOFTMAX_LWS / 2; s > 0; s >>= 1) {
+    if (tid < s)
+      lscratch[tid] += lscratch[tid + s];
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  const float row_sum = lscratch[0];
+  const float inv = (row_sum > 0.0f) ? (1.0f / row_sum) : 0.0f;
+  barrier(CLK_LOCAL_MEM_FENCE);
+
+  // Pass 3: divide by sum (in-place).
+  for (int n = n_lo + tid; n < n_hi; n += SOFTMAX_LWS) {
+    row[n] = (half)((float)row[n] * inv);
+  }
+}
+
 
 // =============================================================
 // SV matmul: O[m, h, x] = sum_n scores[h, m, n] * V[n, h_kv, x]
