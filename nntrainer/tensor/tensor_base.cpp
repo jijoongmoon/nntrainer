@@ -94,9 +94,9 @@ void TensorBase::read(ReadSource src, size_t start_offset,
     << "read size: " << bytes()
     << " is too big. It cannot be represented by std::streamsize";
 
-  /* [load-trace] Split the two halves of a weight read: committing the
-     tensor's own storage (which faults and zero-fills fresh anonymous pages)
-     and the copy out of the file mapping into it. */
+  // [load-trace] Split the two halves of a weight read: committing the
+  // tensor's own storage (which faults and zero-fills fresh anonymous pages)
+  // and the copy out of the file mapping into it.
   char *dst = nullptr;
   {
     nntrainer::load_trace::Scope _lt(nntrainer::load_trace::T_GETDATA);

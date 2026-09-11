@@ -2192,38 +2192,38 @@ void v8c_push_pending(cl_event ev, std::vector<uint8_t> &&staging) {
 
 } // namespace
 
-/* ---------------------------------------------------------------------------
- * [L4] One arena for the v8c aux buffers.
- *
- * Every QS4CX weight gets two tiny device buffers -- a per-output-channel fp32
- * scale and a per-output-channel int32 row sum, 4N bytes each -- and they were
- * two clCreateBuffer(COPY_HOST_PTR) calls per weight. On a gemma4 E2B load
- * that is 554 driver allocations for ~11 MiB of payload, and on the pre-packed
- * arm they cost 1 206 busy ms: once the CPU permute is gone, eight loader
- * workers arrive at the CL allocator together and the allocator, not the file
- * and not the GPU, is what the load waits on.
- *
- * A sub-buffer allocates nothing -- it is a window on a parent buffer -- so the
- * pair for every weight is carved out of a few megabyte-scale arenas instead,
- * and the two host->device copies COPY_HOST_PTR used to make become one
- * clEnqueueWriteBuffer over the pair's contiguous span. The pair is placed with
- * the scale first, padded up to the device's sub-buffer origin granularity
- * (CL_DEVICE_MEM_BASE_ADDR_ALIGN, 128 B on this device), then the row sum, so
- * both origins are legal and one write covers both.
- *
- * The arena is a bump allocator and never reclaims. That is the right shape
- * here: these buffers are keyed into the v8c weight cache and live as long as
- * the process, so there is nothing to reclaim. The one exception -- a weight
- * cache entry evicted because its pointer key was reused -- leaks its slot,
- * bounded by 8 B per output channel of the weights that lose the race, and the
- * old path leaked the allocation itself in exactly the same case.
- *
- * NNTR_V8C_AUX_ARENA=0 restores a private buffer per aux in the same binary;
- * NNTR_V8C_AUX_ARENA_MB sets the chunk size. Anything the device refuses --
- * the arena allocation, the sub-buffer, the write -- falls through to the
- * private buffers for that weight alone, so the lever degrades one weight at a
- * time rather than all at once.
- * ------------------------------------------------------------------------ */
+// ---------------------------------------------------------------------------
+// [L4] One arena for the v8c aux buffers.
+//
+// Every QS4CX weight gets two tiny device buffers -- a per-output-channel fp32
+// scale and a per-output-channel int32 row sum, 4N bytes each -- and they were
+// two clCreateBuffer(COPY_HOST_PTR) calls per weight. On a gemma4 E2B load
+// that is 554 driver allocations for ~11 MiB of payload, and on the pre-packed
+// arm they cost 1 206 busy ms: once the CPU permute is gone, eight loader
+// workers arrive at the CL allocator together and the allocator, not the file
+// and not the GPU, is what the load waits on.
+//
+// A sub-buffer allocates nothing -- it is a window on a parent buffer -- so the
+// pair for every weight is carved out of a few megabyte-scale arenas instead,
+// and the two host->device copies COPY_HOST_PTR used to make become one
+// clEnqueueWriteBuffer over the pair's contiguous span. The pair is placed with
+// the scale first, padded up to the device's sub-buffer origin granularity
+// (CL_DEVICE_MEM_BASE_ADDR_ALIGN, 128 B on this device), then the row sum, so
+// both origins are legal and one write covers both.
+//
+// The arena is a bump allocator and never reclaims. That is the right shape
+// here: these buffers are keyed into the v8c weight cache and live as long as
+// the process, so there is nothing to reclaim. The one exception -- a weight
+// cache entry evicted because its pointer key was reused -- leaks its slot,
+// bounded by 8 B per output channel of the weights that lose the race, and the
+// old path leaked the allocation itself in exactly the same case.
+//
+// NNTR_V8C_AUX_ARENA=0 restores a private buffer per aux in the same binary;
+// NNTR_V8C_AUX_ARENA_MB sets the chunk size. Anything the device refuses --
+// the arena allocation, the sub-buffer, the write -- falls through to the
+// private buffers for that weight alone, so the lever degrades one weight at a
+// time rather than all at once.
+// ------------------------------------------------------------------------
 namespace {
 
 bool v8c_aux_arena_on() {

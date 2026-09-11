@@ -1071,9 +1071,9 @@ void NeuralNetwork::load(const std::string &file_path,
   /// @todo this switch case should be delegating the function call only. It's
   /// not delegating for now as required logics are manageable for now.
 
-  /* [load-trace] The record walk below is the one single-threaded stretch
-     ahead of the worker fan-out; time it separately so a slow header parse
-     cannot hide inside the load's wall clock. */
+  // [load-trace] The record walk below is the one single-threaded stretch
+  // ahead of the worker fan-out; time it separately so a slow header parse
+  // cannot hide inside the load's wall clock.
   const auto _lt_load_t0 = std::chrono::steady_clock::now();
 
   bool fsu_mode = std::get<props::Fsu>(model_flex_props);
