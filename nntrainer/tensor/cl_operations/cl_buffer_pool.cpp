@@ -210,17 +210,93 @@ void ClBufferPool::allocate() {
    *  against a 132 MiB shared plane is otherwise unreadable. */
   if (opencl::clMemAcctOn()) {
     size_t sum = 0, biggest = 0;
+    cl_uint align_bits = 0;
+    auto *cc_a = clContext();
+    if (cc_a != nullptr)
+      opencl::clGetDeviceInfo(cc_a->context_inst_.GetDeviceId(),
+                              CL_DEVICE_MEM_BASE_ADDR_ALIGN, sizeof(align_bits),
+                              &align_bits, nullptr);
+    const size_t align = align_bits ? align_bits / 8u : 0u;
+    size_t aligned = 0;
     for (const auto &kv : offset_size_) {
       sum += kv.second;
       biggest = std::max(biggest, kv.first + kv.second);
+      if (align && kv.first % align == 0)
+        ++aligned;
     }
     std::fprintf(stderr,
                  "[clmempool] shared plane %.1f MiB; %zu planner offsets, "
-                 "sum %.1f MiB, top-of-plane %.1f MiB\n",
+                 "sum %.1f MiB, top-of-plane %.1f MiB; sub-buffer align %zu B, "
+                 "%zu/%zu offsets aligned\n",
                  size() / 1048576.0, offset_size_.size(), sum / 1048576.0,
-                 biggest / 1048576.0);
+                 biggest / 1048576.0, align, aligned, offset_size_.size());
     std::fflush(stderr);
   }
+}
+
+/**
+ * @brief NNTR_CLMEM_SUBBUF: carve the device plane out of one buffer.
+ *
+ * @details ON by default; =0 restores a private clCreateBuffer per offset in
+ * the same binary, which is the arm the previous device baselines were taken
+ * with.
+ */
+static bool clmemSubbufOn() {
+  static const bool on = []() {
+    const char *e = std::getenv("NNTR_CLMEM_SUBBUF");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  return on;
+}
+
+void *ClBufferPool::devicePlaneBaseLocked(size_t span) {
+  if (device_plane_ != nullptr || device_plane_failed_)
+    return device_plane_;
+
+  auto *cc = clContext();
+  if (cc == nullptr)
+    return nullptr;
+
+  cl_ulong max_alloc = 0;
+  opencl::clGetDeviceInfo(cc->context_inst_.GetDeviceId(),
+                          CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof(max_alloc),
+                          &max_alloc, nullptr);
+  if (span == 0 || (max_alloc > 0 && static_cast<cl_ulong>(span) > max_alloc)) {
+    device_plane_failed_ = true;
+    return nullptr;
+  }
+
+  cl_int err = CL_SUCCESS;
+  opencl::ClMemAcctScope _acct("act:device_plane");
+  cl_mem base = opencl::clCreateBufferT(cc->context_inst_.GetContext(),
+                                        CL_MEM_READ_WRITE, span, nullptr, &err);
+  if (err != CL_SUCCESS || base == nullptr) {
+    ml_logw("ClBufferPool: device plane of %.1f MB failed with %d; falling "
+            "back to one buffer per planner offset",
+            span / 1048576.0, err);
+    device_plane_failed_ = true;
+    return nullptr;
+  }
+
+  /** One fill for the whole plane, for the reason the per-offset fill below
+   *  gives: a producer writes only the rows it has and an element-wise
+   *  consumer reads the padded rows too. Doing it once over the span also
+   *  covers the bytes between two offsets that no token claims. */
+  const cl_uchar zero = 0;
+  if (opencl::clEnqueueFillBuffer(cc->command_queue_inst_.GetCommandQueue(),
+                                  base, &zero, sizeof(zero), 0, span, 0,
+                                  nullptr, nullptr) != CL_SUCCESS) {
+    opencl::clReleaseMemObjectT(base);
+    ml_logw("ClBufferPool: zero-filling the %.1f MB device plane failed; "
+            "falling back to one buffer per planner offset",
+            span / 1048576.0);
+    device_plane_failed_ = true;
+    return nullptr;
+  }
+
+  device_plane_ = static_cast<void *>(base);
+  device_plane_bytes_ = span;
+  return device_plane_;
 }
 
 void *ClBufferPool::createDeviceBufferLocked(size_t offset) {
@@ -235,6 +311,53 @@ void *ClBufferPool::createDeviceBufferLocked(size_t offset) {
 
   auto *cc = clContext();
   cl_device_id dev = cc->context_inst_.GetDeviceId();
+
+  /** ---- The device plane as ONE buffer with a sub-buffer per offset. ----
+   *
+   *  A buffer per planner offset throws away the only thing the planner did:
+   *  two tokens whose lifetimes are disjoint are given offsets whose byte
+   *  ranges OVERLAP, and the shared plane gets that reuse for free because it
+   *  is one region. Measured on the Adreno 840 gemma4 E2B cell -- 36 planner
+   *  offsets, 328.5 MiB of per-offset sizes over a 132.5 MiB plane span -- so
+   *  the private-buffer plane costs 2.5x what the layout it is copying does.
+   *
+   *  A sub-buffer allocates nothing; it is a window on the base. Binding one
+   *  as a kernel argument is binding the region the planner assigned, and the
+   *  aliasing it re-creates is exactly the aliasing the shared plane has
+   *  always relied on -- same offsets, same disjoint lifetimes, same in-order
+   *  queue sequencing the tokens that share a region.
+   *
+   *  Two conditions, both checked rather than assumed: the region origin must
+   *  be a multiple of CL_DEVICE_MEM_BASE_ADDR_ALIGN (128 B on this device;
+   *  36 of 36 offsets satisfy it), and it must fit inside the span. Anything
+   *  that fails either -- or a driver that refuses the sub-buffer -- falls
+   *  through to the private buffer below for that offset alone, so the plane
+   *  degrades one tensor at a time instead of all at once. */
+  if (clmemSubbufOn()) {
+    cl_uint align_bits = 0;
+    opencl::clGetDeviceInfo(dev, CL_DEVICE_MEM_BASE_ADDR_ALIGN,
+                            sizeof(align_bits), &align_bits, nullptr);
+    const size_t align = align_bits ? align_bits / 8u : 0u;
+    const size_t span = size();
+    if (align != 0 && offset % align == 0 && bytes <= span &&
+        offset <= span - bytes) {
+      cl_mem base = static_cast<cl_mem>(devicePlaneBaseLocked(span));
+      if (base != nullptr) {
+        cl_buffer_region region{offset, bytes};
+        cl_int serr = CL_SUCCESS;
+        cl_mem sub = opencl::clCreateSubBufferT(
+          base, CL_MEM_READ_WRITE, CL_BUFFER_CREATE_TYPE_REGION, &region,
+          &serr);
+        if (serr == CL_SUCCESS && sub != nullptr) {
+          offset_buffer_[offset] = static_cast<void *>(sub);
+          return offset_buffer_[offset];
+        }
+        ml_logw("ClBufferPool: clCreateSubBuffer at offset %zu (%zu B) failed "
+                "with %d; this offset takes a private buffer",
+                offset, bytes, serr);
+      }
+    }
+  }
 
   /** A single allocation larger than the device can hold is not a device
    *  buffer at all. Report it and leave the tensor on the shared plane, which
@@ -293,10 +416,19 @@ void *ClBufferPool::deviceMemory(unsigned int idx) {
 void ClBufferPool::deallocate() {
   {
     std::lock_guard<std::mutex> lk(device_mtx_);
+    /** Sub-buffers first, then the base they are windows on: releasing the
+     *  base while a sub-buffer still references it is the one ordering the
+     *  runtime does not have to survive. */
     for (auto &entry : offset_buffer_)
       if (entry.second != nullptr)
         opencl::clReleaseMemObjectT(static_cast<cl_mem>(entry.second));
     offset_buffer_.clear();
+    if (device_plane_ != nullptr) {
+      opencl::clReleaseMemObjectT(static_cast<cl_mem>(device_plane_));
+      device_plane_ = nullptr;
+      device_plane_bytes_ = 0;
+    }
+    device_plane_failed_ = false;
     offset_size_.clear();
     token_offset_.clear();
     shared_slice_skipped_.clear();

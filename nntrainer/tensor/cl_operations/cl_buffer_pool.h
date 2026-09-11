@@ -108,8 +108,22 @@ private:
   /** planner offset -> largest tensor the planner placed there */
   std::unordered_map<size_t, size_t> offset_size_;
   /** planner offset -> the one device cl_mem backing it (held as void* so the
-   *  header stays free of the OpenCL types) */
+   *  header stays free of the OpenCL types). Normally a SUB-buffer of
+   *  device_plane_ below; a private buffer for any offset the sub-buffer
+   *  route declined. */
   std::unordered_map<size_t, void *> offset_buffer_;
+  /** The device plane: one cl_mem spanning the same bytes as the shared plane,
+   *  which the per-offset handles above are windows on. A buffer per offset
+   *  instead would discard the planner's reuse -- two tokens with disjoint
+   *  lifetimes get offsets whose ranges overlap, and only one region can
+   *  express that. Null until the first device tensor asks. */
+  void *device_plane_ = nullptr;
+  /** Span of device_plane_, 0 while it does not exist. */
+  size_t device_plane_bytes_ = 0;
+  /** The plane was attempted and refused. Sticky, so a driver that says no
+   *  is asked once and every offset then takes a private buffer, rather than
+   *  the pool retrying a failing allocation per tensor. */
+  bool device_plane_failed_ = false;
   /** offsets whose device buffer allocate() created up front and whose shared
    *  slice it therefore skipped. Only offsets in here answer false to
    *  sharedSliceNeeded(); an offset whose device buffer failed to materialise
@@ -133,6 +147,16 @@ private:
    * site needed it after. Idempotent.
    */
   void recordPlannerLayout();
+
+  /**
+   * @brief The one device buffer the per-offset handles are windows on.
+   * @param span bytes to cover -- the shared plane's span, so the two planes
+   *        describe the same layout
+   * @return the base cl_mem, or nullptr when the device refused it (sticky:
+   *         asked once, after which every offset takes a private buffer)
+   * @note Caller holds device_mtx_.
+   */
+  void *devicePlaneBaseLocked(size_t span);
 
   /**
    * @brief Create the device buffer for one planner offset, or return nullptr.
