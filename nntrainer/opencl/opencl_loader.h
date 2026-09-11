@@ -275,6 +275,40 @@ extern PFN_clSetKernelArgSVMPointer clSetKernelArgSVMPointer;
 extern PFN_clWaitForEvents clWaitForEvents;
 extern PFN_clReleaseEvent clReleaseEvent;
 extern PFN_clEnqueueBarrierWithWaitList clEnqueueBarrierWithWaitList;
+
+/**
+ * @brief Monotonic epoch of OpenCL memory-object handle allocation.
+ *
+ * Any cache that remembers a cl_mem / SVM pointer VALUE has to survive the one
+ * way such a value can lie: a handle is released and the driver hands the same
+ * address back for a different object. Everything that creates a memory object
+ * in this tree bumps this counter, so a cache that stores the epoch alongside
+ * the value can tell "same object" from "same address, new object" without
+ * tracking releases. Steady-state decode creates nothing, so the epoch is
+ * constant there and every such cache stays hot.
+ */
+unsigned long long clHandleEpoch();
+
+/**
+ * @brief Invalidate every handle-value cache. Called by the memory-object
+ *        creation wrappers below.
+ */
+void clBumpHandleEpoch();
+
+/// Handle-epoch-tracking wrappers around the creation entry points. They are
+/// the ONLY way this tree should create memory objects, so that the epoch
+/// above is a complete record.
+cl_mem clCreateBufferT(cl_context context, cl_mem_flags flags, size_t size,
+                       void *host_ptr, cl_int *errcode_ret);
+cl_mem clCreateSubBufferT(cl_mem buffer, cl_mem_flags flags,
+                          cl_buffer_create_type type, const void *info,
+                          cl_int *errcode_ret);
+cl_mem clCreateImageT(cl_context context, cl_mem_flags flags,
+                      const cl_image_format *format,
+                      const cl_image_desc *desc, void *host_ptr,
+                      cl_int *errcode_ret);
+void *clSVMAllocT(cl_context context, cl_svm_mem_flags flags, size_t size,
+                  unsigned int alignment);
 } // namespace nntrainer::opencl
 
 #endif // __OPENCL_LOADER_H__

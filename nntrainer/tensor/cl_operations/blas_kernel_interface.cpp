@@ -589,7 +589,7 @@ static bool v8c_ensure_buf(cl_context ctx, cl_mem *buf, size_t *cap,
     *cap = 0;
   }
   cl_int err = CL_SUCCESS;
-  *buf = opencl::clCreateBuffer(ctx, flags, bytes, nullptr, &err);
+  *buf = opencl::clCreateBufferT(ctx, flags, bytes, nullptr, &err);
   if (err != CL_SUCCESS || !*buf) {
     *buf = nullptr;
     *cap = 0;
@@ -1284,7 +1284,7 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
           opencl::clReleaseMemObject(sc.act_image[act_slot]);
           sc.act_image[act_slot] = nullptr;
         }
-        cl_mem img = opencl::clCreateImage(ctx, CL_MEM_READ_ONLY, &afmt, &adesc,
+        cl_mem img = opencl::clCreateImageT(ctx, CL_MEM_READ_ONLY, &afmt, &adesc,
                                            nullptr, &err);
         if (err != CL_SUCCESS)
           throw std::runtime_error("act image view fail");

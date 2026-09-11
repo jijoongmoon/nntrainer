@@ -13,6 +13,7 @@
 
 #include "opencl_loader.h"
 
+#include <atomic>
 #include <dynamic_library_loader.h>
 #include <nntrainer_log.h>
 #include <string>
@@ -276,4 +277,54 @@ PFN_clSetKernelArgSVMPointer clSetKernelArgSVMPointer;
 PFN_clWaitForEvents clWaitForEvents;
 PFN_clReleaseEvent clReleaseEvent;
 PFN_clEnqueueBarrierWithWaitList clEnqueueBarrierWithWaitList;
+
+// ---------------------------------------------------------------------------
+// Handle epoch.
+//
+// Caches that key on a cl_mem / SVM pointer VALUE (the kernel-argument cache in
+// opencl_kernel.cpp, the image->backing-buffer cache in blas_kernels.cpp) are
+// only sound while a value identifies one object. The single way that breaks is
+// release-then-recreate at the same address, so every creation entry point in
+// this tree goes through the wrappers below and bumps this counter; a cache
+// stores the epoch it was filled at and drops itself when the epoch moves.
+// Bumping on CREATION rather than release is what makes the record complete:
+// a release alone cannot make a stale value point at a different object.
+//
+// Relaxed atomics: the dispatch path is single threaded, and a cache that
+// observes a stale epoch merely re-issues the call it could have skipped.
+static std::atomic<unsigned long long> g_handle_epoch{1};
+
+unsigned long long clHandleEpoch() {
+  return g_handle_epoch.load(std::memory_order_relaxed);
+}
+
+void clBumpHandleEpoch() {
+  g_handle_epoch.fetch_add(1, std::memory_order_relaxed);
+}
+
+cl_mem clCreateBufferT(cl_context context, cl_mem_flags flags, size_t size,
+                       void *host_ptr, cl_int *errcode_ret) {
+  clBumpHandleEpoch();
+  return clCreateBuffer(context, flags, size, host_ptr, errcode_ret);
+}
+
+cl_mem clCreateSubBufferT(cl_mem buffer, cl_mem_flags flags,
+                          cl_buffer_create_type type, const void *info,
+                          cl_int *errcode_ret) {
+  clBumpHandleEpoch();
+  return clCreateSubBuffer(buffer, flags, type, info, errcode_ret);
+}
+
+cl_mem clCreateImageT(cl_context context, cl_mem_flags flags,
+                      const cl_image_format *format, const cl_image_desc *desc,
+                      void *host_ptr, cl_int *errcode_ret) {
+  clBumpHandleEpoch();
+  return clCreateImage(context, flags, format, desc, host_ptr, errcode_ret);
+}
+
+void *clSVMAllocT(cl_context context, cl_svm_mem_flags flags, size_t size,
+                  unsigned int alignment) {
+  clBumpHandleEpoch();
+  return clSVMAlloc(context, flags, size, alignment);
+}
 } // namespace nntrainer::opencl
