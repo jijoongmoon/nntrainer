@@ -2109,6 +2109,32 @@ static int attn_band_mode() {
   return v;
 }
 
+// NNTR_ATTN_BAND_DECODE_QK: decode-only, DEFAULT OFF. The banded qk *grid* is
+// a loss at M == 1 -- measured, see the launch site -- so decode bands only its
+// softmax. 1 turns the banded qk grid on at decode as well (the A/B arm).
+static bool attn_band_decode_qk_on() {
+  static const bool v = []() {
+    const char *e = std::getenv("NNTR_ATTN_BAND_DECODE_QK");
+    return e != nullptr && e[0] != '0';
+  }();
+  return v;
+}
+
+// NNTR_ATTN_NX_QUANT: decode-only. The number of n-tiles the qk grid launches
+// at M == 1 is rounded up to the NEXT multiple of this, so the work size is
+// constant for that many *64 keys instead of stepping every 64 tokens. 0 = off.
+// See the comment at the launch site. Default 64 tiles = 512 keys.
+static size_t attn_nx_quant() {
+  static const size_t v = []() -> size_t {
+    const char *e = std::getenv("NNTR_ATTN_NX_QUANT");
+    if (e == nullptr)
+      return 64;
+    long n = std::atol(e);
+    return n > 0 ? (size_t)n : 0;
+  }();
+  return v;
+}
+
 // NNTR_ATTN_BAND_DECODE: 0 = decode (M == 1) keeps the unbanded qk grid and
 // the full-row softmax while prefill stays banded -- the A/B control that
 // isolates the decode half of the score band. Default 1 (banded).
@@ -2179,8 +2205,19 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
   // banded); NNTR_ATTN_BAND=0 remains the control for both.
   const bool band_on = attn_band_mode() != 0 && causal && attn_sv_win_on() &&
                        (M > 1 || attn_band_decode_on());
-  const bool qk_band_on =
-    band_on && attn_band_mode() == 1 && k_image_in != nullptr;
+  // The qk half of the band is PREFILL-ONLY by default. At M == 1 it is a
+  // measured LOSS: qk_matmul's whole-tile window skip already declined the
+  // d-reduction for the tiles the band removes, so all the narrower grid saves
+  // is 8 halves of -INF per tile -- while the shorter n grid gives the Adreno
+  // scheduler fewer workgroups to hide latency with. CL event census, decode
+  // dispatches, clock-normalised: at an 883-token context attn.qk 3.421 ->
+  // 3.573 ms/token (+4.4 %) against attn.softmax 0.334 -> 0.257 (-0.077), i.e.
+  // net +0.12 ms/token; at 3595 tokens attn.qk 9.191 -> 9.175 (nothing) against
+  // attn.softmax 0.990 -> 0.396 (-0.594). Banding the softmax alone is the
+  // strictly-positive subset at both, so that is what decode ships.
+  const bool qk_band_on = band_on && attn_band_mode() == 1 &&
+                          k_image_in != nullptr &&
+                          (M > 1 || attn_band_decode_qk_on());
 
   // ---- Resolve V image2d: either caller-provided, or build / reuse a
   //      cached one keyed on V_buf_in + shape. ----
@@ -2329,6 +2366,25 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
         }
       }
       nx = w > 0 ? w : 1;
+    }
+    // [decode] Keep the qk work size CONSTANT from token to token. The
+    // recordable decode queue (NNTR_CL_RECORD_DECODE) throws a whole token's
+    // recording away whenever any dispatch's work size moves, and qk's n grid
+    // is the ONLY decode work size that tracks N_kv: unbanded it is
+    // ceil(N_kv/8), which steps every time N_kv crosses a multiple of 64, and
+    // banded it is ceil((N_kv mod 64 + W)/8), which steps on the sliding
+    // layers for the same reason. Round the tile count up to the NEXT multiple
+    // of NX_QUANT (=64 tiles = 512 keys) and both classes hold still for 512
+    // tokens at a time: the recorder's re-records fall to ~0 and its plain
+    // fallback chunks with them. The extra tiles return without writing
+    // anything (n0 >= band_hi in the banded kernel, n0 >= N_kv in the
+    // unbanded one), so the scores are bit-identical -- and decode measures
+    // surplus qk tiles as free: a CL event census removed 378 of 450 of
+    // them at a 3595-token context for 0.016 ms/token, i.e. nothing.
+    if (M == 1) {
+      const size_t nq = attn_nx_quant();
+      if (nq > 0)
+        nx = (nx / nq + 1) * nq;
     }
     // The LWS is env-overridable + measured (NNTR_QK_LWS="x,y,z"); default
     // {16,4,1} won a fair A/B/A/B sweep at M=1024 on Adreno 830 (SD8 Elite):
