@@ -11,8 +11,8 @@
  */
 
 #include <cstdlib>
-#include <variant>
 #include <fc_layer_cl.h>
+#include <variant>
 
 #include <limits>
 

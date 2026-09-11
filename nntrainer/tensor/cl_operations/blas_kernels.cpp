@@ -17,7 +17,6 @@
 #include "cl_tensor_view.h"
 #include "util_func.h"
 #include "v8c_pack_cache.h"
-#include <load_trace.h>
 #include <array>
 #include <atomic>
 #include <cerrno>
@@ -25,6 +24,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fp16.h>
+#include <load_trace.h>
 #include <opencl_loader.h>
 #include <string>
 #include <thread>
@@ -2340,7 +2340,8 @@ struct V8cAuxChunk {
   cl_mem base = nullptr;
   size_t span = 0;
   size_t used = 0;
-  std::vector<uint8_t> staging; /**< host image of [0, used); empty once written */
+  std::vector<uint8_t>
+    staging; /**< host image of [0, used); empty once written */
 };
 
 std::mutex &v8c_aux_mtx() {
@@ -2819,8 +2820,7 @@ std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
       if (!hostptr) {
         if (upload_async) {
           cl_event ev = nullptr;
-          nntrainer::load_trace::Scope _ltu(
-            nntrainer::load_trace::MISS_UPLOAD);
+          nntrainer::load_trace::Scope _ltu(nntrainer::load_trace::MISS_UPLOAD);
           _ltu.bytes(nrows * v8c_row_bytes);
           const cl_int werr = opencl::clEnqueueWriteBuffer(
             cq, w_buf, CL_FALSE, n0 * v8c_row_bytes, nrows * v8c_row_bytes,
@@ -2833,8 +2833,7 @@ std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
           }
           v8c_push_pending(ev, std::move(chunk_staging));
         } else {
-          nntrainer::load_trace::Scope _ltu(
-            nntrainer::load_trace::MISS_UPLOAD);
+          nntrainer::load_trace::Scope _ltu(nntrainer::load_trace::MISS_UPLOAD);
           _ltu.bytes(nrows * v8c_row_bytes);
           const cl_int werr = opencl::clEnqueueWriteBuffer(
             cq, w_buf, CL_TRUE, n0 * v8c_row_bytes, nrows * v8c_row_bytes,
@@ -2910,12 +2909,12 @@ std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
       {
         nntrainer::load_trace::Scope _lt_sub(nntrainer::load_trace::AUX_SUB);
         s_sub = opencl::clCreateSubBuffer(parent, CL_MEM_READ_ONLY,
-                                           CL_BUFFER_CREATE_TYPE_REGION,
-                                           &sc_reg, &serr);
+                                          CL_BUFFER_CREATE_TYPE_REGION, &sc_reg,
+                                          &serr);
         if (serr == CL_SUCCESS && s_sub != nullptr)
           r_sub = opencl::clCreateSubBuffer(parent, CL_MEM_READ_ONLY,
-                                             CL_BUFFER_CREATE_TYPE_REGION,
-                                             &rs_reg, &serr);
+                                            CL_BUFFER_CREATE_TYPE_REGION,
+                                            &rs_reg, &serr);
       }
       if (serr == CL_SUCCESS && s_sub != nullptr && r_sub != nullptr) {
         // Scale first, then the row sum at the next legal origin. The gap
@@ -2932,9 +2931,9 @@ std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
           std::vector<uint8_t> staging(pair, 0);
           std::memcpy(staging.data(), fp32_scales, sc_bytes);
           std::memcpy(staging.data() + sc_pad, row_sum_w_int4.data(), rs_bytes);
-          const cl_int werr = opencl::clEnqueueWriteBuffer(
-            cq, parent, CL_TRUE, origin, pair, staging.data(), 0, nullptr,
-            nullptr);
+          const cl_int werr =
+            opencl::clEnqueueWriteBuffer(cq, parent, CL_TRUE, origin, pair,
+                                         staging.data(), 0, nullptr, nullptr);
           if (werr == CL_SUCCESS) {
             sb = s_sub;
             rsw_buf = r_sub;

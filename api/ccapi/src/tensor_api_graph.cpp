@@ -13,9 +13,9 @@
  * @note This is experimental API and not stable.
  */
 
+#include "tensor_api_impl.h"
 #include <chrono>
 #include <load_trace.h>
-#include "tensor_api_impl.h"
 
 #include <model.h>
 
