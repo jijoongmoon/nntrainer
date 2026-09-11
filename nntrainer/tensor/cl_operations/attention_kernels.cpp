@@ -2324,6 +2324,19 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
         !kp->SetKernelArguments(8, &gqa, sizeof(int)) ||
         !kp->SetKernelArguments(9, &causal_i, sizeof(int)))
       return false;
+    // arg 10 = the sliding window, the same value K1 already gets. Both sv
+    // kernels start their n loop at the window floor instead of 0; on the 28
+    // sliding layers of gemma4 that is ~half the V texels, and the skipped
+    // ones are exactly the +0.0 scores softmax_row_f16 wrote for the keys K1
+    // masked to -INFINITY. NNTR_SV_WIN=0 is the control arm (pass 0 = the old
+    // full-range loop) and leaves the binary otherwise identical.
+    static const bool sv_win = []() {
+      const char *e = std::getenv("NNTR_SV_WIN");
+      return e ? (std::atoi(e) != 0) : true;
+    }();
+    int sv_lw = sv_win ? (int)local_window : 0;
+    if (!kp->SetKernelArguments(10, &sv_lw, sizeof(int)))
+      return false;
     // TDX=8 tiled: each WI computes 8 output channels, so the x grid is
     // head_dim/8 work-items. Workgroup (LWS_X x's, LWS_Y=4 m's).
     // The LWS is env-overridable + measured (NNTR_SV_LWS="x,y,z"); default
