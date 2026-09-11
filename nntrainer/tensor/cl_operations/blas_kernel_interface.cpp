@@ -532,14 +532,36 @@ struct V8cScratch {
   size_t act_rs_bytes[V8C_ACT_SLOTS] = {};
   cl_mem act_zp[V8C_ACT_SLOTS] = {}; // [M] int32, asymmetric act zero-point
   size_t act_zp_bytes[V8C_ACT_SLOTS] = {};
-  // Cached image2d-from-buffer view per slot, built once per (buffer, M_pad,
+  // Cached image2d-from-buffer views per slot, built once per (buffer, M_pad,
   // K) and reused across the fanout's GEMMs instead of per-call create/release
-  // (which also leaked on the exception path). Rebuilt when the slot's buffer
-  // is grown or M_pad/K change.
-  cl_mem act_image[V8C_ACT_SLOTS] = {};
-  cl_mem act_image_buf[V8C_ACT_SLOTS] = {};
-  unsigned int act_image_M_pad[V8C_ACT_SLOTS] = {};
-  unsigned int act_image_K[V8C_ACT_SLOTS] = {};
+  // (which also leaked on the exception path).
+  //
+  // One cached view per slot was not enough. A transformer layer sends five or
+  // more DIFFERENT K through the four-slot ring -- qkv, o, gate/up, down --
+  // so the single (buffer, M_pad, K) key missed on nearly every call and the
+  // "cache" rebuilt the view each time: 175 clCreateImage plus 175
+  // clReleaseMemObject per decode token on an Adreno 840 cell, all of it
+  // host work in front of a GPU waiting for its next dispatch. Keeping a small
+  // SET of views per slot, one per shape seen, turns that into a fill during
+  // the first layer and hits afterwards, because the shapes repeat every
+  // layer. The views alias the same buffer read-only and are never live
+  // concurrently on different data (the slot ring is what separates writers
+  // from in-flight readers), so holding several changes nothing about the WAR
+  // hazard the ring exists for.
+  //
+  // The set is bounded: past the cap the least recently used view is released,
+  // so a graph with unbounded shape variety degrades to today's behaviour
+  // rather than leaking images.
+  static constexpr int kActViewsPerSlot = 12;
+  struct ActView {
+    cl_mem image = nullptr;
+    cl_mem buf = nullptr;
+    unsigned int M_pad = 0;
+    unsigned int K = 0;
+    unsigned long long lru = 0;
+  };
+  ActView act_views[V8C_ACT_SLOTS][kActViewsPerSlot] = {};
+  unsigned long long act_view_clock = 0;
   int ring_pos = 0; /**< last slot handed out; advance-on-miss */
   cl_mem y_fp16 = nullptr;
   size_t y_fp16_bytes = 0;
@@ -1276,24 +1298,59 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
       adesc.image_height = M_pad;
       adesc.image_row_pitch = K;
       adesc.buffer = act_i8_arg;
-      if (sc.act_image[act_slot] == nullptr ||
-          sc.act_image_buf[act_slot] != act_i8_arg ||
-          sc.act_image_M_pad[act_slot] != M_pad ||
-          sc.act_image_K[act_slot] != K) {
-        if (sc.act_image[act_slot]) {
-          opencl::clReleaseMemObject(sc.act_image[act_slot]);
-          sc.act_image[act_slot] = nullptr;
+
+      // NNTR_V8C_ACT_VIEW_SET=0 keeps one view per slot (the previous
+      // behaviour), so the same binary can be its own control arm.
+      static const bool view_set = []() {
+        const char *e = std::getenv("NNTR_V8C_ACT_VIEW_SET");
+        return !(e != nullptr && e[0] == '0');
+      }();
+      const int cap =
+        view_set ? V8cScratch::kActViewsPerSlot : 1;
+      auto &views = sc.act_views[act_slot];
+      int hit = -1, free_slot = -1, victim = 0;
+      for (int i = 0; i < cap; ++i) {
+        if (views[i].image == nullptr) {
+          if (free_slot < 0)
+            free_slot = i;
+          continue;
         }
-        cl_mem img = opencl::clCreateImageT(ctx, CL_MEM_READ_ONLY, &afmt, &adesc,
-                                           nullptr, &err);
+        if (views[i].buf == act_i8_arg && views[i].M_pad == M_pad &&
+            views[i].K == K) {
+          hit = i;
+          break;
+        }
+        if (views[victim].image == nullptr || views[i].lru < views[victim].lru)
+          victim = i;
+      }
+      // A grown slot buffer invalidates every view over the old one; drop them
+      // rather than let a stale alias be handed out.
+      if (hit < 0) {
+        for (int i = 0; i < cap; ++i) {
+          if (views[i].image != nullptr && views[i].buf != act_i8_arg) {
+            opencl::clReleaseMemObject(views[i].image);
+            views[i] = V8cScratch::ActView{};
+            if (free_slot < 0)
+              free_slot = i;
+          }
+        }
+        int use = free_slot >= 0 ? free_slot : victim;
+        if (views[use].image != nullptr) {
+          opencl::clReleaseMemObject(views[use].image);
+          views[use] = V8cScratch::ActView{};
+        }
+        cl_mem img = opencl::clCreateImageT(ctx, CL_MEM_READ_ONLY, &afmt,
+                                            &adesc, nullptr, &err);
         if (err != CL_SUCCESS)
           throw std::runtime_error("act image view fail");
-        sc.act_image[act_slot] = img;
-        sc.act_image_buf[act_slot] = act_i8_arg;
-        sc.act_image_M_pad[act_slot] = M_pad;
-        sc.act_image_K[act_slot] = K;
+        views[use].image = img;
+        views[use].buf = act_i8_arg;
+        views[use].M_pad = M_pad;
+        views[use].K = K;
+        hit = use;
       }
-      act_image = sc.act_image[act_slot];
+      views[hit].lru = ++sc.act_view_clock;
+      act_image = views[hit].image;
     }
 
     // v8c GEMM -- run on padded M_pad rows, but only the valid M rows reach

@@ -24,9 +24,53 @@
 #include <cstdlib>
 #include <fp16.h>
 #include <opencl_loader.h>
+#include <unordered_map>
 #include <thread>
 
 namespace nntrainer {
+
+/**
+ * @brief Backing cl_mem of an image2d-from-buffer view, memoised.
+ *
+ * The coop GEMV reads its operands through the images' backing buffers, and it
+ * asked the driver for both of them on every call -- ~543 clGetImageInfo per
+ * decode token on an Adreno 840 decode cell, for an answer that is a property of
+ * the image object and cannot change while that object lives. The map keys on
+ * the image handle and is dropped whole whenever any memory object is created
+ * (opencl::clHandleEpoch), which is the only way a live handle value can come
+ * to name a different object; steady-state decode creates none, so the map is
+ * filled once and read thereafter.
+ */
+static cl_mem v8c_image_backing(cl_mem image) {
+  static std::unordered_map<cl_mem, cl_mem> cache;
+  static unsigned long long cache_epoch = 0;
+  static const bool cache_on = []() {
+    const char *e = std::getenv("NNTR_CL_IMGINFO_CACHE");
+    return !(e != nullptr && e[0] == '0');
+  }();
+
+  if (!cache_on) {
+    cl_mem buf = nullptr;
+    opencl::clGetImageInfo(image, CL_IMAGE_BUFFER, sizeof(cl_mem), &buf,
+                           nullptr);
+    return buf;
+  }
+
+  const unsigned long long epoch = opencl::clHandleEpoch();
+  if (cache_epoch != epoch) {
+    cache.clear();
+    cache_epoch = epoch;
+  }
+  auto it = cache.find(image);
+  if (it != cache.end())
+    return it->second;
+
+  cl_mem buf = nullptr;
+  opencl::clGetImageInfo(image, CL_IMAGE_BUFFER, sizeof(cl_mem), &buf, nullptr);
+  cache.emplace(image, buf);
+  return buf;
+}
+
 
 void gemv_int4_async_cl(std::vector<void *> weights,
                         std::vector<uint16_t *> scales, uint16_t *input,
@@ -1579,10 +1623,8 @@ void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
       wbuf = weight_image; // raw cl_mem on the buffer path
       abuf = act_image;
     } else {
-      opencl::clGetImageInfo(weight_image, CL_IMAGE_BUFFER, sizeof(cl_mem),
-                             &wbuf, nullptr);
-      opencl::clGetImageInfo(act_image, CL_IMAGE_BUFFER, sizeof(cl_mem), &abuf,
-                             nullptr);
+      wbuf = v8c_image_backing(weight_image);
+      abuf = v8c_image_backing(act_image);
     }
     if (wbuf != nullptr && abuf != nullptr) {
       ClContext::SharedPtrClKernel ck = blas_cc->registerClKernel(
