@@ -583,26 +583,48 @@ bool ClContext::clCreateKernel(std::string &kernel_string,
   auto binary_data = (KERNEL_CACHE_ENABLED && kernel_cache_usable)
                        ? readBinaryFile(binary_file_path)
                        : std::vector<std::byte>();
+  // Where the bytes actually came from. The log line used to name the resolved
+  // directory whatever the answer was, which reads as a cache that is whole
+  // when it is in fact split across two directories.
+  std::string binary_read_path = binary_file_path;
+  bool served_from_legacy_dir = false;
   if (KERNEL_CACHE_ENABLED && kernel_cache_usable && binary_data.empty() &&
       kernelCacheDir() != opencl::Program::DEFAULT_KERNEL_PATH) {
     // Fall back to the legacy working-directory location so a cache written
-    // before the directory was resolvable is still used (read-only: new
-    // entries go to the resolved directory).
-    binary_data = readBinaryFile(opencl::Program::DEFAULT_KERNEL_PATH + "/" +
-                                 binary_file_name);
+    // before the directory was resolvable is still used.
+    const std::string legacy_path =
+      opencl::Program::DEFAULT_KERNEL_PATH + "/" + binary_file_name;
+    binary_data = readBinaryFile(legacy_path);
+    if (!binary_data.empty()) {
+      binary_read_path = legacy_path;
+      served_from_legacy_dir = true;
+    }
   }
 
   bool loaded_from_binary = false;
   if (KERNEL_CACHE_ENABLED && kernel_cache_usable && !binary_data.empty()) {
     ml_logi("Using cached version of kernel: %s at path %s",
-            kernel_name.c_str(), binary_file_path.c_str());
+            kernel_name.c_str(), binary_read_path.c_str());
     loaded_from_binary = program.CreateCLProgramWithBinary(
       opencl::ContextManager::Global().GetContext(),
       opencl::ContextManager::Global().GetDeviceId(), binary_data,
-      binary_file_path, "");
-    if (!loaded_from_binary)
+      binary_read_path, "");
+    if (!loaded_from_binary) {
       ml_logw("Cached kernel binary %s was rejected; recompiling from source",
-              binary_file_path.c_str());
+              binary_read_path.c_str());
+    } else if (served_from_legacy_dir) {
+      // Promote the hit into the resolved directory. The legacy location is
+      // the process working directory, so an entry that lives only there is
+      // lost the moment the application is started from anywhere else -- and
+      // nothing ever writes it back, because the fallback is read-only by
+      // design. Copying the accepted binary across costs one small write on
+      // the launch that found it and keeps the cache whole afterwards. The
+      // key already folds in the device name and driver version, so this
+      // moves a binary that this device just accepted, never a foreign one.
+      if (!writeBinaryFile(binary_file_path, binary_data))
+        ml_logw("Could not promote kernel cache entry %s to %s; continuing",
+                binary_read_path.c_str(), binary_file_path.c_str());
+    }
   }
 
   if (loaded_from_binary) {
