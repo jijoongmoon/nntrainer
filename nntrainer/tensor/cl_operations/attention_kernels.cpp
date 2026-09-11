@@ -208,7 +208,7 @@ bool two_conv_attention_prefill_f16_cl(
 
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
-  cl_context ctx = blas_cc->context_inst_.GetContext();
+  cl_context ctx = blas_cc->context_inst_.GetContextNoRetain();
   cl_command_queue q = blas_cc->command_queue_inst_.GetCommandQueue();
 
   const size_t HD_Q = (size_t)num_heads_Q * head_dim;
@@ -567,7 +567,7 @@ bool rope_inplace_f16_cl(const uint16_t *in, uint16_t *out,
 
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
-  cl_context ctx = blas_cc->context_inst_.GetContext();
+  cl_context ctx = blas_cc->context_inst_.GetContextNoRetain();
   cl_command_queue q = blas_cc->command_queue_inst_.GetCommandQueue();
 
   ClContext::SharedPtrClKernel kp =
@@ -735,7 +735,7 @@ void attention_prewarm_programs(ClContext &cc) {
 bool ensure_cl_stage_buf(void **buf, size_t *cap, size_t bytes) {
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
-  cl_context ctx = blas_cc->context_inst_.GetContext();
+  cl_context ctx = blas_cc->context_inst_.GetContextNoRetain();
   return tca_ensure(ctx, reinterpret_cast<cl_mem *>(buf), cap, bytes,
                     CL_MEM_READ_WRITE);
 }
@@ -747,7 +747,7 @@ bool gpu_copy_f16_cl(const uint16_t *in, uint16_t *out, unsigned int N,
     return false;
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
-  cl_context ctx = blas_cc->context_inst_.GetContext();
+  cl_context ctx = blas_cc->context_inst_.GetContextNoRetain();
   cl_command_queue q = blas_cc->command_queue_inst_.GetCommandQueue();
   ClContext::SharedPtrClKernel kp =
     blas_cc->registerClKernel(rope_inplace_kernel, "scatter_copy_f16");
@@ -896,7 +896,7 @@ bool create_ohwi_kv_mirror(bool is_v, unsigned int num_heads_KV,
     return false; // 8 halves/texel
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
-  cl_context ctx = blas_cc->context_inst_.GetContext();
+  cl_context ctx = blas_cc->context_inst_.GetContextNoRetain();
   cl_command_queue q = blas_cc->command_queue_inst_.GetCommandQueue();
   const size_t bytes =
     (size_t)num_heads_KV * max_S * head_dim * sizeof(uint16_t);
@@ -965,7 +965,7 @@ bool create_ohwi_v_image_view(void *v_buf, unsigned int num_heads_KV,
     return false;
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
-  cl_context ctx = blas_cc->context_inst_.GetContext();
+  cl_context ctx = blas_cc->context_inst_.GetContextNoRetain();
   // image2d_from_buffer requires the row pitch to be a multiple of
   // CL_DEVICE_IMAGE_PITCH_ALIGNMENT *pixels* (RGBA32UI pixel = 8 halves), so
   // the stride S must be a multiple of 8*align (Adreno: align=32 -> S
@@ -1160,7 +1160,7 @@ bool two_conv_attention_prefill_f16_kvi8_cl(
 
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
-  cl_context ctx = blas_cc->context_inst_.GetContext();
+  cl_context ctx = blas_cc->context_inst_.GetContextNoRetain();
   cl_command_queue q = blas_cc->command_queue_inst_.GetCommandQueue();
 
   const size_t HD_Q = (size_t)num_heads_Q * head_dim;
@@ -1358,7 +1358,7 @@ bool two_conv_attention_prefill_f16_img_cl(
 
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
-  cl_context ctx = blas_cc->context_inst_.GetContext();
+  cl_context ctx = blas_cc->context_inst_.GetContextNoRetain();
   cl_command_queue q = blas_cc->command_queue_inst_.GetCommandQueue();
 
   const size_t HD_Q = (size_t)num_heads_Q * head_dim;
@@ -1599,7 +1599,7 @@ bool two_conv_attention_prefill_f16_ohwi_cl(
 
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
-  cl_context ctx = blas_cc->context_inst_.GetContext();
+  cl_context ctx = blas_cc->context_inst_.GetContextNoRetain();
   cl_command_queue q = blas_cc->command_queue_inst_.GetCommandQueue();
 
   const size_t HD_Q = (size_t)num_heads_Q * head_dim;
@@ -1793,7 +1793,7 @@ bool two_conv_attention_prefill_f16_ohwi_full_cl(
 
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
-  cl_context ctx = blas_cc->context_inst_.GetContext();
+  cl_context ctx = blas_cc->context_inst_.GetContextNoRetain();
   cl_command_queue q = blas_cc->command_queue_inst_.GetCommandQueue();
 
   const size_t HD_Q = (size_t)num_heads_Q * head_dim;
@@ -2031,7 +2031,7 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
 
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
-  cl_context ctx = blas_cc->context_inst_.GetContext();
+  cl_context ctx = blas_cc->context_inst_.GetContextNoRetain();
   cl_command_queue q = blas_cc->command_queue_inst_.GetCommandQueue();
 
   const size_t HD_Q = (size_t)num_heads_Q * head_dim;
