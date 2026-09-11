@@ -102,7 +102,7 @@ std::string ContextManager::GetDeviceSignature() {
 
 void *ContextManager::createSVMRegion(size_t size) {
   if (context_)
-    return clSVMAlloc(context_, CL_MEM_READ_WRITE, size, 0);
+    return clSVMAllocT(context_, CL_MEM_READ_WRITE, size, 0);
   else
     return nullptr;
 }

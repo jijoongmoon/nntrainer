@@ -132,7 +132,7 @@ static bool tca_ensure(cl_context ctx, cl_mem *buf, size_t *cap, size_t bytes,
     *cap = 0;
   }
   cl_int err = CL_SUCCESS;
-  *buf = opencl::clCreateBuffer(ctx, flags, bytes, nullptr, &err);
+  *buf = opencl::clCreateBufferT(ctx, flags, bytes, nullptr, &err);
   if (err != CL_SUCCESS || !*buf) {
     *buf = nullptr;
     *cap = 0;
@@ -903,7 +903,7 @@ bool create_ohwi_kv_mirror(bool is_v, unsigned int num_heads_KV,
 
   cl_int err = CL_SUCCESS;
   cl_mem buf =
-    opencl::clCreateBuffer(ctx, CL_MEM_READ_WRITE, bytes, nullptr, &err);
+    opencl::clCreateBufferT(ctx, CL_MEM_READ_WRITE, bytes, nullptr, &err);
   if (err != CL_SUCCESS || buf == nullptr)
     return false;
   // Zero the padding rows once. Enqueued non-blocking: this runs on the
@@ -930,7 +930,7 @@ bool create_ohwi_kv_mirror(bool is_v, unsigned int num_heads_KV,
   d.buffer = buf;
   cl_int ie = CL_SUCCESS;
   cl_mem image =
-    opencl::clCreateImage(ctx, CL_MEM_READ_ONLY, &fmt, &d, nullptr, &ie);
+    opencl::clCreateImageT(ctx, CL_MEM_READ_ONLY, &fmt, &d, nullptr, &ie);
   if (ie != CL_SUCCESS || image == nullptr) {
     opencl::clReleaseMemObject(buf);
     return false;
@@ -993,7 +993,7 @@ bool create_ohwi_v_image_view(void *v_buf, unsigned int num_heads_KV,
   d.buffer = reinterpret_cast<cl_mem>(v_buf);
   cl_int ie = CL_SUCCESS;
   cl_mem image =
-    opencl::clCreateImage(ctx, CL_MEM_READ_ONLY, &fmt, &d, nullptr, &ie);
+    opencl::clCreateImageT(ctx, CL_MEM_READ_ONLY, &fmt, &d, nullptr, &ie);
   if (ie != CL_SUCCESS || image == nullptr)
     return false;
   *out_image = image;
@@ -1417,7 +1417,7 @@ bool two_conv_attention_prefill_f16_img_cl(
     qd.image_height = M;
     qd.image_row_pitch = HD_Q * sizeof(uint16_t);
     qd.buffer = sc.q_buf;
-    sc.q_image = opencl::clCreateImage(ctx, CL_MEM_READ_ONLY, &img_fmt, &qd,
+    sc.q_image = opencl::clCreateImageT(ctx, CL_MEM_READ_ONLY, &img_fmt, &qd,
                                        nullptr, &err);
     if (err != CL_SUCCESS || !sc.q_image)
       return false;
@@ -1428,14 +1428,14 @@ bool two_conv_attention_prefill_f16_img_cl(
     kd.image_height = N_kv;
     kd.image_row_pitch = HD_KV * sizeof(uint16_t);
     kd.buffer = sc.k_buf;
-    sc.k_image = opencl::clCreateImage(ctx, CL_MEM_READ_ONLY, &img_fmt, &kd,
+    sc.k_image = opencl::clCreateImageT(ctx, CL_MEM_READ_ONLY, &img_fmt, &kd,
                                        nullptr, &err);
     if (err != CL_SUCCESS || !sc.k_image)
       return false;
 
     cl_image_desc vd = kd;
     vd.buffer = sc.v_buf;
-    sc.v_image = opencl::clCreateImage(ctx, CL_MEM_READ_ONLY, &img_fmt, &vd,
+    sc.v_image = opencl::clCreateImageT(ctx, CL_MEM_READ_ONLY, &img_fmt, &vd,
                                        nullptr, &err);
     if (err != CL_SUCCESS || !sc.v_image)
       return false;
@@ -2065,7 +2065,7 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
       vd.image_row_pitch = (size_t)max_seq_len * sizeof(uint16_t);
       vd.buffer = v_buf_in;
       cl_int err = CL_SUCCESS;
-      sc.v_ohwi_image = opencl::clCreateImage(ctx, CL_MEM_READ_ONLY, &img_fmt,
+      sc.v_ohwi_image = opencl::clCreateImageT(ctx, CL_MEM_READ_ONLY, &img_fmt,
                                               &vd, nullptr, &err);
       if (err != CL_SUCCESS || !sc.v_ohwi_image) {
         sc.v_ohwi_image = nullptr;

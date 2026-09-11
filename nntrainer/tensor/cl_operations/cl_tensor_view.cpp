@@ -71,7 +71,7 @@ cl_mem TensorBacking::imageView(const ViewSpec &spec) {
 
   cl_int err = CL_SUCCESS;
   cl_mem img =
-    opencl::clCreateImage(ctx_, CL_MEM_READ_ONLY, &fmt, &desc, nullptr, &err);
+    opencl::clCreateImageT(ctx_, CL_MEM_READ_ONLY, &fmt, &desc, nullptr, &err);
   if (err != CL_SUCCESS || img == nullptr) {
     throw std::runtime_error("TensorBacking::imageView clCreateImage failed: " +
                              std::to_string(err));
