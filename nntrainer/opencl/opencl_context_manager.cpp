@@ -129,7 +129,7 @@ void ContextManager::releaseSVMRegion(void *svm_ptr) {
 
   if (svm_ptr) {
     // deallocates the SVM memory
-    clSVMFree(context_, svm_ptr);
+    clSVMFreeT(context_, svm_ptr);
   } else {
     ml_logw("Attempted to deallocate a null pointer");
   }

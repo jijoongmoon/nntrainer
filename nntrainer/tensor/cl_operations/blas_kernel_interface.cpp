@@ -426,7 +426,7 @@ public:
   /** @brief Release the held object and adopt another */
   void reset(cl_mem mem = nullptr) {
     if (mem_)
-      opencl::clReleaseMemObject(mem_);
+      opencl::clReleaseMemObjectT(mem_);
     mem_ = mem;
   }
   /** @brief The raw handle, for binding as a kernel argument */
@@ -646,11 +646,12 @@ static bool v8c_ensure_buf(cl_context ctx, cl_mem *buf, size_t *cap,
   if (*buf && *cap >= bytes)
     return true;
   if (*buf) {
-    opencl::clReleaseMemObject(*buf);
+    opencl::clReleaseMemObjectT(*buf);
     *buf = nullptr;
     *cap = 0;
   }
   cl_int err = CL_SUCCESS;
+  opencl::ClMemAcctScope _acct("scratch:v8c");
   *buf = opencl::clCreateBufferT(ctx, flags, bytes, nullptr, &err);
   if (err != CL_SUCCESS || !*buf) {
     *buf = nullptr;
@@ -1548,7 +1549,7 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
       if (hit < 0) {
         for (int i = 0; i < cap; ++i) {
           if (views[i].image != nullptr && views[i].buf != act_i8_arg) {
-            opencl::clReleaseMemObject(views[i].image);
+            opencl::clReleaseMemObjectT(views[i].image);
             views[i] = V8cScratch::ActView{};
             if (free_slot < 0)
               free_slot = i;
@@ -1556,7 +1557,7 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
         }
         int use = free_slot >= 0 ? free_slot : victim;
         if (views[use].image != nullptr) {
-          opencl::clReleaseMemObject(views[use].image);
+          opencl::clReleaseMemObjectT(views[use].image);
           views[use] = V8cScratch::ActView{};
         }
         cl_mem img = opencl::clCreateImageT(ctx, CL_MEM_READ_ONLY, &afmt,
