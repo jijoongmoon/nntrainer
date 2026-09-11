@@ -351,6 +351,45 @@ void clMemAcctPush(const char *tag);
 void clMemAcctPop();
 
 /**
+ * @brief Mark every allocation made in this scope as a VIEW: counted, but
+ *        charged ZERO bytes.
+ *
+ * @details A view is memory that already exists and is already counted
+ * somewhere else -- a sub-buffer, an image over a buffer, or a
+ * CL_MEM_USE_HOST_PTR buffer over an allocation the ledger has seen. Charging
+ * its bytes again makes the ledger disagree with the driver's own counter by
+ * exactly the amount the aliasing saves, and since the application's reported
+ * Peak Mem is computed FROM this ledger, that overstates the footprint by the
+ * saving. Sub-buffers and images-from-buffer set the flag at their call site;
+ * this scope is for the case only the caller can recognise.
+ */
+void clMemAcctPushView();
+
+/**
+ * @copydoc clMemAcctPushView
+ */
+void clMemAcctPopView();
+
+/**
+ * @brief RAII view scope. `ClMemAcctViewScope _v;` -- see clMemAcctPushView().
+ */
+struct ClMemAcctViewScope {
+  ClMemAcctViewScope() : on_(clMemAcctOn()) {
+    if (on_)
+      clMemAcctPushView();
+  }
+  ~ClMemAcctViewScope() {
+    if (on_)
+      clMemAcctPopView();
+  }
+  ClMemAcctViewScope(const ClMemAcctViewScope &) = delete;
+  ClMemAcctViewScope &operator=(const ClMemAcctViewScope &) = delete;
+
+private:
+  bool on_;
+};
+
+/**
  * @brief RAII tag scope. `ClMemAcctScope _t("kv:mirror");`
  */
 struct ClMemAcctScope {

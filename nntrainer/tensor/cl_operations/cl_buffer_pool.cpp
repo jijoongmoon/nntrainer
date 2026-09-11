@@ -30,9 +30,9 @@
 
 #include <cl_context.h>
 #include <engine.h>
-#include <residency_policy.h>
 #include <nntrainer_log.h>
 #include <opencl_loader.h>
+#include <residency_policy.h>
 
 namespace nntrainer {
 
@@ -69,7 +69,6 @@ ClContext *clContext() {
     return nullptr;
   }
 }
-
 
 // ---------------------------------------------------------------------------
 // NNTR_CLMEM_PLANE_CANARY -- which pooled planes does the HOST actually touch?
@@ -129,7 +128,8 @@ _Unwind_Reason_Code pc_unwind_cb(struct _Unwind_Context *ctx, void *arg) {
     return _URC_END_OF_STACK;
   Dl_info info{};
   char line[256];
-  if (dladdr(reinterpret_cast<void *>(pc), &info) && info.dli_sname != nullptr) {
+  if (dladdr(reinterpret_cast<void *>(pc), &info) &&
+      info.dli_sname != nullptr) {
     std::snprintf(line, sizeof(line), "[PLANE-CANARY]  #%02d %s + 0x%lx (%s)\n",
                   *n, info.dli_sname,
                   (unsigned long)((uintptr_t)pc - (uintptr_t)info.dli_saddr),
@@ -179,7 +179,8 @@ void pc_sigsegv(int sig, siginfo_t *si, void *uc) {
 
   /** Not one of ours: restore the previous disposition and let the real fault
    *  happen, so this diagnostic cannot swallow a genuine crash. */
-  const struct sigaction *prev = (sig == SIGBUS) ? &g_pc_prev_bus : &g_pc_prev_segv;
+  const struct sigaction *prev =
+    (sig == SIGBUS) ? &g_pc_prev_bus : &g_pc_prev_segv;
   sigaction(sig, prev, nullptr);
   (void)uc;
 }
@@ -194,17 +195,16 @@ struct PlaneCanaryReport {
       if (r.touched) {
         ++touched_n;
         touched_bytes += r.bytes;
-        std::fprintf(stderr,
-                     "[PLANE-CANARY] TOUCHED offset %10zu  %8.2f MiB  hits=%d\n",
-                     r.offset, r.bytes / 1048576.0, r.hits);
+        std::fprintf(
+          stderr, "[PLANE-CANARY] TOUCHED offset %10zu  %8.2f MiB  hits=%d\n",
+          r.offset, r.bytes / 1048576.0, r.hits);
       } else {
         untouched_bytes += r.bytes;
       }
     }
     for (const auto &r : g_pc_ranges)
       if (!r.touched)
-        std::fprintf(stderr,
-                     "[PLANE-CANARY] clean   offset %10zu  %8.2f MiB\n",
+        std::fprintf(stderr, "[PLANE-CANARY] clean   offset %10zu  %8.2f MiB\n",
                      r.offset, r.bytes / 1048576.0);
     std::fprintf(stderr,
                  "[PLANE-CANARY] mode=%d: %d of %zu candidate offsets touched "
@@ -477,7 +477,14 @@ void *ClBufferPool::devicePlaneBaseLocked(size_t span) {
     return nullptr;
   }
 
-  /** NNTR_CLMEM_ALIAS_SVM=1 -- one PHYSICAL plane, two views.
+  /** NNTR_CLMEM_ALIAS_SVM=1 -- one PHYSICAL plane, two views. Opt-in.
+   *
+   *  Opt-in, not default, because making the two views one plane also makes
+   *  every undrained write through one view a real hazard for the other: what
+   *  was a stale copy nobody read becomes the bytes the next kernel reads. On
+   *  one driver the answer is not stable with this on. It stays off until the
+   *  long-prefill correctness series that fixes exactly those drain hazards
+   *  lands, and the default can be flipped then.
    *
    *  The double charge this pool is measured for is not one layout held twice
    *  by accident: it is two real allocations of the same bytes. The shared
@@ -508,7 +515,7 @@ void *ClBufferPool::devicePlaneBaseLocked(size_t span) {
    *  what USE_HOST_PTR wants for a zero-copy mapping. */
   static const bool alias_svm = [] {
     const char *e = std::getenv("NNTR_CLMEM_ALIAS_SVM");
-    return e != nullptr && e[0] == '1';
+    return e != nullptr && e[0] != 0 && e[0] != '0';
   }();
 
   cl_int err = CL_SUCCESS;
@@ -525,7 +532,13 @@ void *ClBufferPool::devicePlaneBaseLocked(size_t span) {
               "private plane",
               size(), span);
     } else {
+      /** A VIEW, not an allocation: these bytes are the shared plane's, which
+       *  the ledger already counted as `svm tensor_pool`. Charging them again
+       *  would make the ledger overstate the footprint by exactly what the
+       *  aliasing saves -- and the app's Peak Mem is computed from the ledger,
+       *  so the saving would never reach the number anyone reads. */
       opencl::ClMemAcctScope _acct_alias("act:device_plane_alias");
+      opencl::ClMemAcctViewScope _acct_view;
       base = opencl::clCreateBufferT(cc->context_inst_.GetContext(),
                                      CL_MEM_READ_WRITE | CL_MEM_USE_HOST_PTR,
                                      span, host, &err);
@@ -572,10 +585,9 @@ void *ClBufferPool::devicePlaneBaseLocked(size_t span) {
    *  Skipped when the plane is aliased: those bytes are the shared plane's and
    *  ClSVMAllocator::alloc() already zeroed them at model load. */
   const cl_uchar zero = 0;
-  if (!aliased &&
-      opencl::clEnqueueFillBuffer(cc->command_queue_inst_.GetCommandQueue(),
-                                  base, &zero, sizeof(zero), 0, span, 0,
-                                  nullptr, nullptr) != CL_SUCCESS) {
+  if (!aliased && opencl::clEnqueueFillBuffer(
+                    cc->command_queue_inst_.GetCommandQueue(), base, &zero,
+                    sizeof(zero), 0, span, 0, nullptr, nullptr) != CL_SUCCESS) {
     opencl::clReleaseMemObjectT(base);
     ml_logw("ClBufferPool: zero-filling the %.1f MB device plane failed; "
             "falling back to one buffer per planner offset",
@@ -638,9 +650,9 @@ void *ClBufferPool::createDeviceBufferLocked(size_t offset) {
       if (base != nullptr) {
         cl_buffer_region region{offset, bytes};
         cl_int serr = CL_SUCCESS;
-        cl_mem sub = opencl::clCreateSubBufferT(
-          base, CL_MEM_READ_WRITE, CL_BUFFER_CREATE_TYPE_REGION, &region,
-          &serr);
+        cl_mem sub = opencl::clCreateSubBufferT(base, CL_MEM_READ_WRITE,
+                                                CL_BUFFER_CREATE_TYPE_REGION,
+                                                &region, &serr);
         if (serr == CL_SUCCESS && sub != nullptr) {
           offset_buffer_[offset] = static_cast<void *>(sub);
           return offset_buffer_[offset];
