@@ -450,24 +450,103 @@ void *ClBufferPool::devicePlaneBaseLocked(size_t span) {
     return nullptr;
   }
 
+  /** NNTR_CLMEM_ALIAS_SVM=1 -- one PHYSICAL plane, two views.
+   *
+   *  The double charge this pool is measured for is not one layout held twice
+   *  by accident: it is two real allocations of the same bytes. The shared
+   *  plane is a clSVMAlloc the attention path reads by pointer (mha_core binds
+   *  query/key/value_step's SVM addresses, and dispatches the image attention
+   *  with q_clmem = nullptr so qk reads the same plane), and the device plane
+   *  is a separate clCreateBuffer the FC/v8c kernels bind as cl_mem. Dropping
+   *  either one breaks whoever reads it.
+   *
+   *  So do not drop one -- make them the SAME bytes. CL_MEM_USE_HOST_PTR over
+   *  the SVM pointer asks the driver to back this buffer with memory that
+   *  already exists, and the per-offset sub-buffers are then windows on the
+   *  very slices the SVM plane hands out. Every kernel reads exactly what it
+   *  reads today, nothing is reclassified, and act:device_plane should vanish
+   *  from the kgsl counter.
+   *
+   *  THE ASSUMPTION THAT HAS TO BE MEASURED: that the driver aliases rather
+   *  than shadow-copies. CL_MEM_USE_HOST_PTR permits a copy, and a copy here
+   *  is a net LOSS -- the same bytes a third time, plus a coherence problem.
+   *  The GPU ledger and /sys/class/kgsl/kgsl/page_alloc answer it directly:
+   *  aliasing shows act:device_plane charged and the kgsl counter NOT moving;
+   *  a shadow copy shows both moving. Default OFF until that measurement
+   *  exists on the device in question.
+   *
+   *  Alignment is already satisfied: every planner offset is a multiple of
+   *  CL_DEVICE_MEM_BASE_ADDR_ALIGN (128 B on Adreno, 36 of 36 offsets), and
+   *  clSVMAlloc returns page-aligned memory for a plane this size, which is
+   *  what USE_HOST_PTR wants for a zero-copy mapping. */
+  static const bool alias_svm = [] {
+    const char *e = std::getenv("NNTR_CLMEM_ALIAS_SVM");
+    return e != nullptr && e[0] == '1';
+  }();
+
   cl_int err = CL_SUCCESS;
-  opencl::ClMemAcctScope _acct("act:device_plane");
-  cl_mem base = opencl::clCreateBufferT(cc->context_inst_.GetContext(),
-                                        CL_MEM_READ_WRITE, span, nullptr, &err);
-  if (err != CL_SUCCESS || base == nullptr) {
-    ml_logw("ClBufferPool: device plane of %.1f MB failed with %d; falling "
-            "back to one buffer per planner offset",
-            span / 1048576.0, err);
-    device_plane_failed_ = true;
-    return nullptr;
+  cl_mem base = nullptr;
+  bool aliased = false;
+  if (alias_svm) {
+    void *host = getMemoryPoolAddress();
+    if (host == nullptr) {
+      ml_logw("ClBufferPool: NNTR_CLMEM_ALIAS_SVM=1 but there is no contiguous "
+              "shared plane to alias (per-offset path); using a private plane");
+    } else if (size() < span) {
+      ml_logw("ClBufferPool: NNTR_CLMEM_ALIAS_SVM=1 but the shared plane "
+              "(%zu B) is smaller than the device span (%zu B); using a "
+              "private plane",
+              size(), span);
+    } else {
+      opencl::ClMemAcctScope _acct_alias("act:device_plane_alias");
+      base = opencl::clCreateBufferT(cc->context_inst_.GetContext(),
+                                     CL_MEM_READ_WRITE | CL_MEM_USE_HOST_PTR,
+                                     span, host, &err);
+      if (err != CL_SUCCESS || base == nullptr) {
+        ml_logw("ClBufferPool: USE_HOST_PTR over the SVM plane failed with %d; "
+                "falling back to a private device plane",
+                err);
+        base = nullptr;
+      } else {
+        aliased = true;
+        /** No zero-fill: the bytes ARE the shared plane's, which
+         *  ClSVMAllocator::alloc() already memset once at model load
+         *  (NNTR_SVM_ZERO). Filling here would be correct but redundant, and
+         *  on an aliased buffer it would also race the host's own view. */
+        std::fprintf(stderr,
+                     "[clmempool] device plane ALIASED onto the SVM plane at "
+                     "%p (%.1f MiB, USE_HOST_PTR). Check kgsl page_alloc: it "
+                     "must NOT grow by this much, or the driver shadow-copied "
+                     "and this lever is a loss.\n",
+                     host, span / 1048576.0);
+        std::fflush(stderr);
+      }
+    }
+  }
+
+  if (base == nullptr) {
+    opencl::ClMemAcctScope _acct("act:device_plane");
+    base = opencl::clCreateBufferT(cc->context_inst_.GetContext(),
+                                   CL_MEM_READ_WRITE, span, nullptr, &err);
+    if (err != CL_SUCCESS || base == nullptr) {
+      ml_logw("ClBufferPool: device plane of %.1f MB failed with %d; falling "
+              "back to one buffer per planner offset",
+              span / 1048576.0, err);
+      device_plane_failed_ = true;
+      return nullptr;
+    }
   }
 
   /** One fill for the whole plane, for the reason the per-offset fill below
    *  gives: a producer writes only the rows it has and an element-wise
    *  consumer reads the padded rows too. Doing it once over the span also
-   *  covers the bytes between two offsets that no token claims. */
+   *  covers the bytes between two offsets that no token claims.
+   *
+   *  Skipped when the plane is aliased: those bytes are the shared plane's and
+   *  ClSVMAllocator::alloc() already zeroed them at model load. */
   const cl_uchar zero = 0;
-  if (opencl::clEnqueueFillBuffer(cc->command_queue_inst_.GetCommandQueue(),
+  if (!aliased &&
+      opencl::clEnqueueFillBuffer(cc->command_queue_inst_.GetCommandQueue(),
                                   base, &zero, sizeof(zero), 0, span, 0,
                                   nullptr, nullptr) != CL_SUCCESS) {
     opencl::clReleaseMemObjectT(base);
