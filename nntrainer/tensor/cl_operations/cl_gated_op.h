@@ -92,12 +92,10 @@ void dispatchGatedClKernel(const ClContext::SharedPtrClKernel &kernel,
     // releasing the host's mapping of it; a device-plane one binds its buffer
     // and needs no unmap at all -- its shared-plane shadow was never written,
     // and unmapping it would flip the host's SVM state one-sidedly.
-    if ((dev.in1 == nullptr &&
-         !cl_context->command_queue_inst_.enqueueSVMUnmap(
-           const_cast<T *>(in1))) ||
-        (dev.in2 == nullptr &&
-         !cl_context->command_queue_inst_.enqueueSVMUnmap(
-           const_cast<T *>(in2)))) {
+    if ((dev.in1 == nullptr && !cl_context->command_queue_inst_.enqueueSVMUnmap(
+                                 const_cast<T *>(in1))) ||
+        (dev.in2 == nullptr && !cl_context->command_queue_inst_.enqueueSVMUnmap(
+                                 const_cast<T *>(in2)))) {
       ml_loge("gated op: failed to unmap the SVM operands");
       return;
     }
