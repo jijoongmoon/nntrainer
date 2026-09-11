@@ -39,6 +39,7 @@
 #include <mutex>
 #include <system_error>
 #include <unordered_map>
+#include <unordered_set>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -509,6 +510,76 @@ bool ClContext::clCreateKernel(std::string &kernel_string,
     ".cl.bin";
   const std::string binary_file_path =
     kernelCacheDir() + "/" + binary_file_name;
+
+  /** ---- Negative cache: a kernel that cannot be built is not free. --------
+   *
+   *  Measured on a mobile GPU handset with a FULLY warm kernel cache: 76-114 ms
+   *  of every init -- a third of the whole non-load init -- is six
+   *  clCreateProgramWithSource+clBuildProgram calls that all end in "Failed to
+   *  register kernel". They are three legacy INT4 kernels
+   *  (fully_connected_gpu_int4_gemv, quantize_input_int4,
+   *  quantize_input_int4_pad) that this device declines, prewarmed by
+   *  initBlasClKernels for a dispatch path the quantized GEMM lane never takes,
+   *  and they are six rather than three because the kernel ring's clone attempt
+   *  and the singleton path below it each pay the same compile for the same
+   *  deterministic failure. Nothing observed it, because a null kernel is only
+   *  ever a silent decline here.
+   *
+   *  A failure is as cacheable as a success and on exactly the same key -- the
+   *  source, its compile options, the device and its driver -- plus the kernel
+   *  NAME, because clCreateKernel can fail for one name in a program that
+   *  built. Record it in-process (which is what collapses the ring's double
+   *  attempt) and as an empty marker file next to the binary cache (which is
+   *  what makes the next launch free). A driver update, a changed source or a
+   *  changed option string all move the key, so a marker can never outlive the
+   *  thing it describes; wiping the cache directory clears them like any other
+   *  entry.
+   *
+   *  NNTR_KERNEL_NEG_CACHE=0 turns it off and restores the retry-every-launch
+   *  behaviour in the same binary.
+   *  ---------------------------------------------------------------------- */
+  static const bool neg_cache_on = []() {
+    const char *e = std::getenv("NNTR_KERNEL_NEG_CACHE");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  const std::string neg_key = binary_file_name + "|" + kernel_name;
+  const std::string neg_file_path =
+    kernelCacheDir() + "/" + binary_file_name + "." + kernel_name + ".fail";
+  static std::unordered_set<std::string> failed_kernels;
+  static std::mutex failed_kernels_mtx;
+  auto note_failure = [&]() {
+    if (!neg_cache_on)
+      return;
+    {
+      const std::lock_guard<std::mutex> lk(failed_kernels_mtx);
+      failed_kernels.insert(neg_key);
+    }
+    if (KERNEL_CACHE_ENABLED && kernel_cache_usable) {
+      std::ofstream fs(neg_file_path, std::ios::out | std::ios::binary);
+      if (!fs)
+        ml_logw("Could not record the failed build of %s at %s; it will be "
+                "retried on the next launch",
+                kernel_name.c_str(), neg_file_path.c_str());
+    }
+  };
+  if (neg_cache_on) {
+    bool known_bad = false;
+    {
+      const std::lock_guard<std::mutex> lk(failed_kernels_mtx);
+      known_bad = failed_kernels.count(neg_key) != 0;
+    }
+    if (!known_bad && KERNEL_CACHE_ENABLED && kernel_cache_usable &&
+        std::filesystem::exists(neg_file_path)) {
+      known_bad = true;
+      const std::lock_guard<std::mutex> lk(failed_kernels_mtx);
+      failed_kernels.insert(neg_key);
+    }
+    if (known_bad) {
+      ml_logd("Kernel %s failed to build here before; not rebuilding it",
+              kernel_name.c_str());
+      return false;
+    }
+  }
   auto binary_data = (KERNEL_CACHE_ENABLED && kernel_cache_usable)
                        ? readBinaryFile(binary_file_path)
                        : std::vector<std::byte>();
@@ -561,6 +632,7 @@ bool ClContext::clCreateKernel(std::string &kernel_string,
   }
 
   if (!result) {
+    note_failure();
     return false;
   }
 
@@ -570,6 +642,11 @@ bool ClContext::clCreateKernel(std::string &kernel_string,
   }
 
   result = kernel_ptr_->CreateKernelFromProgram(program, kernel_name);
+
+  // The program built; this NAME is not in it, or the device refused the
+  // kernel object. Either way the next attempt gets the same answer.
+  if (!result)
+    note_failure();
 
   return result;
 }
