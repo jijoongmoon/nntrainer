@@ -23,6 +23,10 @@
 #include <tensor_wrap_specs.h>
 #include <util_func.h>
 
+#if defined(ENABLE_OPENCL)
+#include <opencl_loader.h> /* GPU memory ledger tag (NNTR_GPU_MEM_ACCT) */
+#endif
+
 namespace nntrainer {
 
 /**
@@ -293,6 +297,13 @@ void TensorPool::allocate(bool init) {
     mem_pool->noteDeviceOnlyTokens(device_only);
   }
 
+#if defined(ENABLE_OPENCL)
+  /** Charge this pool's plane to its own name in the GPU ledger. The two pools
+   *  a model builds -- weights and activations -- allocate through the same
+   *  wrappers, and telling a 1.1 GiB weight plane from a 0.4 GiB activation
+   *  plane is the first question any footprint number raises. */
+  opencl::ClMemAcctScope _acct_plane(pool_tag_.c_str());
+#endif
   mem_pool->allocate();
 
   /** set the pointers using the token for all the tensors */

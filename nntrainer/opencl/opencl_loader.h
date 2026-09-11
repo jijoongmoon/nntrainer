@@ -264,11 +264,20 @@ extern PFN_clRetainContext clRetainContext;
 extern PFN_clReleaseContext clReleaseContext;
 extern PFN_clRetainCommandQueue clRetainCommandQueue;
 extern PFN_clReleaseCommandQueue clReleaseCommandQueue;
-extern PFN_clReleaseMemObject clReleaseMemObject;
+/**
+ * @brief Accounting wrapper (see clMemAcct* below). Same signature and
+ * semantics as the driver entry point it forwards to; it exists so that the GPU
+ * memory ledger sees a release without every call site having to name a second
+ * symbol.
+ */
+cl_int clReleaseMemObjectT(cl_mem memobj);
 extern PFN_clFlush clFlush;
 extern PFN_clFinish clFinish;
 extern PFN_clSVMAlloc clSVMAlloc;
-extern PFN_clSVMFree clSVMFree;
+/**
+ * @brief Accounting wrapper, as clReleaseMemObject above.
+ */
+void clSVMFreeT(cl_context context, void *svm_pointer);
 extern PFN_clEnqueueSVMMap clEnqueueSVMMap;
 extern PFN_clEnqueueSVMUnmap clEnqueueSVMUnmap;
 extern PFN_clSetKernelArgSVMPointer clSetKernelArgSVMPointer;
@@ -295,9 +304,11 @@ unsigned long long clHandleEpoch();
  */
 void clBumpHandleEpoch();
 
-/// Handle-epoch-tracking wrappers around the creation entry points. They are
-/// the ONLY way this tree should create memory objects, so that the epoch
-/// above is a complete record.
+/**
+ * @brief Handle-epoch-tracking wrappers around the creation entry points. They
+ * are the ONLY way this tree should create memory objects, so that the epoch
+ * above is a complete record.
+ */
 cl_mem clCreateBufferT(cl_context context, cl_mem_flags flags, size_t size,
                        void *host_ptr, cl_int *errcode_ret);
 cl_mem clCreateSubBufferT(cl_mem buffer, cl_mem_flags flags,
@@ -308,6 +319,67 @@ cl_mem clCreateImageT(cl_context context, cl_mem_flags flags,
                       void *host_ptr, cl_int *errcode_ret);
 void *clSVMAllocT(cl_context context, cl_svm_mem_flags flags, size_t size,
                   unsigned int alignment);
+
+/**
+ * @brief GPU memory ledger -- what the driver was asked for, by whom.
+ *
+ * @details On Adreno every clSVMAlloc / clCreateBuffer is a kgsl allocation
+ * and is charged to /sys/class/kgsl/kgsl/page_alloc at the ioctl, whether or
+ * not a page is ever touched. That counter is the honest GPU footprint and it
+ * is also completely anonymous: it says 1 665 MiB and nothing about which of
+ * the weight repack, the activation plane, the KV mirrors or a grow-only
+ * scratch buffer is holding it. The ledger closes that gap by recording every
+ * allocation this tree makes -- the four creation wrappers above are the only
+ * way it makes one -- against a tag pushed by the call site, and every release,
+ * so the dump is live bytes and not merely cumulative ones.
+ *
+ * OFF unless NNTR_GPU_MEM_ACCT is set to something other than 0: when off,
+ * every entry point below is a load of one bool and a return, and no map, mutex
+ * or string is touched on any allocation path.
+ *
+ * A sub-buffer and an image created from a buffer are VIEWS -- they allocate
+ * nothing -- and are recorded with zero bytes so that the count still shows
+ * them without the byte column double counting the backing they share.
+ */
+bool clMemAcctOn();
+
+/**
+ * @brief Push/pop the tag new allocations on THIS thread are charged to. Prefer
+ * the scope object below; these are for the rare site that cannot use it.
+ */
+void clMemAcctPush(const char *tag);
+void clMemAcctPop();
+
+/**
+ * @brief RAII tag scope. `ClMemAcctScope _t("kv:mirror");`
+ */
+struct ClMemAcctScope {
+  ClMemAcctScope(const char *tag) : on_(clMemAcctOn()) {
+    if (on_)
+      clMemAcctPush(tag);
+  }
+  ~ClMemAcctScope() {
+    if (on_)
+      clMemAcctPop();
+  }
+  ClMemAcctScope(const ClMemAcctScope &) = delete;
+  ClMemAcctScope &operator=(const ClMemAcctScope &) = delete;
+
+private:
+  const bool on_;
+};
+
+/**
+ * @brief Print the ledger, tagged with a phase name.
+ *
+ * @details Written to stderr rather than the log, for the reason the pool
+ * banners give: on Android ml_logi goes to logcat and never into the run's
+ * captured output, and a number nobody can see in the run that produced it is
+ * a claim rather than a measurement. Called at the phase boundaries a run
+ * cares about (load / prefill / decode) and once more from the ledger's own
+ * destructor, so a run that ends early still reports.
+ */
+void clMemAcctDump(const char *phase);
 } // namespace nntrainer::opencl
 
 #endif // __OPENCL_LOADER_H__

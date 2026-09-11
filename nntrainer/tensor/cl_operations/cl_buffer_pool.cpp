@@ -231,6 +231,7 @@ void *ClBufferPool::createDeviceBufferLocked(size_t offset) {
   }
 
   cl_int err = CL_SUCCESS;
+  opencl::ClMemAcctScope _acct("act:device_plane");
   cl_mem buf = opencl::clCreateBufferT(cc->context_inst_.GetContext(),
                                        CL_MEM_READ_WRITE, bytes, nullptr, &err);
   if (err != CL_SUCCESS || buf == nullptr) {
@@ -248,7 +249,7 @@ void *ClBufferPool::createDeviceBufferLocked(size_t offset) {
   if (opencl::clEnqueueFillBuffer(cc->command_queue_inst_.GetCommandQueue(),
                                   buf, &zero, sizeof(zero), 0, bytes, 0,
                                   nullptr, nullptr) != CL_SUCCESS) {
-    opencl::clReleaseMemObject(buf);
+    opencl::clReleaseMemObjectT(buf);
     ml_logw("ClBufferPool: zero-filling a %zu byte device buffer failed; the "
             "tensor stays on the shared plane",
             bytes);
@@ -274,7 +275,7 @@ void ClBufferPool::deallocate() {
     std::lock_guard<std::mutex> lk(device_mtx_);
     for (auto &entry : offset_buffer_)
       if (entry.second != nullptr)
-        opencl::clReleaseMemObject(static_cast<cl_mem>(entry.second));
+        opencl::clReleaseMemObjectT(static_cast<cl_mem>(entry.second));
     offset_buffer_.clear();
     offset_size_.clear();
     token_offset_.clear();

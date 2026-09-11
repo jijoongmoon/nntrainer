@@ -127,11 +127,12 @@ static bool tca_ensure(cl_context ctx, cl_mem *buf, size_t *cap, size_t bytes,
   if (*buf && *cap >= bytes)
     return true;
   if (*buf) {
-    opencl::clReleaseMemObject(*buf);
+    opencl::clReleaseMemObjectT(*buf);
     *buf = nullptr;
     *cap = 0;
   }
   cl_int err = CL_SUCCESS;
+  opencl::ClMemAcctScope _acct("scratch:attn");
   *buf = opencl::clCreateBufferT(ctx, flags, bytes, nullptr, &err);
   if (err != CL_SUCCESS || !*buf) {
     *buf = nullptr;
@@ -902,6 +903,7 @@ bool create_ohwi_kv_mirror(bool is_v, unsigned int num_heads_KV,
     (size_t)num_heads_KV * max_S * head_dim * sizeof(uint16_t);
 
   cl_int err = CL_SUCCESS;
+  opencl::ClMemAcctScope _acct(is_v ? "kv:mirror_v" : "kv:mirror_k");
   cl_mem buf =
     opencl::clCreateBufferT(ctx, CL_MEM_READ_WRITE, bytes, nullptr, &err);
   if (err != CL_SUCCESS || buf == nullptr)
@@ -932,7 +934,7 @@ bool create_ohwi_kv_mirror(bool is_v, unsigned int num_heads_KV,
   cl_mem image =
     opencl::clCreateImageT(ctx, CL_MEM_READ_ONLY, &fmt, &d, nullptr, &ie);
   if (ie != CL_SUCCESS || image == nullptr) {
-    opencl::clReleaseMemObject(buf);
+    opencl::clReleaseMemObjectT(buf);
     return false;
   }
   *out_buf = buf;
@@ -944,7 +946,7 @@ bool create_ohwi_kv_mirror(bool is_v, unsigned int num_heads_KV,
 // link OpenCL (the CausalLM layers link only libnntrainer + ccapi).
 void release_cl_mem(void *mem) {
   if (mem)
-    opencl::clReleaseMemObject(reinterpret_cast<cl_mem>(mem));
+    opencl::clReleaseMemObjectT(reinterpret_cast<cl_mem>(mem));
 }
 
 // Create a TIGHT-stride V image2d view over an existing (full-capacity) V
@@ -1398,15 +1400,15 @@ bool two_conv_attention_prefill_f16_img_cl(
                              !sc.q_image || !sc.k_image || !sc.v_image;
   if (shape_changed) {
     if (sc.q_image) {
-      opencl::clReleaseMemObject(sc.q_image);
+      opencl::clReleaseMemObjectT(sc.q_image);
       sc.q_image = nullptr;
     }
     if (sc.k_image) {
-      opencl::clReleaseMemObject(sc.k_image);
+      opencl::clReleaseMemObjectT(sc.k_image);
       sc.k_image = nullptr;
     }
     if (sc.v_image) {
-      opencl::clReleaseMemObject(sc.v_image);
+      opencl::clReleaseMemObjectT(sc.v_image);
       sc.v_image = nullptr;
     }
 
@@ -2054,7 +2056,7 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
       sc.v_ohwi_HD_KV != HD_KV || sc.v_ohwi_S_max != max_seq_len;
     if (v_changed) {
       if (sc.v_ohwi_image) {
-        opencl::clReleaseMemObject(sc.v_ohwi_image);
+        opencl::clReleaseMemObjectT(sc.v_ohwi_image);
         sc.v_ohwi_image = nullptr;
       }
       cl_image_format img_fmt{CL_RGBA, CL_UNSIGNED_INT32};

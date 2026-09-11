@@ -44,6 +44,7 @@ public:
    * @brief     Constructor of TensorPool
    */
   TensorPool() :
+    pool_tag_("pool"),
     allocator_(std::make_shared<MemAllocator>()),
     mem_pool(std::make_unique<MemoryPool>(allocator_)),
     cache_loader(nullptr) {}
@@ -61,6 +62,7 @@ public:
     ml::train::ExecutionMode execution_mode = ml::train::ExecutionMode::TRAIN,
     std::shared_ptr<MemAllocator> allocator =
       std::make_shared<MemAllocator>()) :
+    pool_tag_(fsu_name.empty() ? std::string("pool") : fsu_name),
     allocator_(std::move(allocator)) {
     if (enable_fsu) {
       auto cache_pool = std::make_shared<CachePool>(fsu_path, fsu_name,
@@ -489,6 +491,12 @@ private:
   std::vector<RequestSpec> pool; /**< list of requested tensors */
   std::unordered_map<std::string, unsigned int>
     name_map; /**< indexing of requested tensors */
+
+  /** Which pool this is ("weight_pool" / "tensor_pool"), for the GPU memory
+   *  ledger. The constructor already takes the name for FSU's cache files;
+   *  keeping it unconditionally costs one string and makes the ledger able to
+   *  say which plane a tagged allocation belongs to. */
+  std::string pool_tag_;
   std::shared_ptr<MemAllocator>
     allocator_; /**< backend allocator threaded down to MemoryPool/
                      CachePool. Stored on TensorPool so reinitialize()

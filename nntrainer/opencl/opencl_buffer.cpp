@@ -156,7 +156,7 @@ bool Buffer::UnMapBuffer(CommandQueueManager &command_queue_inst,
  */
 void Buffer::Release() {
   if (mem_buf_) {
-    clReleaseMemObject(mem_buf_);
+    clReleaseMemObjectT(mem_buf_);
     mem_buf_ = nullptr;
   }
   size_ = 0;

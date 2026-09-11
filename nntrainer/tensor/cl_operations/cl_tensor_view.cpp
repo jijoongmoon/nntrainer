@@ -26,10 +26,10 @@ TensorBacking::TensorBacking(cl_context ctx, cl_mem buf, Encoding enc,
 TensorBacking::~TensorBacking() {
   for (auto &kv : image_cache_) {
     if (kv.second)
-      opencl::clReleaseMemObject(kv.second);
+      opencl::clReleaseMemObjectT(kv.second);
   }
   if (owned_ && buf_)
-    opencl::clReleaseMemObject(buf_);
+    opencl::clReleaseMemObjectT(buf_);
 }
 
 cl_mem TensorBacking::imageView(const ViewSpec &spec) {

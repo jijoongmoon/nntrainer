@@ -2298,6 +2298,7 @@ std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
   // collapse it to a single zero-copy allocation. It does the opposite: +1434MB
   // peak. The plain device buffer below is already the single copy.
   const bool hostptr = v8c_hostptr_on();
+  opencl::ClMemAcctScope _acct("w:v8c_repack");
   cl_mem_flags wflags = CL_MEM_READ_ONLY;
   if (hostptr)
     wflags |= CL_MEM_ALLOC_HOST_PTR;
@@ -2374,7 +2375,7 @@ std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
       cq, w_buf, CL_TRUE, CL_MAP_WRITE_INVALIDATE_REGION, 0, total_bytes, 0,
       nullptr, nullptr, &err));
     if (err != CL_SUCCESS || !map_ptr) {
-      opencl::clReleaseMemObject(w_buf);
+      opencl::clReleaseMemObjectT(w_buf);
       throw std::runtime_error(
         "make_v8c_weight_backing_from_qs4cx: clEnqueueMapBuffer failed: " +
         std::to_string(err));
@@ -2495,7 +2496,7 @@ std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
     for (auto &th : crew)
       th.join();
     if (chunk_err.load() != CL_SUCCESS) {
-      opencl::clReleaseMemObject(w_buf);
+      opencl::clReleaseMemObjectT(w_buf);
       throw std::runtime_error(
         "make_v8c_weight_backing_from_qs4cx: chunk write failed: " +
         std::to_string(chunk_err.load()));
@@ -2534,7 +2535,7 @@ std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
             cq, w_buf, CL_FALSE, n0 * v8c_row_bytes, nrows * v8c_row_bytes,
             chunk_staging.data(), 0, nullptr, &ev);
           if (werr != CL_SUCCESS) {
-            opencl::clReleaseMemObject(w_buf);
+            opencl::clReleaseMemObjectT(w_buf);
             throw std::runtime_error(
               "make_v8c_weight_backing_from_qs4cx: chunk write failed: " +
               std::to_string(werr));
@@ -2545,7 +2546,7 @@ std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
             cq, w_buf, CL_TRUE, n0 * v8c_row_bytes, nrows * v8c_row_bytes,
             packed.data(), 0, nullptr, nullptr);
           if (werr != CL_SUCCESS) {
-            opencl::clReleaseMemObject(w_buf);
+            opencl::clReleaseMemObjectT(w_buf);
             throw std::runtime_error(
               "make_v8c_weight_backing_from_qs4cx: chunk write failed: " +
               std::to_string(werr));
@@ -2558,7 +2559,7 @@ std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
     const cl_int uerr =
       opencl::clEnqueueUnmapMemObject(cq, w_buf, map_ptr, 0, nullptr, nullptr);
     if (uerr != CL_SUCCESS) {
-      opencl::clReleaseMemObject(w_buf);
+      opencl::clReleaseMemObjectT(w_buf);
       throw std::runtime_error(
         "make_v8c_weight_backing_from_qs4cx: clEnqueueUnmapMemObject failed: " +
         std::to_string(uerr));
@@ -2579,6 +2580,7 @@ std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
     /** owned */ true);
 
   // Per-channel scale: QS4CX stores fp32 directly (no fp16->fp32 promotion).
+  opencl::ClMemAcctScope _acct_aux("w:v8c_aux");
   cl_mem sb =
     opencl::clCreateBufferT(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
                             sizeof(float) * N, (void *)fp32_scales, &err);
@@ -2594,7 +2596,7 @@ std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
     // The scale buffer is this function's until both out-parameters are set:
     // the caller's handler cannot release what it was never handed, so a
     // throw between the two allocations would leak it.
-    opencl::clReleaseMemObject(sb);
+    opencl::clReleaseMemObjectT(sb);
     throw std::runtime_error("make_v8c_weight_backing_from_qs4cx: "
                              "clCreateBuffer (row_sum) failed: " +
                              std::to_string(err));
@@ -2896,11 +2898,11 @@ bool lmhead_gemv_q6_k_cl(const void *w_q6k_host, const float *act_f32_host,
     if (!e.x || !e.out) {
       std::fprintf(stderr, "[lmhead-q6k] act/out clCreateBuffer err=%d\n", err);
       if (e.w)
-        opencl::clReleaseMemObject(e.w);
+        opencl::clReleaseMemObjectT(e.w);
       if (e.x)
-        opencl::clReleaseMemObject(e.x);
+        opencl::clReleaseMemObjectT(e.x);
       if (e.out)
-        opencl::clReleaseMemObject(e.out);
+        opencl::clReleaseMemObjectT(e.out);
       cache.erase(w_q6k_host);
       return false;
     }
@@ -3059,7 +3061,7 @@ bool lmhead_int4_v8c_gemv_cl(void *w_buf_clmem, void *scale_buf_clmem,
   const size_t out_bytes = sizeof(uint16_t) * (size_t)N;
   if (out_buf == nullptr || out_cap < out_bytes) {
     if (out_buf)
-      opencl::clReleaseMemObject(out_buf);
+      opencl::clReleaseMemObjectT(out_buf);
     cl_int e = CL_SUCCESS;
     out_buf =
       opencl::clCreateBufferT(ctx, CL_MEM_WRITE_ONLY, out_bytes, nullptr, &e);
@@ -3229,11 +3231,11 @@ bool lmhead_gemv_fp32w_cl(const void *w_fp32_host, const void *act_fp16_host,
       std::fprintf(stderr, "[lmhead-fp32w] act/out clCreateBuffer err=%d\n",
                    err);
       if (e.w)
-        opencl::clReleaseMemObject(e.w);
+        opencl::clReleaseMemObjectT(e.w);
       if (e.x)
-        opencl::clReleaseMemObject(e.x);
+        opencl::clReleaseMemObjectT(e.x);
       if (e.out)
-        opencl::clReleaseMemObject(e.out);
+        opencl::clReleaseMemObjectT(e.out);
       cache.erase(w_fp32_host);
       return false;
     }

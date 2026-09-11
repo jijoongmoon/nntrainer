@@ -33,6 +33,25 @@
 #include <utility>
 #include <vector>
 
+#include <compute_ops.h>
+#include <env_compat.h> // nntr_env_on: value-checked read of auto-injected flags
+#include <neuralnet.h>
+
+#if defined(ENABLE_OPENCL)
+#include <cl_context.h> // OpenCL-only; registration uses the Engine facade.
+
+namespace nntrainer::opencl {
+/**
+ * @brief GPU memory ledger phase boundary.
+ *
+ * Declared rather than included: the ledger lives behind the OpenCL backend's
+ * own headers and the app wants exactly this one call, so that the phases a
+ * footprint question turns on (load / prefill / decode) are named by the only
+ * code that knows where they are. Inert unless NNTR_GPU_MEM_ACCT is set.
+ */
+void clMemAcctDump(const char *phase);
+} // namespace nntrainer::opencl
+#endif
 #include <common.h>
 #include <layer_context.h>
 #include <lm_head.h>
@@ -363,6 +382,12 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
                    const WSTR tail_prompt, bool log_output) {
 
   auto start_total = std::chrono::high_resolution_clock::now();
+#if defined(ENABLE_OPENCL)
+  /** Load is finished here and no forward has run: everything in the ledger at
+   *  this point is weights, planes and mirrors, i.e. the part of the footprint
+   *  that a prompt cannot change. */
+  nntrainer::opencl::clMemAcctDump("after-load");
+#endif
   if (!is_initialized) {
     throw std::runtime_error("CausalLM model is not initialized. Please call "
                              "initialize() before run().");
@@ -615,6 +640,12 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN] =
       static_cast<float>(id_list[b]);
 
+#if defined(ENABLE_OPENCL)
+  /** The GPU footprint peaks somewhere between "the graph is built" and "the
+   *  first token is out", and which side of the prefill it peaks on decides
+   *  which lever is worth building. Name the boundary. */
+  nntrainer::opencl::clMemAcctDump("after-prefill");
+#endif
   auto start_generation = std::chrono::high_resolution_clock::now();
 
   for (unsigned int token_generation_idx = input_len + 1;
@@ -684,6 +715,9 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   auto finish_total = std::chrono::high_resolution_clock::now();
   auto total_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
     finish_total - start_total);
+#if defined(ENABLE_OPENCL)
+  nntrainer::opencl::clMemAcctDump("after-decode");
+#endif
   size_t peak_memory = getPeakMemoryKb();
 
   if (log_output) {

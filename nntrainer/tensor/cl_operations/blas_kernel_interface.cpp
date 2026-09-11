@@ -616,11 +616,12 @@ static bool v8c_ensure_buf(cl_context ctx, cl_mem *buf, size_t *cap,
   if (*buf && *cap >= bytes)
     return true;
   if (*buf) {
-    opencl::clReleaseMemObject(*buf);
+    opencl::clReleaseMemObjectT(*buf);
     *buf = nullptr;
     *cap = 0;
   }
   cl_int err = CL_SUCCESS;
+  opencl::ClMemAcctScope _acct("scratch:v8c");
   *buf = opencl::clCreateBufferT(ctx, flags, bytes, nullptr, &err);
   if (err != CL_SUCCESS || !*buf) {
     *buf = nullptr;
@@ -804,9 +805,9 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
       // class of failure is a crash or a garbage weight read on the very
       // next FC).
       if (e.scale_buf)
-        opencl::clReleaseMemObject(e.scale_buf);
+        opencl::clReleaseMemObjectT(e.scale_buf);
       if (e.row_sum_w_int4)
-        opencl::clReleaseMemObject(e.row_sum_w_int4);
+        opencl::clReleaseMemObjectT(e.row_sum_w_int4);
       return &it->second;
     }
     if (it != cache.end())
@@ -1337,7 +1338,7 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
       if (hit < 0) {
         for (int i = 0; i < cap; ++i) {
           if (views[i].image != nullptr && views[i].buf != act_i8_arg) {
-            opencl::clReleaseMemObject(views[i].image);
+            opencl::clReleaseMemObjectT(views[i].image);
             views[i] = V8cScratch::ActView{};
             if (free_slot < 0)
               free_slot = i;
@@ -1345,7 +1346,7 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
         }
         int use = free_slot >= 0 ? free_slot : victim;
         if (views[use].image != nullptr) {
-          opencl::clReleaseMemObject(views[use].image);
+          opencl::clReleaseMemObjectT(views[use].image);
           views[use] = V8cScratch::ActView{};
         }
         cl_mem img = opencl::clCreateImageT(ctx, CL_MEM_READ_ONLY, &afmt,
