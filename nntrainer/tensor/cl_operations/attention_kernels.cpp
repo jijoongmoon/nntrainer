@@ -1418,7 +1418,7 @@ bool two_conv_attention_prefill_f16_img_cl(
     qd.image_row_pitch = HD_Q * sizeof(uint16_t);
     qd.buffer = sc.q_buf;
     sc.q_image = opencl::clCreateImageT(ctx, CL_MEM_READ_ONLY, &img_fmt, &qd,
-                                       nullptr, &err);
+                                        nullptr, &err);
     if (err != CL_SUCCESS || !sc.q_image)
       return false;
 
@@ -1429,14 +1429,14 @@ bool two_conv_attention_prefill_f16_img_cl(
     kd.image_row_pitch = HD_KV * sizeof(uint16_t);
     kd.buffer = sc.k_buf;
     sc.k_image = opencl::clCreateImageT(ctx, CL_MEM_READ_ONLY, &img_fmt, &kd,
-                                       nullptr, &err);
+                                        nullptr, &err);
     if (err != CL_SUCCESS || !sc.k_image)
       return false;
 
     cl_image_desc vd = kd;
     vd.buffer = sc.v_buf;
     sc.v_image = opencl::clCreateImageT(ctx, CL_MEM_READ_ONLY, &img_fmt, &vd,
-                                       nullptr, &err);
+                                        nullptr, &err);
     if (err != CL_SUCCESS || !sc.v_image)
       return false;
 
@@ -2066,7 +2066,7 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
       vd.buffer = v_buf_in;
       cl_int err = CL_SUCCESS;
       sc.v_ohwi_image = opencl::clCreateImageT(ctx, CL_MEM_READ_ONLY, &img_fmt,
-                                              &vd, nullptr, &err);
+                                               &vd, nullptr, &err);
       if (err != CL_SUCCESS || !sc.v_ohwi_image) {
         sc.v_ohwi_image = nullptr;
         return false;

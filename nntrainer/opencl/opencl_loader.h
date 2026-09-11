@@ -304,9 +304,8 @@ cl_mem clCreateSubBufferT(cl_mem buffer, cl_mem_flags flags,
                           cl_buffer_create_type type, const void *info,
                           cl_int *errcode_ret);
 cl_mem clCreateImageT(cl_context context, cl_mem_flags flags,
-                      const cl_image_format *format,
-                      const cl_image_desc *desc, void *host_ptr,
-                      cl_int *errcode_ret);
+                      const cl_image_format *format, const cl_image_desc *desc,
+                      void *host_ptr, cl_int *errcode_ret);
 void *clSVMAllocT(cl_context context, cl_svm_mem_flags flags, size_t size,
                   unsigned int alignment);
 } // namespace nntrainer::opencl

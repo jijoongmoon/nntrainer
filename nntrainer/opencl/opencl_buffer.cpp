@@ -42,8 +42,7 @@ Buffer::Buffer(ContextManager &context_manager, size_t size_in_bytes,
   cl_int error_code;
 
   // clCreateBuffer returns NULL with error code if fails
-  mem_buf_ =
-    clCreateBufferT(context, flags, size_in_bytes, data, &error_code);
+  mem_buf_ = clCreateBufferT(context, flags, size_in_bytes, data, &error_code);
   size_ = size_in_bytes;
   if (!mem_buf_) {
     size_ = 0;
