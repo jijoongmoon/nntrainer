@@ -26,16 +26,17 @@
 #include "model_common_properties.h"
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <compute_ops.h>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <future>
 #include <iomanip>
+#include <load_trace.h>
 #include <mutex>
 #include <sstream>
 #include <thread>
@@ -46,7 +47,6 @@
 
 #if !defined(_WIN32)
 #include <fcntl.h> // posix_fadvise: drop the weight file's page cache after the load
-#include <load_trace.h>
 #endif
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
 #include <cuda_fc_qs4cx.h> // [wprefetch] cuda_fc_qs4cx_prefetch_weight
