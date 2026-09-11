@@ -159,6 +159,14 @@ private:
   void *devicePlaneBaseLocked(size_t span);
 
   /**
+   * @brief Register this pool's skip candidates with the plane canary.
+   * @details No-op unless NNTR_CLMEM_PLANE_CANARY is set. Registers, but does
+   *          not protect: clPlaneCanaryArm() does that at the first forward.
+   * @note Caller holds device_mtx_.
+   */
+  void registerPlaneCanaryCandidates();
+
+  /**
    * @brief Create the device buffer for one planner offset, or return nullptr.
    * @param offset planner offset
    * @return the cl_mem, or nullptr when the device cannot back it
@@ -166,6 +174,17 @@ private:
    */
   void *createDeviceBufferLocked(size_t offset);
 };
+
+/**
+ * @brief Arm the NNTR_CLMEM_PLANE_CANARY page protection.
+ *
+ * @details Call once at the first forward, after every legitimate host write to
+ * the plane (initialisers, weight load) has happened, so that what faults from
+ * here on is a host access on the INFERENCE path -- which is the question the
+ * canary asks. A no-op when NNTR_CLMEM_PLANE_CANARY is unset, when no pool
+ * registered candidates, or on Windows. Diagnostic only.
+ */
+void clPlaneCanaryArm();
 
 } // namespace nntrainer
 

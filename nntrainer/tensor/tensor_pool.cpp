@@ -275,8 +275,16 @@ void TensorPool::allocate(bool init) {
    *  A declared raise/lower boundary is excluded even though it classifies
    *  GPU_CLMEM: those are exactly the tensors whose host side IS written (a
    *  raise uploads it, a lower reads back into it), so their shared slice is
-   *  live memory, not a duplicate. */
+   *  live memory, not a duplicate. So is a declared host_plane tensor, which
+   *  is the same statement for a producer the class cannot see: an embedding
+   *  lookup writes its output with CPU stores while every consumer of it is a
+   *  device kernel, so the heuristic calls it device-only and it is not.
+   *  Measured rather than assumed -- NNTR_CLMEM_PLANE_CANARY protects exactly
+   *  the set this loop produces and names whoever faults. */
   {
+    const char *host_plane = policy.host_plane_patterns.empty()
+                               ? nullptr
+                               : policy.host_plane_patterns.c_str();
     std::vector<unsigned int> device_only;
     for (auto &spec : pool) {
       auto details = std::get_if<SourceDetails>(&spec.details);
@@ -284,7 +292,8 @@ void TensorPool::allocate(bool init) {
         continue;
       const std::string &nm = spec.tensor->getName();
       if (ResidencyPlanner::nameMatchesAny(nm, planner.raise) ||
-          ResidencyPlanner::nameMatchesAny(nm, planner.lower))
+          ResidencyPlanner::nameMatchesAny(nm, planner.lower) ||
+          ResidencyPlanner::nameMatchesAny(nm, host_plane))
         continue;
       ResidencyClass cls = planner.classify(
         details->engine, details->all_consumers_device,
@@ -343,6 +352,30 @@ void TensorPool::allocate(bool init) {
           cls = ResidencyClass::SVM;
       }
       md->setResidency(cls, dev);
+
+      /** NNTR_CLMEM_RESIDENCY_DUMP: one line per tensor naming the plane the
+       *  planner put it on. Written to stderr rather than the log because the
+       *  log ring buffer drops lines under load, which makes the partition
+       *  counts lie -- and the whole point of this dump is to compare two
+       *  runs' partitions exactly. */
+      static const bool dump_residency =
+        std::getenv("NNTR_CLMEM_RESIDENCY_DUMP") != nullptr;
+      if (dump_residency) {
+        const char *cn = cls == ResidencyClass::GPU_CLMEM ? "GPU_CLMEM"
+                         : cls == ResidencyClass::SVM     ? "SVM"
+                                                          : "HOST";
+        std::fprintf(stderr,
+                     "[residency] %-44s %-9s eng=%d allcons=%d "
+                     "fp16=%d init=%d dev=%p host=%p bytes=%zu\n",
+                     spec.tensor->getName().c_str(), cn, (int)details->engine,
+                     (int)details->all_consumers_device,
+                     (int)(spec.tensor->getDataType() ==
+                           ml::train::TensorDim::DataType::FP16),
+                     (int)(spec.tensor->getInitializer() != Initializer::NONE),
+                     dev, spec.tensor->getData(),
+                     spec.tensor->getMemoryBytes());
+        std::fflush(stderr);
+      }
     }
 
     syncDependents(spec);

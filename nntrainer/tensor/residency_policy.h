@@ -49,6 +49,23 @@ struct ResidencyPolicy {
   /** comma-separated substring patterns for tensors kept off the device plane
    */
   std::string exclude_patterns;
+  /** comma-separated substring patterns for tensors that MAY be device
+   *  resident but whose shared-plane slice is live memory, because host code
+   *  reads or writes it on the inference path.
+   *
+   *  This does not move a tensor: it only says the shared half of a
+   *  double-planed tensor cannot be dropped. A pool that holds both planes
+   *  (ClBufferPool) charges every GPU_CLMEM tensor twice, and dropping the
+   *  shared half is only sound for the tensors nothing on the host addresses.
+   *  An embedding lookup is the standing example: it is a host gather whose
+   *  output the planner classifies device-resident because every CONSUMER is
+   *  a device kernel, so nothing in the class itself says the producer wrote
+   *  it with CPU stores. Measured with NNTR_CLMEM_PLANE_CANARY. */
+  std::string host_plane_patterns;
+  /** the application has audited its host accesses (host_plane_patterns above)
+   *  and asks the pool to drop the shared slice of every other device-resident
+   *  tensor. NNTR_CLMEM_SKIP_SHARED still overrides in both directions. */
+  bool skip_shared_slice = false;
   /** layer types that are engine-neutral consumers of the device plane */
   std::vector<std::string> engine_neutral_types;
 

@@ -17,9 +17,20 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <vector>
+
+#ifndef _WIN32
+#include <csignal>
+#include <dlfcn.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <unwind.h>
+#endif
 
 #include <cl_context.h>
 #include <engine.h>
+#include <residency_policy.h>
 #include <nntrainer_log.h>
 #include <opencl_loader.h>
 
@@ -31,6 +42,155 @@ namespace {
 ClContext *clContext() {
   return static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
 }
+
+
+// ---------------------------------------------------------------------------
+// NNTR_CLMEM_PLANE_CANARY -- which pooled planes does the HOST actually touch?
+//
+// Every planner offset the residency planner classified GPU_CLMEM gets a device
+// cl_mem sub-buffer AND keeps its slice of the shared SVM plane, so the
+// activation plane is charged twice. Dropping the shared half wholesale
+// (NNTR_CLMEM_SKIP_SHARED=1) saves 96.6 MiB and
+// changes the answer, because a handful of those offsets DO have a host reader
+// or writer and the drop leaves it addressing nothing.
+//
+// This is the measurement that separates the two sets. Arm it and every
+// candidate offset's shared slice is mprotect()ed; a host access faults, the
+// handler names the offset and unprotects it (permanently, so the run
+// completes), and the exit report lists touched vs untouched with bytes. The
+// untouched set is exactly the set a correct skip may drop.
+//
+// The device is unaffected: it reaches these bytes through the kgsl mapping,
+// not through this process' CPU page tables, so a fault here is a HOST access
+// by construction -- the same property NNTR_QP_CANARY relies on.
+//
+//   =1  PROT_READ  -- host WRITES only
+//   =2  PROT_NONE  -- any host access, read or write (this is the set that
+//                     decides the skip; a read of a slice that does not exist
+//                     is just as fatal as a write)
+//
+// Diagnostic only, off by default, and nothing is armed when the env is absent.
+#ifndef _WIN32
+struct PlaneCanaryRange {
+  size_t offset;    /**< planner offset */
+  size_t bytes;     /**< largest token the planner placed there */
+  uintptr_t lo, hi; /**< page-aligned protected interior */
+  int hits;         /**< host accesses seen */
+  bool touched;     /**< at least one host access */
+};
+
+/** Fixed after arming; the handler only mutates hits/touched, never the
+ *  container, so no allocation happens on the signal path. */
+std::vector<PlaneCanaryRange> g_pc_ranges;
+size_t g_pc_untouched_bytes = 0; /**< bytes still protected, for the report */
+bool g_pc_armed = false;
+struct sigaction g_pc_prev_segv {};
+struct sigaction g_pc_prev_bus {};
+
+int planeCanaryMode() {
+  static const int m = [] {
+    const char *e = std::getenv("NNTR_CLMEM_PLANE_CANARY");
+    return (e != nullptr && e[0] != 0) ? std::atoi(e) : 0;
+  }();
+  return m;
+}
+
+_Unwind_Reason_Code pc_unwind_cb(struct _Unwind_Context *ctx, void *arg) {
+  int *n = static_cast<int *>(arg);
+  const uintptr_t pc = _Unwind_GetIP(ctx);
+  if (pc == 0 || *n >= 20)
+    return _URC_END_OF_STACK;
+  Dl_info info{};
+  char line[256];
+  if (dladdr(reinterpret_cast<void *>(pc), &info) && info.dli_sname != nullptr) {
+    std::snprintf(line, sizeof(line), "[PLANE-CANARY]  #%02d %s + 0x%lx (%s)\n",
+                  *n, info.dli_sname,
+                  (unsigned long)((uintptr_t)pc - (uintptr_t)info.dli_saddr),
+                  info.dli_fname ? info.dli_fname : "?");
+  } else if (dladdr(reinterpret_cast<void *>(pc), &info)) {
+    std::snprintf(line, sizeof(line), "[PLANE-CANARY]  #%02d +0x%lx (%s)\n", *n,
+                  (unsigned long)((uintptr_t)pc - (uintptr_t)info.dli_fbase),
+                  info.dli_fname ? info.dli_fname : "?");
+  } else {
+    std::snprintf(line, sizeof(line), "[PLANE-CANARY]  #%02d %p\n", *n,
+                  (void *)pc);
+  }
+  ssize_t w = write(2, line, std::strlen(line));
+  (void)w;
+  ++(*n);
+  return _URC_NO_REASON;
+}
+
+void pc_sigsegv(int sig, siginfo_t *si, void *uc) {
+  const uintptr_t a = reinterpret_cast<uintptr_t>(si->si_addr);
+  for (auto &r : g_pc_ranges) {
+    if (a < r.lo || a >= r.hi)
+      continue;
+    const bool first = !r.touched;
+    r.touched = true;
+    ++r.hits;
+    /** Unprotect for the rest of the run: the question is WHICH offsets the
+     *  host touches, and one fault per offset answers it. Leaving it protected
+     *  would turn a hot loop into a fault storm and change what the run
+     *  measures. */
+    mprotect(reinterpret_cast<void *>(r.lo), (size_t)(r.hi - r.lo),
+             PROT_READ | PROT_WRITE);
+    if (first) {
+      char head[256];
+      std::snprintf(head, sizeof(head),
+                    "\n[PLANE-CANARY] HOST access at %p -- planner offset %zu "
+                    "(%.2f MiB), byte %ld of the slice\n",
+                    si->si_addr, r.offset, r.bytes / 1048576.0,
+                    (long)(a - r.lo));
+      ssize_t w = write(2, head, std::strlen(head));
+      (void)w;
+      int n = 0;
+      _Unwind_Backtrace(pc_unwind_cb, &n);
+    }
+    return;
+  }
+
+  /** Not one of ours: restore the previous disposition and let the real fault
+   *  happen, so this diagnostic cannot swallow a genuine crash. */
+  const struct sigaction *prev = (sig == SIGBUS) ? &g_pc_prev_bus : &g_pc_prev_segv;
+  sigaction(sig, prev, nullptr);
+  (void)uc;
+}
+
+struct PlaneCanaryReport {
+  ~PlaneCanaryReport() {
+    if (!g_pc_armed)
+      return;
+    size_t touched_bytes = 0, untouched_bytes = 0;
+    int touched_n = 0;
+    for (const auto &r : g_pc_ranges) {
+      if (r.touched) {
+        ++touched_n;
+        touched_bytes += r.bytes;
+        std::fprintf(stderr,
+                     "[PLANE-CANARY] TOUCHED offset %10zu  %8.2f MiB  hits=%d\n",
+                     r.offset, r.bytes / 1048576.0, r.hits);
+      } else {
+        untouched_bytes += r.bytes;
+      }
+    }
+    for (const auto &r : g_pc_ranges)
+      if (!r.touched)
+        std::fprintf(stderr,
+                     "[PLANE-CANARY] clean   offset %10zu  %8.2f MiB\n",
+                     r.offset, r.bytes / 1048576.0);
+    std::fprintf(stderr,
+                 "[PLANE-CANARY] mode=%d: %d of %zu candidate offsets touched "
+                 "by the host (%.1f MiB); %zu clean (%.1f MiB droppable)\n",
+                 planeCanaryMode(), touched_n, g_pc_ranges.size(),
+                 touched_bytes / 1048576.0, g_pc_ranges.size() - touched_n,
+                 untouched_bytes / 1048576.0);
+    std::fflush(stderr);
+    (void)g_pc_untouched_bytes;
+  }
+};
+PlaneCanaryReport g_pc_report;
+#endif // _WIN32
 
 } // namespace
 
@@ -96,32 +256,54 @@ void ClBufferPool::allocate() {
    *   1           leave their shared slice unallocated,
    *   2           allocate per offset but skip nothing (the control arm that
    *               isolates the per-offset allocation shape from the skip),
-   *   0 (default) the pre-existing single-buffer plane.
+   *   0           the pre-existing single-buffer plane.
    *
-   *  The skip is OFF by default because its premise -- that a GPU_CLMEM tensor
-   *  is one no host code touches -- is a property of the GRAPH, not of the
-   *  pool. A model whose attention lowers an input back to the host
-   *  (clmem_lower_cl -> clEnqueueReadBuffer into Tensor::getData()) has no
-   *  shared-plane destination for that read-back once the slice is gone: 3/3
-   *  runs died with "clmem_lower_cl: buffer read-back failed for
-   *  layer0_attention:input0", while =0 gave rc=0 and the byte-identical
-   *  reference output. A graph that never takes that path is unaffected either
-   *  way and can opt in with =1. Making this safe by default needs either a
-   *  narrower qualification rule (exclude the offsets a host read-back path
-   *  touches) or a lazy fallback in clmem_lower_cl that reads into a temporary
-   *  host buffer when the tensor has no shared plane.
+   *  Unset, the answer is the application's: ResidencyPolicy::skip_shared_slice
+   *  means "I have declared every tensor of mine the host touches
+   *  (host_plane_patterns), so drop the rest". No model in tree sets it, so the
+   *  default is 0; the env overrides in both directions and stays the A/B arm.
    *
    *  Measured on an Adreno 840 device: the shared plane holds 132.5 MiB that
-   *  the host touches 17.9 MiB of, because every offset the planner classified
+   *  the host touches 24.0 MiB of, because every offset the planner classified
    *  GPU_CLMEM gets a device cl_mem AND keeps its slice of the shared plane. On
    *  this driver an SVM allocation is a kernel-side mapping, so those bytes are
    *  charged to the GPU whether or not anything reads them.
+   *
+   *  WHAT QUALIFIES, and how it is known. The premise -- that a GPU_CLMEM
+   *  tensor is one no host code touches -- is a statement about CONSUMERS, and
+   *  the planner only checks consumers. A host PRODUCER that writes its output
+   *  with CPU stores classifies device-only and is not: an embedding lookup
+   *  does exactly that (EmbeddingLayer::incremental_forwarding stores into its
+   *  own output from worker threads), and a model whose attention lowers an
+   *  input back to the host (clmem_lower_cl -> clEnqueueReadBuffer into
+   *  Tensor::getData()) reads one. With the slice skipped and neither declared,
+   *  one measured model died 3/3 with "clmem_lower_cl: buffer read-back failed
+   *  for layer0_attention:input0" and another survived but answered differently
+   *  -- 1 363 bytes instead of the reference 821, in both of two runs and at
+   *  both prompt lengths. So an application opts in by DECLARING what the host
+   *  touches, and TensorPool::allocate() keeps the shared slice for those.
+   *  NNTR_CLMEM_PLANE_CANARY is the instrument that checks a declaration is
+   *  complete -- it mprotects exactly the set that would be dropped and names
+   *  whoever faults. On the measured lane it reports 2 of 31 candidate offsets
+   *  touched, both by the embedding, in prefill and decode and at 1 and 4
+   *  chunks alike.
+   *
+   *  Even with a complete declaration this lever is NOT sound wherever the
+   *  attention path binds a device-only tensor by SVM pointer rather than by
+   *  handle: the OHWI GPU-RoPE in mha_core does that for Q/K/V, so a dropped
+   *  slice hands a kernel a null SVM pointer, the device reads zeros through
+   *  its own mapping and the model answers something else -- which no host-page
+   *  canary can see, the access being a DEVICE read. That is why no model in
+   *  tree sets skip_shared_slice, and why the plane's double charge is removed
+   *  by aliasing the two planes instead (see devicePlaneBaseLocked).
    *
    *  Skipping needs the per-offset path: a hole cannot be left in one
    *  contiguous allocation. */
   const int skip_mode = [] {
     const char *e = std::getenv("NNTR_CLMEM_SKIP_SHARED");
-    return (e != nullptr && e[0] != 0) ? std::atoi(e) : 0;
+    if (e != nullptr && e[0] != 0)
+      return std::atoi(e);
+    return ResidencyPolicy::global().skip_shared_slice ? 1 : 0;
   }();
 
   std::lock_guard<std::mutex> lk(device_mtx_);
@@ -232,6 +414,8 @@ void ClBufferPool::allocate() {
                  biggest / 1048576.0, align, aligned, offset_size_.size());
     std::fflush(stderr);
   }
+
+  registerPlaneCanaryCandidates();
 }
 
 /**
@@ -401,6 +585,96 @@ void *ClBufferPool::createDeviceBufferLocked(size_t offset) {
 
   offset_buffer_[offset] = static_cast<void *>(buf);
   return offset_buffer_[offset];
+}
+
+/**
+ * @brief Hand the plane canary the offsets a skip would drop.
+ *
+ * @details Same qualification as NNTR_CLMEM_SKIP_SHARED=1 -- an offset counts
+ * only when EVERY token the planner put there is device-only -- so what the
+ * canary protects is exactly what the skip would leave unallocated. Nothing is
+ * protected yet: arming happens at the first forward (clPlaneCanaryArm), after
+ * the initialisers and the weight load have had their legitimate go at the
+ * plane.
+ */
+void ClBufferPool::registerPlaneCanaryCandidates() {
+#ifndef _WIN32
+  if (planeCanaryMode() == 0 || device_only_tokens_.empty())
+    return;
+  void *base = getMemoryPoolAddress();
+  if (base == nullptr)
+    return; /** allocateFSU() path: no contiguous plane to slice */
+
+  std::unordered_set<size_t> device_only_offsets;
+  for (unsigned int tok : device_only_tokens_) {
+    const size_t i = tok - 1;
+    if (i < token_offset_.size())
+      device_only_offsets.insert(token_offset_[i]);
+  }
+  std::unordered_set<unsigned int> dev_tok(device_only_tokens_.begin(),
+                                           device_only_tokens_.end());
+  std::unordered_set<size_t> host_offsets;
+  for (size_t i = 0; i < token_offset_.size(); ++i)
+    if (dev_tok.find(static_cast<unsigned int>(i + 1)) == dev_tok.end())
+      host_offsets.insert(token_offset_[i]);
+
+  const long pg = sysconf(_SC_PAGESIZE);
+  for (size_t off : device_only_offsets) {
+    if (host_offsets.find(off) != host_offsets.end())
+      continue;
+    auto sit = offset_size_.find(off);
+    if (sit == offset_size_.end() || sit->second == 0)
+      continue;
+    const uintptr_t p = reinterpret_cast<uintptr_t>(base) + off;
+    const uintptr_t lo = (p + pg - 1) & ~(uintptr_t)(pg - 1);
+    const uintptr_t hi = (p + sit->second) & ~(uintptr_t)(pg - 1);
+    if (hi <= lo)
+      continue; /** shorter than a page interior: nothing to protect */
+    g_pc_ranges.push_back(PlaneCanaryRange{off, sit->second, lo, hi, 0, false});
+  }
+  std::fprintf(stderr,
+               "[PLANE-CANARY] %zu candidate offsets registered on plane %p "
+               "(mode %d); arming at the first forward\n",
+               g_pc_ranges.size(), base, planeCanaryMode());
+  std::fflush(stderr);
+#endif
+}
+
+void clPlaneCanaryArm() {
+#ifndef _WIN32
+  const int mode = planeCanaryMode();
+  if (mode == 0 || g_pc_armed || g_pc_ranges.empty())
+    return;
+  g_pc_armed = true;
+
+  struct sigaction sa {};
+  sa.sa_sigaction = pc_sigsegv;
+  sa.sa_flags = SA_SIGINFO;
+  sigemptyset(&sa.sa_mask);
+  sigaction(SIGSEGV, &sa, &g_pc_prev_segv);
+  sigaction(SIGBUS, &sa, &g_pc_prev_bus);
+
+  const int prot = (mode >= 2) ? PROT_NONE : PROT_READ;
+  size_t armed_bytes = 0;
+  size_t failed = 0;
+  for (auto &r : g_pc_ranges) {
+    if (mprotect(reinterpret_cast<void *>(r.lo), (size_t)(r.hi - r.lo), prot) !=
+        0) {
+      /** Treat a refusal as "host-touchable": an offset we could not watch
+       *  must not be reported clean. */
+      r.touched = true;
+      ++failed;
+      continue;
+    }
+    armed_bytes += r.bytes;
+  }
+  std::fprintf(stderr,
+               "[PLANE-CANARY] armed %zu ranges (%.1f MiB) with prot=%s; "
+               "%zu mprotect failures\n",
+               g_pc_ranges.size() - failed, armed_bytes / 1048576.0,
+               prot == PROT_NONE ? "NONE" : "READ", failed);
+  std::fflush(stderr);
+#endif
 }
 
 void *ClBufferPool::deviceMemory(unsigned int idx) {
