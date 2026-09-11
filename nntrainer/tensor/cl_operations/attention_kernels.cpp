@@ -2006,6 +2006,68 @@ bool two_conv_attention_prefill_f16_ohwi_kvimg_view_cl(
 // dispatch the new sv_matmul_f16_ohwi_img kernel. Same Adreno-image-
 // cache mechanism that v8c FC exploits for 87% peak.
 // =============================================================================
+// =============================================================================
+// Host mirror of two_conv_attention.cl's tca_score_band(). Same integer
+// arithmetic, so the grid the host launches and the band the kernels compute
+// cannot drift. See THE SCORE-BAND CONTRACT in two_conv_attention.cl.
+// =============================================================================
+static inline void tca_score_band_host(int M, int N_kv, int causal,
+                                       int local_window, int pair_lo,
+                                       int pair_hi, int align_lo, int *n_lo,
+                                       int *n_hi) {
+  int lo = 0;
+  int hi = N_kv;
+  if (causal) {
+    const int q_off = N_kv - M;
+    int tex_hi = (N_kv + 7) >> 3;
+    const int tex_hi_causal = ((q_off + pair_hi) >> 3) + 1;
+    if (tex_hi_causal < tex_hi)
+      tex_hi = tex_hi_causal;
+    if (local_window > 0) {
+      const int n_first = q_off + pair_lo - local_window + 1;
+      int t0 = 0;
+      if (n_first > 0)
+        t0 = n_first >> 3;
+      if (t0 > tex_hi)
+        t0 = tex_hi;
+      lo = t0 << 3;
+      if (align_lo > 1)
+        lo = lo & ~(align_lo - 1);
+    }
+    hi = tex_hi << 3;
+    if (hi > N_kv)
+      hi = N_kv;
+  }
+  if (lo > hi)
+    lo = hi;
+  *n_lo = lo;
+  *n_hi = hi;
+}
+
+// sv_matmul's sliding-window floor (NNTR_SV_WIN=0 = the old full-range loop).
+// Hoisted to file scope because the score band is only valid while sv honours
+// it: with SV_WIN off sv reads from texel 0 and nothing may be banded.
+static bool attn_sv_win_on() {
+  static const bool v = []() {
+    const char *e = std::getenv("NNTR_SV_WIN");
+    return e ? (std::atoi(e) != 0) : true;
+  }();
+  return v;
+}
+
+// NNTR_ATTN_BAND: 0 = the full-row qk grid + full-row softmax (control
+// arm), 1 = banded qk grid + banded softmax (default), 2 = the
+// reverted per-row attempt's arithmetic (per-ROW softmax band, unbanded qk)
+// kept ONLY so its failure is reproducible; it breaks the golden by
+// construction.
+static int attn_band_mode() {
+  static const int v = []() {
+    const char *e = std::getenv("NNTR_ATTN_BAND");
+    return e ? std::atoi(e) : 1;
+  }();
+  return v;
+}
+
 static bool two_conv_attention_prefill_f16_ohwi_img_impl(
   const uint16_t *Q_svm, const uint16_t *K_svm, cl_mem v_buf_in,
   cl_mem v_image_in, cl_mem k_image_in, uint16_t *O_svm, unsigned int M,
@@ -2046,6 +2108,17 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
   if (!tca_ensure(ctx, &sc.scores, &sc.scores_bytes, scores_bytes,
                   CL_MEM_READ_WRITE))
     return false;
+
+  // ---- The score band. qk's n grid and
+  // softmax's n loop are both restricted to the band sv_matmul actually reads,
+  // instead of the whole N_kv row. Prefill only: decode (M == 1) keeps the
+  // original two kernels byte for byte. Requires sv to honour its window floor
+  // (NNTR_SV_WIN=1, the default) -- with SV_WIN=0 sv reads from texel 0 and
+  // nothing may be narrowed.
+  const bool band_on =
+    attn_band_mode() != 0 && causal && M > 1 && attn_sv_win_on();
+  const bool qk_band_on =
+    band_on && attn_band_mode() == 1 && k_image_in != nullptr;
 
   // ---- Resolve V image2d: either caller-provided, or build / reuse a
   //      cached one keyed on V_buf_in + shape. ----
@@ -2112,14 +2185,16 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
   // ---- K1: QK matmul OHWI — pick image2d-K kernel when caller gave
   //          us a K image, else the SVM buffer kernel.
   {
-    const char *k1_name =
-      k_image_in != nullptr ? "qk_matmul_f16_ohwi_img" : "qk_matmul_f16_ohwi";
+    const char *k1_name = k_image_in != nullptr
+                            ? (qk_band_on ? "qk_matmul_f16_ohwi_img_band"
+                                          : "qk_matmul_f16_ohwi_img")
+                            : "qk_matmul_f16_ohwi";
     // Per-call-site kernel handle cache: registerClKernel
     // measured ~12ms per cached lookup from this wrapper (3x/layer = the
     // 36ms/layer host issue tax the CL-event profiler shows as GPU idle).
-    static ClContext::SharedPtrClKernel kp_img, kp_buf;
+    static ClContext::SharedPtrClKernel kp_img, kp_img_band, kp_buf;
     ClContext::SharedPtrClKernel &kp =
-      (k_image_in != nullptr) ? kp_img : kp_buf;
+      (k_image_in != nullptr) ? (qk_band_on ? kp_img_band : kp_img) : kp_buf;
     if (!kp)
       kp = blas_cc->registerClKernel(two_conv_attention_kernel, k1_name,
                                      tca_copts());
@@ -2168,8 +2243,31 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
       if (!kp->SetKernelArguments(11, &lw, sizeof(int)))
         return false;
     }
-    const size_t nx = (N_kv + TN_QK - 1) / TN_QK;
+    size_t nx = (N_kv + TN_QK - 1) / TN_QK;
     const size_t mx = (M + TM_QK - 1) / TM_QK;
+    // Banded grid: gws.x counts n-tiles inside an m-tile's band, and the
+    // kernel adds that m-tile's band_lo itself. Take the widest band over all
+    // m-tiles so every tile's [band_lo, band_hi) is covered. On gemma4's
+    // sliding owning layers (W=512) this is ~74 tiles instead of ceil(N_kv/8)
+    // = 450 at N_kv=3595; on the full-attention ones the band is the causal
+    // prefix, so the width is unchanged but the tiles past band_hi now return
+    // WITHOUT writing the -INFINITY nobody reads.
+    if (qk_band_on) {
+      size_t w = 0;
+      for (size_t m0 = 0; m0 < (size_t)M; m0 += TM_QK) {
+        const size_t ml =
+          (m0 + TM_QK - 1 < (size_t)M - 1) ? (m0 + TM_QK - 1) : (size_t)M - 1;
+        int blo = 0, bhi = 0;
+        tca_score_band_host((int)M, (int)N_kv, 1, (int)local_window, (int)m0,
+                            (int)ml, (int)SOFTMAX_LWS, &blo, &bhi);
+        if (bhi > blo) {
+          const size_t t = ((size_t)(bhi - blo) + TN_QK - 1) / TN_QK;
+          if (t > w)
+            w = t;
+        }
+      }
+      nx = w > 0 ? w : 1;
+    }
     // The LWS is env-overridable + measured (NNTR_QK_LWS="x,y,z"); default
     // {16,4,1} won a fair A/B/A/B sweep at M=1024 on Adreno 830 (SD8 Elite):
     // qk_matmul_f16_ohwi_img 76.5 ms vs 110.2 ms for the prior {64,1,1}
@@ -2238,10 +2336,12 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
   // ---- K2: row softmax (scores cl_mem, in-place) ----
   {
     static double tp2_reg = 0, tp2_arg = 0, tp2_enq = 0;
-    static ClContext::SharedPtrClKernel kp; // call-site handle cache
+    const char *k2_name = band_on ? "softmax_row_band_f16" : "softmax_row_f16";
+    static ClContext::SharedPtrClKernel kp_plain, kp_bandk; // handle cache
+    ClContext::SharedPtrClKernel &kp = band_on ? kp_bandk : kp_plain;
     if (!kp)
-      kp = blas_cc->registerClKernel(two_conv_attention_kernel,
-                                     "softmax_row_f16", tca_copts());
+      kp = blas_cc->registerClKernel(two_conv_attention_kernel, k2_name,
+                                     tca_copts());
     if (!kp)
       return false;
     if (attn_tprof) {
@@ -2258,6 +2358,15 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
     if (!kp->SetKernelArguments(1, &Mi, sizeof(int)) ||
         !kp->SetKernelArguments(2, &Nkvi, sizeof(int)))
       return false;
+    if (band_on) {
+      int causal_k2 = causal ? 1 : 0;
+      int lw_k2 = (int)local_window;
+      int bmode_k2 = attn_band_mode();
+      if (!kp->SetKernelArguments(3, &causal_k2, sizeof(int)) ||
+          !kp->SetKernelArguments(4, &lw_k2, sizeof(int)) ||
+          !kp->SetKernelArguments(5, &bmode_k2, sizeof(int)))
+        return false;
+    }
     if (attn_tprof) {
       double t = tnow();
       tp2_arg += t - t_a;
@@ -2330,11 +2439,7 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
     // ones are exactly the +0.0 scores softmax_row_f16 wrote for the keys K1
     // masked to -INFINITY. NNTR_SV_WIN=0 is the control arm (pass 0 = the old
     // full-range loop) and leaves the binary otherwise identical.
-    static const bool sv_win = []() {
-      const char *e = std::getenv("NNTR_SV_WIN");
-      return e ? (std::atoi(e) != 0) : true;
-    }();
-    int sv_lw = sv_win ? (int)local_window : 0;
+    int sv_lw = attn_sv_win_on() ? (int)local_window : 0;
     if (!kp->SetKernelArguments(10, &sv_lw, sizeof(int)))
       return false;
     // TDX=8 tiled: each WI computes 8 output channels, so the x grid is
