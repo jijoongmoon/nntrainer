@@ -14,6 +14,7 @@
 #ifndef __OPENCL_KERNEL_H__
 #define __OPENCL_KERNEL_H__
 
+#include <cstdint>
 #include <string>
 
 #include "CL/cl.h"
@@ -28,6 +29,35 @@ namespace nntrainer::opencl {
  */
 class Kernel {
   cl_kernel kernel_{nullptr};
+
+  /// Kernel-argument value cache. Decode re-binds ~6.6 arguments per dispatch
+  /// and ~9 700 per token, almost all of them the same handle or the same
+  /// scalar as the token before; each one is a host call the GPU waits behind
+  /// (P2 measured host issue cost converting ~1:1 into wall time). The cache
+  /// remembers the bytes last passed to clSetKernelArg for this kernel object
+  /// and skips the call when they are unchanged.
+  ///
+  /// Soundness rests on two things. (1) The cl_kernel object holds argument
+  /// state, so "unchanged bytes" really means "already bound" -- and a
+  /// cl_kernel here is per (program, name, build options) and dispatched from
+  /// the single-threaded forward path. (2) A remembered cl_mem/SVM VALUE can
+  /// only lie if the handle was released and reissued for a different object,
+  /// which is exactly what opencl::clHandleEpoch() tracks: the epoch is stored
+  /// with the cache and any creation anywhere drops it.
+  static constexpr int kArgCacheSlots = 20;
+  static constexpr int kArgCacheBytes = 16;
+  unsigned char arg_bytes_[kArgCacheSlots][kArgCacheBytes] = {};
+  unsigned char arg_size_[kArgCacheSlots] = {}; ///< bound size, 0 = unset
+  unsigned char arg_kind_[kArgCacheSlots] = {}; ///< 0 unset, 1 plain, 2 SVM
+  unsigned long long arg_epoch_ = 0;
+
+  /**
+   * @brief Look the argument up in the cache; on a miss, record it.
+   * @return true when the argument is already bound and the driver call can be
+   *         skipped
+   */
+  bool argCacheHit(cl_uint arg_index, const void *arg_value, size_t size,
+                   unsigned char kind);
 
 public:
   /**
