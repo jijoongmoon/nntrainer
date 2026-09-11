@@ -14,6 +14,7 @@
 
 #include <CL/cl.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 
@@ -201,6 +202,25 @@ void ClBufferPool::allocate() {
    *  running it again keeps the post-condition ("the maps describe the plane
    *  that now exists") true from either path. */
   recordPlannerLayout();
+
+  /** Under the GPU ledger, say how the two planes relate. The device plane is
+   *  one buffer per planner offset, sized to the largest token there, so its
+   *  TOTAL is the sum over offsets -- which is not the same number as the
+   *  shared plane's span, and the ledger showing 310 MiB of device buffers
+   *  against a 132 MiB shared plane is otherwise unreadable. */
+  if (opencl::clMemAcctOn()) {
+    size_t sum = 0, biggest = 0;
+    for (const auto &kv : offset_size_) {
+      sum += kv.second;
+      biggest = std::max(biggest, kv.first + kv.second);
+    }
+    std::fprintf(stderr,
+                 "[clmempool] shared plane %.1f MiB; %zu planner offsets, "
+                 "sum %.1f MiB, top-of-plane %.1f MiB\n",
+                 size() / 1048576.0, offset_size_.size(), sum / 1048576.0,
+                 biggest / 1048576.0);
+    std::fflush(stderr);
+  }
 }
 
 void *ClBufferPool::createDeviceBufferLocked(size_t offset) {
