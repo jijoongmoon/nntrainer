@@ -2068,6 +2068,17 @@ static int attn_band_mode() {
   return v;
 }
 
+// NNTR_ATTN_BAND_DECODE: 0 = decode (M == 1) keeps the unbanded qk grid and
+// the full-row softmax while prefill stays banded -- the A/B control that
+// isolates the decode half of the score band. Default 1 (banded).
+static bool attn_band_decode_on() {
+  static const bool v = []() {
+    const char *e = std::getenv("NNTR_ATTN_BAND_DECODE");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  return v;
+}
+
 static bool two_conv_attention_prefill_f16_ohwi_img_impl(
   const uint16_t *Q_svm, const uint16_t *K_svm, cl_mem v_buf_in,
   cl_mem v_image_in, cl_mem k_image_in, uint16_t *O_svm, unsigned int M,
@@ -2109,14 +2120,24 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
                   CL_MEM_READ_WRITE))
     return false;
 
-  // ---- The score band. qk's n grid and
-  // softmax's n loop are both restricted to the band sv_matmul actually reads,
-  // instead of the whole N_kv row. Prefill only: decode (M == 1) keeps the
-  // original two kernels byte for byte. Requires sv to honour its window floor
-  // (NNTR_SV_WIN=1, the default) -- with SV_WIN=0 sv reads from texel 0 and
-  // nothing may be narrowed.
-  const bool band_on =
-    attn_band_mode() != 0 && causal && M > 1 && attn_sv_win_on();
+  // ---- The score band.
+  // qk's n grid and softmax's n loop are both restricted to the band sv_matmul
+  // actually reads, instead of the whole N_kv row. Requires sv to honour its
+  // window floor (NNTR_SV_WIN=1, the default) -- with SV_WIN=0 sv reads from
+  // texel 0 and nothing may be narrowed.
+  //
+  // M == 1 (decode) is banded by the SAME band function: the single query row
+  // pairs with itself (pair_lo = pair_hi = 0), the causal cap is the whole
+  // row (q_off = N_kv-1 => hi = N_kv) and the only narrowing is the sliding
+  // floor, so a W=512 layer touches ~576 keys instead of N_kv while a full
+  // layer (W=0) keeps the identical grid. sv_matmul_f16_ohwi_img_tm2 already
+  // starts at the same window floor (see arg 10 below), so its reads stay
+  // inside the band; the 64-aligned floor keeps softmax's n == tid (mod 64)
+  // work-item mapping, hence bit-identical row_max/row_sum.
+  // NNTR_ATTN_BAND_DECODE=0 is the decode-only control arm (prefill still
+  // banded); NNTR_ATTN_BAND=0 remains the control for both.
+  const bool band_on = attn_band_mode() != 0 && causal && attn_sv_win_on() &&
+                       (M > 1 || attn_band_decode_on());
   const bool qk_band_on =
     band_on && attn_band_mode() == 1 && k_image_in != nullptr;
 
