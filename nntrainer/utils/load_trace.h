@@ -69,14 +69,14 @@ enum Slot {
 
 inline const char *slot_name(int s) {
   static const char *n[N_SLOTS] = {
-    "prescan",     "pack_open",  "map",         "madvise",    "node_read",
-    "prebuild",    "fingerprint", "lookup",     "hit_upload", "wbuf_create",
-    "permute",     "pack_write", "miss_upload", "aux_create", "aux_sub",
-    "aux_stage",   "image_view", "drop",        "t_getdata",  "t_copy",
-    "ctx_create",  "krn_blas",   "krn_attn",    "krn_bin_read", "krn_prog_bin",
-    "krn_prog_src", "krn_obj",   "g_add",       "g_compile",  "g_init",
-    "g_alloc",
-    "wall"};
+    "prescan",      "pack_open",    "map",         "madvise",
+    "node_read",    "prebuild",     "fingerprint", "lookup",
+    "hit_upload",   "wbuf_create",  "permute",     "pack_write",
+    "miss_upload",  "aux_create",   "aux_sub",     "aux_stage",
+    "image_view",   "drop",         "t_getdata",   "t_copy",
+    "ctx_create",   "krn_blas",     "krn_attn",    "krn_bin_read",
+    "krn_prog_bin", "krn_prog_src", "krn_obj",     "g_add",
+    "g_compile",    "g_init",       "g_alloc",     "wall"};
   return (s >= 0 && s < N_SLOTS) ? n[s] : "?";
 }
 

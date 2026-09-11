@@ -20,7 +20,6 @@
 #include <blas_kernels.h>
 #include <cerrno>
 #include <cl_context.h>
-#include <load_trace.h>
 #include <cl_kernels/cl_kernels.h>
 #include <cl_svm_allocator.h>
 #include <compute_ops.h>
@@ -31,6 +30,7 @@
 #include <gelu_cl_op.h>
 #include <layer_normalization_layer.h>
 #include <layernorm_cl_op.h>
+#include <load_trace.h>
 #include <opencl_context_manager.h>
 #include <opencl_loader.h>
 #include <reshape_cl.h>

@@ -9,8 +9,8 @@
  * @bug		No known bugs except for NYI items
  */
 
-#include <tensor.h>
 #include <load_trace.h>
+#include <tensor.h>
 #include <tensor_base.h>
 
 namespace nntrainer {

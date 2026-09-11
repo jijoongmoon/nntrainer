@@ -993,9 +993,8 @@ bool dotCl_v8c_prebuild_weight_from(const Tensor &weight,
   const unsigned int K = weight.height();
   if (N == 0 || K == 0 || N % 8 != 0 || K % 32 != 0)
     return false;
-  return v8c_get_or_build_weight(weight, K, N,
-                                 static_cast<const uint8_t *>(src_nibbles)) !=
-         nullptr;
+  return v8c_get_or_build_weight(
+           weight, K, N, static_cast<const uint8_t *>(src_nibbles)) != nullptr;
 }
 
 // fp16 GEMM output -> output tensor, written on the GPU (residency: no host
