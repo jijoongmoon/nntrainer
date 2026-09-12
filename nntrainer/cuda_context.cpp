@@ -128,15 +128,41 @@ void CudaContext::initialize() noexcept {
       // What makes it safe is the device-only activation pool
       // (NNTR_CUDA_DEV_ACT): with activations in real device memory a host
       // fallback cannot silently engage -- it faults -- so every op is on the
-      // device and one drain per token is enough. That pool's staging half
-      // (the device prefill V-copy, the D2H of the logits row) lives in the
-      // layers this backend is driven by, not in this library, so the pool is
-      // not on by default here and host fallbacks stay reachable.
+      // device and one drain per token is enough. The switch is read in this
+      // library (Manager::activationAllocator gives the tensor pool the
+      // device-only allocator while the weights keep UVM), so a discrete part
+      // can be given the pool the async profile needs right here.
       //
-      // So async is auto-enabled only alongside the device-only pool, which
-      // means not by default in this tree. NNTR_CUDA_ASYNC=1 still forces it
-      // on for an A/B, and NNTR_DETERMINISTIC=1 continues to pin drained
-      // submission explicitly.
+      // NNTR_CUDA_VCOPY_PREFILL is part of the same profile rather than a
+      // separate decision: it moves the prefill V-cache copy onto the GPU, and
+      // that copy is the last host touch left inside the prefill chain -- kept
+      // on the host it reinstates a per-layer drain and hands most of the
+      // prefill win back. Its read site is in the attention layer this backend
+      // is driven by rather than in this library, so on a library-only build
+      // the value is simply never read; it is defaulted here because a profile
+      // describes the DEVICE it probed, not one directory.
+      //
+      // Measured on a discrete laptop part (cMA=1) with a 1K summarisation
+      // cell, both models: prefill 7.26k -> 8.96k TPS (+23 %), decode
+      // 68.5 -> 132.6 TPS (+94 %), same token count, same end-of-turn stop,
+      // byte-identical output, VmHWM unchanged, GPU residency +6 MiB.
+      //
+      // Opting out is per lever and explicit, since setenv(overwrite=0) never
+      // overwrites a value the environment already carries:
+      // NNTR_CUDA_DEV_ACT=0 restores the managed activation pool and with it
+      // drained submission (async is only auto-enabled alongside the pool),
+      // NNTR_CUDA_VCOPY_PREFILL=0 puts the prefill V-copy back on the host,
+      // and NNTR_DETERMINISTIC=1 keeps drained submission with the pool on.
+      setenv("NNTR_CUDA_DEV_ACT", "1", 0);
+      setenv("NNTR_CUDA_VCOPY_PREFILL", "1", 0);
+      // The remaining decode lever of this profile, NNTR_CUDA_M2B (the
+      // single-capture decode graph), stays opt-in: it needs the same
+      // graph-walk half as NNTR_CUDA_GRAPH below, which this tree does not
+      // have, and measured here it moves nothing either way.
+      //
+      // Async submission is auto-enabled alongside the device-only pool, so on
+      // this profile it is on by default; NNTR_CUDA_ASYNC=0 forces the per-op
+      // drains back for an A/B, and NNTR_DETERMINISTIC=1 pins them.
       {
         const char *det = getenv("NNTR_DETERMINISTIC");
         const char *dev_act = getenv("NNTR_CUDA_DEV_ACT");
