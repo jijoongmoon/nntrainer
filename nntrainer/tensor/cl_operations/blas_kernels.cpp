@@ -2394,6 +2394,24 @@ void v8c_open_aux_arena() {
 }
 
 void v8c_flush_aux_arena() {
+  // This is a load-TAIL hook: the weight load calls it once at the end, and
+  // the only thing guarding that call is ENABLE_OPENCL -- so it also runs on a
+  // CPU or CUDA run of a build that merely has OpenCL compiled in. The "gpu"
+  // Context, however, is registered only when the run selected it
+  // (Engine::add_default_object), and getRegisteredContext() throws for a name
+  // that is not registered. That throw left the load as
+  // "[Engine] gpu Context is not registered" and killed an engine=cuda run of
+  // a cuda+opencl build at weight load, before its first token.
+  //
+  // Nothing can have been carved from the arena on such a run -- every carve
+  // site is an OpenCL v8c weight build -- so the correct answer is to seal and
+  // return, exactly as the normal path ends: after the seal a weight built
+  // lazily at its first dispatch writes its own scale/row-sum pair, so no
+  // reader can see an aux buffer whose bytes have not landed.
+  if (!Engine::Global().isContextRegistered("gpu")) {
+    v8c_aux_sealed.store(true, std::memory_order_release);
+    return;
+  }
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
   cl_command_queue cq = blas_cc->command_queue_inst_.GetCommandQueue();
