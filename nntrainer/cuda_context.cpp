@@ -30,6 +30,8 @@
 #include <logit_softcapping.h>
 #include <qkv_layer.h>
 #include <scalar_multiply.h>
+#include <sigmoid_add_layer.h>
+#include <sigmoid_glu_layer.h>
 #include <swiglu_layer.h>
 #include <tie_word_embedding.h>
 
@@ -421,6 +423,12 @@ void CudaContext::add_default_object() {
   registerFactory(nntrainer::createLayer<SwiGLULayer>, SwiGLULayer::type);
   registerFactory(nntrainer::createLayer<TieWordEmbedding>,
                   TieWordEmbedding::type);
+  // The sigmoid-gated pair likewise: CudaComputeOps has a device kernel for
+  // each of them, so the neutral layers reach the device through the table.
+  registerFactory(nntrainer::createLayer<SigmoidGluLayer>,
+                  SigmoidGluLayer::type);
+  registerFactory(nntrainer::createLayer<SigmoidAddLayer>,
+                  SigmoidAddLayer::type);
 }
 
 template <typename T>
