@@ -166,7 +166,7 @@ void Manager::deallocateWeights() { weight_pool.deallocate(); }
  * @note  Local to this translation unit rather than a shared env-compat
  *        helper, since this branch does not carry one yet.
  */
-static bool manager_env_on(const char *name) {
+[[maybe_unused]] static bool manager_env_on(const char *name) {
   const char *e = std::getenv(name);
   return e != nullptr && e[0] != '0';
 }
