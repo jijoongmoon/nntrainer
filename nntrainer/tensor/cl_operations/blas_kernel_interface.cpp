@@ -497,12 +497,12 @@ struct V8cWeightEntry {
   // is skipped for EVERY weight although an image would be creatable, and only
   // this flag may route to the imageless lm_head GEMV.
   bool imageless = false;
-  // Forward-pass generation this weight was last dispatched in. Used only to
-  // INFER a pass boundary for the shared-quant cache below (a weight is
+  // Forward-pass generation this weight was last dispatched in: a weight is
   // dispatched at most once per pass, so seeing it twice in one generation
-  // means a new pass began). The inference cannot cover every graph shape, so
-  // the dispatches it cannot vouch for refuse the cache rather than risk a
-  // stale hit -- see the boundary note in dotCl_v8c.
+  // means a new pass began. This inferred boundary no longer gates the
+  // shared-quant cache below -- that keys on the dispatch write log, which is
+  // exact where the inference could only be conservative -- but the counter is
+  // this tree's only pass marker and costs a compare per weight.
   unsigned long long last_use_gen = 0;
 };
 
@@ -599,19 +599,16 @@ struct V8cScratch {
   // the first call populates act_i8/act_scale/act_zp/act_rs for that input,
   // the sibling calls skip the upload AND the quant kernel.
   //
-  // Cache key: (pass generation, input data pointer, M, K, M_pad, dtype).
-  // Pointer identity is sufficient within one forward pass since the layer
-  // graph executes serially — the input buffer isn't aliased between
-  // dispatches. It is NOT sufficient across passes: activations live in the
-  // tensor pool, whose addresses are recycled every pass, so the same
-  // (pointer, shape, dtype) tuple names DIFFERENT data one pass later. The
-  // generation below scopes a hit to the pass that produced it, and a hit is
-  // taken only where the boundary is provably established: the boundary is
-  // inferred from repeated weight dispatch, so a dispatch that cannot have
-  // participated in that inference bypasses the cache and warns once (see the
-  // boundary note in dotCl_v8c).
+  // Cache key: (input handle, M, K, M_pad, dtype, dispatch seq of the quant).
+  // An address on its own is NOT a key -- the tensor pool recycles activation
+  // slots within a single forward pass, so the same (pointer, shape, dtype)
+  // tuple can name different data a few dispatches later. The last term is
+  // what makes the key sound: the write log (opencl::Kernel) answers whether
+  // anything has written that handle since, and a hit needs that answer. Only
+  // the device plane is admitted, since the log sees dispatch writes and not
+  // host writes; see the note in dotCl_v8c.
   unsigned long long pass_gen = 1; /**< current forward-pass generation */
-  /** generation whose activation the cached int8 belongs to */
+  /** unused by the shared-quant key; kept for the pass-boundary detector */
   unsigned long long last_quant_gen = 0;
   const void *last_quant_in_ptr = nullptr;
   unsigned int last_quant_M = 0;
@@ -619,10 +616,35 @@ struct V8cScratch {
   unsigned int last_quant_M_pad = 0;
   int last_quant_dtype = -1;
   int last_quant_slot = 0; /**< slot whose int8 the cache hit refers to */
+  /** dispatch seq at which the cached int8 was produced (device-plane reuse) */
+  unsigned long long last_quant_seq = 0;
 };
 
 static V8cScratch &v8c_scratch() {
   static V8cScratch s;
+  return s;
+}
+
+// Shared-quant accounting. Whether a sibling FC may reuse a fanout's
+// quantisation hinges on a window of the dispatch write log staying clean, and
+// whether a given graph keeps it clean is not something to guess at --
+// NNTR_FUSE_STATS=1 prints the tally at exit so a decline can be attributed
+// instead of assumed.
+struct V8cFuseStats {
+  unsigned long long share_hit = 0; /**< FCs served by a sibling's quant */
+  unsigned long long quant = 0;     /**< FCs that ran their own quant */
+  unsigned long long dirty = 0; /**< sibling reuses the write log ruled out */
+  ~V8cFuseStats() {
+    if (std::getenv("NNTR_FUSE_STATS") == nullptr)
+      return;
+    ml_logi("[v8c fuse] quant elided: sibling=%llu  quant kernels run=%llu  "
+            "write-log declines=%llu",
+            share_hit, quant, dirty);
+  }
+};
+
+static V8cFuseStats &v8c_fuse_stats() {
+  static V8cFuseStats s;
   return s;
 }
 
@@ -701,6 +723,21 @@ static unsigned int v8c_m_pad_for(unsigned int M) {
   const unsigned int eff =
     (M >= V8C_MPAD_ALIGN || (pad_all && M > 1)) ? V8C_MPAD_ALIGN : V8C_TM;
   return (M + eff - 1) / eff * eff;
+}
+
+// Advance the per-fanout activation ring, and drop the shared-quant cache
+// entry when the slot it points at is the one being handed out: once the ring
+// hands its slot out the int8 it names is about to be overwritten by a
+// different activation, so the entry stops being a valid answer here rather
+// than at the point of use. This is the "never across a recycled slot" half of
+// the reuse rule; the write log is the "never across a rewritten buffer" half.
+static int v8c_ring_advance(V8cScratch &sc) {
+  sc.ring_pos = (sc.ring_pos + 1) % V8C_ACT_SLOTS;
+  if (sc.last_quant_slot == sc.ring_pos) {
+    sc.last_quant_in_ptr = nullptr;
+    sc.last_quant_seq = 0;
+  }
+  return sc.ring_pos;
 }
 
 // Get or build the cached v8c weight backing for a given int4 (QS4CX) weight.
@@ -1179,11 +1216,10 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
   // take the normal buffer GEMM below.
   if (w->imageless) {
     // Join the pass-boundary detector before taking the early exit. This
-    // weight is the untied lm_head: it uses no shared-quant cache itself, but
-    // it is the one FC guaranteed to be dispatched on every decode pass, so
-    // leaving it out would hide a boundary from every weight that does use
-    // the cache. The scratch lock is taken and released here because the GEMV
-    // below runs outside it.
+    // weight is the untied lm_head: it is the one FC guaranteed to be
+    // dispatched on every decode pass, so leaving it out would hide a boundary
+    // from the counter entirely. The scratch lock is taken and released here
+    // because the GEMV below runs outside it.
     {
       std::lock_guard<std::mutex> glock(v8c_cache_mtx());
       V8cScratch &gsc = v8c_scratch();
@@ -1251,8 +1287,8 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
     device_clmem_in ? static_cast<const void *>(clmem_in)
                     : static_cast<const void *>(input.getData<uint8_t>());
 
-  // Shared-quant cache: REFUSED, because its key cannot tell two activations
-  // apart.
+  // Shared-quant cache: its ADDRESS key was refused, because an address cannot
+  // tell two activations apart.
   //
   // The cache skipped the staging copy and the activation-quant kernel when a
   // call arrived with the same (input data pointer, M, K, M_pad, dtype) as the
@@ -1276,7 +1312,39 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
   // is always correct. Restoring the fast path needs a key that names the
   // PRODUCER of the activation, or an invalidation hooked to every write into
   // the activation plane; the address on its own cannot carry either.
-  const bool quant_cache_hit = false;
+  //
+  // The dispatch write log IS that invalidation, so the fast path comes back on
+  // a different question. Not "is this the same tensor" -- which a pooled
+  // sub-buffer handle cannot answer -- but "are these the same BYTES", which is
+  // what the reuse actually needs: if nothing has written that handle since the
+  // cached quantisation was produced, this FC's own quantiser would read
+  // precisely those bytes and produce precisely that result, whichever tensor
+  // the graph believes the handle belongs to. The KV-shared case above then
+  // fails the test on its own terms instead of being excluded by a blanket rule
+  // -- the shared-KV normalization WROTE the handle between the two fanouts, so
+  // the window is dirty and the sibling re-quantises. The recycled-slot half of
+  // the rule is enforced one level up, in v8c_ring_advance(): handing out a
+  // slot drops any cache entry naming it.
+  //
+  // Readmitted for the DEVICE plane only. On the shared/host plane the
+  // activation can be rewritten by the host or by a non-dispatch transfer, and
+  // the log records neither, so there the refusal stands unchanged.
+  // NNTR_FUSE_QUANT_SHARE=0 refuses both planes, as before this change.
+  static const bool quant_share_device = []() {
+    const char *e = std::getenv("NNTR_FUSE_QUANT_SHARE");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  const bool shape_tuple_hit =
+    device_clmem_in && sc.last_quant_in_ptr != nullptr &&
+    sc.last_quant_in_ptr == cur_in_ptr && sc.last_quant_M == M &&
+    sc.last_quant_K == K && sc.last_quant_M_pad == M_pad &&
+    sc.last_quant_dtype == cur_dtype;
+  const bool quant_cache_hit =
+    quant_share_device && shape_tuple_hit &&
+    opencl::Kernel::bufferUnchangedSince(static_cast<void *>(clmem_in),
+                                         sc.last_quant_seq);
+  if (quant_share_device && shape_tuple_hit && !quant_cache_hit)
+    ++v8c_fuse_stats().dirty;
   const bool skip_upload_and_quant = quant_cache_hit;
 
   // [Lever 1] NNTR_FC_QUANT_DIRECT: on the cl_mem residency edge, quantize the
@@ -1306,9 +1374,8 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
   // fanout's quant WRITE lands in a buffer distinct from the prior fanout's
   // still-in-flight GEMM image READ (a WAR hazard through the image alias
   // the driver may not track).
-  const int act_slot = quant_cache_hit
-                         ? sc.last_quant_slot
-                         : (sc.ring_pos = (sc.ring_pos + 1) % V8C_ACT_SLOTS);
+  const int act_slot =
+    quant_cache_hit ? sc.last_quant_slot : v8c_ring_advance(sc);
   // Grow only the chosen slot to this call's (M_pad, K). Grow-only => a hit
   // (same M_pad,K as the miss that filled it) never reallocates, so the
   // cached int8/scale/zp/rs survive for the wk/wv reuse.
@@ -1416,15 +1483,19 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
                                  act_zp_arg, act_rs_arg, quant_rows, K);
       // Update cache key only after a successful quant. Record WHICH slot now
       // holds this input's int8 so a subsequent cache hit (wk/wv) reads the
-      // right per-fanout buffer, not whatever the ring last pointed at, and
-      // WHICH pass generation it belongs to so the next pass cannot hit it.
-      sc.last_quant_gen = sc.pass_gen;
+      // right per-fanout buffer, not whatever the ring last pointed at, and at
+      // WHICH dispatch it was produced, so the write log can say whether the
+      // bytes behind that key still are the bytes that were quantised.
       sc.last_quant_in_ptr = cur_in_ptr;
       sc.last_quant_M = M;
       sc.last_quant_K = K;
       sc.last_quant_M_pad = M_pad;
       sc.last_quant_dtype = cur_dtype;
       sc.last_quant_slot = act_slot;
+      sc.last_quant_seq = opencl::Kernel::dispatchSeq();
+      ++v8c_fuse_stats().quant;
+    } else {
+      ++v8c_fuse_stats().share_hit;
     }
 
     // v8c GEMM input binding. The buffer path (Intel NEO) selects the *_buf
