@@ -1057,6 +1057,7 @@ static void v8c_write_output_resident(cl_mem y_fp16, Tensor &output,
       return;
     const int gws2[3] = {(int)(((size_t)n + 63) / 64 * 64), 1, 1};
     const int lws2[3] = {64, 1, 1};
+    opencl::Kernel::noteDispatchWrites(out_clmem);
     cc->command_queue_inst_.DispatchCommand(kp, gws2, lws2);
     return;
   }
@@ -1404,6 +1405,9 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
       // including the zero pad).
       cl_mem quant_src = quant_direct_clmem ? clmem_in : sc.act_in;
       const unsigned int quant_rows = quant_direct_clmem ? M : M_pad;
+      // The quantiser writes only v8c's own per-fanout scratch, never a graph
+      // tensor.
+      opencl::Kernel::noteDispatchWritesNothing();
       if (input.getDataType() == ml::train::TensorDim::DataType::FP16)
         quantize_act_v8c_fp16_cl(quant_src, act_i8_arg, act_scale_arg,
                                  act_zp_arg, act_rs_arg, quant_rows, K);
@@ -1501,6 +1505,11 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
     // calls to the fast GEMV (M=1 decode) and multi-row calls to the TM=4
     // tiled kernel with the M_valid store guard; consumers only ever read
     // the real M rows.
+    // Declare the GEMM's one device-plane write for the log: under direct_out
+    // that is the output tensor's planner sub-buffer, otherwise the private
+    // y_fp16 scratch. Either way it is the only buffer this dispatch stores
+    // into, which is what an outstanding handoff has to be checked against.
+    opencl::Kernel::noteDispatchWrites(static_cast<void *>(gemm_y_arg));
     gemm_int8_v8c_cl(gemm_act_arg, gemm_wgt_arg, act_scale_arg,
                      w->scale_buf.get(), act_rs_arg, act_zp_arg,
                      w->row_sum_w_int4.get(), gemm_y_arg, M_pad, N, K, M);
