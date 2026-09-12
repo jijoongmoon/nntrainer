@@ -40,6 +40,10 @@
 #include <reshape_cl.h>
 #include <rmsnorm_layer_cl.h>
 #include <scalar_multiply.h>
+#include <sigmoid_add_cl_op.h>
+#include <sigmoid_add_layer.h>
+#include <sigmoid_glu_cl_op.h>
+#include <sigmoid_glu_layer.h>
 #include <swiglu_cl_op.h>
 #include <swiglu_layer.h>
 #include <tie_word_embedding.h>
@@ -381,6 +385,24 @@ void ClContext::add_default_object() {
                   ScalarMultiplyLayer::type);
   registerFactory(nntrainer::createLayer<TieWordEmbedding>,
                   TieWordEmbedding::type);
+  // The sigmoid-gated pair, registered exactly the way GeGLU above is: gated on
+  // their kernels compiling, so a device that cannot build them leaves the type
+  // unregistered rather than accepting the layer and throwing at the first
+  // forward. Neither has an ml::train::LayerType enumerator, so both take an
+  // auto-assigned integer key, which registerFactory() skips past whatever the
+  // explicit enum keys already hold.
+  if (registerSigmoidGluClKernels(*this)) {
+    registerFactory(nntrainer::createLayer<SigmoidGluLayer>,
+                    SigmoidGluLayer::type);
+  } else {
+    ml_logw("failed to register the OpenCL sigmoid_glu kernels");
+  }
+  if (registerSigmoidAddClKernels(*this)) {
+    registerFactory(nntrainer::createLayer<SigmoidAddLayer>,
+                    SigmoidAddLayer::type);
+  } else {
+    ml_logw("failed to register the OpenCL sigmoid_add kernels");
+  }
 }
 
 template <typename T>
