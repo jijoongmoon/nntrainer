@@ -34,7 +34,6 @@
 #include <vector>
 
 #include <compute_ops.h>
-#include <env_compat.h> // nntr_env_on: value-checked read of auto-injected flags
 #include <neuralnet.h>
 
 #if defined(ENABLE_OPENCL)
