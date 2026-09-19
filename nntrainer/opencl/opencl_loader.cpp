@@ -386,9 +386,11 @@ public:
     } else {
       st.cum += bytes;
       st.live += bytes;
-      st.peak = std::max(st.peak, st.live);
+      // (std::max): this TU pulls in windows.h transitively on MSVC, whose
+      // min/max macros would otherwise eat the bare call.
+      st.peak = (std::max)(st.peak, st.live);
       live_bytes_ += bytes;
-      peak_bytes_ = std::max(peak_bytes_, live_bytes_);
+      peak_bytes_ = (std::max)(peak_bytes_, live_bytes_);
     }
     live_[handle] = AcctRec{tag, view ? 0u : bytes};
   }
@@ -402,8 +404,8 @@ public:
       return;
     auto &st = tags_[it->second.tag];
     ++st.n_free;
-    st.live -= std::min(st.live, it->second.bytes);
-    live_bytes_ -= std::min(live_bytes_, it->second.bytes);
+    st.live -= (std::min)(st.live, it->second.bytes);
+    live_bytes_ -= (std::min)(live_bytes_, it->second.bytes);
     live_.erase(it);
   }
 
