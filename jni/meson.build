@@ -190,6 +190,20 @@ foreach src: nntrainer_sources
   ndk_input += files(src)
 endforeach
 
+# The QNN backend's TUs are compiled by this same ndk-build (Android.mk.in
+# splices them in as MESON_QNN_SRCS) but are NOT in nntrainer_sources, so
+# without this loop ninja saw no dependency on them: editing qnn_context.cpp or
+# qnn_rpc_manager.cpp and re-running `ninja` reported "no work to do" and the
+# install step then copied the STALE libqnn_context.so. That is silent -- you
+# get an unchanged binary and a green build. qnn_sources_abs is absolute (the
+# Android.mk needs it that way), and files() only takes paths relative to this
+# subdir, hence the fs.relative_to().
+if get_option('enable-npu')
+  foreach src : qnn_sources_abs
+    ndk_input += files(fs.relative_to(src, meson.current_source_dir()))
+  endforeach
+endif
+
 if get_option('enable-tflite-interpreter')
   ndk_depends += flat_header
 endif
