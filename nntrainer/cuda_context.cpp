@@ -487,6 +487,42 @@ sharedConstTensors CudaContext::runDecode(NeuralNetwork &nn, unsigned int from,
   const bool feed_declared = !nn.getGraphReplayFeedNodes().empty();
   const bool single_token = (to - from) == 1 && from != 0;
 
+  // A capture freezes every host decision taken while it recorded, and some of
+  // those depend on the CURRENT key count rather than on the token: a dispatch
+  // site picks its kernel, its grid and its masking arm by comparing the live
+  // KV length against a fixed bound (the split-KV decode engages at
+  // NNTR_CUDA_FLASH_DECODE keys, the GEMM prefill arm at its key floor, the
+  // sliding window at its width). The kernels can be taught to read the moving
+  // values from cuda_pos_buffer(), but the `if` that picked them already
+  // happened and no replay re-asks it, so the answer stays fluent and quietly
+  // becomes wrong from the token the bound was crossed on.
+  //
+  // So the sites REPORT their comparisons while the capture records
+  // (nntrainer::cuda::kv_regime_gt) and this asks them again, at this step's
+  // key count, before every replay; when one has flipped the graph is retired
+  // and recaptured against the arm that is now correct.
+  //
+  // Measured on a discrete part, 46-token prompt, 600 tokens: the capture lands
+  // at 48 keys, below the 64-key split-KV threshold, so the replay kept the
+  // dense per-key kernel while the eager path crossed into the split reduce at
+  // absolute position 64 -- the two texts diverge at exactly that token.
+  // Pinning either arm for the whole run (NNTR_CUDA_FLASH_DECODE=8 or =999999)
+  // made replay byte-identical to eager again, which is the evidence that the
+  // ARM, not the arithmetic, was the difference.
+  const int step_kv = (int)from + 1; // == cuda_set_pos()'s n_kv for this token
+  const bool regime_holds =
+    cached_exec == nullptr || nntrainer::cuda::kv_regime_holds(step_kv);
+  if (cached_exec != nullptr && !regime_holds) {
+    if (graph_dbg)
+      std::fprintf(stderr,
+                   "[CUDA_GRAPH] captured decode graph retired at kv=%d "
+                   "(a dispatch threshold flipped); recapturing\n",
+                   step_kv);
+    cudaGraphExecDestroy(cached_exec);
+    cached_exec = nullptr;
+    cached_out = {};
+  }
+
   if (decode_graph && feed_declared && !single_token &&
       cached_exec != nullptr) {
     // A new sequence, or a resumed multi-token step, is about to run eagerly.
@@ -559,14 +595,20 @@ sharedConstTensors CudaContext::runDecode(NeuralNetwork &nn, unsigned int from,
       captured = true;
     } else if (sm.beginCapture()) {
       nntrainer::cuda::cuda_set_pos((int)from, (int)from + 1);
+      // Collect the host comparisons this forward takes, so a later step can
+      // ask whether they still hold.
+      nntrainer::cuda::kv_regime_begin(step_kv);
       out = nn.incremental_forwarding(from, to, input, label, false);
+      nntrainer::cuda::kv_regime_seal();
       cudaGraph_t graph = nullptr;
       if (sm.endCapture(&graph) && graph != nullptr) {
         if (graph_dbg) {
           size_t n_nodes = 0;
           cudaGraphGetNodes(graph, nullptr, &n_nodes);
-          std::fprintf(stderr, "[CUDA_GRAPH] decode graph: %zu nodes\n",
-                       n_nodes);
+          std::fprintf(stderr,
+                       "[CUDA_GRAPH] decode graph: %zu nodes, %d kv-length "
+                       "comparison(s) recorded at kv=%d\n",
+                       n_nodes, nntrainer::cuda::kv_regime_size(), step_kv);
         }
         if (cudaGraphInstantiate(&cached_exec, graph, 0) == cudaSuccess) {
           cudaGraphLaunch(cached_exec, sm.GetStream());

@@ -950,7 +950,10 @@ bool attention_splitkv_decode(const unsigned short *q, const unsigned short *k,
     const char *e = std::getenv("NNTR_CUDA_SPLITKV_CLIP");
     return !(e != nullptr && e[0] == '0');
   }();
-  const int clip = (clip_on && window > 0 && window < N_kv) ? 1 : 0;
+  // [kv-regime] same sliding-window regime as the dense path's win_bq, and the
+  // clipped stride is what the captured grid froze.
+  const int clip =
+    (clip_on && window > 0 && kv_regime_gt(N_kv, window)) ? 1 : 0;
   if (clip) {
     const long wc = (long)window / chunk_kv + 2;
     if (wc < (long)max_nc)
@@ -1003,6 +1006,20 @@ bool attention_splitkv_decode(const unsigned short *q, const unsigned short *k,
   const int eff_nc = clip ? max_nc : ((n_chunks < max_nc) ? n_chunks : max_nc);
   int hpw = 1;
   if (fuse_on && warp_ok && gqa_all > 1) {
+    // [kv-regime] On an unclipped (full-attention) layer eff_nc is the live
+    // chunk count, so the fused-head choice below -- kernel name AND gridDim.x
+    // -- is a step function of the key count. The comment on fuse_on says the
+    // fold is bit-identical to HPW=1, but "the geometry stays valid" is not the
+    // same claim as "the bytes are the same", and a default has to rest on the
+    // stronger one. Report the bracket of key counts that yields this eff_nc:
+    // the capture then lives until the chunk count moves (every chunk_kv tokens
+    // on a global layer, never on a window-clipped one, where eff_nc is a
+    // per-layer constant).
+    if (!clip) {
+      kv_regime_gt(N_kv, (eff_nc - 1) * chunk_kv);
+      if (eff_nc < max_nc)
+        kv_regime_gt(N_kv, eff_nc * chunk_kv);
+    }
     const int hpw_cap = (d == 512) ? 4 : 6; // register budget per head_dim
     static const int cand[] = {6, 4, 3, 2};
     for (int i = 0; i < 4; ++i) {
@@ -1211,10 +1228,21 @@ bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
   // mirror the KV cache to the device if it is host-resident (engine=cuda KV
   // cache is not UVM). K/V are [N_kv, num_heads_KV*head_dim] interleaved.
   const size_t kv_elems = (size_t)N_kv * num_heads_KV * head_dim;
+  const unsigned short *k_src = k_fp16, *v_src = v_fp16;
   k_fp16 = mirror_kv(k_fp16, kv_elems);
   v_fp16 = mirror_kv(v_fp16, kv_elems);
   if (!k_fp16 || !v_fp16)
     return false;
+  // [kv-regime] A mirror is a cudaMemcpy whose LENGTH is the key count, and a
+  // captured copy node keeps the length it recorded: every replayed token would
+  // attend a cache frozen at the capture. Unlike a branch this cannot be
+  // re-asked, so report the key count as consumed exactly and let the capture
+  // expire on the next token. On a platform where the KV cache is
+  // device-accessible (mirror_kv returns its argument) nothing is reported and
+  // the graph lives the full sequence -- which is the discrete-GPU case the
+  // decode graph exists for.
+  if (k_fp16 != k_src || v_fp16 != v_src)
+    kv_regime_exact(N_kv);
 
   // Flash-decoding (split-KV) for M=1 decode with enough keys to fill the SMs.
   static const int sk_chunk = []() {
@@ -1224,7 +1252,12 @@ bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
     int c = atoi(e);
     return c > 0 ? c : 64; // =1 -> default chunk 64; or an explicit chunk size
   }();
-  if (sk_chunk > 0 && N_q == 1 && N_kv > sk_chunk) {
+  // [kv-regime] THE decode arm flip: this threshold (64 keys by default)
+  // decides between the split-KV reduce below and the dense per-key kernel at
+  // the bottom of this function, and the two reduce in different orders. A
+  // short-prompt capture lands on the dense side and a replay never re-asks --
+  // see kv_regime_gt() for the measurement.
+  if (sk_chunk > 0 && N_q == 1 && kv_regime_gt(N_kv, sk_chunk)) {
     if (attention_splitkv_decode(q_fp16, k_fp16, v_fp16, o_fp16, num_heads_Q,
                                  num_heads_KV, N_kv, cache_from, head_dim,
                                  window, softcap, sk_chunk)) {
@@ -1255,7 +1288,13 @@ bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
   // window<=0 or window>=N_kv -> no sliding mask (full causal); mha passes
   // INT_MAX for global layers. Hoisted here because the GEMM default keys off
   // it; the block-Q path below reuses the same value (identical semantic).
-  const int win_bq = (window <= 0 || window >= N_kv) ? 0 : window;
+  // [kv-regime] `window >= N_kv` is the sliding-window regime: while the window
+  // still covers the whole cache there is no mask to apply. It flips once, when
+  // the cache outgrows the window, and a capture taken before the flip keeps
+  // launching the unmasked variant after it. A model that knows its own window
+  // can name that position in advance; recording the comparison here means the
+  // measurement finds the same flip without being told.
+  const int win_bq = (window <= 0 || !kv_regime_gt(N_kv, window)) ? 0 : window;
   // Default: integrated GPUs (Orin sm_87) need the cuBLAS GEMM attention for
   // every layer because block-Q runs ~0.2 TFLOP/s there. On discrete GPUs the
   // long-context FULL-attention layers (win_bq==0) also want it: their key
@@ -1275,7 +1314,8 @@ bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
   const bool gemm_attn_on =
     (gemm_attn_mode == 1) ||
     (gemm_attn_mode != 0 &&
-     (integrated_gpu || (win_bq == 0 && N_kv >= gemm_min_kv)));
+     (integrated_gpu ||
+      (win_bq == 0 && kv_regime_gt(N_kv, gemm_min_kv - 1)))); // >= gemm_min_kv
   // head_dim 256/512 (gemma4 sliding/global) were historically excluded because
   // block-Q beat the cuBLAS path on RTX/Adreno. On Orin (sm_87) block-Q runs at
   // only ~0.2 TFLOP/s, so the cuBLAS int8/fp16 Tensor-Core QK/PV is worth
