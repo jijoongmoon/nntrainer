@@ -598,5 +598,19 @@ bool v_gather_ohwi_t_img_cl(void *src_image, uint16_t *dst_svm, unsigned int M,
                             unsigned int max_S, unsigned int position,
                             bool drain = true);
 
+/**
+ * @brief Model-teardown hook: drop the process-lifetime attention caches this
+ *        translation unit holds.
+ *
+ * @details Two items, both unsound once a process loads a second model: the
+ * per-slot resident RoPE cos/sin LUT pair, keyed by the caller's (cos, sin)
+ * HOST pointers (a device pair per slot that nothing else frees, on a key the
+ * next load can be handed again), and the OHWI V image2d view, which is a view
+ * over a buffer this file does NOT own (the model's KV cache) memoised by that
+ * buffer's handle value. Pure reset -- both are rebuilt lazily -- and no driver
+ * call when the lane was never used. Call only when no run is in flight.
+ */
+void cl_attention_release_caches();
+
 } // namespace nntrainer
 #endif /* __ATTENTION_KERNELS_H__ */

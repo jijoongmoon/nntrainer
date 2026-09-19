@@ -2348,7 +2348,24 @@ struct V8cAuxChunk {
   size_t span = 0;
   size_t used = 0;
   std::vector<uint8_t>
-    staging; /**< host image of [0, used); empty once written */
+    staging; /**< host image of [written, used); empty once written */
+  /**
+   * @brief Bytes of this chunk already enqueued to the device.
+   *
+   * @details The staging image is created empty and filled only where a carve
+   * copies into it, so "write [0, used)" is correct only while every carve
+   * since the chunk was created is still staged. A flush ends that: it releases
+   * the image and a LATER carve re-creates it zero-filled. Writing from 0 then
+   * overwrites everything carved before the flush with zeros -- and those
+   * bytes are a previous model's per-channel scales and int4 row sums, whose
+   * sub-buffers are still held by the v8c weight cache, so the FCs that read
+   * them multiply by zero and the model answers the empty string. The chunk
+   * therefore remembers where the device is already correct and never rewrites
+   * it. (The teardown hook below keeps a reload from re-entering a flushed
+   * chunk at all; this is the same invariant stated where it belongs, so it
+   * also holds for a caller that never announces a teardown.)
+   */
+  size_t written = 0;
 };
 
 std::mutex &v8c_aux_mtx() {
@@ -2377,14 +2394,19 @@ std::atomic<bool> v8c_aux_sealed{true};
 
 /** @brief Enqueue one chunk's staged bytes and release the staging. */
 void v8c_aux_write_chunk_locked(V8cAuxChunk &c, cl_command_queue cq) {
-  if (c.staging.empty() || c.used == 0)
+  if (c.staging.empty() || c.used <= c.written)
     return;
+  // Only [written, used) -- see V8cAuxChunk::written.
+  const size_t off = c.written;
+  const size_t len = c.used - off;
   const cl_int werr = opencl::clEnqueueWriteBuffer(
-    cq, c.base, CL_TRUE, 0, c.used, c.staging.data(), 0, nullptr, nullptr);
+    cq, c.base, CL_TRUE, off, len, c.staging.data() + off, 0, nullptr, nullptr);
   if (werr != CL_SUCCESS)
     ml_loge("[v8c] aux arena chunk write of %.2f MiB failed with %d; the "
             "weights carved from it will read zeros",
-            c.used / 1048576.0, werr);
+            len / 1048576.0, werr);
+  else
+    c.written = c.used;
   std::vector<uint8_t>().swap(c.staging);
 }
 
@@ -2441,7 +2463,7 @@ bool v8c_aux_reserve(cl_context ctx, cl_command_queue cq, size_t bytes,
               span / 1048576.0, err);
       return false;
     }
-    chunks.push_back(V8cAuxChunk{base, span, 0, {}});
+    chunks.push_back(V8cAuxChunk{base, span, 0, {}, 0});
   }
   V8cAuxChunk &c = chunks.back();
   *parent = c.base;
@@ -2461,10 +2483,42 @@ bool v8c_aux_reserve(cl_context ctx, cl_command_queue cq, size_t bytes,
     *staged = true;
   }
   c.used += need;
+  if (!defer) {
+    // A carve taken while the arena is SEALED is written by the caller itself,
+    // so the flush must never rewrite that region from a staging image it is
+    // not in. Advancing `written` past it is what says so -- otherwise a later
+    // deferred carve into the same chunk would create a zero-filled image and
+    // the flush would cover this region with those zeros.
+    c.written = c.used;
+  }
   return true;
 }
 
 } // namespace
+
+/**
+ * @brief One lm_head / embed weight's device residency: the weight copy plus
+ *        the activation and logits scratch that go with it.
+ *
+ * @details [reload] The two maps below are keyed by the weight's HOST pointer
+ * and own every handle they hold. They were function-local statics, on the
+ * premise that a weight lives as long as the process; a process that destroys a
+ * model and loads another breaks that twice over -- the entries are a per-cycle
+ * device leak, and the next load's allocator can hand the same address to a
+ * different weight, which this cache (unlike the v8c weight cache) does not
+ * check for. At file scope so v8c_release_lmhead_caches() can reach them.
+ * Unguarded, as they were: both are reached only from the serial decode tail,
+ * and the teardown hook runs with no run in flight.
+ */
+struct LmheadEntry {
+  cl_mem w = nullptr;   /**< device copy of the weight table */
+  cl_mem x = nullptr;   /**< activation staging */
+  cl_mem out = nullptr; /**< logits */
+};
+/** @brief Q6_K lm_head residency, keyed by the packed table's host pointer. */
+static std::unordered_map<const void *, LmheadEntry> g_lmhead_q6k_cache;
+/** @brief The same for the fp32 embed / lm_head table. */
+static std::unordered_map<const void *, LmheadEntry> g_lmhead_fp32_cache;
 
 void v8c_open_aux_arena() {
   v8c_aux_sealed.store(false, std::memory_order_release);
@@ -2508,6 +2562,52 @@ void v8c_flush_aux_arena() {
   if (chunks != 0)
     ml_logd("[v8c] aux arena: %zu chunk(s), %.2f MiB carved", chunks,
             carved / 1048576.0);
+}
+
+void v8c_release_aux_arena() {
+  // [reload] Model-teardown hook. The arena is a bump allocator that "never
+  // reclaims" because its carvings live in the v8c weight cache for the
+  // process; the moment a process loads a SECOND model that premise is gone and
+  // the arena becomes both a per-cycle device leak and, through its
+  // partially-used tail chunk, the reason a reloaded model answers the empty
+  // string. Every sub-buffer carved from these chunks belongs to a weight-cache
+  // entry, so the caller MUST clear that cache first (see
+  // CausalLM::releaseDeviceCaches, which orders the two); releasing a parent
+  // whose sub-buffers are still live would be the mirror defect.
+  //
+  // Makes no driver call when nothing was ever carved, so a CPU/CUDA-only run
+  // of an OpenCL-capable build never touches the loader.
+  std::lock_guard<std::mutex> lock(v8c_aux_mtx());
+  auto &chunks = v8c_aux_chunks();
+  for (auto &c : chunks) {
+    if (c.base)
+      opencl::clReleaseMemObjectT(c.base);
+    std::vector<uint8_t>().swap(c.staging);
+  }
+  chunks.clear();
+  // The next load opens the arena for itself; leave it sealed so a carve
+  // outside a load still writes its own bytes.
+  v8c_aux_sealed.store(true, std::memory_order_release);
+}
+
+void v8c_release_lmhead_caches() {
+  // [reload] The two lm_head residency caches are keyed by the weight's HOST
+  // pointer with no identity check at all (unlike the v8c weight cache, which
+  // validates name and shape), and they own the device weight copy plus the
+  // activation and logits buffers. A second load recycles those addresses, so a
+  // surviving entry is both a per-cycle device leak and a hit that runs the
+  // GEMV over the previous model's lm_head. Pure reset: the next call rebuilds.
+  for (auto *cache : {&g_lmhead_q6k_cache, &g_lmhead_fp32_cache}) {
+    for (auto &kv : *cache) {
+      if (kv.second.w)
+        opencl::clReleaseMemObjectT(kv.second.w);
+      if (kv.second.x)
+        opencl::clReleaseMemObjectT(kv.second.x);
+      if (kv.second.out)
+        opencl::clReleaseMemObjectT(kv.second.out);
+    }
+    cache->clear();
+  }
 }
 
 void v8c_flush_pending_uploads() {
@@ -3271,13 +3371,12 @@ bool lmhead_gemv_q6_k_cl(const void *w_q6k_host, const float *act_f32_host,
 
   // Per-weight device residency (the Q6_K table never changes after load):
   // weight + act + logits buffers keyed by the weight host pointer.
-  struct LmheadEntry {
-    cl_mem w = nullptr;
-    cl_mem x = nullptr;
-    cl_mem out = nullptr;
-  };
-  static std::unordered_map<const void *, LmheadEntry> cache;
-  LmheadEntry &e = cache[w_q6k_host];
+  // [reload] File scope, not a function-local static, so
+  // v8c_release_lmhead_caches() can drop it at model teardown -- that host
+  // pointer is an address the next load's allocator hands out again. Unguarded
+  // as before: the lm_head GEMV is the serial decode tail, and the teardown
+  // hook runs with no run in flight.
+  LmheadEntry &e = g_lmhead_q6k_cache[w_q6k_host];
   const size_t nb = hidden / 256;
   const size_t w_bytes = (size_t)vocab * nb * 210;
   cl_int err = CL_SUCCESS;
@@ -3303,7 +3402,7 @@ bool lmhead_gemv_q6_k_cl(const void *w_q6k_host, const float *act_f32_host,
         opencl::clReleaseMemObjectT(e.x);
       if (e.out)
         opencl::clReleaseMemObjectT(e.out);
-      cache.erase(w_q6k_host);
+      g_lmhead_q6k_cache.erase(w_q6k_host);
       return false;
     }
   }
@@ -4222,13 +4321,10 @@ bool lmhead_gemv_fp32w_cl(const void *w_fp32_host, const void *act_fp16_host,
   // Per-weight device residency: the embed/lm_head table never changes after
   // load, so cache the device weight buffer (+ act/out scratch) keyed by the
   // weight host pointer.
-  struct LmheadFp32Entry {
-    cl_mem w = nullptr;
-    cl_mem x = nullptr;
-    cl_mem out = nullptr;
-  };
-  static std::unordered_map<const void *, LmheadFp32Entry> cache;
-  LmheadFp32Entry &e = cache[w_fp32_host];
+  // [reload] File scope for the same reason as the Q6_K cache above: the key is
+  // an address the next load's allocator hands out again, so the teardown hook
+  // has to be able to reach the map.
+  LmheadEntry &e = g_lmhead_fp32_cache[w_fp32_host];
   const size_t w_bytes = (size_t)vocab * (size_t)hidden * sizeof(float);
   cl_int err = CL_SUCCESS;
   if (e.w == nullptr) {
@@ -4255,7 +4351,7 @@ bool lmhead_gemv_fp32w_cl(const void *w_fp32_host, const void *act_fp16_host,
         opencl::clReleaseMemObjectT(e.x);
       if (e.out)
         opencl::clReleaseMemObjectT(e.out);
-      cache.erase(w_fp32_host);
+      g_lmhead_fp32_cache.erase(w_fp32_host);
       return false;
     }
   }

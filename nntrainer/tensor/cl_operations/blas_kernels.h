@@ -636,6 +636,34 @@ void v8c_flush_aux_arena();
 void v8c_open_aux_arena();
 
 /**
+ * @brief Model-teardown hook: free the v8c aux arena's device chunks.
+ *
+ * @details The arena is a bump allocator that never reclaims, which is right
+ * only while its carvings live as long as the process. In a process that
+ * destroys a model and loads another it is a per-cycle device leak, and its
+ * partially-used tail chunk is worse than a leak: the next load re-enters that
+ * chunk with a fresh, zero-filled staging image, so the flush rewrites the
+ * previous load's still-referenced scales and row sums as zeros and the model
+ * answers the empty string. Every sub-buffer carved here belongs to a v8c
+ * weight-cache entry, so the CALLER MUST clear that cache first --
+ * CausalLM::releaseDeviceCaches() orders the two. Pure reset, no driver call
+ * when nothing was carved; call only when no run is in flight.
+ */
+void v8c_release_aux_arena();
+
+/**
+ * @brief Model-teardown hook: free the lm_head / embed device residency caches.
+ *
+ * @details Both are keyed by the weight table's HOST pointer and own the device
+ * weight copy plus its activation and logits scratch, on the premise that a
+ * weight lives as long as the process. A second load in one process makes each
+ * surviving entry a per-cycle device leak and, on a recycled address, a hit
+ * that runs the GEMV over the previous model's table. Pure reset: the next call
+ * rebuilds. Call only when no run is in flight.
+ */
+void v8c_release_lmhead_caches();
+
+/**
  * @brief 8/4/4 paper attention path: int8(act) × int8(weight) channel-wise
  * GEMM. Signature mirrors gemm_int8_v8c_cl (row_sum_act ignored). Weight image
  *        must be the plain row-major int8 view (width K/16). Dispatches the

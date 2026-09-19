@@ -40,6 +40,8 @@
 #include <neuralnet.h>
 
 #if defined(ENABLE_OPENCL)
+#include <attention_kernels.h>     // [reload] cl_attention_release_caches
+#include <blas_kernel_interface.h> // [reload] cl_fc_release_caches
 #include <blas_kernels.h> // the lm_head GEMV's deferred-logits / argmax hooks
 #include <cl_context.h>   // OpenCL-only; registration uses the Engine facade.
 
@@ -2072,6 +2074,22 @@ void CausalLM::releaseDeviceCaches() {
   nntrainer::cuda::cuda_fc_qs4cx_release_weight_caches();
   nntrainer::cuda::cuda_attention_release_caches();
   nntrainer::cuda_reset_decode_graph_cache();
+#endif
+#if defined(ENABLE_OPENCL)
+  // [reload] The OpenCL half of the same class, and the same contract: a pure
+  // reset per translation unit, no driver call when the lane was never used.
+  // ORDER MATTERS. The FC hook drops the v8c weight packs, whose per-channel
+  // scale and row-sum buffers are SUB-BUFFERS of the aux arena's chunks, so the
+  // arena is released second -- freeing a parent while its sub-buffers are live
+  // would be the mirror of the defect this fixes. Field signature of NOT doing
+  // this on Intel: the third load in one process answers the empty string
+  // (d41d8cd9), because the arena's partially-used tail chunk is re-entered by
+  // the next load with a zero-filled staging image and the flush rewrites the
+  // previous load's still-referenced scales as zeros.
+  nntrainer::cl_fc_release_caches();
+  nntrainer::v8c_release_aux_arena();
+  nntrainer::v8c_release_lmhead_caches();
+  nntrainer::cl_attention_release_caches();
 #endif
 }
 

@@ -2344,4 +2344,60 @@ void debug_dump_rows_cl(const std::string &name, const Tensor &t,
   std::fprintf(stderr, "[dump] %04u %s plane=%s rows=%u W=%zu es=%zu\n", seq,
                name.c_str(), plane, rows, W, es);
 }
+
+void cl_fc_release_caches() {
+  // [reload] Model-teardown counterpart to the process-lifetime state this file
+  // latches. Each item was written as "build once, keep for the process" --
+  // true for a one-shot CLI, false for an SDK consumer that destroys the handle
+  // and loads another in the same process. No run is in flight at the call site
+  // and every item is rebuilt lazily or by the next load, so an empty state is
+  // always valid. Nothing here calls into the driver when nothing was cached,
+  // so a CPU/CUDA-only run of an OpenCL-capable build never pokes the loader.
+  std::lock_guard<std::mutex> lock(v8c_cache_mtx());
+  // 1. The derived weight packs. Every entry OWNS its device backing, its scale
+  //    and row-sum sub-buffers, so "keep for the process" means each load leaks
+  //    a whole model's worth of device memory: measured on the Intel lane, the
+  //    GPU ledger went 630 -> 1229 -> 1492 MB over three loads of one 1.5B
+  //    model and init went 240 -> 850 ms. The map is also keyed by the weight's
+  //    HOST address, which the next load's allocator hands out again; the
+  //    (name, N, K) check on a hit keeps such an entry from being bound for
+  //    ANOTHER weight, but a same-named hit is served -- and what it serves is
+  //    the previous model's pack, whose aux sub-buffers point into an arena the
+  //    next load is still bumping through (see v8c_release_aux_arena).
+  v8c_weight_cache().clear();
+  // 2. The norm-site strike counters, keyed by the gamma HOST pointer: a
+  //    recycled address hands the next model's norm the previous model's
+  //    "written off, never fuse again" verdict.
+  v8c_norm_sites().clear();
+  // 3. The two quantisation handoffs in the shared scratch. Both name their
+  //    input by a device-buffer handle plus a dispatch sequence number, and the
+  //    soundness of both rests on the dispatch write log -- which across a
+  //    teardown can say "unchanged" about a handle that now belongs to a
+  //    different model, because loading one dispatches no kernels and the
+  //    activation plane is USE_HOST_PTR over an SVM plane whose address the
+  //    next load recycles (measured: the third load of a 1.5B model landed on
+  //    the second's plane). Drop the identities; the scratch BUFFERS stay, so
+  //    the next load does not pay to reallocate them.
+  V8cScratch &sc = v8c_scratch();
+  sc.nq_site = nullptr;
+  sc.nq_src = nullptr;
+  sc.nq_seq = 0;
+  sc.nq_rows = 0;
+  sc.nq_K = 0;
+  sc.nq_slot = -1;
+  sc.nq_pending_slot = -1;
+  sc.last_quant_in_ptr = nullptr;
+  sc.last_quant_seq = 0;
+  sc.last_quant_gen = 0;
+  sc.last_quant_M = 0;
+  sc.last_quant_K = 0;
+  sc.last_quant_M_pad = 0;
+  sc.last_quant_dtype = -1;
+  // 4. A teardown is as much a handle-epoch boundary as a creation: the next
+  //    load's memory objects land on freed addresses, so every remaining
+  //    handle-VALUE-keyed memo in the tree (the kernel-argument cache, the
+  //    image->backing-buffer cache) has to be told that a value may now name a
+  //    different object.
+  opencl::clBumpHandleEpoch();
+}
 } // namespace nntrainer

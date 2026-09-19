@@ -5132,4 +5132,46 @@ bool flash_decode_f16_cl(const uint16_t *Q_host, const uint16_t *K_host,
   return true;
 }
 
+void cl_attention_release_caches() {
+  // [reload] Model-teardown counterpart to what this file latches for the
+  // process. No run is in flight at the call site and every item is rebuilt
+  // lazily, so an empty state is always valid; nothing calls the driver when
+  // the lane was never used.
+  {
+    // The per-slot resident RoPE cos/sin LUTs, keyed by the (cos, sin) HOST
+    // pointers the caller's flat-LUT cache hands out, with `uploaded` meaning
+    // "the device copy already holds these tables". Both halves of that break
+    // at a reload: the buffers are one device pair per slot that nothing else
+    // frees, so they leak per cycle, and the key is an address the next load
+    // can be given again, which would let the new model's positions read the
+    // old model's table. tca_mtx() is the only lock this file has; it guards
+    // the TcaScratch half below. RopeScratch never had one -- it is written
+    // from the single attention dispatch thread -- and a teardown has no run in
+    // flight either.
+    std::lock_guard<std::mutex> lk(tca_mtx());
+    RopeScratch &rs = rope_scratch();
+    for (auto &kv : rs.lut_slots) {
+      if (kv.second.cos)
+        opencl::clReleaseMemObjectT(kv.second.cos);
+      if (kv.second.sin)
+        opencl::clReleaseMemObjectT(kv.second.sin);
+    }
+    rs.lut_slots.clear();
+    // The OHWI V image is a VIEW over a buffer this scratch does not own -- the
+    // model's KV cache -- and its cache key is that buffer's handle value. Once
+    // the model is gone the view names a released object, and a next load whose
+    // KV buffer takes the same handle value would sample it. The key is what
+    // has to go; the view is released with it because nothing else can.
+    TcaScratch &ts = tca_scratch();
+    if (ts.v_ohwi_image)
+      opencl::clReleaseMemObjectT(ts.v_ohwi_image);
+    ts.v_ohwi_image = nullptr;
+    ts.v_ohwi_buf = nullptr;
+    ts.v_ohwi_HD_KV = 0;
+    ts.v_ohwi_S_max = 0;
+  }
+  // A teardown is a handle-epoch boundary for this file's memos too.
+  opencl::clBumpHandleEpoch();
+}
+
 } // namespace nntrainer

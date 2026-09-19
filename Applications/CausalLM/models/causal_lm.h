@@ -72,13 +72,15 @@ public:
 
   /**
    * @brief Model-teardown hook for the process-global device caches the
-   *        CUDA lane keys by HOST pointer (derived FC weights, scale side
-   *        buffers, the KV mirror and split-KV scratch, the decode graph).
-   *        Call after the model objects of a handle are destroyed and before
-   *        the next load: a second load in the same process otherwise lands
-   *        its weights on recycled addresses and takes stale cache hits. Pure
-   *        reset -- every cache is rebuilt lazily or by the next load's
-   *        prewarm. No-op on a build or a process that never used CUDA.
+   *        CUDA and OpenCL lanes key by HOST pointer or handle value (CUDA:
+   *        derived FC weights, scale side buffers, the KV mirror and split-KV
+   *        scratch, the decode graph; OpenCL: the v8c weight packs and their
+   *        aux arena, the lm_head residency, the RoPE LUTs and the V image
+   *        view). Call after the model objects of a handle are destroyed and
+   *        before the next load: a second load in the same process otherwise
+   *        lands its weights on recycled addresses and takes stale cache hits.
+   *        Pure reset -- every cache is rebuilt lazily or by the next load's
+   *        prewarm. No driver call for a lane the process never used.
    */
   static void releaseDeviceCaches();
 

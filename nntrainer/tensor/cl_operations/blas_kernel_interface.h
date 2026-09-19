@@ -275,5 +275,24 @@ void v8cNormQuantCommit(void *src_clmem, unsigned int rows, unsigned int K);
  */
 void v8cNormQuantAbort();
 
+/**
+ * @brief Model-teardown hook: drop every process-lifetime cache the OpenCL FC
+ *        path keys by a HOST pointer, plus the quantisation handoffs in its
+ *        shared scratch.
+ *
+ * @details The v8c derived-weight packs, the norm-site strike counters and the
+ * two activation-quantisation handoffs are all written as "build once, keep for
+ * the process" -- correct for a one-shot CLI, wrong for an SDK consumer that
+ * destroys a handle and loads another, because the next load's allocator hands
+ * out the very addresses those caches are keyed by. Surviving weight packs are
+ * a whole model's worth of device memory per load cycle; a surviving quant
+ * handoff lets the new model's first FC of a fanout multiply its weights by the
+ * previous model's activation. Pure reset -- each item is rebuilt lazily or by
+ * the next load -- and no driver call when nothing was cached. Call only when
+ * no run is in flight, and before v8c_release_aux_arena(), whose chunks these
+ * packs carve.
+ */
+void cl_fc_release_caches();
+
 } // namespace nntrainer
 #endif /* __BLAS_KERNEL_INTERFACE_H__ */
