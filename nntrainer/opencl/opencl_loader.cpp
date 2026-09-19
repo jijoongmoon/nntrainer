@@ -351,11 +351,27 @@ public:
   }
 
   ~MemAcct() {
-    if (enabled_)
+    if (dump_)
       dump("atexit");
   }
 
   bool enabled() const { return enabled_; }
+
+  /// Bytes outstanding right now, and the high-water of that. This is the
+  /// quantity the honest footprint wants: what this process has asked the
+  /// driver for and not given back.
+  size_t liveBytes() {
+    if (!enabled_)
+      return 0;
+    std::lock_guard<std::mutex> lk(m_);
+    return live_bytes_;
+  }
+  size_t peakBytes() {
+    if (!enabled_)
+      return 0;
+    std::lock_guard<std::mutex> lk(m_);
+    return peak_bytes_;
+  }
 
   void note(const char *kind, const void *handle, size_t bytes, bool view) {
     if (!enabled_ || handle == nullptr)
@@ -409,7 +425,7 @@ public:
   }
 
   void dump(const char *phase) {
-    if (!enabled_)
+    if (!dump_)
       return;
     std::vector<std::pair<std::string, AcctTagStat>> rows;
     size_t live = 0, peak = 0;
@@ -438,7 +454,18 @@ public:
 private:
   MemAcct() {
     const char *e = std::getenv("NNTR_GPU_MEM_ACCT");
-    enabled_ = (e != nullptr && e[0] != 0 && e[0] != '0');
+    /** The counting is ON by default and NNTR_GPU_MEM_ACCT=0 opts out; the
+     *  stderr dumps stay opt-in and need the flag set to something else.
+     *
+     *  The reason the ledger cannot stay opt-in: it is the only per-process
+     *  GPU byte count the app can read. /sys/class/kgsl/kgsl/proc/<pid>/gpumem
+     *  is Permission denied to the shell uid AND to the application uid on the
+     *  Android devices this was measured on, so the global page_alloc counter
+     *  -- which is not ours alone -- is all an outside observer gets.
+     *  A run that has to report its own honest footprint has to count from
+     *  the inside, on every run, not only when a flag is set. */
+    enabled_ = (e == nullptr || (e[0] != 0 && e[0] != '0'));
+    dump_ = (e != nullptr && e[0] != 0 && e[0] != '0');
   }
 
   static std::vector<const char *> &stack() {
@@ -461,6 +488,7 @@ private:
   }
 
   bool enabled_ = false;
+  bool dump_ = false;
   std::mutex m_;
   std::unordered_map<const void *, AcctRec> live_;
   std::unordered_map<std::string, AcctTagStat> tags_;
@@ -479,6 +507,12 @@ void clMemAcctPop() { MemAcct::get().pop(); }
 void clMemAcctPushView() { MemAcct::get().pushView(); }
 void clMemAcctPopView() { MemAcct::get().popView(); }
 void clMemAcctDump(const char *phase) { MemAcct::get().dump(phase); }
+size_t clMemAcctLiveBytes() {
+  return g_acct_on ? MemAcct::get().liveBytes() : 0;
+}
+size_t clMemAcctPeakBytes() {
+  return g_acct_on ? MemAcct::get().peakBytes() : 0;
+}
 
 cl_int clReleaseMemObjectT(cl_mem memobj) {
   if (g_acct_on)

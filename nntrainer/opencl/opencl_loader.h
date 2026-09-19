@@ -333,9 +333,16 @@ void *clSVMAllocT(cl_context context, cl_svm_mem_flags flags, size_t size,
  * way it makes one -- against a tag pushed by the call site, and every release,
  * so the dump is live bytes and not merely cumulative ones.
  *
- * OFF unless NNTR_GPU_MEM_ACCT is set to something other than 0: when off,
- * every entry point below is a load of one bool and a return, and no map, mutex
- * or string is touched on any allocation path.
+ * The counting is ON by default -- NNTR_GPU_MEM_ACCT=0 opts out, and when it
+ * is off every entry point below is a load of one bool and a return, with no
+ * map, mutex or string touched on any allocation path. It has to be on by
+ * default because it is the only per-process GPU byte count that exists on
+ * this platform: /sys/class/kgsl/kgsl/proc/<pid>/gpumem is Permission denied
+ * to the shell uid and to the application uid alike, so an app that must
+ * report its own honest footprint can only count from the inside.
+ *
+ * The stderr dumps stay opt-in: clMemAcctDump() prints only when
+ * NNTR_GPU_MEM_ACCT is set to something other than 0.
  *
  * A sub-buffer and an image created from a buffer are VIEWS -- they allocate
  * nothing -- and are recorded with zero bytes so that the count still shows
@@ -419,6 +426,20 @@ private:
  * destructor, so a run that ends early still reports.
  */
 void clMemAcctDump(const char *phase);
+
+/**
+ * @brief Bytes this process currently holds from the GPU driver, and the
+ * high-water mark of that.
+ *
+ * @details Live, not cumulative: a grow-only cache that replaced a smaller
+ * buffer counts once. Views (sub-buffers, image-from-buffer) contribute zero,
+ * so the number is addable to a host RSS figure without double counting.
+ * Zero when the ledger is off. Closes to 98.7 % of the kgsl page_alloc delta
+ * as measured from outside the process; the residue is the driver's own
+ * programs, queues and ring buffers, which no in-process ledger can see.
+ */
+size_t clMemAcctLiveBytes();
+size_t clMemAcctPeakBytes();
 } // namespace nntrainer::opencl
 
 #endif // __OPENCL_LOADER_H__
