@@ -59,8 +59,9 @@ inline bool kvRingEngineEligible() {
  * @details mha_core resolves attention through a cascade, and only three of its
  * arms take the ring capacity and read row (n % cap):
  * flash_attention_prefill_f16_cl, flash_decode_f16_cl and
- * cuda_attention_interleaved_fp16. The remaining arms (the two_conv family, the
- * OHWI-direct and OHWI image paths, and the host compute_kcaches /
+ * cuda_attention_interleaved_fp16; the Adreno OHWI image arm reaches the same
+ * result without a modulo (a sliding mirror, see below). The remaining arms
+ * (the two_conv family, the OHWI-direct path, and the host compute_kcaches /
  * gemm_attention fallback) index the cache linearly from the LOGICAL key count,
  * so pointing them at a Wcap-high buffer reads past its end.
  *
@@ -87,13 +88,30 @@ inline bool kvRingArmAvailable() {
   // on a Wcap-high plane, reproduced on Xe), and its readers -- the OHWI-direct
   // two_conv arm and the OHWI->concat gather -- are linear too. mha_core
   // presence-checks that variable, so presence is what disqualifies here. The
-  // image arms, which preempt flash on Adreno, are not ring-aware either.
+  // two_conv image arm (NNTR_MHA_GPU_IMG) is linear too.
   if (!nntr_env_on("NNTR_MHA_GPU"))
     return false;
   if (std::getenv("NNTR_KV_OHWI") != nullptr)
     return false;
-  if (nntr_env_on("NNTR_KV_IMG_ATTN") || nntr_env_on("NNTR_MHA_GPU_IMG"))
+  if (nntr_env_on("NNTR_MHA_GPU_IMG"))
     return false;
+  if (nntr_env_on("NNTR_KV_IMG_ATTN")) {
+    // The Adreno OHWI image arm serves a ringed layer through a SLIDING
+    // mirror: the per-layer K/V mirror is ring-cap rows high and holds the
+    // absolute rows [base, base + rows), re-based (and back-filled from the
+    // ringed cache) whenever the window moves past it, so the image kernels
+    // keep their linear addressing over a bounded height. Two things still
+    // close it: the opt-in staged chain (NNTR_KV_STAGE), whose mirrors are
+    // the ONLY K/V store during prefill, so there is no cache to back-fill
+    // from; and NNTR_KV_IMG_RING=0, the control arm that restores the linear
+    // full-height cache under the image bundle.
+    if (std::getenv("NNTR_KV_STAGE") != nullptr &&
+        std::getenv("NNTR_NO_KV_STAGE") == nullptr)
+      return false;
+    const char *ir = std::getenv("NNTR_KV_IMG_RING");
+    if (ir != nullptr && ir[0] == '0')
+      return false;
+  }
   return true;
 #else
   return false;

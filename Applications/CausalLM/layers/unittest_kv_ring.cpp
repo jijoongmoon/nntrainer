@@ -129,7 +129,8 @@ TEST(KVRing, refused_without_a_ring_aware_arm) {
 #if defined(ENABLE_OPENCL)
 /**
  * @brief On OpenCL the ring-aware flash arms live in the concat-layout block:
- *        NNTR_MHA_GPU opens it, NNTR_KV_OHWI and the image arms close it.
+ *        NNTR_MHA_GPU opens it, NNTR_KV_OHWI and the two_conv image arm close
+ *        it; the OHWI image arm (Adreno) keeps it open.
  * @details NNTR_KV_OHWI used to be listed as a precondition. It is the
  * opposite: the OHWI K scatter places rows by absolute position (a heap
  * overwrite on a Wcap-high plane) and its readers are linear.
@@ -152,10 +153,30 @@ TEST(KVRing, opencl_arm_rule) {
     EXPECT_FALSE(causallm::kvRingArmAvailable());
   }
   {
+    // The Adreno bundle: the OHWI image arm serves the ring through its
+    // sliding mirror, unless the staged (mirror-only) store or the control
+    // arm is selected.
     ScopedEnv on("NNTR_KV_IMG_ATTN", "1");
+    ScopedEnv stage("NNTR_KV_STAGE", nullptr);
+    ScopedEnv ctl("NNTR_KV_IMG_RING", nullptr);
+    EXPECT_TRUE(causallm::kvRingArmAvailable());
+    {
+      ScopedEnv ring_unset("NNTR_KV_WINDOW_RING", nullptr);
+      EXPECT_TRUE(causallm::kvRingEnabled(true));
+    }
+    {
+      ScopedEnv off("NNTR_KV_IMG_RING", "0");
+      EXPECT_FALSE(causallm::kvRingArmAvailable());
+    }
+    {
+      ScopedEnv st("NNTR_KV_STAGE", "1");
+      ScopedEnv nst("NNTR_NO_KV_STAGE", nullptr);
+      EXPECT_FALSE(causallm::kvRingArmAvailable());
+    }
+  }
+  {
+    ScopedEnv on("NNTR_MHA_GPU_IMG", "1");
     EXPECT_FALSE(causallm::kvRingArmAvailable());
-    EXPECT_FALSE(causallm::kvRingEnabled());
-    EXPECT_FALSE(causallm::kvRingEnabled(true)); // a model default too
   }
 }
 #endif

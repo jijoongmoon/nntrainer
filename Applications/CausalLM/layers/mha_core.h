@@ -579,6 +579,13 @@ private:
    *  once at finalize from max_timestep so every layer's K mirror and the
    *  kernels (KIMG_GSH) agree. 0 = today's one-row-per-(head,seq) view. */
   unsigned int kv_kimg_gsh = 0;
+  /** [kv-window-ring] Absolute KV position held in mirror row 0. Always 0 for
+   *  a linear (non-ringed) layer. A ringed layer's mirror is only ring-cap
+   *  rows high and slides: it holds the absolute rows [kv_mirror_base,
+   *  kv_{k,v}_valid_to), and the image kernels are handed mirror-local
+   *  positions (absolute - base). Attention depends only on position
+   *  DIFFERENCES once K is rotated, so the result is the linear one. */
+  unsigned int kv_mirror_base = 0;
   int use_image_attn = -1;
 
   /**

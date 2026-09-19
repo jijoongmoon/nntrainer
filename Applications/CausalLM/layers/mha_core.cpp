@@ -989,7 +989,12 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
       const char *e = std::getenv("NNTR_KV_MIRROR_CAP");
       return e ? (unsigned int)std::atoi(e) : 0u;
     }();
-    unsigned int S_max = (max_timestep + 7u) & ~7u;
+    // Ring-aware (port of ed271ee7d): a W-bounded layer stores only
+    // kv_ring_cap rows, so mirroring max_timestep both over-allocates and
+    // disagrees with the lazy mirror-init site, which derives S_max from the
+    // KV cache height (= the ring cap when ringed). Constant for the run.
+    unsigned int S_max =
+      nntrainer::ohwi_mirror_capacity(kv_ring_cap ? kv_ring_cap : max_timestep);
     if (mirror_cap >= 8 && mirror_cap < S_max)
       S_max = (mirror_cap + 7u) & ~7u;
     kv_mirror_S_max = S_max;
@@ -998,8 +1003,8 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
     // process must be packed the same way, and max_timestep is the one value
     // all layers share. 0 (today's view, instruction for instruction) whenever
     // KV heads x max_timestep already fits the device image height.
-    kv_kimg_gsh =
-      nntrainer::kimg_gsh_for(num_heads_KV, (max_timestep + 7u) & ~7u);
+    kv_kimg_gsh = nntrainer::kimg_gsh_for(
+      num_heads_KV, nntrainer::ohwi_mirror_capacity(max_timestep));
     bool m_ok = nntrainer::create_ohwi_kv_mirror(
                   /*is_v=*/false, num_heads_KV, head_dim, S_max,
                   reinterpret_cast<cl_mem *>(&k_buf_ohwi),
@@ -1018,7 +1023,9 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
       // it on demand if the live sequence exceeds the guess).
       unsigned int s_tight = S_max < 1024u ? S_max : 1024u;
       void *nimg = nullptr;
-      if (nntrainer::create_ohwi_v_image_view(v_buf_ohwi, num_heads_KV,
+      // (linear layers only: a ringed layer keeps one stride, see the engage)
+      if (kv_ring_cap == 0 &&
+          nntrainer::create_ohwi_v_image_view(v_buf_ohwi, num_heads_KV,
                                               head_dim, &s_tight, &nimg) &&
           s_tight < S_max) {
         v_image_tight = nimg;
@@ -1030,6 +1037,17 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
       use_image_attn = 0; // permanent disable; flash takes over (same as
                           // the lazy-init failure path)
       mha_report_image_mirror_refused(num_heads_KV, head_dim, S_max);
+      // With the ring granted the layers no longer share one mirror size, so a
+      // refusal can leave image and buffer layers mixed in one process -- the
+      // combination the note above rules out -- and a ringed layer has no
+      // validated buffer arm on this bundle. Fail the load, precisely.
+      NNTR_THROW_IF(causallm::kvRingEnabled(ring_model_default),
+                    std::runtime_error)
+        << "[IMG-ATTN] the K/V image mirror could not be created while the "
+           "sliding-window KV ring is on (KV heads="
+        << num_heads_KV << ", head_dim=" << head_dim << ", rows=" << S_max
+        << "). Lower max_seq_len, or set NNTR_KV_IMG_RING=0 to run the linear "
+           "cache (the buffer attention arm then serves every layer).";
     }
   }
 #endif // ENABLE_OPENCL (OHWI mirror prebuild)
@@ -3100,10 +3118,10 @@ void MHACoreLayer::one_batch_incremental_forwarding(
         // attention over evicted keys (gemma4 W=512: 999-tok Adreno prefill
         // degenerates into word salad, severity ~ (cache_to - W)). Route
         // those calls to the flash kernels below, which take local_window.
-        // The OHWI image kernels take a window but not a ring capacity, so a
-        // ringed cache must not reach them (see mha_ring_refuses_arm).
-        if (use_image_attn == 1 && svm_ok && !kv_int8 && head_dim % 8 == 0 &&
-            !mha_ring_refuses_arm(kv_ring_cap, "ohwi-image")) {
+        // The OHWI image kernels take a window but not a ring capacity. A
+        // ringed layer reaches them through a SLIDING mirror instead (see
+        // kv_mirror_base): linear addressing over a ring-cap-high mirror.
+        if (use_image_attn == 1 && svm_ok && !kv_int8 && head_dim % 8 == 0) {
           // NNTR_KV_MIRROR_CAP (experiment): clamp the OHWI mirror S_max.
           // gpu_native runs S_max=1024 and its qk_matmul_f16_ohwi_img is
           // 4.7x faster than ours at S_max=2048 (59.8 vs ~281ms at M=1024,
@@ -3114,7 +3132,8 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             const char *e = std::getenv("NNTR_KV_MIRROR_CAP");
             return e ? (unsigned int)std::atoi(e) : 0u;
           }();
-          unsigned int S_max = (cache_key_dim.height() + 7u) & ~7u;
+          unsigned int S_max =
+            nntrainer::ohwi_mirror_capacity(cache_key_dim.height());
           if (mirror_cap >= 8 && mirror_cap < S_max)
             S_max = (mirror_cap + 7u) & ~7u;
           if (!kv_mirror_init) {
@@ -3122,11 +3141,10 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             // Same derivation as the finalize prebuild (which is Android-only).
             kv_kimg_gsh = nntrainer::kimg_gsh_for(
               num_heads_KV,
-              ((unsigned int)std::get<nntrainer::props::MaxTimestep>(
-                 mha_core_props)
-                 .get() +
-               7u) &
-                ~7u);
+              nntrainer::ohwi_mirror_capacity(
+                (unsigned int)std::get<nntrainer::props::MaxTimestep>(
+                  mha_core_props)
+                  .get()));
             bool m_ok =
               nntrainer::create_ohwi_kv_mirror(
                 /*is_v=*/false, num_heads_KV, head_dim, S_max,
@@ -3142,8 +3160,94 @@ void MHACoreLayer::one_batch_incremental_forwarding(
               mha_report_image_mirror_refused(num_heads_KV, head_dim, S_max);
             }
           }
-          if (kv_mirror_init && S_max == kv_mirror_S_max &&
-              cache_to <= kv_mirror_S_max) {
+          // [kv-window-ring] Where the mirror window sits for this call. A
+          // linear layer's mirror starts at absolute row 0 and never moves.
+          // A ringed layer's is only ring-cap rows high, so its base slides
+          // forward to the oldest key this step can attend (cache_from-W+1):
+          //  - prefill slides EAGERLY, which also keeps N_kv -- and with it the
+          //    [hQ, M, N_kv] scores scratch -- near W + M instead of the cap;
+          //  - decode slides only when the mirror is full (once per cap-W
+          //    tokens), since a slide back-fills ~W rows from the cache.
+          // The base is a multiple of 64 whenever that fits: the score band
+          // and the row softmax partition the key axis on 8/64-aligned
+          // boundaries, so a 64-aligned base makes the mirror-local grid the
+          // absolute one shifted, and ring on == ring off bit for bit.
+          bool mirror_fits = false;
+          if (kv_mirror_init && S_max == kv_mirror_S_max) {
+            if (kv_ring_cap == 0) {
+              mirror_fits = cache_to <= kv_mirror_S_max;
+            } else {
+              const unsigned int W = (unsigned int)local_window_size;
+              const unsigned int need_lo =
+                cache_from + 1u > W ? cache_from + 1u - W : 0u;
+              const unsigned int al64 = need_lo & ~63u;
+              unsigned int nb = kv_mirror_base;
+              if (cache_from < nb)
+                nb = al64; // rewind / a new request
+              else if (step_size > 1 && al64 > nb)
+                nb = al64;
+              else if (cache_to - nb > kv_mirror_S_max)
+                nb = al64;
+              if (cache_to - nb > kv_mirror_S_max)
+                nb = need_lo; // 64-alignment does not fit: exact floor
+              mirror_fits = cache_to - nb <= kv_mirror_S_max;
+              if (mirror_fits && nb != kv_mirror_base) {
+                // Everything the mirror held sits at the old offsets: drop it
+                // and let the back-fill below re-scatter [nb, cache_from)
+                // from the (ringed, complete) SVM cache.
+                kv_mirror_base = nb;
+                kv_k_valid_to = nb;
+                kv_v_valid_to = nb;
+              }
+            }
+          }
+          // mirror-local positions (== absolute for a linear layer)
+          const unsigned int m_from = cache_from - kv_mirror_base;
+          const unsigned int m_to = cache_to - kv_mirror_base;
+          // Back-fill absolute rows [abs_from, abs_to) of the SVM cache into
+          // the mirror. The cache is ring-indexed for a ringed layer, so the
+          // span may cross the seam: one scatter per contiguous segment. With
+          // no ring this is the single scatter it always was.
+          auto mirror_backfill = [&](bool is_v, unsigned int abs_from,
+                                     unsigned int abs_to, unsigned int stride) {
+            const size_t hd = (size_t)num_heads_KV * head_dim;
+            unsigned int pos = abs_from;
+            while (pos < abs_to) {
+              const size_t phys = cacheRow(pos);
+              unsigned int seg = abs_to - pos;
+              if (kv_ring_cap && (size_t)seg > (size_t)kv_ring_cap - phys)
+                seg = (unsigned int)((size_t)kv_ring_cap - phys);
+              if (is_v)
+                nntrainer::v_scatter_ohwi_t_cl(
+                  reinterpret_cast<const uint16_t *>(
+                    cache_value.getData<_FP16>() +
+                    (size_t)batch * cache_value_dim.getFeatureLen() +
+                    phys * hd),
+                  reinterpret_cast<cl_mem>(v_buf_ohwi), seg, num_heads_KV,
+                  head_dim, stride, pos - kv_mirror_base);
+              else
+                nntrainer::k_scatter_ohwi_cl(
+                  reinterpret_cast<const uint16_t *>(
+                    cache_key.getData<_FP16>() +
+                    (size_t)batch * cache_key_dim.getFeatureLen() + phys * hd),
+                  reinterpret_cast<cl_mem>(k_buf_ohwi), seg, num_heads_KV,
+                  head_dim, kv_mirror_S_max, pos - kv_mirror_base);
+              pos += seg;
+            }
+          };
+          // A ringed layer has no other validated arm on this bundle: the
+          // buffer (flash) arm under the image bundle is exact on a LINEAR
+          // cache but measured wrong on a 2048-row ring on Adreno 840, and
+          // image attention is all-or-nothing per process anyway. Stop with
+          // the way out rather than emit plausible text.
+          NNTR_THROW_IF(kv_ring_cap != 0 && !mirror_fits, std::runtime_error)
+            << "[kv-window-ring] the Adreno image-attention mirror cannot "
+               "serve this step of a ringed layer (mirror_init="
+            << (int)kv_mirror_init << " rows=" << kv_mirror_S_max << " step=["
+            << cache_from << "," << cache_to << ") ring=" << kv_ring_cap
+            << "). Set NNTR_KV_IMG_RING=0 to keep the linear KV cache under "
+               "NNTR_KV_IMG_ATTN.";
+          if (mirror_fits) {
             // --- Tight-stride V image (texture-cache cliff). The sv kernel
             // walks V texels along the sequence axis; a pitch sized to the
             // 2048 allocation cap instead of the live sequence wastes the
@@ -3157,8 +3261,16 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             }();
             void *v_img_use = v_image_ohwi;
             unsigned int v_stride = kv_mirror_S_max;
-            if (v_tight_on) {
-              unsigned int need = (cache_to + 7u) & ~7u;
+            // A ringed layer keeps ONE stride for the whole run: its mirror is
+            // already small (ring-cap rows) and constant, so there is no cliff
+            // for a tight view to avoid, and a stride that never changes never
+            // re-lays V (port of ed271ee7d's "the restride cannot recur"). A
+            // tight view there also measured WRONG on Adreno 840 once the
+            // stride shrank mid-run (2048 -> 1536 at the last 1024-chunk:
+            // repetition loop, NNTR_KV_VTIGHT=0 exact) -- not root-caused, so
+            // not offered.
+            if (v_tight_on && kv_ring_cap == 0) {
+              unsigned int need = (m_to + 7u) & ~7u;
               // [prefill-long] Lay the tight image out for the WHOLE prefill
               // span, not just this chunk, so the stride never changes mid
               // prefill (a change re-scatters every row already written).
@@ -3185,7 +3297,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                   }
                 }
               }
-              if (v_image_tight != nullptr && cache_to <= kv_v_img_S) {
+              if (v_image_tight != nullptr && m_to <= kv_v_img_S) {
                 v_img_use = v_image_tight;
                 v_stride = kv_v_img_S;
               }
@@ -3196,40 +3308,35 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             // a V stride change invalidates ALL prior rows; decode tokens
             // land only in the SVM cache, leaving [valid_to, cache_from)
             // missing from both mirrors on a follow-up prefill.
+            static const bool _ring_trace =
+              std::getenv("NNTR_IMG_RING_TRACE") != nullptr;
+            if (_ring_trace)
+              std::fprintf(stderr,
+                           "[IMG-RING] W=%zu cap=%u from=%u to=%u base=%u "
+                           "m_to=%u S_max=%u v_stride=%u cur_stride=%u "
+                           "kvalid=%u vvalid=%u tightS=%u\n",
+                           local_window_size, kv_ring_cap, cache_from, cache_to,
+                           kv_mirror_base, m_to, kv_mirror_S_max, v_stride,
+                           kv_v_cur_stride, kv_k_valid_to, kv_v_valid_to,
+                           kv_v_img_S);
             if (v_stride != kv_v_cur_stride) {
-              if (cache_from > 0) {
+              if (cache_from > kv_mirror_base) {
                 // MHA_CLMEM: the re-scatter source is the concat slab --
                 // gather the mirror-only rows back first (no-op otherwise).
                 sync_kv_slab(cache_from);
-                nntrainer::v_scatter_ohwi_t_cl(
-                  reinterpret_cast<const uint16_t *>(
-                    cache_value.getData<_FP16>() +
-                    (size_t)batch * cache_value_dim.getFeatureLen()),
-                  reinterpret_cast<cl_mem>(v_buf_ohwi), cache_from,
-                  num_heads_KV, head_dim, v_stride, 0);
+                mirror_backfill(/*is_v=*/true, kv_mirror_base, cache_from,
+                                v_stride);
               }
               kv_v_cur_stride = v_stride;
               kv_v_valid_to = cache_from;
             } else if (cache_from > kv_v_valid_to) {
-              nntrainer::v_scatter_ohwi_t_cl(
-                reinterpret_cast<const uint16_t *>(
-                  cache_value.getData<_FP16>() +
-                  (size_t)batch * cache_value_dim.getFeatureLen() +
-                  (size_t)kv_v_valid_to * num_heads_KV * head_dim),
-                reinterpret_cast<cl_mem>(v_buf_ohwi),
-                cache_from - kv_v_valid_to, num_heads_KV, head_dim, v_stride,
-                kv_v_valid_to);
+              mirror_backfill(/*is_v=*/true, kv_v_valid_to, cache_from,
+                              v_stride);
               kv_v_valid_to = cache_from;
             }
             if (cache_from > kv_k_valid_to) {
-              nntrainer::k_scatter_ohwi_cl(
-                reinterpret_cast<const uint16_t *>(
-                  cache_key.getData<_FP16>() +
-                  (size_t)batch * cache_key_dim.getFeatureLen() +
-                  (size_t)kv_k_valid_to * num_heads_KV * head_dim),
-                reinterpret_cast<cl_mem>(k_buf_ohwi),
-                cache_from - kv_k_valid_to, num_heads_KV, head_dim,
-                kv_mirror_S_max, kv_k_valid_to);
+              mirror_backfill(/*is_v=*/false, kv_k_valid_to, cache_from,
+                              kv_mirror_S_max);
               kv_k_valid_to = cache_from;
             }
             // Scatter this step's rotated K into the OHWI K mirror at row
@@ -3258,7 +3365,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             }
             nntrainer::k_scatter_ohwi_cl(
               k_sc_src, reinterpret_cast<cl_mem>(k_buf_ohwi), step_size,
-              num_heads_KV, head_dim, kv_mirror_S_max, cache_from,
+              num_heads_KV, head_dim, kv_mirror_S_max, m_from,
               /*src_clmem=*/k_stage, /*src_off=*/k_sc_off);
             kv_k_valid_to = cache_to;
             const double _kvst_tk = _kvst_on() ? _kvst_now() : 0;
@@ -3281,7 +3388,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             }
             nntrainer::v_scatter_ohwi_t_cl(
               v_sc_src, reinterpret_cast<cl_mem>(v_buf_ohwi), step_size,
-              num_heads_KV, head_dim, v_stride, cache_from,
+              num_heads_KV, head_dim, v_stride, m_from,
               /*src_clmem=*/v_stage_clmem, /*src_off=*/v_sc_off);
             kv_v_valid_to = cache_to;
             const double _kvst_tv = _kvst_on() ? _kvst_now() : 0;
@@ -3302,27 +3409,69 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             // Sliding-window layers: pass the effective window so the OHWI
             // kernels mask keys older than the window (n + W <= q_pos) —
             // same convention as the flash call below (0 = no window).
-            const unsigned int win_img = (local_window_size >= (size_t)cache_to)
+            const unsigned int win_img = (local_window_size >= (size_t)m_to)
                                            ? 0u
                                            : (unsigned int)local_window_size;
-            ok = nntrainer::two_conv_attention_prefill_f16_ohwi_kvimg_view_cl(
-              Q_p, reinterpret_cast<cl_mem>(k_image_ohwi),
-              reinterpret_cast<cl_mem>(v_img_use), O_p, step_size, cache_to,
-              num_heads_Q, num_heads_KV, head_dim, kv_mirror_S_max, is_causal,
-              attn_logit_softcapping, /*q_clmem=*/q_clmem_use,
-              /*o_clmem=*/o_cl, win_img);
+            // [prefill-long] The 3-kernel chain materializes [hQ, M, N_kv]
+            // fp16 scores: 16 heads x 4096 x 16384 is 2 GiB for ONE launch.
+            // Past a budget, run the query rows in sub-blocks instead; each
+            // row's scores, softmax and output are independent of the other
+            // rows, and a 64-row-aligned cut keeps the qk m-tiles and the sv
+            // row pairs where they were, so the output is bit-identical. A
+            // sub-block addresses Q/O through the SVM plane (interior
+            // pointers), so O is raised to its cl_mem afterwards like any
+            // other SVM-written arm. NNTR_ATTN_SCORES_MB (default 512: every
+            // single-shot prompt that fits the 4K plane stays ONE launch).
+            static const size_t scores_budget = []() -> size_t {
+              const char *e = std::getenv("NNTR_ATTN_SCORES_MB");
+              const long mb = e ? std::atol(e) : 512;
+              return (size_t)(mb > 0 ? mb : 512) << 20;
+            }();
+            const size_t row_bytes =
+              (size_t)num_heads_Q * (size_t)m_to * sizeof(uint16_t);
+            unsigned int sub = step_size;
+            if (step_size > 64u && q_clmem_use == nullptr &&
+                row_bytes * step_size > scores_budget) {
+              sub = (unsigned int)(scores_budget / row_bytes) & ~63u;
+              if (sub < 64u)
+                sub = 64u;
+            }
+            if (sub >= step_size) {
+              ok = nntrainer::two_conv_attention_prefill_f16_ohwi_kvimg_view_cl(
+                Q_p, reinterpret_cast<cl_mem>(k_image_ohwi),
+                reinterpret_cast<cl_mem>(v_img_use), O_p, step_size, m_to,
+                num_heads_Q, num_heads_KV, head_dim, kv_mirror_S_max, is_causal,
+                attn_logit_softcapping, /*q_clmem=*/q_clmem_use,
+                /*o_clmem=*/o_cl, win_img);
+              if (ok && o_cl != nullptr)
+                o_written_clmem = true;
+            } else {
+              const size_t q_row = (size_t)num_heads_Q * head_dim;
+              ok = true;
+              for (unsigned int a = 0; ok && a < step_size; a += sub) {
+                const unsigned int b = std::min(a + sub, step_size);
+                ok =
+                  nntrainer::two_conv_attention_prefill_f16_ohwi_kvimg_view_cl(
+                    Q_p + (size_t)a * q_row,
+                    reinterpret_cast<cl_mem>(k_image_ohwi),
+                    reinterpret_cast<cl_mem>(v_img_use),
+                    O_p + (size_t)a * q_row, b - a, m_from + b, num_heads_Q,
+                    num_heads_KV, head_dim, kv_mirror_S_max, is_causal,
+                    attn_logit_softcapping,
+                    /*q_clmem=*/nullptr, /*o_clmem=*/nullptr, win_img);
+              }
+              // O went to the SVM plane: the raise below lands it in o_cl.
+            }
             if (_kvst_on())
               _kvst_mark_scatter(_kvst_t1, _kvst_tk, _kvst_tv, _kvst_now());
-            if (ok && o_cl != nullptr)
-              o_written_clmem = true;
             static int _img_attn_logged = 0;
             if (!_img_attn_logged) {
               _img_attn_logged = 1;
               ml_logd("[IMG-ATTN] engaged ok=%d M=%u N_kv=%u S_max=%u "
-                      "hQ=%zu hKV=%zu d=%zu softcap=%.1f",
+                      "hQ=%zu hKV=%zu d=%zu softcap=%.1f ring_cap=%u gsh=%u",
                       (int)ok, step_size, cache_to, kv_mirror_S_max,
                       num_heads_Q, num_heads_KV, head_dim,
-                      attn_logit_softcapping);
+                      attn_logit_softcapping, kv_ring_cap, kv_kimg_gsh);
             }
           }
         }
