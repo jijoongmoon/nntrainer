@@ -3420,17 +3420,49 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             // row pairs where they were, so the output is bit-identical. A
             // sub-block addresses Q/O through the SVM plane (interior
             // pointers), so O is raised to its cl_mem afterwards like any
-            // other SVM-written arm. NNTR_ATTN_SCORES_MB (default 512: every
-            // single-shot prompt that fits the 4K plane stays ONE launch).
+            // other SVM-written arm.
+            //
+            // The scratch buffer is kept at the largest launch it ever served,
+            // so the budget IS resident footprint. Two regimes, and a single
+            // MiB number is the wrong answer for both (measured on Adreno,
+            // 1300 MHz, warm kernel cache, ids bit-identical in every pair):
+            //
+            //  - SINGLE-SHOT prefill, the whole prompt in ONE launch (the key
+            //    span this prefill reaches is this launch's M). Splitting it is
+            //    pure loss: at a 256 MiB budget the 0.3B 4095-token cell drops
+            //    18784 -> 14677 TPS (-22%) and the 1.5B 3925-token cell 3533 ->
+            //    3153 (-11%). And what it needs is BOUNDED -- hQ * M^2 * 2,
+            //    i.e. 268 MiB for the 0.3B at 4096 rows and 537 MiB for the
+            //    1.5B -- because the plane (and so M) is now sized to the
+            //    prompt and capped at kPrefillBlockCap. So never split it.
+            //
+            //  - CHUNKED prefill, M rows against a span that keeps growing:
+            //    [hQ, 4096, 16384] fp16 is 2 GiB for one launch, so this one
+            //    must be bounded -- and here the SMALLER budget is both cheaper
+            //    and faster, 256 vs 512 MiB:
+            //      0.3B 16K  4457 vs 4326 TPS   1073.6 vs 1330.2 MiB honest
+            //      1.5B  8K  1741 vs 1670 TPS   2211.0 vs 2467.3 MiB
+            //      1.5B 16K  1082 vs 1044 TPS   2211.9 vs 2468.1 MiB
+            //    -256 MiB and a hair faster on all three: a 256 MiB working set
+            //    sits better in the caches than a 512 MiB one.
+            //
+            // NNTR_ATTN_SCORES_MB is that chunked-regime budget, default 256.
+            // The regimes are told apart by the driver's span hint, and only a
+            // hint that PROVES this launch is the whole prefill skips the
+            // split -- with no hint (span 0) the old bounded behaviour stands,
+            // because the first chunk of a chunked prefill is indistinguishable
+            // from a single-shot one by its own arguments alone.
             static const size_t scores_budget = []() -> size_t {
               const char *e = std::getenv("NNTR_ATTN_SCORES_MB");
-              const long mb = e ? std::atol(e) : 512;
-              return (size_t)(mb > 0 ? mb : 512) << 20;
+              const long mb = e ? std::atol(e) : 256;
+              return (size_t)(mb > 0 ? mb : 256) << 20;
             }();
+            const unsigned int _span = prefillSpanHint();
+            const bool one_block = (_span != 0u && _span <= step_size);
             const size_t row_bytes =
               (size_t)num_heads_Q * (size_t)m_to * sizeof(uint16_t);
             unsigned int sub = step_size;
-            if (step_size > 64u && q_clmem_use == nullptr &&
+            if (!one_block && step_size > 64u && q_clmem_use == nullptr &&
                 row_bytes * step_size > scores_budget) {
               sub = (unsigned int)(scores_budget / row_bytes) & ~63u;
               if (sub < 64u)
