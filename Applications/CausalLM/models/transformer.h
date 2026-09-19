@@ -344,6 +344,39 @@ public:
   }
 
   /**
+   * @brief The chunk the prefill DRIVE LOOP feeds, in query rows (0 = the
+   *        prompt is bounded by the activation plane and is fed as one block).
+   * @details prefillChunk() answers a storage question as well -- the KV ring
+   * capacity is a multiple of it -- so it is 0 wherever the ring is refused
+   * (the cpu engine, NNTR_KV_WINDOW_RING=0, an attention bundle with no
+   * ring-aware arm). Whether a prompt longer than the plane can be FED is a
+   * different question with a different answer: a chunk is fed at input row 0
+   * and writes its KV at absolute rows, which a linear cache takes exactly as
+   * a ringed one does. Tying the two together meant that a model which chunks
+   * by design had a long prompt cut to INIT_SEQ_LEN, with rc=0, on every lane
+   * where the ring did not resolve. A model that declares chunking
+   * (chunkLongPrompts()) therefore feeds plane-height chunks whenever the ring
+   * did not already pick a chunk. A prompt that fits the plane is still one
+   * block either way, so nothing changes below INIT_SEQ_LEN.
+   */
+  unsigned int prefillDriveChunk() const {
+    const unsigned int c = prefillChunk();
+    if (c != 0u)
+      return c;
+    return chunkLongPrompts() ? static_cast<unsigned int>(INIT_SEQ_LEN) : 0u;
+  }
+
+  /**
+   * @brief Whether a prompt longer than INIT_SEQ_LEN is fed in chunks even
+   *        when no KV ring resolved. Defaults to the model's ring default: a
+   *        model that asks for the ring is one whose chunked prefill is
+   *        validated. Others keep the single-block bound, and a prompt cut by
+   *        it is reported through
+   *        TransformerPerformanceMetrics::prompt_truncated_tokens.
+   */
+  virtual bool chunkLongPrompts() const { return kvRingByDefault(); }
+
+  /**
    * @brief Whether this model wants the sliding-window KV ring (and the
    *        chunked prefill that comes with it) when NNTR_KV_WINDOW_RING is
    *        unset.

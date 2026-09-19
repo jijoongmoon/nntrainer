@@ -1277,14 +1277,16 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   // getenv("NNTR_PREFILL_CHUNK") meant that chunking never opened the budget,
   // so a 29K-token prompt was cut to INIT_SEQ_LEN even though the prefill
   // could have fed it in chunks.
-  const bool _prefill_chunking = prefillChunk() > 0;
+  const bool _prefill_chunking = prefillDriveChunk() > 0;
   unsigned int num_allow_str =
     _prefill_chunking ? kv_budget
                       : std::min<unsigned int>(INIT_SEQ_LEN, kv_budget);
   unsigned int text_len = _len;
 
+  performance_metrics.prompt_truncated_tokens = 0;
   if (_len > num_allow_str) {
     text_len = num_allow_str;
+    performance_metrics.prompt_truncated_tokens = _len - num_allow_str;
     // Silent tail truncation loses whatever the prompt ENDS with (round-13
     // field case: a summarization instruction at the tail was dropped and
     // the model continued the body instead). Unexpected state -> always warn.
@@ -1610,7 +1612,10 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   // budget above and the KV ring capacity are computed from, so a chunk always
   // fits the INIT_SEQ_LEN-height activation buffer and never straddles the
   // ring's wrap seam.
-  const unsigned int prefill_chunk = prefillChunk();
+  // prefillDriveChunk() == prefillChunk() whenever the ring picked a chunk; it
+  // only adds plane-height chunking for a chunk-by-design model whose ring was
+  // refused (see transformer.h).
+  const unsigned int prefill_chunk = prefillDriveChunk();
   // [kv-window-ring] A ringed layer stores absolute position p at row
   // (p % Wcap) and takes ONE contiguous slice per call, so every prefill call
   // [p, p+L) must satisfy (p % Wcap) + L <= Wcap. Wcap is a multiple of the

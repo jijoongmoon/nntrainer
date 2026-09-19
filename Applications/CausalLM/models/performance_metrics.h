@@ -37,6 +37,11 @@ typedef struct {
    *  accelerator, never reset. Kept for debugging; it is what peak_memory_kb
    *  used to be. */
   size_t peak_rss_kb;
+  /** Prompt tokens DROPPED from the tail of the last request because the
+   *  prompt did not fit the prefill window (0 = the whole prompt was fed). A
+   *  truncated run still returns success and fluent text, so this is the only
+   *  way a caller can tell that the model never saw the end of its prompt. */
+  unsigned int prompt_truncated_tokens;
 } TransformerPerformanceMetrics;
 
 #ifdef __cplusplus
