@@ -246,11 +246,33 @@ void CudaContext::initialize() noexcept {
     // writing), and NNTR_DETERMINISTIC=1 keeps the drains. The runtime gate in
     // cuda_stream_manager additionally requires a non-integrated part.
     {
-      const char *det = getenv("NNTR_DETERMINISTIC");
       const char *dev_act = getenv("NNTR_CUDA_DEV_ACT");
-      const bool async_ok = dev_act != nullptr && dev_act[0] == '1' &&
-                            !(det != nullptr && det[0] == '1');
-      setenv("NNTR_CUDA_ASYNC", async_ok ? "1" : "0", 0);
+      const bool pool_on = dev_act != nullptr && dev_act[0] == '1';
+      // Determinism does NOT have to cost the async profile, and it used to:
+      // this derivation also required !NNTR_DETERMINISTIC, so asking for
+      // reproducible output halved decode (measured on WDDM, 80 -> 41.8 TPS on
+      // one model and 67 -> 36.6 on a second; on a Linux discrete part the same
+      // ~2x).
+      //
+      // The reason for the old coupling was real but narrower than the gate:
+      // the hazard of undrained submission is a HOST op reading a buffer a
+      // kernel is still writing, and async ALONE (no device-only pool) was
+      // measurably non-deterministic -- one run 214 tokens, another 267, on the
+      // same input. With the pool on there is no host op left in the chain to
+      // race: an activation lives in real device memory, so a host fallback
+      // faults instead of quietly participating. The drains then order nothing
+      // that is not already ordered.
+      //
+      // Evidence for dropping it: 5 runs per model on a discrete part with the
+      // profile on, byte-identical every time on both models (one of them also
+      // with the decode graph enabled), and 3 runs per arm on WDDM likewise.
+      // So determinism now keeps the pool's async, and only turns off the
+      // levers whose ordering it actually pins (see cuda_blas_manager).
+      //
+      // An explicit NNTR_CUDA_ASYNC=0 still forces the drains back -- this
+      // write is overwrite=0 like every other default -- so a machine that
+      // disagrees has a one-variable way out and a bug report worth having.
+      setenv("NNTR_CUDA_ASYNC", pool_on ? "1" : "0", 0);
     }
 
     add_default_object();
