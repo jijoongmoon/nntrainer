@@ -2222,4 +2222,47 @@ bool clmem_lower_cl(const Tensor &t, unsigned int valid_bytes) {
                              t.getName());
   return true;
 }
+/**
+ * Debug: write rows of a layer output to NNTR_DUMP_ROWS_DIR. Inert unless the
+ * caller (neuralnet.cpp) saw the env set. Reads a device-plane tensor into a
+ * private bounce buffer so the run itself is not perturbed beyond the drain.
+ */
+void debug_dump_rows_cl(const std::string &name, const Tensor &t,
+                        unsigned int rows, const char *dir, unsigned int seq) {
+  auto *cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  const size_t W = t.width();
+  const size_t es = t.getDataType() == Tdatatype::FP16   ? 2
+                    : t.getDataType() == Tdatatype::FP32 ? 4
+                                                         : 0;
+  if (es == 0 || W == 0 || rows == 0 || rows > t.height())
+    return;
+  const size_t bytes = (size_t)rows * W * es;
+  std::vector<uint8_t> buf(bytes);
+  const char *plane = "host";
+  if (t.isClMem() && t.getClMem() != nullptr && cc) {
+    plane = "clmem";
+    if (!cc->command_queue_inst_.EnqueueReadBufferRegion(
+          static_cast<cl_mem>(t.getClMem()), bytes, buf.data(), 0,
+          t.getOffset() * es, false))
+      return;
+  } else {
+    if (cc)
+      opencl::clFinish(cc->command_queue_inst_.GetCommandQueue());
+    std::memcpy(buf.data(), t.getData<uint8_t>(), bytes);
+  }
+  char path[1024];
+  std::snprintf(path, sizeof(path), "%s/%04u_%s.%s.%zux%zu.bin", dir, seq,
+                name.c_str(), es == 2 ? "f16" : "f32", (size_t)rows, W);
+  static const bool all_rows = std::getenv("NNTR_DUMP_ROWS_ALL") != nullptr;
+  if (std::FILE *f = std::fopen(path, "wb")) {
+    if (all_rows)
+      std::fwrite(buf.data(), 1, bytes, f);
+    else
+      std::fwrite(buf.data() + (size_t)(rows - 1) * W * es, 1, W * es, f);
+    std::fclose(f);
+  }
+  std::fprintf(stderr, "[dump] %04u %s plane=%s rows=%u W=%zu es=%zu\n", seq,
+               name.c_str(), plane, rows, W, es);
+}
 } // namespace nntrainer

@@ -106,6 +106,8 @@ void load_complete();
 void v8c_flush_pending_uploads();
 void v8c_flush_aux_arena();
 void v8c_open_aux_arena();
+void debug_dump_rows_cl(const std::string &name, const Tensor &t,
+                        unsigned int rows, const char *dir, unsigned int seq);
 #endif
 
 namespace {
@@ -712,6 +714,20 @@ sharedConstTensors NeuralNetwork::incremental_forwarding(
       //      start_prefill time
       model_graph.flushCacheExcept(f);
       node->incremental_forwarding(from, to, training);
+#if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
+      // Debug: NNTR_DUMP_ROWS_DIR=<dir> writes each node's output rows of the
+      // prefill step (to - from > 1). Inert when unset.
+      static const char *dump_dir = std::getenv("NNTR_DUMP_ROWS_DIR");
+      if (dump_dir != nullptr && to - from > 1 && node->getNumOutputs() > 0) {
+        static const char *match = std::getenv("NNTR_DUMP_ROWS_MATCH");
+        static unsigned int seq = 0;
+        if (match == nullptr ||
+            node->getName().find(match) != std::string::npos)
+          debug_dump_rows_cl(node->getName(), node->getOutput(0), to - from,
+                             dump_dir, seq);
+        ++seq;
+      }
+#endif
       // auto end_layer =
       //  std::chrono::high_resolution_clock::now(); // log th
       //   auto duration_ =
