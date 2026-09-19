@@ -183,6 +183,25 @@ inline bool kvRingLayerEligible(bool attention_sink, bool external_cache) {
 }
 
 /**
+ * @brief The prefill BLOCK the measured sweep picks, in query rows.
+ * @details One constant, read by both halves of the block policy so the two
+ * cannot drift:
+ *
+ *   - requestedPrefillChunk() below -- how many rows one prefill launch feeds;
+ *   - Transformer::prefillPlaneFor() -- how tall the activation plane is built,
+ *     which is the CEILING on the above (a chunk is fed at row 0 of the plane,
+ *     so effectivePrefillChunk() clamps the request to the plane).
+ *
+ * 4096 because the equal-thermal ring-on sweep is monotone in the block but
+ * with a poor marginal ratio past 4096 (the next step up buys under a percent
+ * of prefill for another GB of working set), and the CUDA tensor-core GEMMs
+ * want a large block anyway -- so one number, no backend branch. It is 64-row
+ * aligned, which the qk m-tiling and the attention score sub-blocking both
+ * assume of any block they are handed.
+ */
+inline constexpr unsigned int kPrefillBlockCap = 4096u;
+
+/**
  * @brief Requested prefill chunk size (0 = no chunking / single-block prefill).
  * @details An explicit NNTR_PREFILL_CHUNK always wins (user override, per-GPU
  * tuning); a non-positive or unparseable value is REJECTED (treated as unset)
@@ -218,7 +237,7 @@ inline unsigned int requestedPrefillChunk(bool ring_model_default = false) {
   }
   if (!kvRingEnabled(ring_model_default))
     return 0u; // chunking is auto-enabled only by the ring
-  return 4096u;
+  return kPrefillBlockCap;
 }
 
 /**
@@ -237,6 +256,83 @@ inline unsigned int effectivePrefillChunk(unsigned int plane_height,
   if (c == 0u || plane_height == 0u)
     return c;
   return std::min(c, plane_height);
+}
+
+/**
+ * @brief Whether a TALLER prefill plane (a bigger block) pays for itself on the
+ *        attention arm this configuration resolves.
+ * @details The plane is charged per run; the block it enables is only worth it
+ * where a launch carries a fixed per-launch cost that fewer, bigger launches
+ * amortize. Measured, both directions:
+ *
+ *   Adreno image arm (NNTR_KV_IMG_ATTN) -- the arm re-materializes the K/V
+ *   image per launch, so the block dominates:
+ *     0.3B  2K   18.7K vs  9.8K TPS prefill   (block 4096 vs 1024)
+ *     0.3B 16K    4370 vs  3078 TPS,  honest 1330 vs 1493 MiB (CHEAPER)
+ *     1.5B 16K    1037 vs   776 TPS,  honest 2468 vs 2475 MiB (equal)
+ *
+ *   CUDA tensor-core arm -- a small win at a small price:
+ *     1.5B 1899-token prompt  8516 vs 8293 TPS, VRAM 1226 vs 1166 MiB
+ *
+ *   Intel Xe flash/XMX arm -- a LOSS, twice measured, at two prompt lengths:
+ *     1.5B 1899 tok  xmx 4427 vs 4366 TPS (+1.4%), host peak 1663 vs 978 MiB
+ *                    dp4a 1582 vs 1548 TPS (+2.2%), 1721 vs 972 MiB
+ *     1.5B 3925 tok  xmx 3878 vs 3909 TPS (-0.8%), 1853 vs 1122 MiB
+ *   i.e. ~+700 MiB for ~2%, and the +700 MiB is a STEP (the same at plane 1920
+ *   and at 3968), so something on that arm allocates per-plane rather than
+ *   per-row -- worth its own investigation before the block is opened there.
+ *
+ * NNTR_PREFILL_GROW forces the answer either way (1 = grow anyway, 0 = never),
+ * so the Intel arm stays one env away from an A/B rather than needing a build.
+ */
+inline bool prefillBlockPays() {
+  if (const char *g = std::getenv("NNTR_PREFILL_GROW"))
+    if (g[0] == '0' || g[0] == '1')
+      return g[0] == '1';
+  const char *e = std::getenv("NNTR_ENGINE");
+  const std::string eng = (e != nullptr) ? std::string(e) : std::string();
+  if (eng == "cuda")
+    return nntr_env_on("NNTR_CUDA_ATTN");
+#if defined(ENABLE_OPENCL)
+  return nntr_env_on("NNTR_KV_IMG_ATTN");
+#else
+  return false;
+#endif
+}
+
+/**
+ * @brief The activation-plane height (== the largest prefill block) a request
+ *        of `prompt_tokens` tokens wants.
+ * @param prompt_tokens the prompt this request prefills. 0 = unknown, which
+ *        keeps `cur_plane` (no growth without a number to grow to).
+ * @param cur_plane the plane the graph is currently built at (INIT_SEQ_LEN).
+ * @param pack_plane the height the PACK shipped -- the floor, so no pack loses
+ *        a plane it was tuned with.
+ * @param max_seq_len the window, which bounds the block from above together
+ *        with kPrefillBlockCap.
+ * @details The pure arithmetic of the policy, free of the Transformer so it can
+ * be pinned by a unit test. Rounds to the 64-row grid the qk m-tiling and the
+ * attention score sub-blocking assume of any block, bounds it by
+ * min(kPrefillBlockCap, max_seq_len), and never returns less than the pack's
+ * own height. A prompt past the bound is NOT truncated -- it is fed in
+ * bound-sized chunks (Transformer::prefillDriveChunk()).
+ */
+inline unsigned int prefillPlaneFor(unsigned int prompt_tokens,
+                                    unsigned int cur_plane,
+                                    unsigned int pack_plane,
+                                    unsigned int max_seq_len) {
+  if (prompt_tokens == 0u)
+    return cur_plane;
+  const unsigned int cap = std::min(kPrefillBlockCap, max_seq_len);
+  if (cap < 8u)
+    return cur_plane;
+  const unsigned int floor_h = std::min(pack_plane, cap);
+  unsigned int want = (prompt_tokens + 63u) & ~63u;
+  if (want > cap || want < prompt_tokens) // the round-up can overflow
+    want = cap;
+  if (want < floor_h)
+    want = floor_h;
+  return want;
 }
 
 /**

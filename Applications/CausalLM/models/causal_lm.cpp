@@ -1171,12 +1171,13 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     ~StreamerEndGuard() { streamer_end(streamer); }
   } streamer_end_guard{streamer_};
 
-  // Allocate the host-owned KV cache and bind it to mha_core's external cache
-  // input slots. Idempotent: only the first call does work; subsequent runs
-  // reuse the same buffers and continue from the computed absolute token
-  // position below.
-  allocateAndBindKVCache();
-
+  // [prefill-plane] The KV cache allocation below reads the plane (the ring
+  // capacity is a multiple of the prefill chunk, which is clamped to the
+  // plane), so the plane has to be settled BEFORE it -- and the plane follows
+  // this request's prompt, which is only known once the prompt is tokenized.
+  // Both therefore moved past the Encode() below; nothing between here and
+  // there touches the cache. The call stays idempotent, so a second turn
+  // reuses the buffers exactly as before.
   has_run_ = false;
   prepareStopRequestForRun();
 
@@ -1242,6 +1243,22 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   /// processor, add_bos_token=false) are byte-identical to the old behavior, so
   /// they are unaffected. (sentence_transformer.cpp already encodes this way.)
   auto _input = tokenizer->Encode(prompt_, /*add_special_tokens=*/true);
+
+  // [prefill-plane] Now that the prompt's real token count is known, give this
+  // request the activation plane (== prefill block) it can use, and no more: a
+  // short prompt keeps the pack's plane and the pack's footprint, a long one
+  // gets the validated 4096-row block and its prefill throughput. A no-op on
+  // every later turn (the plane only ever grows, and it grows before the cache
+  // exists) and on every model that does not chunk by design. See
+  // Transformer::growPrefillPlane().
+  if (!kv_cache.isAllocated())
+    growPrefillPlane(static_cast<unsigned int>(_input.size()));
+
+  // Allocate the host-owned KV cache and bind it to mha_core's external cache
+  // input slots. Idempotent: only the first call does work; subsequent runs
+  // reuse the same buffers and continue from the computed absolute token
+  // position below. Sized from the plane settled just above.
+  allocateAndBindKVCache();
 
   // | <------------------- MAX_SEQ_LEN -------------------> |
   //                       ||             ||

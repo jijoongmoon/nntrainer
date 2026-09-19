@@ -331,6 +331,79 @@ TEST(KVRing, effective_chunk_clamps_to_the_plane) {
 }
 
 /**
+ * @brief The plane a request gets is the prompt, on the 64-row grid, bounded by
+ *        the validated block and by the window, and never under the pack's own
+ *        height.
+ * @details The plane is charged on EVERY run while the block it enables is only
+ * worth paying for on a run whose prompt is that long (measured on Adreno: a
+ * 919-token prompt at plane 4096 costs +375 MiB of honest footprint over plane
+ * 1024 and buys nothing -- one block either way). These cases are the policy:
+ * a short prompt must come back at the pack's height, a long one at the cap,
+ * and nothing may exceed the window.
+ */
+TEST(KVRing, prefill_plane_follows_the_prompt) {
+  const unsigned int pack = 1024u, msl = 16896u;
+  // short prompt -> the pack's plane, unchanged (today's footprint)
+  EXPECT_EQ(causallm::prefillPlaneFor(0, pack, pack, msl), pack); // no number
+  EXPECT_EQ(causallm::prefillPlaneFor(1, pack, pack, msl), pack);
+  EXPECT_EQ(causallm::prefillPlaneFor(919, pack, pack, msl), pack);
+  EXPECT_EQ(causallm::prefillPlaneFor(1024, pack, pack, msl), pack);
+  // past the pack's plane -> the 64-row grid, not the raw token count
+  EXPECT_EQ(causallm::prefillPlaneFor(1025, pack, pack, msl), 1088u);
+  EXPECT_EQ(causallm::prefillPlaneFor(2047, pack, pack, msl), 2048u);
+  EXPECT_EQ(causallm::prefillPlaneFor(2048, pack, pack, msl), 2048u);
+  EXPECT_EQ(causallm::prefillPlaneFor(3925, pack, pack, msl), 3968u);
+  // at and past the validated block -> the block, and a longer prompt is
+  // chunked at it rather than given a taller plane
+  EXPECT_EQ(causallm::prefillPlaneFor(4096, pack, pack, msl),
+            causallm::kPrefillBlockCap);
+  EXPECT_EQ(causallm::prefillPlaneFor(16203, pack, pack, msl),
+            causallm::kPrefillBlockCap);
+  EXPECT_EQ(causallm::prefillPlaneFor(0xFFFFFFFFu, pack, pack, msl),
+            causallm::kPrefillBlockCap); // the round-up must not wrap
+  // the window bounds the block from above, below the cap
+  EXPECT_EQ(causallm::prefillPlaneFor(8000, 512u, 512u, 2048u), 2048u);
+  // a pack that ships a TALL plane keeps it whatever the prompt is ...
+  EXPECT_EQ(causallm::prefillPlaneFor(100, 4096u, 4096u, msl), 4096u);
+  // ... but the floor cannot climb over the window either
+  EXPECT_EQ(causallm::prefillPlaneFor(100, 2048u, 8192u, 2048u), 2048u);
+}
+
+/**
+ * @brief A bigger block is taken only on an arm it was measured to pay off on,
+ *        and NNTR_PREFILL_GROW forces the answer either way.
+ */
+TEST(KVRing, prefill_block_pays_only_on_the_arms_it_was_measured_on) {
+  {
+    ScopedEnv eng("NNTR_ENGINE", "cpu");
+    ScopedEnv img("NNTR_KV_IMG_ATTN", nullptr);
+    ScopedEnv cu("NNTR_CUDA_ATTN", nullptr);
+    EXPECT_FALSE(causallm::prefillBlockPays());
+    // the Intel Xe flash/XMX arm: gpu engine WITHOUT the image arm -> no
+    ScopedEnv gpu("NNTR_ENGINE", "gpu");
+    EXPECT_FALSE(causallm::prefillBlockPays());
+    { // the Adreno image arm -> yes
+      ScopedEnv on("NNTR_KV_IMG_ATTN", "1");
+#if defined(ENABLE_OPENCL)
+      EXPECT_TRUE(causallm::prefillBlockPays());
+#endif
+    }
+    { // cuda follows its own attention arm
+      ScopedEnv cuda("NNTR_ENGINE", "cuda");
+      EXPECT_FALSE(causallm::prefillBlockPays());
+      ScopedEnv attn("NNTR_CUDA_ATTN", "1");
+      EXPECT_TRUE(causallm::prefillBlockPays());
+    }
+    // the env forces both directions, so an arm can be A/B'd without a build
+    ScopedEnv off("NNTR_PREFILL_GROW", "0");
+    EXPECT_FALSE(causallm::prefillBlockPays());
+  }
+  ScopedEnv cpu("NNTR_ENGINE", "cpu");
+  ScopedEnv on("NNTR_PREFILL_GROW", "1");
+  EXPECT_TRUE(causallm::prefillBlockPays());
+}
+
+/**
  * @brief A non-positive or unparseable NNTR_PREFILL_CHUNK is rejected, not
  *        wrapped into a ~4e9 unsigned that the (W/C + 2) * C arithmetic eats.
  */

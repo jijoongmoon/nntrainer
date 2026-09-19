@@ -156,6 +156,63 @@ public:
   virtual void repack_weight();
 
   /**
+   * @brief The activation-plane height (== the largest prefill block) this
+   *        request wants, in query rows.
+   * @param prompt_tokens the prompt this request will prefill (0 = unknown).
+   * @details The pack's init_seq_len is a DEFAULT plane height, not a
+   * capability: the plane is [init_seq_len x width] for every activation the
+   * planner sizes, so it is charged on EVERY run, while the block it enables is
+   * only worth paying for on a run whose prompt is actually that long
+   * (measured, 919-token prompt, Adreno: plane 4096 costs +375 MiB of
+   * honest footprint over plane 1024 and buys 0 -- the prompt is one block
+   * either way).
+   *
+   * So the height follows the prompt: round it up to the 64-row grid the qk
+   * m-tiling and the score sub-blocking assume, bound it above by the validated
+   * block (kPrefillBlockCap, itself bounded by max_seq_len -- and max_seq_len
+   * is already clamped to max_position_embeddings by setupParameters), and
+   * never go BELOW the height the pack shipped, so no pack can lose a plane it
+   * was tuned with. A prompt past the cap is not truncated: it is fed in
+   * cap-sized chunks (prefillDriveChunk()).
+   */
+  unsigned int prefillPlaneFor(unsigned int prompt_tokens) const;
+
+  /**
+   * @brief Rebuild the graph at the plane this request needs, if it needs more.
+   * @param prompt_tokens the prompt this request will prefill.
+   * @return true when the graph was rebuilt (INIT_SEQ_LEN changed).
+   * @details Only the caller knows the prompt, and the prompt is known only
+   * after load(); the plane, in contrast, is fixed when the graph is BUILT --
+   * every layer derives its own geometry from INIT_SEQ_LEN in constructModel()
+   * (the `init_seq_len` property mha_core sizes its ring capacity and its KV
+   * mirror from, the {1,1,1,INIT_SEQ_LEN} input, the attention plane). There is
+   * no in-place resize: NetworkGraph::resetInputDimension() needs
+   * Layer::updateTensorsByInputDimensions(), which all but a handful of layers
+   * (and no CausalLM layer) implement -- it throws "currently not supported".
+   *
+   * Rebuilding the whole graph at the new height is therefore the only way to
+   * move the plane that cannot leave one consumer disagreeing with another:
+   * initialize() re-derives ALL of it from the one number. The price is one
+   * extra weight load (measured on device: 756 ms for the 1.5B, 280 ms for the
+   * 0.3B, both mmap-backed and page-cache warm on the second pass) paid once,
+   * on the first long prompt only -- against 1.6 s (0.3B 16K) to 5.3 s (1.5B
+   * 16K) of prefill that the larger block saves on that same request.
+   *
+   * Refused (returns false, keeping today's behaviour) when: the resolved
+   * attention arm is not one a bigger block pays off on
+   * (causallm::prefillBlockPays(), which carries the per-arm measurement), the
+   * model does not chunk its prefill by design, NNTR_INIT_SEQ_LEN pinned the
+   * plane, the graph is not initialized, no weight path was recorded (a caller
+   * that built the weights some other way), FSU/memory-swap is on, or the
+   * target is not taller than the current plane. The old graph is released
+   * BEFORE the new one is built, so the peak is max(old, new) and not their sum
+   * -- and nothing else is live at that moment either: the plane grows before
+   * the first prefill, so the K/V mirrors, the score scratch and the KV cache
+   * (all allocated lazily at or after the first forward) do not exist yet.
+   */
+  bool growPrefillPlane(unsigned int prompt_tokens);
+
+  /**
    * @brief Save the weight to a file
    */
   virtual void save_weight(const std::string &weight_path);
@@ -677,6 +734,17 @@ protected:
 
   unsigned int BATCH_SIZE;              /**< Batch size for the model */
   unsigned int INIT_SEQ_LEN;            /**< Initial sequence length */
+  /** The height the PACK shipped, before any per-request growth. The floor of
+   *  prefillPlaneFor(): a pack that ships a tall plane keeps it. */
+  unsigned int PACK_INIT_SEQ_LEN = 0;
+  /** NNTR_INIT_SEQ_LEN pinned the plane -> never grow it behind the user's
+   *  back (the override exists to A/B exactly this number). */
+  bool plane_pinned_ = false;
+  /** The argument load_weight() was given, so growPrefillPlane() can replay the
+   *  load after rebuilding the graph. Empty = no recorded load, no growth. */
+  std::string weight_path_;
+  /** Whether repack_weight() was called, so the replay repeats it in order. */
+  bool weight_repacked_ = false;
   unsigned int MAX_POSITION_EMBEDDINGS; /**< max_position embeddings */
   bool MEMORY_SWAP;                     /**< memory swap option */
   unsigned int FSU_LOOKAHEAD;

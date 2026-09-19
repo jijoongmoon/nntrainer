@@ -267,6 +267,11 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
       }
     }
   }
+  /** The pack's plane height, AFTER the max_seq_len / max_position_embeddings
+   *  clamps above have had their say. This is the floor prefillPlaneFor() never
+   *  goes below, so a pack that ships a tall plane keeps it and only a pack
+   *  that ships a small one gets grown per request. */
+  PACK_INIT_SEQ_LEN = INIT_SEQ_LEN;
   const unsigned int isl_cap = nntr_cfg["max_seq_len"].get<unsigned int>();
   if (const char *isl = std::getenv("NNTR_INIT_SEQ_LEN")) {
     const int want = std::atoi(isl);
@@ -277,6 +282,9 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
                    static_cast<unsigned int>(INIT_SEQ_LEN), want);
       std::fflush(stderr);
       INIT_SEQ_LEN = want;
+      /** An explicit height is an A/B of exactly this number: do not then move
+       *  it per request behind the experimenter's back. */
+      plane_pinned_ = true;
     } else {
       std::fprintf(stderr,
                    "[init_seq_len] ignoring NNTR_INIT_SEQ_LEN=%s: outside "
@@ -546,7 +554,66 @@ void Transformer::load_weight(const std::string &weight_path) {
     throw std::runtime_error("Failed to load model weights: " +
                              std::string(e.what()));
   }
+  /** Recorded so growPrefillPlane() can replay this exact load after rebuilding
+   *  the graph at a taller plane. Stored verbatim: some callers hand a file,
+   *  some a model directory, and the override that resolves it is the same one
+   *  either way. */
+  weight_path_ = weight_path;
 };
+
+unsigned int Transformer::prefillPlaneFor(unsigned int prompt_tokens) const {
+  return causallm::prefillPlaneFor(
+    prompt_tokens, static_cast<unsigned int>(INIT_SEQ_LEN), PACK_INIT_SEQ_LEN,
+    static_cast<unsigned int>(MAX_SEQ_LEN));
+}
+
+bool Transformer::growPrefillPlane(unsigned int prompt_tokens) {
+  if (plane_pinned_ || !is_initialized || weight_path_.empty())
+    return false;
+  /** The arm has to be one a bigger block pays off on -- see
+   *  causallm::prefillBlockPays() for the measurement on each. */
+  if (!causallm::prefillBlockPays())
+    return false;
+  /** A model that does not chunk its prefill by design is bounded by its plane,
+   *  so moving the plane would move which prompts it can answer at all. Only a
+   *  chunk-by-design model (the ring models) is grown, and for it the plane is
+   *  purely a speed/memory dial -- the prompt it accepts is the same either
+   * way.
+   */
+  if (!chunkLongPrompts())
+    return false;
+  if (MEMORY_SWAP) // FSU re-plans the swap around the graph; out of scope
+    return false;
+
+  const unsigned int from = static_cast<unsigned int>(INIT_SEQ_LEN);
+  const unsigned int to = prefillPlaneFor(prompt_tokens);
+  if (to <= from)
+    return false;
+
+  std::fprintf(stderr,
+               "[prefill-plane] prompt %u tokens: plane %u -> %u (pack %u, cap "
+               "%u); rebuilding the graph and replaying the weight load\n",
+               prompt_tokens, from, to, PACK_INIT_SEQ_LEN,
+               std::min<unsigned int>(causallm::kPrefillBlockCap,
+                                      static_cast<unsigned int>(MAX_SEQ_LEN)));
+  std::fflush(stderr);
+
+  /** Release the OLD graph first: its weights and its planned tensors are the
+   *  large part, and holding both graphs at once would double the weight
+   *  residency for the length of the reload. is_initialized follows, so a throw
+   *  below leaves the object visibly uninitialized rather than half-built. */
+  const std::string wpath = weight_path_; // load_weight() rewrites the member
+  const bool repack = weight_repacked_;
+  INIT_SEQ_LEN = to;
+  model.reset();
+  is_initialized = false;
+
+  initialize();
+  load_weight(wpath);
+  if (repack)
+    repack_weight();
+  return true;
+}
 
 /**
  * @brief Save model weights to a binary nntrainer model file.
@@ -600,6 +667,10 @@ void Transformer::repack_weight() {
       "Transformer model is not initialized. Please call "
       "initialize() before repack_weight().");
   }
+  /** Recorded (before the engine gate below, which is a per-engine no-op rather
+   *  than "the caller did not ask") so growPrefillPlane() replays the caller's
+   *  load sequence in the same order it happened. */
+  weight_repacked_ = true;
 
   // [perf/thermal] The KAI rhs-pack below is consumed ONLY by the ARM CPU
   // KleidiAI GEMM. The GPU (v8c) and x86 paths read the plain on-disk QS4CX
