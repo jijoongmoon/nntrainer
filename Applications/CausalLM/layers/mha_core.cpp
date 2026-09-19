@@ -744,6 +744,33 @@ static void mha_ring_assert_host_path_ok(unsigned int ring_cap,
        "NNTR_CUDA_ATTN=1 on NNTR_ENGINE=cuda) or set NNTR_KV_WINDOW_RING=0.";
 }
 
+// The Adreno image attention needs a K/V mirror per layer, and the mirror is an
+// image2d whose size the device bounds. When it cannot be built the layer runs
+// the buffer (flash) arm instead, which is several times slower; that used to
+// happen with nothing logged at all. Once per process, on stderr as well as
+// the log, with the numbers that decide it.
+[[maybe_unused]] static void
+mha_report_image_mirror_refused(size_t num_heads_KV, size_t head_dim,
+                                unsigned int S_max) {
+  static bool reported = false;
+  if (reported)
+    return;
+  reported = true;
+  char msg[512];
+  std::snprintf(
+    msg, sizeof(msg),
+    "[IMG-ATTN] the K/V image mirror could not be created (KV heads=%zu, "
+    "head_dim=%zu, rows=%u -> K image %zu rows before packing); the device "
+    "image limits or the allocation refused it. Image attention is OFF for "
+    "this process: attention runs the buffer (flash) arm -- correct, but "
+    "several times slower. Lower max_seq_len, or check "
+    "CL_DEVICE_IMAGE2D_MAX_HEIGHT/WIDTH.",
+    num_heads_KV, head_dim, S_max, num_heads_KV * (size_t)S_max);
+  ml_loge("%s", msg);
+  std::fprintf(stderr, "%s\n", msg);
+  std::fflush(stderr);
+}
+
 void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
 
   NNTR_THROW_IF(context.getNumInputs() < 3 || context.getNumInputs() > 5,
@@ -995,6 +1022,7 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
     } else {
       use_image_attn = 0; // permanent disable; flash takes over (same as
                           // the lazy-init failure path)
+      mha_report_image_mirror_refused(num_heads_KV, head_dim, S_max);
     }
   }
 #endif // ENABLE_OPENCL (OHWI mirror prebuild)
@@ -1756,6 +1784,11 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   // 2026-06-12: Q-only CLMEM flips, Q-only + a qk-side drain is clean).
   void *q_attn_clmem = q_cl;
   void *q_rope_staged = nullptr;
+  // Set when the GPU RoPE read the FC output from q_cl but wrote the ROTATED Q
+  // into the SVM plane (the image-attention form, see the rope call below).
+  // From then on q_cl holds the UN-rotated Q and must never be lowered over
+  // the SVM plane: the fallbacks under the image arm consume the plane as is.
+  bool q_rotated_in_svm_plane = false;
   auto lower_q = [&]() {
 #if defined(ENABLE_OPENCL)
     if (q_cl) {
@@ -2160,6 +2193,8 @@ void MHACoreLayer::one_batch_incremental_forwarding(
           q_attn_clmem = q_out_stage;
           q_rope_staged = q_out_stage;
         }
+        if (ok && q_rope_out == nullptr && q_cl != nullptr)
+          q_rotated_in_svm_plane = true;
         if (ok && k_out_stage != nullptr) {
           // Side-fill the SVM cache slice for host decode (consumed only
           // after the lm_head lower drains the queue): no per-op drain.
@@ -3086,8 +3121,10 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                           reinterpret_cast<cl_mem *>(&v_buf_ohwi),
                           reinterpret_cast<cl_mem *>(&v_image_ohwi));
             kv_mirror_init = m_ok;
-            if (!m_ok)
+            if (!m_ok) {
               use_image_attn = 0; // permanent disable; flash takes over
+              mha_report_image_mirror_refused(num_heads_KV, head_dim, S_max);
+            }
           }
           if (kv_mirror_init && S_max == kv_mirror_S_max &&
               cache_to <= kv_mirror_S_max) {
@@ -3294,6 +3331,20 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             step_size * (unsigned int)num_heads_Q * (unsigned int)head_dim,
             /*svm_inputs=*/true, /*in_clmem=*/q_rope_staged,
             /*out_clmem=*/nullptr, /*drain=*/true);
+          q_cl = nullptr;
+        }
+        if (!ok && q_rotated_in_svm_plane && q_cl != nullptr) {
+          // The image arm did not take this call (no mirror -- the K image did
+          // not fit the device, or the call is past the mirror capacity), but
+          // NNTR_KV_IMG_ATTN still shaped the RoPE above: the rotated Q is in
+          // the SVM plane and q_cl still holds the FC's UN-rotated output.
+          // lower_q() below would copy that over the plane, and every arm
+          // under this one would then attend with a position-less Q against
+          // rotated keys -- fluent for a sentence, then a repetition loop, and
+          // a first token that moves with the chunk size. That was the whole
+          // of "the non-image fallback is wrong". Drop the stale handle
+          // instead (one drain: that rotation was enqueued without one).
+          nntrainer::cl_queue_finish();
           q_cl = nullptr;
         }
         if (!ok && (kv_stage_on || k_stage != nullptr ||
