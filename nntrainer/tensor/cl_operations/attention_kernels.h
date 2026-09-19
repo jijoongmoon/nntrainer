@@ -366,6 +366,14 @@ void attention_prewarm_programs(ClContext &cc);
  */
 unsigned int kimg_gsh_for(unsigned int num_heads_KV, unsigned int max_S);
 
+/**
+ * @brief Row capacity to build an OHWI K/V mirror with for `rows` KV rows:
+ *        rounded up to 8 and to the device's image pitch alignment, so the V
+ *        image view can be created for any max_seq_len. Identity for an
+ *        already-aligned capacity.
+ */
+unsigned int ohwi_mirror_capacity(unsigned int rows);
+
 bool create_ohwi_kv_mirror(bool is_v, unsigned int num_heads_KV,
                            unsigned int head_dim, unsigned int max_S,
                            cl_mem *out_buf, cl_mem *out_image,

@@ -971,6 +971,17 @@ unsigned int kimg_gsh_for(unsigned int num_heads_KV, unsigned int max_S) {
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
   if (!blas_cc || num_heads_KV == 0 || max_S == 0)
     return 0;
+  // NNTR_KIMG_PACK=0: control arm -- never pack, so a K image taller than the
+  // device limit fails to create exactly as it did before packing existed
+  // (and the layer reports it and runs the buffer arm).
+  static const bool pack_off = []() {
+    const char *e = std::getenv("NNTR_KIMG_PACK");
+    return e != nullptr && e[0] == '0';
+  }();
+  if (pack_off) {
+    g_kimg_gsh = 0;
+    return 0;
+  }
   size_t max_h = 0, max_w = 0;
   cl_device_id dev = blas_cc->context_inst_.GetDeviceId();
   opencl::clGetDeviceInfo(dev, CL_DEVICE_IMAGE2D_MAX_HEIGHT, sizeof(max_h),
@@ -993,6 +1004,32 @@ unsigned int kimg_gsh_for(unsigned int num_heads_KV, unsigned int max_S) {
             rows, max_h, 1u << gsh, gsh);
   g_kimg_gsh = gsh;
   return gsh;
+}
+
+// The V mirror image's row pitch is the mirror's row capacity, and
+// image2d_from_buffer wants that pitch to be a multiple of
+// CL_DEVICE_IMAGE_PITCH_ALIGNMENT pixels (8 halves each): a max_seq_len such as
+// 4104 builds a 513-pixel pitch, clCreateImage refuses it, and the whole
+// process leaves the image path. Capacity is free to round UP, so do that; a
+// capacity that is already aligned (typical values: 1024/2048/4096/...) is
+// returned unchanged.
+unsigned int ohwi_mirror_capacity(unsigned int rows) {
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  rows = (rows + 7u) & ~7u;
+  if (!blas_cc || rows == 0)
+    return rows;
+  static const cl_uint pitch_align = [blas_cc]() {
+    cl_uint a = 0;
+    cl_device_id dev = blas_cc->context_inst_.GetDeviceId();
+    if (opencl::clGetDeviceInfo(dev, CL_DEVICE_IMAGE_PITCH_ALIGNMENT,
+                                sizeof(cl_uint), &a, nullptr) != CL_SUCCESS ||
+        a == 0)
+      a = 1; // no constraint reported: keep the 8-row rounding only
+    return a;
+  }();
+  const unsigned int s_align = 8u * (unsigned int)pitch_align;
+  return (rows + s_align - 1u) / s_align * s_align;
 }
 
 bool create_ohwi_kv_mirror(bool is_v, unsigned int num_heads_KV,
@@ -1041,7 +1078,7 @@ bool create_ohwi_kv_mirror(bool is_v, unsigned int num_heads_KV,
     // KIMG_GSH in the kernel -- both come from kimg_gsh_for().
     const size_t g = (size_t)1u << k_gsh;
     if (((size_t)num_heads_KV * max_S) % g != 0) {
-      clReleaseMemObject(buf);
+      opencl::clReleaseMemObjectT(buf);
       return false;
     }
     d.image_width = ((size_t)head_dim / 8) * g;
@@ -2916,7 +2953,7 @@ bool flash_attention_prefill_f16_cl(
   // (flash_attention_prefill_f16_blockq): one workgroup owns FBQ_TM query rows
   // of one head_q and loads each K[n]/V[n] ONCE for all TM rows -> cuts the
   // K/V re-read traffic that bottlenecks the 1-row vec kernel on Intel.
-  static const int flash_blockq = []() {
+  static const int flash_blockq_cfg = []() {
     const char *e = std::getenv("NNTR_FLASH_BLOCKQ");
     if (e)
       return std::atoi(e) != 0 ? 1 : 0;
@@ -2925,6 +2962,32 @@ bool flash_attention_prefill_f16_cl(
     // vs vec-flash ~1119, token-identical). Adreno (unset) uses the image path.
     return v8c_use_buffer_path() ? 1 : 0; // Intel buffer path => 1
   }();
+  // Block-Q (and XMX on top of it) is the ONLY variant that declares the chunk
+  // offset (q_off = N_kv - M), the sliding window, the logit soft-cap and the
+  // ring capacity. The coop / vec / skeleton kernels take none of them: their
+  // causal bound is the chunk-LOCAL row (n <= m), and the host simply did not
+  // bind the rest. Wherever Block-Q is not the configured default -- every
+  // Adreno run that leaves the image path -- a second prefill chunk therefore
+  // attended only to keys [0, m] instead of [0, q_off + m], a sliding layer
+  // attended to every evicted key, and a ringed cache was read linearly: a
+  // first token several logits off, a repetition loop, ids that move with the
+  // chunk size, nothing logged. A call that needs any of those four is served
+  // by Block-Q regardless of the configured variant.
+  const bool flash_needs_blockq = (causal && N_kv != M) ||
+                                  (local_window > 0 && local_window < N_kv) ||
+                                  attn_softcap != 0.0f || ring_cap != 0;
+  const int flash_blockq = (flash_blockq_cfg || flash_needs_blockq) ? 1 : 0;
+  if (flash_needs_blockq && !flash_blockq_cfg) {
+    static bool said = false;
+    if (!said) {
+      said = true;
+      ml_logw("flash prefill: this call needs the chunk offset / window / "
+              "soft-cap / ring (M=%u N_kv=%u window=%u ring=%u); using the "
+              "Block-Q kernel instead of the configured variant, which has "
+              "none of them",
+              M, N_kv, local_window, ring_cap);
+    }
+  }
   // FBQ_TM: query rows per workgroup. Default 4 (=> acc+q 2*TM*VPL floats stays
   // in registers at LWS>=32). Only 1/2/4/8 supported.
   // Default by head width: TM=2 measured best at d>=256; at d<=128 the 2*TM*VPL
@@ -2966,11 +3029,10 @@ bool flash_attention_prefill_f16_cl(
   // model with TWO head_dims (gemma4: 256 sliding / 512 full) gets the right
   // VPL=d/LWS<=8 per call. The kernel cache (key = name+copts) still dedups the
   // compile per distinct (head_dim,...) so this stays a single compile per d.
-  // flash_blockq is static const (function-static) -- it has static storage
-  // duration and is accessible inside the lambda WITHOUT a capture; capturing
-  // it is ill-formed (ARM/NDK clang rejects it, x86 was lax). flash_blockq_tm
-  // now depends on head_dim and is deliberately not read here any more.
-  const int flash_coop_lws = [head_dim]() {
+  // flash_blockq is a plain local (it depends on this call's arguments), so
+  // the lambda has to capture it. flash_blockq_tm depends on head_dim and is
+  // deliberately not read here.
+  const int flash_coop_lws = [head_dim, flash_blockq]() {
     const char *e = std::getenv("NNTR_FLASH_COOP_LWS");
     int v;
     if (e && std::atoi(e) > 0) {
