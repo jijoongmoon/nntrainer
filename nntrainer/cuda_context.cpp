@@ -88,6 +88,14 @@ void CudaContext::initialize() noexcept {
       return;
     }
 
+    // Default-ON opt-out. nntr_env_on() cannot express this: it answers false
+    // for an unset variable, which is the right default for a lever but the
+    // wrong one for a profile that must apply unless someone says not to.
+    const auto wddmProfileWanted = []() {
+      const char *e = std::getenv("NNTR_CUDA_WDDM_PROFILE");
+      return !(e != nullptr && e[0] == '0');
+    };
+
     const bool integrated = context_inst_.isIntegrated();
     ml_logi("[CudaContext] device=\"%s\" arch=%s integrated=%d "
             "concurrentManagedAccess=%d",
@@ -160,16 +168,9 @@ void CudaContext::initialize() noexcept {
       // graph-walk half as NNTR_CUDA_GRAPH below, which this tree does not
       // have, and measured here it moves nothing either way.
       //
-      // Async submission is auto-enabled alongside the device-only pool, so on
-      // this profile it is on by default; NNTR_CUDA_ASYNC=0 forces the per-op
-      // drains back for an A/B, and NNTR_DETERMINISTIC=1 pins them.
-      {
-        const char *det = getenv("NNTR_DETERMINISTIC");
-        const char *dev_act = getenv("NNTR_CUDA_DEV_ACT");
-        const bool async_ok = dev_act != nullptr && dev_act[0] == '1' &&
-                              !(det != nullptr && det[0] == '1');
-        setenv("NNTR_CUDA_ASYNC", async_ok ? "1" : "0", 0);
-      }
+      // Async submission is auto-enabled alongside the device-only pool; the
+      // derivation now lives after this block, because its precondition is the
+      // pool -- not the device probe that happens to set the pool here.
       // NNTR_CUDA_GRAPH is deliberately NOT auto-enabled. Capture/replay of a
       // decode step is only correct with the FEED half wired up: between two
       // replays of the same captured graph the host has to re-run the nodes
@@ -188,6 +189,68 @@ void CudaContext::initialize() noexcept {
       // wins everywhere.
       setenv("NNTR_RMSNORM_CUDA_OFF", "all", 0);
       setenv("NNTR_LAYERNORM_CUDA_OFF", "all", 0);
+    } else if (!integrated && wddmProfileWanted()) {
+      // Discrete part whose driver does not report concurrent managed access:
+      // in practice the Windows WDDM model. It used to fall through with only
+      // the unconditional flags above, which left it on drained submission --
+      // measured on an RTX 5070 Laptop, gemma4 1K decode 40.6 TPS against 134
+      // for the same tree on a cMA=1 Linux part.
+      //
+      // The reason the levers were withheld does not apply to this device the
+      // way the comment above states it. That text reasons about a MANAGED
+      // activation pool, but on cMA=0 there is no managed pool to touch:
+      // CudaMemAllocator::use_host_mapped() already defaults to true here and
+      // hands out pinned host-mapped (zero-copy) memory instead, whose pages
+      // never migrate -- a host touch mid-kernel is a data race, not the access
+      // violation the comment describes. And NNTR_CUDA_DEV_ACT bypasses that
+      // pool into real cudaMalloc device memory, where a host fallback faults
+      // loudly instead of racing, which is what makes the profile safe.
+      //
+      // So this device gets the same two levers, for the same reason, and they
+      // are not new on Windows: an application layered on this engine can set
+      // exactly these from its own `#if defined(_WIN32)` environment block, and
+      // that pairing is the second half of an OS-divergence defect -- one gate
+      // turning the levers off by device probe, another turning them back on by
+      // platform macro, neither configuration tested as a pair. Defaulting them
+      // here makes a plain NNTR_ENGINE=cuda run on Windows behave the same way,
+      // so a caller does not have to carry device policy.
+      //
+      // NOT included: NNTR_CUDA_KV_DEV / CUBLAS_WS_MB / QS4CX_DECOMMIT, which
+      // such an environment block usually sets too -- those are memory-budget
+      // choices, not this profile's subject, and the measurement that motivated
+      // them folded them together. Also not NNTR_CUDA_M2B: no reader here.
+      //
+      // NNTR_CUDA_WDDM_PROFILE=0 disables this block wholesale; each lever
+      // remains individually opt-out via its own =0, as everywhere else.
+      setenv("NNTR_CUDA_DEV_ACT", "1", 0);
+      setenv("NNTR_CUDA_VCOPY_PREFILL", "1", 0);
+      setenv("NNTR_RMSNORM_CUDA_OFF", "all", 0);
+      setenv("NNTR_LAYERNORM_CUDA_OFF", "all", 0);
+      ml_logi("[CudaContext] WDDM discrete profile applied "
+              "(concurrentManagedAccess=0); NNTR_CUDA_WDDM_PROFILE=0 to skip");
+    }
+
+    // Async submission follows the device-only activation pool, wherever that
+    // pool came from -- this profile, an embedding application's environment
+    // block, or the caller's shell. It used to be derived INSIDE the cMA guard,
+    // so a device that had NNTR_CUDA_DEV_ACT set by someone else never got the
+    // matching NNTR_CUDA_ASYNC written and ran drained: precisely the Windows
+    // case, where such a block sets the pool and the guard skipped the
+    // derivation.
+    // Moving it out changes nothing for a cMA=1 part (the guard above sets the
+    // pool, then this fires exactly as before) and grants nothing on its own:
+    // with no pool, async_ok is false and this writes "0", as today.
+    //
+    // The rule itself is unchanged: async is coherent only with the pool (a
+    // host op in the middle of an undrained chain reads bytes a kernel is still
+    // writing), and NNTR_DETERMINISTIC=1 keeps the drains. The runtime gate in
+    // cuda_stream_manager additionally requires a non-integrated part.
+    {
+      const char *det = getenv("NNTR_DETERMINISTIC");
+      const char *dev_act = getenv("NNTR_CUDA_DEV_ACT");
+      const bool async_ok = dev_act != nullptr && dev_act[0] == '1' &&
+                            !(det != nullptr && det[0] == '1');
+      setenv("NNTR_CUDA_ASYNC", async_ok ? "1" : "0", 0);
     }
 
     add_default_object();
