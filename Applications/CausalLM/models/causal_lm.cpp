@@ -382,9 +382,11 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
                    const WSTR tail_prompt, bool log_output) {
 
   auto start_total = std::chrono::high_resolution_clock::now();
-  /** The peak belongs to THIS request. Starting here resets it, so the second
-   *  message does not inherit the first one's high-water. */
-  FootprintSampler::get().start();
+  /** The peak belongs to THIS request, so the second message does not inherit
+   *  the first one's high-water. arm() rather than a reset because a caller
+   *  that lazily loaded the model just before this call has already started
+   *  measuring, and that load is part of the same request. */
+  FootprintSampler::get().arm();
 #if defined(ENABLE_OPENCL)
   /** Load is finished here and no forward has run: everything in the ledger at
    *  this point is weights, planes and mirrors, i.e. the part of the footprint
@@ -722,7 +724,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   nntrainer::opencl::clMemAcctDump("after-decode");
 #endif
   const size_t maxrss_kb = getPeakMemoryKb();
-  const size_t honest_kb = FootprintSampler::get().stop();
+  const size_t honest_kb = FootprintSampler::get().finish();
   const size_t peak_memory = resolvePeakMemoryKb(honest_kb, maxrss_kb);
 
   if (log_output) {

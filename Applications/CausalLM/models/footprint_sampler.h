@@ -157,20 +157,37 @@ public:
     return s;
   }
 
-  /** Begin a run. Any previous run's sampler is stopped first. */
-  void start() {
-    stop();
+  /**
+   * @brief Begin measuring, if nobody already is.
+   *
+   * @details Composable on purpose. A request that lazily loads the model
+   * arms at the load and again at the generation; the second call is a no-op,
+   * so the load's transient stays inside the request's peak instead of being
+   * thrown away by a reset in between. A request that finds the model already
+   * loaded arms only at the generation, and gets a peak that starts from zero
+   * there. Either way the number belongs to one request.
+   */
+  void arm() {
+    if (th_.joinable())
+      return;
     {
       std::lock_guard<std::mutex> lk(m_);
       peak_kb_ = 0;
+      peak_anon_kb_ = peak_gpu_kb_ = peak_dma_kb_ = 0;
       stop_ = false;
     }
     sample(); // one synchronous sample, so a run shorter than a tick reports
     th_ = std::thread([this] { loop(); });
   }
 
-  /** End the run, take one last sample, and return the peak in KB. */
-  size_t stop() {
+  /**
+   * @brief Stop measuring and return the peak in KB.
+   *
+   * @details Does not clear: the next arm() does that. So an inner caller
+   * (the model's own run) and an outer one (the API's request boundary) both
+   * read the same number, in either order, and calling it twice is harmless.
+   */
+  size_t finish() {
     if (th_.joinable()) {
       {
         std::lock_guard<std::mutex> lk(m_);
@@ -178,8 +195,8 @@ public:
       }
       cv_.notify_all();
       th_.join();
+      sample();
     }
-    sample();
     std::lock_guard<std::mutex> lk(m_);
     return peak_kb_;
   }
@@ -189,6 +206,14 @@ public:
     return peak_kb_;
   }
 
+  /** The three terms as they stood at the peak, for the run summary. */
+  void peakTerms(size_t &anon_kb, size_t &gpu_kb, size_t &dma_kb) {
+    std::lock_guard<std::mutex> lk(m_);
+    anon_kb = peak_anon_kb_;
+    gpu_kb = peak_gpu_kb_;
+    dma_kb = peak_dma_kb_;
+  }
+
   /** Read the three terms once and fold them into the peak. */
   void sample() {
     const size_t anon_kb = readRssAnonKb();
@@ -196,14 +221,12 @@ public:
       return; // no /proc: leave the peak at 0 and let the caller fall back
     const size_t gpu_kb = readGpuBytes() / 1024;
 
-    /** dma-buf costs an open() per fd, so it is read every third tick and
-     *  carried in between -- the cadence an external observer samples at. The
-     *  GPU ledger is a mutex and an integer, so it is read every tick. */
-    if (dma_countdown_ == 0) {
-      dma_kb_ = readDmabufBytes() / 1024;
-      dma_countdown_ = 3;
-    }
-    --dma_countdown_;
+    /** Every tick, not every third one. The NPU arm's peak is a transient
+     *  inside the QNN graph preparation that a 450 ms cadence walks straight
+     *  past (measured: 2 659 MiB reported against 2 860 MiB observed from
+     *  outside, on a peak that lasts well under half a second). A scan is one
+     *  open()/read()/close() per open fd, a few dozen of them. */
+    dma_kb_ = readDmabufBytes() / 1024;
 
     /** One run uses one accelerator. Adding the two would count a mirror
      *  twice; the larger is the one that is really there. */
@@ -211,8 +234,12 @@ public:
 
     std::lock_guard<std::mutex> lk(m_);
     const size_t now_kb = anon_kb + accel_kb;
-    if (now_kb > peak_kb_)
+    if (now_kb > peak_kb_) {
       peak_kb_ = now_kb;
+      peak_anon_kb_ = anon_kb;
+      peak_gpu_kb_ = gpu_kb;
+      peak_dma_kb_ = dma_kb_;
+    }
   }
 
 private:
@@ -224,7 +251,7 @@ private:
         period_ms_ = (int)v;
     }
   }
-  ~FootprintSampler() { stop(); }
+  ~FootprintSampler() { finish(); }
 
   void loop() {
     for (;;) {
@@ -242,12 +269,25 @@ private:
   std::thread th_;
   bool stop_ = true;
   size_t peak_kb_ = 0;
-  /** Touched by sample() only, and sample() is never concurrent: start()
-   *  takes its synchronous sample before the thread exists and stop() takes
+  size_t peak_anon_kb_ = 0;
+  size_t peak_gpu_kb_ = 0;
+  size_t peak_dma_kb_ = 0;
+  /** Touched by sample() only, and sample() is never concurrent: arm()
+   *  takes its synchronous sample before the thread exists and finish() takes
    *  its last one after the join. */
   size_t dma_kb_ = 0;
-  int dma_countdown_ = 0;
-  int period_ms_ = 150;
+  int period_ms_ = 100;
+};
+
+/**
+ * @brief Arm the sampler for the duration of a scope, and read the peak out of
+ * it on the way out.
+ */
+struct FootprintRun {
+  FootprintRun() { FootprintSampler::get().arm(); }
+  ~FootprintRun() { FootprintSampler::get().finish(); }
+  FootprintRun(const FootprintRun &) = delete;
+  FootprintRun &operator=(const FootprintRun &) = delete;
 };
 
 /**

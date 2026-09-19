@@ -464,7 +464,7 @@ void Lfm2CausalLM::run_with_embeddings(const void *inputs_embeds,
 
   auto start_total = std::chrono::high_resolution_clock::now();
   /** The peak belongs to THIS request -- see causal_lm.cpp. */
-  FootprintSampler::get().start();
+  FootprintSampler::get().arm();
 
   if (!is_initialized) {
     throw std::runtime_error(
@@ -679,7 +679,7 @@ void Lfm2CausalLM::run_with_embeddings(const void *inputs_embeds,
   auto total_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
     finish_total - start_total);
   const size_t maxrss_kb = getPeakMemoryKb();
-  const size_t honest_kb = FootprintSampler::get().stop();
+  const size_t honest_kb = FootprintSampler::get().finish();
   const size_t peak_memory = resolvePeakMemoryKb(honest_kb, maxrss_kb);
 
   if (log_output) {
