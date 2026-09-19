@@ -244,6 +244,29 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
       std::fflush(stderr);
     }
   }
+  /** The pack's own max_seq_len gets the SAME bound as the env override above.
+   *  The RoPE table is built for max_position_embeddings positions, so a pack
+   *  asking for a longer window walks the host rotation past the end of that
+   *  table (a segfault in compute_rotary_emb_value on the first long prompt,
+   *  not a load error). Clamp, say so once, and let init_seq_len follow. */
+  if (cfg.contains("max_position_embeddings") &&
+      nntr_cfg.contains("max_seq_len")) {
+    const unsigned int cap = cfg["max_position_embeddings"].get<unsigned int>();
+    const unsigned int pack = nntr_cfg["max_seq_len"].get<unsigned int>();
+    if (cap != 0 && pack > cap) {
+      std::fprintf(stderr,
+                   "[max_seq_len] nntr_config max_seq_len=%u exceeds "
+                   "max_position_embeddings=%u; clamping to %u\n",
+                   pack, cap, cap);
+      std::fflush(stderr);
+      nntr_cfg["max_seq_len"] = cap;
+      if (nntr_cfg.contains("init_seq_len") &&
+          nntr_cfg["init_seq_len"].get<unsigned int>() > cap) {
+        nntr_cfg["init_seq_len"] = cap;
+        INIT_SEQ_LEN = cap;
+      }
+    }
+  }
   const unsigned int isl_cap = nntr_cfg["max_seq_len"].get<unsigned int>();
   if (const char *isl = std::getenv("NNTR_INIT_SEQ_LEN")) {
     const int want = std::atoi(isl);
