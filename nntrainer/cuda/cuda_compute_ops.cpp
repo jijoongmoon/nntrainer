@@ -522,10 +522,38 @@ public:
       cuda::StreamManager::Global().maybeFinish();
       return;
     }
+
+#ifdef ENABLE_FP16
+    // FP16 weight: cuBLAS fp16 GEMM, fp32 accumulate. A DENSE fp16 FC had no
+    // device arm here and fell to the host, which the comment below calls
+    // "correct for FP16" -- and it is, on a host-coherent UVM tensor. With the
+    // device-only activation pool (NNTR_CUDA_DEV_ACT, the discrete default) it
+    // is not correct at all: the host reference dereferences real device
+    // pointers and segfaults. A package that stores some of its FC weights
+    // dense fp16 rather than quantised is exactly that case, and it crashed in
+    // HalfTensor::dotHalf under this fallback.
+    //
+    // Guarded on device-accessibility like the FP32 arm above, so a host-side
+    // tensor still takes the host path.
+    if (wt == DT::FP16 && at == DT::FP16 && M > 0 && N > 0 && K > 0) {
+      const auto *Xp = (const unsigned short *)input_.getData<_FP16>();
+      const auto *Wp = (const unsigned short *)weight.getData<_FP16>();
+      auto *Yp = (unsigned short *)hidden_.getData<_FP16>();
+      if (nntrainer::cuda::dev_accessible(Xp) &&
+          nntrainer::cuda::dev_accessible(Wp) &&
+          nntrainer::cuda::dev_accessible(Yp) &&
+          cuda::BlasManager::Global().hgemmRowMajor(M, N, K, Xp, Wp, Yp)) {
+        cuda::StreamManager::Global().maybeFinish();
+        return;
+      }
+    }
+#endif
 #endif
 
-    // Host fallback: correct for FP16 / Q4_x / Q6_K / cross-engine host input
-    // (and any GPU-path failure) on the host-coherent UVM tensors.
+    // Host fallback: correct for Q4_x / Q6_K / cross-engine host input (and any
+    // GPU-path failure) on the host-coherent UVM tensors. NOTE that it is only
+    // correct while the tensors ARE host-addressable -- see the FP16 arm above
+    // for the case where they are not.
     CpuComputeOps::fc(input, weight, output);
   }
 };

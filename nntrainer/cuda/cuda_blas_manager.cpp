@@ -97,6 +97,26 @@ bool BlasManager::sgemmRowMajor(int M, int N, int K, const float *X,
   return true;
 }
 
+bool BlasManager::hgemmRowMajor(int M, int N, int K, const unsigned short *X,
+                                const unsigned short *W, unsigned short *Y) {
+  if (!ok_)
+    return false;
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  // Same orientation as sgemmRowMajor: column-major C[N,M] = W_view[N,K] *
+  // X_view[K,M], read back row-major as Y[M,N] = X*W. fp16 in/out, fp32
+  // accumulate.
+  cublasStatus_t s =
+    cublasGemmEx(handle_, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, W,
+                 CUDA_R_16F, N, X, CUDA_R_16F, K, &beta, Y, CUDA_R_16F, N,
+                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+  if (s != CUBLAS_STATUS_SUCCESS) {
+    ml_loge("[CUDA] cublasGemmEx fp16 failed: %d", (int)s);
+    return false;
+  }
+  return true;
+}
+
 bool BlasManager::igemmRowMajor(int M, int N, int K, const signed char *A,
                                 const signed char *B, int *C) {
   static int dbg = -2;
