@@ -993,10 +993,17 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
     if (mirror_cap >= 8 && mirror_cap < S_max)
       S_max = (mirror_cap + 7u) & ~7u;
     kv_mirror_S_max = S_max;
+    // [kimg-pack] Derived from max_timestep, NOT this layer's S_max: the
+    // kernels carry a single compile-time KIMG_GSH, so every K mirror in the
+    // process must be packed the same way, and max_timestep is the one value
+    // all layers share. 0 (today's view, instruction for instruction) whenever
+    // KV heads x max_timestep already fits the device image height.
+    kv_kimg_gsh =
+      nntrainer::kimg_gsh_for(num_heads_KV, (max_timestep + 7u) & ~7u);
     bool m_ok = nntrainer::create_ohwi_kv_mirror(
                   /*is_v=*/false, num_heads_KV, head_dim, S_max,
                   reinterpret_cast<cl_mem *>(&k_buf_ohwi),
-                  reinterpret_cast<cl_mem *>(&k_image_ohwi)) &&
+                  reinterpret_cast<cl_mem *>(&k_image_ohwi), kv_kimg_gsh) &&
                 nntrainer::create_ohwi_kv_mirror(
                   /*is_v=*/true, num_heads_KV, head_dim, S_max,
                   reinterpret_cast<cl_mem *>(&v_buf_ohwi),
@@ -3112,14 +3119,23 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             S_max = (mirror_cap + 7u) & ~7u;
           if (!kv_mirror_init) {
             kv_mirror_S_max = S_max;
-            bool m_ok = nntrainer::create_ohwi_kv_mirror(
-                          /*is_v=*/false, num_heads_KV, head_dim, S_max,
-                          reinterpret_cast<cl_mem *>(&k_buf_ohwi),
-                          reinterpret_cast<cl_mem *>(&k_image_ohwi)) &&
-                        nntrainer::create_ohwi_kv_mirror(
-                          /*is_v=*/true, num_heads_KV, head_dim, S_max,
-                          reinterpret_cast<cl_mem *>(&v_buf_ohwi),
-                          reinterpret_cast<cl_mem *>(&v_image_ohwi));
+            // Same derivation as the finalize prebuild (which is Android-only).
+            kv_kimg_gsh = nntrainer::kimg_gsh_for(
+              num_heads_KV,
+              ((unsigned int)std::get<nntrainer::props::MaxTimestep>(
+                 mha_core_props)
+                 .get() +
+               7u) &
+                ~7u);
+            bool m_ok =
+              nntrainer::create_ohwi_kv_mirror(
+                /*is_v=*/false, num_heads_KV, head_dim, S_max,
+                reinterpret_cast<cl_mem *>(&k_buf_ohwi),
+                reinterpret_cast<cl_mem *>(&k_image_ohwi), kv_kimg_gsh) &&
+              nntrainer::create_ohwi_kv_mirror(
+                /*is_v=*/true, num_heads_KV, head_dim, S_max,
+                reinterpret_cast<cl_mem *>(&v_buf_ohwi),
+                reinterpret_cast<cl_mem *>(&v_image_ohwi));
             kv_mirror_init = m_ok;
             if (!m_ok) {
               use_image_attn = 0; // permanent disable; flash takes over
