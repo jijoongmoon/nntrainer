@@ -947,6 +947,11 @@ flash_decode_reduce(__global const float *part_acc, // [H_q][n_chunks][d]
 #ifndef FXA_XRED
 #define FXA_XRED 0
 #endif
+// FXA_PREC: 1 (default) = tile-normalised P with a matching normaliser (see
+// the softmax update); 0 = P against the running max, exact fp32 normaliser.
+#ifndef FXA_PREC
+#define FXA_PREC 1
+#endif
 #define FXA_DSUB (FXA_D / FXA_NSG)
 #define FXA_KCH_SUB (FXA_DSUB / 16)
 // Row tiles are built from DPAS M<=8 fragments: FXA_FR rows per fragment,
@@ -1019,7 +1024,12 @@ flash_attention_prefill_f16_xmx(
         Q[(long)m * HD_Q + (long)head_q * FXA_D + dbase + ch * 16 + lane]);
     }
 
-  float m_i[FXA_TM], l_i[FXA_TM], alpha[FXA_TM], p[FXA_TM];
+  float m_i[FXA_TM], l_i[FXA_TM], alpha[FXA_TM];
+#if FXA_PREC
+  float beta[FXA_TM];
+#else
+  float p[FXA_TM];
+#endif
   float acc[FXA_TM][FXA_KCH_SUB];
 #pragma unroll
   for (int r = 0; r < FXA_TM; ++r) {
@@ -1148,6 +1158,7 @@ flash_attention_prefill_f16_xmx(
 
       // ---- flash softmax update; every subgroup's lane owns the same key
       const int key = n0 + lane;
+      short parr[FXA_TM];
 #pragma unroll
       for (int r = 0; r < FXA_TM; ++r) {
         float s = scale * sc[r];
@@ -1162,16 +1173,34 @@ flash_attention_prefill_f16_xmx(
         const float tmax = sub_group_reduce_max(s);
         const float m_new = fmax(m_i[r], tmax);
         alpha[r] = exp(m_i[r] - m_new);
+#if FXA_PREC
+        // The DPAS A operand is fp16, so P is rounded to half before P*V.
+        // (1) Normalise P to the TILE's own max: its largest weight is exactly
+        // 1.0 and the tile's weights keep 11 significant bits relative to each
+        // other, however far the tile sits below the running max (against the
+        // running max they fell into the subnormals below 6e-5 and flushed to
+        // zero below 3e-8). beta carries the tile to the running max in fp32.
+        // (2) Accumulate the normaliser from the SAME rounded weights P*V sees.
+        // With the exact fp32 sum the output was sum(round(p) v) / sum(p): a
+        // per-row gain error common to every channel of the head.
+        const half ph = ok ? convert_half(exp(s - tmax)) : (half)0.0h;
+        beta[r] = exp(tmax - m_new);
+        parr[r] = as_short(ph);
+        l_i[r] =
+          alpha[r] * l_i[r] + beta[r] * sub_group_reduce_add((float)ph);
+#else
         p[r] = exp(s - m_new);
         l_i[r] = alpha[r] * l_i[r] + sub_group_reduce_add(p[r]);
+#endif
         m_i[r] = m_new;
       }
 
       // ---- P*V via DPAS over this subgroup's d-slice
-      short parr[FXA_TM];
+#if !FXA_PREC
 #pragma unroll
       for (int r = 0; r < FXA_TM; ++r)
         parr[r] = as_short(convert_half(p[r]));
+#endif
 #pragma unroll
       for (int ch = 0; ch < FXA_KCH_SUB; ++ch) {
         int vbarr[8];
@@ -1193,8 +1222,14 @@ flash_attention_prefill_f16_xmx(
           FXA_CV_STORE(pv8, pvarr);
 #pragma unroll
           for (int rr = 0; rr < FXA_FR; ++rr)
+#if FXA_PREC
+            acc[f * FXA_FR + rr][ch] =
+              alpha[f * FXA_FR + rr] * acc[f * FXA_FR + rr][ch] +
+              beta[f * FXA_FR + rr] * pvarr[rr];
+#else
             acc[f * FXA_FR + rr][ch] =
               alpha[f * FXA_FR + rr] * acc[f * FXA_FR + rr][ch] + pvarr[rr];
+#endif
         }
       }
     }

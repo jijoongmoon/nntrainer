@@ -12,6 +12,7 @@
  */
 
 #include "attention_kernels_templates.h"
+#include <algorithm>
 #include <array>
 #include <blas_kernel_interface.h>
 #include <blas_kernels.h> // v8c_use_buffer_path()
@@ -2936,10 +2937,10 @@ bool flash_attention_prefill_f16_cl(
   // (validated: gemma2 d=256, gemma4 d=512 via the NSG=2 split +72%@32K;
   // CHECK numerics clean on both, det 2-run byte-identical).
   // NNTR_FLASH_XMX=0 restores the scalar blockq path;
-  // sliding-window calls are never routed (they keep the measured-best
-  // blockq + window-skip path). NNTR_FLASH_XMX_CHECK=N additionally runs the
-  // blockq kernel first on the same buffers and host-compares (first N
-  // calls).
+  // sliding-window calls with d<=128 take it too (NNTR_FLASH_XMX_WIN, see
+  // xmx_win_ok below); wider heads keep the blockq + window-skip path.
+  // NNTR_FLASH_XMX_CHECK=N additionally runs the blockq kernel first on the
+  // same buffers and host-compares (first N calls).
   static const int flash_xmx_req = []() {
     const char *e = std::getenv("NNTR_FLASH_XMX");
     if (e)
@@ -2956,7 +2957,26 @@ bool flash_attention_prefill_f16_cl(
   }();
   const int win_i =
     (local_window > 0 && local_window < N_kv) ? (int)local_window : 0;
-  const bool use_xmx = flash_blockq && flash_xmx_req && causal && win_i == 0 &&
+  // Sliding-window calls. The XMX kernel is window-aware (tile-aligned window
+  // floor + per-key mask). At d=128 it halves the windowed call
+  // (919 rows, W=512, 16 heads: 5.0 -> 2.85 ms; 1556 rows, W=1024, 12 heads:
+  // 12.3 -> 6.0 ms), so d<=128 takes it by DEFAULT. At d=256 it measured
+  // SLOWER than Block-Q + window-skip (842 rows, W=512: 5.7 vs 4.9 ms/call),
+  // so wider heads stay on Block-Q unless NNTR_FLASH_XMX_WIN=2.
+  // Accuracy: scored against a host fp64 attention over the same fp16 Q/K/V
+  // (NNTR_FLASH_XMX_CHECK_REF) both kernels sit on the fp16 OUTPUT rounding
+  // floor (relF 2.06e-4); the XMX excess over it is 0.45e-4 with FXA_PREC=1
+  // (0.68e-4 before). Note for whoever A/Bs this route on a whole model: an
+  // early-step divergence on a 24-layer decoder traced to the OpenCL rms_norm
+  // epsilon floor amplifying one-ULP differences, not to this kernel.
+  // NNTR_FLASH_XMX_WIN=0 keeps windowed calls on Block-Q, =2 routes every d.
+  static const int flash_xmx_win = []() {
+    const char *e = std::getenv("NNTR_FLASH_XMX_WIN");
+    return e ? std::atoi(e) : 1;
+  }();
+  const bool xmx_win_ok = win_i == 0 || flash_xmx_win >= 2 ||
+                          (flash_xmx_win == 1 && (int)head_dim <= 128);
+  const bool use_xmx = flash_blockq && flash_xmx_req && causal && xmx_win_ok &&
                        (int)head_dim % 16 == 0 && (int)head_dim <= 512 &&
                        ClContext::Global().caps().dpas;
   // DPAS row-tile (M dimension). TM=8 measured best at every d incl. 512:
@@ -3024,6 +3044,13 @@ bool flash_attention_prefill_f16_cl(
   }();
   const int xmx_xred =
     (xmx_nsg > 1) ? (xmx_xred_env < 0 ? 1 : xmx_xred_env) : 0;
+  // P rounding (the DPAS A operand is fp16): 1 = tile-normalised P and a
+  // normaliser summed from the rounded weights; NNTR_FLASH_XMX_PREC=0 restores
+  // P against the running max with the exact fp32 normaliser (A/B).
+  static const int xmx_prec = []() {
+    const char *e = std::getenv("NNTR_FLASH_XMX_PREC");
+    return (e && e[0] == '0') ? 0 : 1;
+  }();
   // Guard: clamp XB so psum + vtile fit the per-WG SLM budget
   // (XB=4 + d=512 defaults previously exceeded it -> launch failure, no
   // fallback). Budget 64KB, the conservative Xe per-WG limit.
@@ -3074,7 +3101,8 @@ bool flash_attention_prefill_f16_cl(
               " -DFXA_TM=" + std::to_string(xmx_tm) +
               " -DFXA_NSG=" + std::to_string(xmx_nsg) +
               " -DFXA_XB=" + std::to_string(xmx_xb) +
-              " -DFXA_XRED=" + std::to_string(xmx_xred);
+              " -DFXA_XRED=" + std::to_string(xmx_xred) +
+              " -DFXA_PREC=" + std::to_string(xmx_prec);
     }
     return base;
   }();
@@ -3281,6 +3309,74 @@ bool flash_attention_prefill_f16_cl(
                  "(row=%zu col=%zu) over_tol=%zu/%zu\n",
                  _xmx_check_done, M, N_kv, max_diff, arg / HD_Q, arg % HD_Q,
                  over_tol, total);
+    // NNTR_FLASH_XMX_CHECK_REF=1: also score BOTH kernels against a host
+    // fp64 attention over the same fp16 Q/K/V (a sample of rows, every head).
+    // The two-kernel diff above cannot say which side is the accurate one.
+    static const bool _xmx_check_ref =
+      std::getenv("NNTR_FLASH_XMX_CHECK_REF") != nullptr;
+    if (_xmx_check_ref) {
+      const size_t d = head_dim;
+      const size_t step = std::max<size_t>(1, (size_t)M / 48);
+      double e_x = 0, e_b = 0, nrm = 0, mx_x = 0, mx_b = 0;
+      std::vector<double> sc(N_kv), o(d);
+      std::vector<size_t> rows;
+      for (size_t m = 0; m + 1 < M; m += step)
+        rows.push_back(m);
+      rows.push_back((size_t)M - 1);
+      size_t cnt = 0;
+      for (size_t m : rows) {
+        const long mabs = (long)m + (long)N_kv - (long)M;
+        const long lo = (win_i > 0) ? std::max<long>(0, mabs - win_i + 1) : 0;
+        for (size_t h = 0; h < num_heads_Q; ++h) {
+          const size_t hk = h / (size_t)gqa;
+          const uint16_t *qp = Q_host + m * HD_Q + h * d;
+          double smax = -1e300;
+          for (long n = lo; n <= mabs; ++n) {
+            const size_t pn = (size_t)n; // physical row of key n
+            const uint16_t *kr = (k_stride > 0)
+                                   ? K_host + hk * (size_t)k_stride * d + pn * d
+                                   : K_host + pn * HD_KV + hk * d;
+            double a = 0;
+            for (size_t c = 0; c < d; ++c)
+              a += (double)_h2f(qp[c]) * (double)_h2f(kr[c]);
+            a *= (double)scale;
+            if (attn_softcap > 0.0f)
+              a = attn_softcap * std::tanh(a / attn_softcap);
+            sc[n] = a;
+            smax = std::max(smax, a);
+          }
+          double l = 0;
+          std::fill(o.begin(), o.end(), 0.0);
+          for (long n = lo; n <= mabs; ++n) {
+            const size_t pn = (size_t)n; // physical row of key n
+            const uint16_t *vr = V_host + pn * HD_KV + hk * d;
+            const double w = std::exp(sc[n] - smax);
+            l += w;
+            for (size_t c = 0; c < d; ++c)
+              o[c] += w * (double)_h2f(vr[c]);
+          }
+          for (size_t c = 0; c < d; ++c) {
+            const double r = o[c] / l;
+            const size_t i = m * HD_Q + h * d + c;
+            const double dx = (double)_h2f(O_host[i]) - r;
+            const double db = (double)_h2f(_xmx_ref[i]) - r;
+            e_x += dx * dx;
+            e_b += db * db;
+            nrm += r * r;
+            mx_x = std::max(mx_x, std::fabs(dx));
+            mx_b = std::max(mx_b, std::fabs(db));
+          }
+        }
+        cnt += (size_t)num_heads_Q * d;
+      }
+      std::fprintf(
+        stderr,
+        "[FLASH-XMX-REF] call=%d win=%d rms_ref=%.4f | xmx relF=%.3e "
+        "max=%.5f | blockq relF=%.3e max=%.5f\n",
+        _xmx_check_done, win_i,
+        std::sqrt(nrm / (double)std::max<size_t>(1, cnt)), std::sqrt(e_x / nrm),
+        mx_x, std::sqrt(e_b / nrm), mx_b);
+    }
     ++_xmx_check_done;
   }
 
