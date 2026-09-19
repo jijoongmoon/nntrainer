@@ -499,7 +499,54 @@ sharedConstTensors CudaContext::runDecode(NeuralNetwork &nn, unsigned int from,
     cached_out = {};
   }
 
-  if (decode_graph && feed_declared && single_token) {
+  /** [capture prewarm] How many decode tokens run EAGER before the capture
+   *  token. Default 1, and that 1 is load-bearing rather than a safety margin.
+   *
+   *  The decode path builds several device-side caches LAZILY, on first use,
+   *  and every one of those builders refuses to allocate inside a stream
+   *  capture -- a cudaMalloc there invalidates the graph -- so under capture
+   *  they return false and their caller falls back to host math. The
+   *  fp32->fp16 gamma conversion every RMSNorm needs is the chief example, and
+   *  first use is the first M=1 forward, because the norms' device path is
+   *  gated to narrow row counts and the whole prefill never touches those
+   *  caches.
+   *
+   *  So capturing ON the first decode token makes "first use" and "capture"
+   *  the same call: every cache is cold, every norm declines its device path,
+   *  and it either throws or silently vanishes from the recorded graph --
+   *  which on a host-addressable pinned pool no residency probe can catch. One
+   *  eager token first moves every lazy build outside the capture, at the cost
+   *  of exactly one un-graphed token per sequence.
+   *
+   *  It is also the only place the split-KV decode can publish its fixed
+   *  stride: that prewarm early-returns while capturing, and without it the
+   *  decode binds no device position buffer and freezes the host KV length at
+   *  the capture token -- the signature being an answer that is right for a
+   *  while and then degrades the further generation runs past the capture
+   *  point.
+   *
+   *  The eager token is a normal decode: the attention layer sets the device
+   *  RoPE/KV position itself when not capturing, so the slot writes stay
+   *  correct. NNTR_CUDA_M2B_WARM overrides the count; 0 restores the old
+   *  capture-on-first-token behaviour.
+   */
+  static const unsigned int m2b_warm = []() {
+    const char *e = std::getenv("NNTR_CUDA_M2B_WARM");
+    return e != nullptr ? (unsigned int)(std::max)(0, std::atoi(e)) : 1u;
+  }();
+  static unsigned int warm_left = m2b_warm;
+  if (from == 0 || (to - from) > 1)
+    warm_left = m2b_warm; /* new sequence or a multi-token step */
+
+  if (decode_graph && feed_declared && single_token && cached_exec == nullptr &&
+      warm_left > 0) {
+    --warm_left;
+    if (graph_dbg)
+      std::fprintf(stderr,
+                   "[CUDA_GRAPH] prewarm: running token at %u eagerly "
+                   "(%u left before capture)\n",
+                   from, warm_left);
+  } else if (decode_graph && feed_declared && single_token) {
     auto &sm = nntrainer::cuda::StreamManager::Global();
     if (cached_exec != nullptr) {
       nn.setStepFeedOnly(true);
