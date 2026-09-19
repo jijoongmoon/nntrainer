@@ -590,6 +590,11 @@ __global__ void rmsnorm_quant_i8_h_v4(const unsigned short *x,
   __shared__ float ssq[32];
   __shared__ float smn[32];
   __shared__ float smx[32];
+)CU"
+  // MSVC C2026: a single string literal caps at 16380 bytes -- keep every raw
+  // chunk under that by splitting at a line boundary (adjacent literals
+  // concatenate; the NVRTC source is unchanged).
+  R"CU(
   float4 carry[VQ_NCARRY];
   int nc = 0;
   float p = 0.f;
