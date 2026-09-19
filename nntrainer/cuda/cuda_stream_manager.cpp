@@ -36,10 +36,23 @@ namespace {
  * fires, and the decode-position buffer is the fixed device address the
  * captured RoPE/attention/KV nodes were recorded against.
  */
+/// Distinct KV-length bounds one captured decode step can compare against.
+/// Four layer kinds x (window, chunk, ring, gemm) with room to spare; a table
+/// that fills up stops recording rather than growing, and the overflow is
+/// reported once under NNTR_CUDA_GRAPH_DBG.
+constexpr int kKvRegimeMax = 32;
+
 struct SharedCudaState {
   cudaStream_t stream = nullptr;
   int capturing = 0;
   int *pos_dev = nullptr; // device int[2] {pos, n_kv}
+  // [kv-regime] the host branches a capture froze. See kv_regime_gt().
+  int regime_recording = 0;
+  int regime_base_kv = 0;
+  int regime_n = 0;
+  int regime_overflow = 0;
+  int regime_exact = 0;
+  int regime_delta[kKvRegimeMax] = {0};
 };
 
 #ifdef _WIN32
@@ -347,6 +360,68 @@ int *cuda_pos_buffer() {
   }
   return sh->pos_dev;
 }
+
+/* [kv-regime] The host half of the decode graph's validity. Declared in
+ * cuda_stream_manager.h, where the mechanism and the measurement that motivated
+ * it are written down. Kept next to SharedCudaState because it has to be ONE
+ * table per process: the sites that record are in the layer module and the site
+ * that asks is in the backend (the cuda_pos_buffer() problem, same solution).
+ */
+bool kv_regime_gt(int kv_len, int threshold) {
+  const bool answer = kv_len > threshold;
+  auto *sh = shared_cuda_state();
+  if (sh->regime_recording == 0)
+    return answer;
+  /* Store the site's distance to its bound, so one per-token delta re-asks the
+   * question no matter which count (N_kv, N_kv-1, ...) the site compared. */
+  const int delta = kv_len - threshold;
+  for (int i = 0; i < sh->regime_n; ++i)
+    if (sh->regime_delta[i] == delta)
+      return answer; /* same question, already recorded */
+  if (sh->regime_n >= kKvRegimeMax) {
+    sh->regime_overflow = 1;
+    return answer;
+  }
+  sh->regime_delta[sh->regime_n++] = delta;
+  return answer;
+}
+
+void kv_regime_exact(int kv_len) {
+  (void)kv_len;
+  auto *sh = shared_cuda_state();
+  if (sh->regime_recording != 0)
+    sh->regime_exact = 1;
+}
+
+void kv_regime_begin(int kv_len) {
+  auto *sh = shared_cuda_state();
+  sh->regime_n = 0;
+  sh->regime_overflow = 0;
+  sh->regime_exact = 0;
+  sh->regime_base_kv = kv_len;
+  sh->regime_recording = 1;
+}
+
+void kv_regime_seal() { shared_cuda_state()->regime_recording = 0; }
+
+bool kv_regime_holds(int kv_len) {
+  auto *sh = shared_cuda_state();
+  const int delta = kv_len - sh->regime_base_kv;
+  if (sh->regime_exact != 0)
+    return delta == 0;
+  /* A table that overflowed is not a description of the capture, so it cannot
+   * certify one. Recapture every step instead of replaying an unknown. */
+  if (sh->regime_overflow != 0)
+    return delta == 0;
+  for (int i = 0; i < sh->regime_n; ++i) {
+    const int d = sh->regime_delta[i];
+    if ((d > 0) != ((d + delta) > 0))
+      return false;
+  }
+  return true;
+}
+
+int kv_regime_size() { return shared_cuda_state()->regime_n; }
 
 void cuda_set_pos(int pos, int n_kv) {
   // Pinned host source so the H2D is a real async DMA (also keeps it capturable

@@ -175,6 +175,70 @@ int *cuda_pos_buffer();
  */
 void cuda_set_pos(int pos, int n_kv);
 
+/**
+ * @brief Record that a host-side dispatch decision compared the live KV length
+ *        against @p threshold, and answer that comparison (@p kv_len >
+ *        @p threshold).
+ *
+ * A capture freezes every host decision taken while it recorded: the kernel a
+ * dispatch selected, the grid it launched, the arm an `if` chose. Kernels can
+ * be taught to read the moving values from cuda_pos_buffer(), but a host branch
+ * cannot -- it already happened. So the branches are made REPORTABLE instead:
+ * every site that compares the key count against a fixed bound routes the
+ * comparison through here, and the capture keeps the answers. Before each
+ * replay, kv_regime_holds() re-asks them at the current key count; when one has
+ * flipped, the graph is retired and recaptured against the arm that is now
+ * correct (nntrainer::CudaContext::runDecode).
+ *
+ * What this catches, measured on a discrete part: the split-KV decode engages
+ * at `N_kv > NNTR_CUDA_FLASH_DECODE` (default 64 keys). A 46-token prompt
+ * captures at ~48 keys -- below it -- so the replay keeps launching the dense
+ * per-key kernel while the eager path crosses into split-KV at absolute
+ * position 64, and the two reduce in different orders: the answer stays fluent
+ * and diverges from the golden at exactly that token. Forcing either arm for
+ * the whole run makes replay byte-identical to eager again, which is what named
+ * the arm flip as the cause.
+ *
+ * Only comparisons taken while recording (i.e. inside the decode capture) are
+ * kept, so a call on a prefill-only path costs one comparison and nothing else.
+ * What is stored is (kv_at_site - threshold), not the two values: every key
+ * count in a decode step advances by exactly one per token, so one delta
+ * re-asks every recorded question regardless of which count each site saw.
+ */
+bool kv_regime_gt(int kv_len, int threshold);
+
+/**
+ * @brief Record that a decision consumed the live KV length as a VALUE rather
+ *        than through a bound -- a copy whose byte count is the key count, say.
+ *        No later key count can satisfy it, so the capture is valid for this
+ *        step only and every following step recaptures.
+ */
+void kv_regime_exact(int kv_len);
+
+/**
+ * @brief Clear the table and start recording, with @p kv_len as the key count
+ *        the recorded answers belong to. Called immediately before a capture.
+ */
+void kv_regime_begin(int kv_len);
+
+/**
+ * @brief Stop recording. The table now describes the captured graph.
+ */
+void kv_regime_seal();
+
+/**
+ * @brief True while every recorded comparison still answers the same way at
+ *        @p kv_len -- i.e. while the captured graph's host decisions are still
+ *        the ones this step would take. An empty table holds (nothing recorded,
+ *        nothing to invalidate).
+ */
+bool kv_regime_holds(int kv_len);
+
+/**
+ * @brief Number of comparisons in the table (diagnostics only).
+ */
+int kv_regime_size();
+
 } // namespace nntrainer::cuda
 
 #endif // __CUDA_STREAM_MANAGER_H__
