@@ -21,8 +21,11 @@
 #include <cuda_runtime.h>
 
 #ifdef _WIN32
-#include <delayimp.h>
 #include <windows.h>
+// delayimp.h uses Windows types (LPCSTR/HMODULE/FARPROC) without declaring
+// them, so it must stay *after* windows.h -- do not let the include sorter
+// move it.
+#include <delayimp.h>
 #endif
 
 namespace nntrainer::cuda {
