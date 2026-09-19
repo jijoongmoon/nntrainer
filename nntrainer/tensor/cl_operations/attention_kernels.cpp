@@ -2837,13 +2837,18 @@ bool flash_attention_prefill_f16_cl(
   }();
   // FBQ_TM: query rows per workgroup. Default 4 (=> acc+q 2*TM*VPL floats stays
   // in registers at LWS>=32). Only 1/2/4/8 supported.
-  static const int flash_blockq_tm = []() {
+  // Default by head width: TM=2 measured best at d>=256; at d<=128 the 2*TM*VPL
+  // row state still fits the registers at TM=4 with LWS=16, measured -17% on
+  // the kernel (919-row prefill, 16 heads: sliding 6.4 -> 5.3 ms/call, full
+  // 7.6 -> 6.6 ms/call) with token-identical output. 0 = env unset.
+  static const int flash_blockq_tm_env = []() {
     const char *e = std::getenv("NNTR_FLASH_BLOCKQ_TM");
-    int v = (e && std::atoi(e) > 0) ? std::atoi(e) : 2; // TM=2 measured best
-    if (v != 1 && v != 2 && v != 4 && v != 8)
-      v = 2;
-    return v;
+    const int v = (e && std::atoi(e) > 0) ? std::atoi(e) : 0;
+    return (v == 1 || v == 2 || v == 4 || v == 8) ? v : 0;
   }();
+  const int flash_blockq_tm = flash_blockq_tm_env
+                                ? flash_blockq_tm_env
+                                : (((int)head_dim <= 128) ? 4 : 2);
   // NNTR_FLASH_SG: Block-Q reduces the d-dot with sub_group_reduce_add
   // (LWS == subgroup size) instead of the LDS tree -> no red_sh, no barriers
   // (the dominant cost: ~512 barriers/WG). Intel only (cl_intel_subgroups).
@@ -2871,10 +2876,10 @@ bool flash_attention_prefill_f16_cl(
   // model with TWO head_dims (gemma4: 256 sliding / 512 full) gets the right
   // VPL=d/LWS<=8 per call. The kernel cache (key = name+copts) still dedups the
   // compile per distinct (head_dim,...) so this stays a single compile per d.
-  // flash_blockq / flash_blockq_tm are static const (file/function-static) --
-  // they have static storage duration and are accessible inside the lambda
-  // WITHOUT a capture; capturing them is ill-formed (ARM/NDK clang rejects it,
-  // x86 was lax).
+  // flash_blockq is static const (function-static) -- it has static storage
+  // duration and is accessible inside the lambda WITHOUT a capture; capturing
+  // it is ill-formed (ARM/NDK clang rejects it, x86 was lax). flash_blockq_tm
+  // now depends on head_dim and is deliberately not read here any more.
   const int flash_coop_lws = [head_dim]() {
     const char *e = std::getenv("NNTR_FLASH_COOP_LWS");
     int v;
@@ -2882,8 +2887,10 @@ bool flash_attention_prefill_f16_cl(
       v = std::atoi(e);
     } else if (flash_blockq) {
       // Block-Q register budget = 2*TM*VPL acc/q floats per WI. TM<=2
-      // keeps half8 (LWS=16, the Intel optimum + the SG subgroup size); TM>=4
-      // needs half4 (LWS=32) to avoid spill (half8/TM>=4 = 96 floats spills).
+      // keeps half8 (LWS=16, the Intel optimum + the SG subgroup size). The
+      // older rule also widened to LWS=32 whenever TM>=4; at d=128 that was
+      // measured slower (TM4/LWS32 126.8 ms vs TM4/LWS16 104.9 ms over 20
+      // sliding calls), so the width now follows head_dim alone.
       // Gemma2 d=256: VPL must stay <=8, so LWS=d/8=32 (VPL=8, half8); at
       // TM=2 that is 2*2*8=32 acc/q floats — no spill. (d=128 keeps LWS=16.)
       // Gemma4 full_attention d=512: VPL must stay <=8 => LWS=d/8=64. A 64-wide
@@ -2891,9 +2898,7 @@ bool flash_attention_prefill_f16_cl(
       // only); the SG path is forced off for it below
       // (intel_reqd_sub_group_size (64) is INVALID — Intel subgroups are
       // {8,16,32}).
-      v = ((int)head_dim >= 512)
-            ? 64
-            : (((int)head_dim > 128 || flash_blockq_tm >= 4) ? 32 : 16);
+      v = ((int)head_dim >= 512) ? 64 : (((int)head_dim > 128) ? 32 : 16);
     } else {
       // Intel/buffer path default LWS=16 => VPL = d/16 = 8 (half8 vloads),
       // the measured Intel-Arc optimum (1153 TPS @ M=1024 vs 981 at LWS=64).
