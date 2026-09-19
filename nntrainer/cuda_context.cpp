@@ -163,25 +163,21 @@ void CudaContext::initialize() noexcept {
       // and NNTR_DETERMINISTIC=1 keeps drained submission with the pool on.
       setenv("NNTR_CUDA_DEV_ACT", "1", 0);
       setenv("NNTR_CUDA_VCOPY_PREFILL", "1", 0);
-      // The remaining decode lever of this profile, NNTR_CUDA_M2B (the
-      // single-capture decode graph), stays opt-in: it needs the same
-      // graph-walk half as NNTR_CUDA_GRAPH below, which this tree does not
-      // have, and measured here it moves nothing either way.
-      //
       // Async submission is auto-enabled alongside the device-only pool; the
       // derivation now lives after this block, because its precondition is the
       // pool -- not the device probe that happens to set the pool here.
-      // NNTR_CUDA_GRAPH is deliberately NOT auto-enabled. Capture/replay of a
-      // decode step is only correct with the FEED half wired up: between two
-      // replays of the same captured graph the host has to re-run the nodes
-      // that produce this token's inputs (the embedding gather) so the replay
-      // reads new bytes instead of the ones frozen into the capture. That half
-      // -- NeuralNetwork::setGraphReplayFeedNodes() / setStepFeedOnly() -- has
-      // a writer but no reader in this tree, so an auto-enabled graph replays
-      // the FIRST decode token's activations for every later token: the first
-      // token is right and the rest are fluent nonsense. Leave the lever
-      // opt-in until the feed pass is implemented; the same capture also makes
-      // any in-capture host FC freeze its output.
+      //
+      // The decode-graph pair (NNTR_CUDA_GRAPH + NNTR_CUDA_M2B) is not decided
+      // here either: it applies to a discrete part of EITHER memory model and
+      // is defaulted in its own block below. What keeps it from reaching an
+      // unverified model is a runtime gate rather than this probe -- capture
+      // and replay are only correct with the FEED half wired up (between two
+      // replays the host has to re-run the nodes that produce this token's
+      // inputs, so the replay reads new bytes instead of the ones frozen into
+      // the capture), and a model that declares no such nodes never reaches the
+      // capture at all. The same capture also makes any in-capture host FC
+      // freeze its output.
+      //
       // The row cap reads "=all" as RAISE, not disable: the device norm kernel
       // synchronizes per call, so on a wide (prefill-shaped) row window the
       // multi-threaded host loop wins and the default caps the device path at
@@ -218,7 +214,8 @@ void CudaContext::initialize() noexcept {
       // NOT included: NNTR_CUDA_KV_DEV / CUBLAS_WS_MB / QS4CX_DECOMMIT, which
       // such an environment block usually sets too -- those are memory-budget
       // choices, not this profile's subject, and the measurement that motivated
-      // them folded them together. Also not NNTR_CUDA_M2B: no reader here.
+      // them folded them together. The decode-graph pair is not part of this
+      // profile either; it is decided for both memory models below.
       //
       // NNTR_CUDA_WDDM_PROFILE=0 disables this block wholesale; each lever
       // remains individually opt-out via its own =0, as everywhere else.
@@ -273,6 +270,55 @@ void CudaContext::initialize() noexcept {
       // write is overwrite=0 like every other default -- so a machine that
       // disagrees has a one-variable way out and a bug report worth having.
       setenv("NNTR_CUDA_ASYNC", pool_on ? "1" : "0", 0);
+    }
+
+    // The captured decode graph, for a discrete part of either memory model.
+    //
+    // It was opt-in for exactly one reason: a capture froze host decisions that
+    // depend on the key count, so a replay could keep launching an arm the step
+    // had outgrown. The dispatch sites now report those comparisons while a
+    // capture records (nntrainer::cuda::kv_regime_gt) and the capture is
+    // retired and retaken when one of them flips, which closes the half this
+    // library can see by itself; a model that knows its own attention window
+    // can name the position where its regime changes, which is the same defect
+    // from the model side.
+    //
+    // What still gates the path is the model's own declaration of the nodes a
+    // replay must re-run on the host (NeuralNetwork::getGraphReplayFeedNodes):
+    // a model that declares none never reaches the capture at all, so this
+    // default cannot reach an unverified model. In this tree nothing declares
+    // them yet -- the declaration is written by the model, so the default is
+    // inert here and becomes effective when a model opts in.
+    //
+    // Why it is worth defaulting: the replay's saving is per-launch submission
+    // cost, which is ~nothing on a Linux discrete part (measured 133 vs 133
+    // TPS) and most of the decode on the Windows WDDM model, where the same
+    // tree goes 64 -> 102 TPS on one model and 80 -> 134 on another, with
+    // byte-identical output. One default for both, rather than a platform macro
+    // that sets the levers on one OS only -- that shape is the OS-divergence
+    // defect this profile block already had to undo once.
+    //
+    // Evidence for the default: 2 models x {46-token prompt + 600 tokens, 1K
+    // cell} x {off, on} x 3 runs, every output equal to the eager arm's and
+    // decode within noise; plus a 5083-token cell with and without the KV ring,
+    // all byte-identical.
+    //
+    // Opting out: NNTR_CUDA_DECODE_GRAPH=0 turns off the pair. Either lever's
+    // own =0 does too, and is written through to the other, because HALF the
+    // pair is corruption rather than a configuration: the capture and the
+    // model-side slot writes have to agree. An explicit 1/0 pair from the
+    // caller is left exactly as given, and refused loudly where it is read.
+    if (!integrated) {
+      const char *pair = std::getenv("NNTR_CUDA_DECODE_GRAPH");
+      const char *capture = std::getenv("NNTR_CUDA_GRAPH");
+      const char *slots = std::getenv("NNTR_CUDA_M2B");
+      const auto declined = [](const char *e) {
+        return e != nullptr && e[0] == '0';
+      };
+      const char *v =
+        (declined(pair) || declined(capture) || declined(slots)) ? "0" : "1";
+      setenv("NNTR_CUDA_GRAPH", v, 0);
+      setenv("NNTR_CUDA_M2B", v, 0);
     }
 
     add_default_object();
