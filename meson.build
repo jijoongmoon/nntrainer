@@ -308,7 +308,13 @@ if get_option('enable-cuda')
 
   cuda_path = get_option('cuda-path')
   cuda_incdir = include_directories(cuda_path / 'include')
-  cuda_libdir = cuda_path / 'lib64'
+  # The toolkit's import libraries live under lib64/ on Linux but lib/x64 on
+  # Windows (there is no lib64 in the Windows CUDA layout at all).
+  if host_machine.system() == 'windows'
+    cuda_libdir = cuda_path / 'lib/x64'
+  else
+    cuda_libdir = cuda_path / 'lib64'
+  endif
 
   cudart_dep   = cxx.find_library('cudart',   dirs: cuda_libdir, required: true)
   nvrtc_dep    = cxx.find_library('nvrtc',    dirs: cuda_libdir, required: true)
