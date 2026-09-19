@@ -46,6 +46,25 @@ public:
                      float *Y);
 
   /**
+   * @brief Row-major fp16 Y[M,N] = X[M,K] * W[K,N], fp32 accumulate.
+   *
+   * Same layout contract and the same operand swap as sgemmRowMajor; the
+   * buffers are raw fp16 bits, which is how an ENABLE_FP16 tensor stores them
+   * and how the fp16 attention path already hands them to cuBLAS.
+   *
+   * This exists for a DENSE fp16 FC on a device-only activation pool. Such a
+   * weight had no device arm at all, and the host fallback under it is only
+   * correct while the tensors are host-addressable: with NNTR_CUDA_DEV_ACT on
+   * they are real device memory, so that fallback does not run slowly, it
+   * faults. Accumulate is fp32 (CUBLAS_COMPUTE_32F), i.e. no worse than the
+   * host reference, which also accumulates in float.
+   *
+   * @return true on CUBLAS_STATUS_SUCCESS
+   */
+  bool hgemmRowMajor(int M, int N, int K, const unsigned short *X,
+                     const unsigned short *W, unsigned short *Y);
+
+  /**
    * @brief Row-major INT8 IMMA GEMM: C[M,N] = A[M,K] * B[K,N], int8 in /
    *        int32 out, on the Tensor Cores (cublasGemmEx CUDA_R_8I /
    *        CUBLAS_COMPUTE_32I). A = per-row int8 activation [M,K], B = int8
