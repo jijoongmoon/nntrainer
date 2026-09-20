@@ -1711,6 +1711,11 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     return out;
   };
 
+  /** [perf-split] Stamped when a token first reaches the caller; default-
+   *  constructed (epoch) means "not yet", i.e. the first token comes out of the
+   *  decode loop. See ttft_ms in performance_metrics.h. */
+  std::chrono::high_resolution_clock::time_point perf_split_first_out{};
+
   if (SKIP_PREFILL && init_len > 1) {
     // Prefill only N-1 tokens; the last input token will be used as the first
     // token in the generation phase (assigned directly, not sampled).
@@ -1734,8 +1739,15 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     // post process of model output
     id_list = generate(output[0], do_sample, 1, ids_history, init_len);
 
-    if (init_len < INIT_SEQ_LEN)
+    if (init_len < INIT_SEQ_LEN) {
       registerOutputs(tokenizer, id_list, init_len, eos_list, log_output);
+      /** [perf-split] Without skip_prefill the FIRST token the caller sees
+       *  is the one prefill's own logits produced, before the boundary below
+       *  -- so TTFT is stamped here, not at the first decode step. (The
+       *  measured model packs set skip_prefill, so this arm serves the
+       *  others.) */
+      perf_split_first_out = std::chrono::high_resolution_clock::now();
+    }
   }
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
   // NNTR_CUDA_I8_EPHEMERAL=1: the prefill just finished and
@@ -1754,6 +1766,49 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   // output should be released after use (returns the row to the pool)
   for (auto &out : output) {
     releaseLogitsBuf(out);
+  }
+
+  /** [perf-split] MEASUREMENT PATH ONLY. The host is here as soon as the last
+   *  prefill chunk has been SUBMITTED; on both async backends the device is
+   *  still working. Stopping the prefill clock now and starting the decode
+   *  clock a few lines down charges that in-flight work to the first decode
+   *  token, so prefill reads fast and decode (averaged over N tokens) reads
+   *  slow by the same amount -- and both move with the prefill block size,
+   *  which is how a block-size sweep ends up reading its own instrument.
+   *
+   *  Draining here makes prefill_duration_ms mean "the prompt is through the
+   *  device" and leaves the first decode step measuring only the first decode
+   *  step. It adds no GPU work and no net wall time (the same queue would have
+   *  been drained by the first token's host read), but it DOES serialize the
+   *  host against the device at a point where production currently overlaps
+   *  the decode-graph setup with the prefill tail, so it stays behind
+   *  NNTR_PERF_SPLIT_DRAIN=1, which only a measurement run sets; nothing on
+   *  the app/production path sets it, and with it unset this block compiles to
+   *  one already-cached bool test. It cannot change results: both calls are
+   *  pure barriers.
+   */
+  double prefill_drain_ms = 0.0;
+  {
+    static const bool split_drain = []() {
+      const char *e = std::getenv("NNTR_PERF_SPLIT_DRAIN");
+      return e != nullptr && e[0] == '1';
+    }();
+    if (split_drain) {
+      const auto drain_begin = std::chrono::high_resolution_clock::now();
+      const std::string eng = causallm_engine();
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+      if (eng == "cuda")
+        nntrainer::cuda::StreamManager::Global().finish();
+#endif
+#if defined(ENABLE_OPENCL)
+      if (eng != "cuda" && eng != "cpu")
+        nntrainer::cl_queue_finish();
+#endif
+      prefill_drain_ms =
+        std::chrono::duration<double, std::milli>(
+          std::chrono::high_resolution_clock::now() - drain_begin)
+          .count();
+    }
   }
 
   auto finish_prefill = std::chrono::high_resolution_clock::now();
@@ -1779,6 +1834,18 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   nntrainer::opencl::clLaunchStatBegin("decode");
 #endif
   auto start_generation = std::chrono::high_resolution_clock::now();
+
+  /** [perf-split] One host timestamp per decode step, taken after the token has
+   *  been streamed to the caller. Free (a clock read per token), always on.
+   *  The first step is kept apart from the rest: it is the one that pays for
+   *  whatever prefill left in flight (and, on CUDA, for the first graph
+   *  capture), so averaging it into "decode TPS" is what made decode TPS a
+   *  function of the prefill block size. Token granularity, not delta
+   *  granularity: registerOutputs() holds a partial UTF-8 sequence, so a
+   *  delta can lag its token by a step. */
+  std::vector<double> decode_step_ms;
+  decode_step_ms.reserve(64);
+  auto decode_step_mark = start_generation;
 
   // registerOutputs() writes ids_history[b * MAX_SEQ_LEN + idx] with no bounds
   // check, so the loop index has to stay inside the row stride the buffer was
@@ -1845,6 +1912,15 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     registerOutputs(tokenizer, ids_list, token_generation_idx, eos_list,
                     log_output);
     ++generation_cnt;
+    {
+      const auto step_end = std::chrono::high_resolution_clock::now();
+      decode_step_ms.push_back(
+        std::chrono::duration<double, std::milli>(step_end - decode_step_mark)
+          .count());
+      decode_step_mark = step_end;
+      if (perf_split_first_out.time_since_epoch().count() == 0)
+        perf_split_first_out = step_end;
+    }
 #if defined(ENABLE_OPENCL)
     nntrainer::opencl::clLaunchStatTick();
 #endif
@@ -1928,6 +2004,47 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   performance_metrics.total_duration_ms = total_duration.count();
   performance_metrics.peak_memory_kb = peak_memory;
   performance_metrics.peak_rss_kb = maxrss_kb;
+
+  /** [perf-split] The honest rows. See performance_metrics.h for why the two
+   *  fields above cannot be trusted on their own. */
+  performance_metrics.prefill_drain_ms = prefill_drain_ms;
+  performance_metrics.ttft_ms =
+    perf_split_first_out.time_since_epoch().count() != 0
+      ? std::chrono::duration<double, std::milli>(perf_split_first_out -
+                                                  start_total)
+          .count()
+      : 0.0;
+  performance_metrics.first_token_ms =
+    decode_step_ms.empty() ? 0.0 : decode_step_ms.front();
+  /* Median, not mean: one throttle notch or one scheduler hiccup in 127 steps
+   * moves a mean and does not move a median, and the question these sweeps ask
+   * is what a step costs, not what the worst step cost. */
+  if (decode_step_ms.size() >= 2) {
+    std::vector<double> tail(decode_step_ms.begin() + 1, decode_step_ms.end());
+    std::sort(tail.begin(), tail.end());
+    const size_t n = tail.size();
+    performance_metrics.decode_steady_ms =
+      (n % 2 != 0) ? tail[n / 2] : 0.5 * (tail[n / 2 - 1] + tail[n / 2]);
+    performance_metrics.decode_steady_tokens = static_cast<unsigned int>(n);
+  } else {
+    performance_metrics.decode_steady_ms = 0.0;
+    performance_metrics.decode_steady_tokens = 0;
+  }
+
+  if (log_output) {
+    /* Its own row, per the measurement rule: TTFT is not prefill + a constant,
+     * and prefill_ms is only queue-drained when the drain was armed. */
+    std::cout << "[PERF-SPLIT] prefill_tok=" << init_len
+              << " prefill_ms=" << prefill_duration.count()
+              << " drain_ms=" << performance_metrics.prefill_drain_ms
+              << " ttft_ms=" << performance_metrics.ttft_ms
+              << " first_token_ms=" << performance_metrics.first_token_ms
+              << " steady_ms=" << performance_metrics.decode_steady_ms
+              << " steady_tok=" << performance_metrics.decode_steady_tokens
+              << " gen_tok=" << generation_cnt
+              << " e2e_ms=" << total_duration.count() << "\n";
+    std::cout.flush();
+  }
 
   has_run_ = true;
 }

@@ -784,6 +784,12 @@ ErrorCode getPerformanceMetrics(PerformanceMetrics *metrics) {
     metrics->generation_duration_ms = internal_metrics.generation_duration_ms;
     metrics->total_duration_ms = internal_metrics.total_duration_ms;
     metrics->peak_memory_kb = internal_metrics.peak_memory_kb;
+    /* [perf-split] the honest rows */
+    metrics->ttft_ms = internal_metrics.ttft_ms;
+    metrics->first_token_ms = internal_metrics.first_token_ms;
+    metrics->decode_steady_ms = internal_metrics.decode_steady_ms;
+    metrics->decode_steady_tokens = internal_metrics.decode_steady_tokens;
+    metrics->prefill_drain_ms = internal_metrics.prefill_drain_ms;
 
     // Overwrite init duration with the one measured in loadModel API
     metrics->initialization_duration_ms = g_initialization_duration_ms;

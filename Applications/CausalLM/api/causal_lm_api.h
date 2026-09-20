@@ -40,6 +40,22 @@ typedef struct {
   double total_duration_ms;
   double initialization_duration_ms;
   size_t peak_memory_kb;
+  /* [perf-split] Appended, never reordered: prefill_duration_ms and
+   * generation_duration_ms take the prefill->decode boundary before the device
+   * queue drains, so on an async backend a bigger prefill block inflates
+   * "prefill TPS" and deflates "decode TPS" by the same amount. These are the
+   * rows that do not move: ttft_ms is its own measurement (prompt submit ->
+   * first token to the caller), first_token_ms is the first decode step alone,
+   * and decode_steady_ms is the median of tokens 2..N. prefill_duration_ms is
+   * additionally queue-corrected when NNTR_PERF_SPLIT_DRAIN=1 is set (the
+   * measurement path only); prefill_drain_ms is what that drain cost, and 0.0
+   * means the drain was not armed and that time is inside first_token_ms.
+   * See Applications/CausalLM/models/performance_metrics.h. */
+  double ttft_ms;
+  double first_token_ms;
+  double decode_steady_ms;
+  unsigned int decode_steady_tokens;
+  double prefill_drain_ms;
 } PerformanceMetrics;
 
 /**
