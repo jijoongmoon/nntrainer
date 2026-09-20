@@ -378,6 +378,137 @@ inline unsigned int kvRingCap(unsigned int local_window, unsigned int max_seq,
 }
 
 /**
+ * @brief Rows the Adreno OHWI K/V image mirror of a RINGED layer must hold.
+ * @param ring_cap Wcap from kvRingCap() (0 = not ringed, this returns 0 too and
+ *        the caller keeps its own derivation -- max_timestep for a linear
+ *        layer).
+ * @param local_window W, the layer's sliding window.
+ * @param chunk C, the chunk the prefill ACTUALLY runs
+ * (effectivePrefillChunk()).
+ * @details The mirror is NOT the ring. The ring is storage, so it is sized by
+ * the longest span any single launch must READ BACK, which the chunk-aligned
+ * seam rule then rounds up to a multiple of C. The mirror is the linear window
+ * the image kernels address, so it only has to hold the rows ONE launch looks
+ * at: a launch at [f, f+S) with S <= C reads keys [f+1-W, f+S), and the base is
+ * floored to the 64-row grid (so that mirror-local == absolute shifted, which
+ * is what keeps ring-on bit-identical to ring-off), giving at most
+ *
+ *     (W - 1) + C + 63   rows.
+ *
+ * Sizing the mirror at Wcap instead -- which is what the ring-aware mirror
+ * landed with -- ties it to the PREFILL chunk twice over: 8192 rows at C=4096
+ * against 2048 at C=1024 for the same W=512 layer. That is pure cost: per
+ * layer, K and V together are 2 * hKV * d * rows * 2 bytes, i.e. ~88 MiB across
+ * the 0.3B's 14 sliding layers and ~160 MiB across the 1.5B's 20.
+ *
+ * Never more than ring_cap (a bigger mirror than the store it back-fills from
+ * cannot be filled), and never less than what one launch needs, so the
+ * mirror_fits backstop in mha_core stays a backstop rather than a live gate.
+ * NNTR_KV_MIRROR_TIGHT=0 restores the Wcap-high mirror.
+ */
+inline unsigned int kvMirrorRows(unsigned int ring_cap,
+                                 unsigned int local_window,
+                                 unsigned int chunk) {
+  if (ring_cap == 0u || local_window == 0u || chunk == 0u)
+    return 0u; // linear layer / no ring -> the caller's own derivation
+  if (const char *t = std::getenv("NNTR_KV_MIRROR_TIGHT"))
+    if (t[0] == '0')
+      return ring_cap; // control arm: the Wcap-high mirror
+  // (W - 1) + C + 63, rounded up to the 64-row grid the base is floored to.
+  const unsigned long need =
+    (unsigned long)local_window + (unsigned long)chunk + 64ul;
+  const unsigned long rows = (need + 63ul) & ~63ul;
+  if (rows >= (unsigned long)ring_cap)
+    return ring_cap;
+  return (unsigned int)rows;
+}
+
+/**
+ * @brief Mirror-local span a DECODE step may occupy before the mirror re-bases.
+ * @param local_window W, the layer's sliding window (0 = no bound).
+ * @param mirror_rows the mirror's physical height (kv_mirror_S_max).
+ * @details This is the number the task "a big prefill block must not cost
+ * decode" comes down to. The sliding mirror holds absolute rows
+ * [base, cache_to) and the image kernels are handed N_kv = cache_to - base --
+ * so N_kv, and with it every per-step attention kernel (qk, row softmax, sv),
+ * is the mirror's OCCUPANCY, not the window. Re-basing costs a back-fill of ~W
+ * rows, so the mirror slid only when it was FULL, which made the occupancy --
+ * and the decode cost -- a function of the mirror height, hence of Wcap, hence
+ * of the PREFILL chunk:
+ *
+ *     C=1024 -> Wcap 2048 -> N_kv cycles ~1536..2048  (0.3B 16K: 48.7 TPS)
+ *     C=4096 -> Wcap 8192 -> N_kv cycles ~4608..8192  (0.3B 16K: 31.8 TPS)
+ *
+ * Decode only ever needs W + 63 rows (one query row, the 64-floored base), so
+ * bound the occupancy at W rounded up to the grid plus one slack band and
+ * re-base when it is reached. The slack is what the re-base amortizes over: a
+ * slide back-fills ~W rows of K and V once every `slack` steps, i.e. ~W/slack
+ * extra rows per step against the ~W rows of attention every step already pays,
+ * while the average N_kv drops from (height + W)/2 to W + slack/2.
+ *
+ * Returns 0 when there is nothing to bound (full-attention layer, or a mirror
+ * already no taller than the bound), which leaves the pre-existing
+ * "slide when full" policy in place. NNTR_KV_DECODE_SLACK sets the band (>= 64,
+ * rounded to 64); 0 disables the eager slide entirely (the control arm).
+ */
+inline unsigned int kvDecodeSlack() {
+  // Not cached: these are called once per layer at finalize and once per
+  // prefill<->decode transition, never per step, and a cached value would make
+  // the unit tests order-dependent.
+  const char *e = std::getenv("NNTR_KV_DECODE_SLACK");
+  if (e == nullptr || e[0] == '\0')
+    return 512u;
+  char *end = nullptr;
+  const long v = std::strtol(e, &end, 10);
+  if (end == e || *end != '\0' || v < 0)
+    return 512u;
+  if (v == 0)
+    return 0u; // control arm: one mirror, "slide only when it is full"
+  return ((unsigned int)v < 64u) ? 64u : (((unsigned int)v + 63u) & ~63u);
+}
+
+/**
+ * @brief Rows a ringed layer's mirror needs for DECODE alone.
+ * @param local_window W, the layer's sliding window (0 = full attention).
+ * @details One query row against the window, with the base floored to the
+ * 64-row grid: W + 63 + 1 rows, rounded to the grid and given one slack band so
+ * the re-base is amortised rather than every step. This is what a mirror is
+ * re-materialised at when prefill hands over to decode -- see
+ * kvMirrorRows() for why the PREFILL height has to be (W-1) + C + 63 and
+ * therefore cannot be this.
+ *
+ * 0 means "do not resize" (full-attention layer, or NNTR_KV_DECODE_SLACK=0).
+ */
+inline unsigned int kvDecodeMirrorRows(unsigned int local_window) {
+  if (local_window == 0u)
+    return 0u;
+  const unsigned int slack = kvDecodeSlack();
+  if (slack == 0u)
+    return 0u;
+  return (((local_window + 63u) & ~63u) + slack);
+}
+
+/**
+ * @brief Mirror-local occupancy a DECODE step may reach before the mirror
+ *        re-bases, given the height the mirror actually has.
+ * @details A mirror already re-materialised at kvDecodeMirrorRows() bounds the
+ * occupancy by being that tall, and this returns 0 (nothing left to bound, the
+ * pre-existing "slide when the mirror is full" policy is the right one). It is
+ * non-zero only where the mirror is TALLER than decode needs and cannot be
+ * resized -- then the base is slid eagerly instead, which bounds N_kv but not
+ * the image geometry.
+ */
+inline unsigned int kvDecodeMirrorSpan(unsigned int local_window,
+                                       unsigned int mirror_rows) {
+  if (local_window == 0u || mirror_rows == 0u)
+    return 0u;
+  const unsigned int span = kvDecodeMirrorRows(local_window);
+  if (span == 0u || span >= mirror_rows)
+    return 0u; // disabled, or the mirror is already that tight
+  return span;
+}
+
+/**
  * @brief Physical cache row for an absolute position under a ring of `cap`
  *        rows (cap == 0 => linear, the identity).
  * @details The host-side twin of the kernels' `n % ring_cap`.

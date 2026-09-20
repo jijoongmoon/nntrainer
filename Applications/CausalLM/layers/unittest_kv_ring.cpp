@@ -477,6 +477,188 @@ TEST(KVRing, read_view_fits_the_allocation) {
   }
 }
 
+/**
+ * @brief The Adreno OHWI mirror height rule: one launch's span, not the ring.
+ * @details kvMirrorRows() is what decoupled the mirror from Wcap. The mirror is
+ * the linear window the image kernels address, so it holds the rows ONE launch
+ * reads -- keys [f+1-W, f+S) with the base floored to the 64-row grid, i.e.
+ * (W-1) + C + 63 rows -- while Wcap is a multiple of C and so up to 4x taller.
+ * A reimplementation must reproduce this table; too SMALL a mirror makes
+ * mha_core's mirror_fits false and a ringed layer then throws.
+ */
+TEST(KVRing, mirror_rows_table) {
+  RingOn on;
+  struct Row {
+    unsigned int W;
+    unsigned int C;
+    unsigned int max_seq;
+    unsigned int expected;
+  };
+  const std::vector<Row> table = {
+    // W     C      max_seq   expected mirror rows (ring cap in the comment)
+    {512, 4096, 32768, 4672},   // cap 8192  -> 4672  (the 0.3B/1.5B model cell)
+    {512, 1024, 32768, 1600},   // cap 2048  -> 1600
+    {512, 512, 32768, 1088},    // cap 1536  -> 1088
+    {1024, 1024, 32768, 2112},  // cap 3072  -> 2112
+    {4096, 1024, 32768, 5184},  // cap 6144  -> 5184
+    {2048, 4096, 32768, 6208},  // cap 8192  -> 6208
+    {8192, 4096, 65536, 12352}, // cap 16384 -> 12352
+  };
+  for (const auto &r : table) {
+    const unsigned int cap = causallm::kvRingCap(r.W, r.max_seq, r.C);
+    ASSERT_NE(cap, 0u) << "W=" << r.W << " C=" << r.C;
+    EXPECT_EQ(causallm::kvMirrorRows(cap, r.W, r.C), r.expected)
+      << "W=" << r.W << " C=" << r.C << " cap=" << cap;
+  }
+  // A linear layer (no ring) keeps its own derivation -- 0 means "not mine".
+  EXPECT_EQ(causallm::kvMirrorRows(0u, 512u, 4096u), 0u);
+  EXPECT_EQ(causallm::kvMirrorRows(8192u, 0u, 4096u), 0u); // full attention
+  EXPECT_EQ(causallm::kvMirrorRows(8192u, 512u, 0u), 0u);  // no chunking
+  // Never taller than the ring it back-fills from.
+  EXPECT_EQ(causallm::kvMirrorRows(2048u, 1024u, 4096u), 2048u);
+  // The control arm restores the Wcap-high mirror.
+  {
+    ScopedEnv tight("NNTR_KV_MIRROR_TIGHT", "0");
+    EXPECT_EQ(causallm::kvMirrorRows(8192u, 512u, 4096u), 8192u);
+  }
+}
+
+/**
+ * @brief A mirror always holds one whole launch, over a sweep.
+ * @details The span a launch at [f, f+S), S <= C, needs is
+ * (f+S) - base. With the exact floor base = f+1-W that is W-1+C, which every
+ * mirror must hold (mha_core's mirror_fits is false otherwise and a ringed
+ * layer throws). With the 64-floored base it is up to W-1+C+63, which is what
+ * the rule asks for -- and gets, except where Wcap itself is tighter than that
+ * (a small C against a W that is not a multiple of it), where mha_core already
+ * falls back to the exact floor.
+ */
+TEST(KVRing, mirror_rows_holds_one_launch) {
+  RingOn on;
+  for (unsigned int C : {256u, 512u, 1024u, 2048u, 4096u}) {
+    for (unsigned int W : {128u, 512u, 1000u, 1024u, 4096u, 8192u}) {
+      for (unsigned int max_seq : {8192u, 16384u, 32768u, 131072u}) {
+        const unsigned int cap = causallm::kvRingCap(W, max_seq, C);
+        if (cap == 0u)
+          continue;
+        const unsigned int rows = causallm::kvMirrorRows(cap, W, C);
+        ASSERT_LE(rows, cap) << "W=" << W << " C=" << C;
+        ASSERT_GE(rows, W + C) << "W=" << W << " C=" << C; // the exact floor
+        if (rows == cap)
+          continue; // Wcap-bounded: the 64-aligned base may not fit, and
+                    // mha_core takes the exact floor there
+        // the worst launch: f is 1 past a 64 boundary, S == C
+        for (unsigned int phase : {0u, 1u, 32u, 63u}) {
+          const unsigned int f = 8u * C + phase;
+          const unsigned int need_lo = f + 1u > W ? f + 1u - W : 0u;
+          const unsigned int base = need_lo & ~63u;
+          ASSERT_LE(f + C - base, rows)
+            << "W=" << W << " C=" << C << " phase=" << phase;
+        }
+      }
+    }
+  }
+}
+
+/**
+ * @brief The DECODE mirror height: W plus one slack band, never the cap.
+ * @details This is the height the mirror is re-materialised at when prefill
+ * hands over to decode, and the number that makes a big prefill block free:
+ * it is a function of W alone, so it does not move when the block does.
+ */
+TEST(KVRing, decode_mirror_rows_table) {
+  EXPECT_EQ(causallm::kvDecodeMirrorRows(512u), 1024u);
+  EXPECT_EQ(causallm::kvDecodeMirrorRows(1000u), 1536u); // W -> 1024 grid
+  EXPECT_EQ(causallm::kvDecodeMirrorRows(1024u), 1536u);
+  EXPECT_EQ(causallm::kvDecodeMirrorRows(4096u), 4608u);
+  EXPECT_EQ(causallm::kvDecodeMirrorRows(0u), 0u); // full attention: no resize
+  {
+    ScopedEnv s("NNTR_KV_DECODE_SLACK", "0"); // control arm: one mirror height
+    EXPECT_EQ(causallm::kvDecodeMirrorRows(512u), 0u);
+  }
+  {
+    ScopedEnv s("NNTR_KV_DECODE_SLACK", "256");
+    EXPECT_EQ(causallm::kvDecodeMirrorRows(512u), 768u);
+  }
+  // it must hold one decode step: the query row plus the window, with the base
+  // floored to the 64-row grid
+  for (unsigned int W : {64u, 128u, 512u, 1000u, 1024u, 4096u}) {
+    const unsigned int rows = causallm::kvDecodeMirrorRows(W);
+    ASSERT_NE(rows, 0u) << "W=" << W;
+    ASSERT_GE(rows, W + 64u) << "W=" << W;
+  }
+}
+
+/**
+ * @brief The eager-slide fallback bound, for a mirror that cannot be resized.
+ */
+TEST(KVRing, decode_span_table) {
+  EXPECT_EQ(causallm::kvDecodeMirrorSpan(512u, 8192u), 1024u);
+  EXPECT_EQ(causallm::kvDecodeMirrorSpan(512u, 4672u), 1024u);
+  EXPECT_EQ(causallm::kvDecodeMirrorSpan(1000u, 8192u), 1536u); // W -> 1024
+  EXPECT_EQ(causallm::kvDecodeMirrorSpan(4096u, 8192u), 4608u);
+  // nothing to bound: the mirror is already no taller than the band
+  EXPECT_EQ(causallm::kvDecodeMirrorSpan(512u, 1024u), 0u);
+  EXPECT_EQ(causallm::kvDecodeMirrorSpan(512u, 1088u), 1024u);
+  EXPECT_EQ(causallm::kvDecodeMirrorSpan(0u, 8192u), 0u); // full attention
+  EXPECT_EQ(causallm::kvDecodeMirrorSpan(512u, 0u), 0u);  // no mirror
+  {
+    ScopedEnv s("NNTR_KV_DECODE_SLACK", "0"); // control arm: slide when full
+    EXPECT_EQ(causallm::kvDecodeMirrorSpan(512u, 8192u), 0u);
+  }
+  {
+    ScopedEnv s("NNTR_KV_DECODE_SLACK", "256");
+    EXPECT_EQ(causallm::kvDecodeMirrorSpan(512u, 8192u), 768u);
+  }
+  {
+    ScopedEnv s("NNTR_KV_DECODE_SLACK", "100"); // rounded up to the 64 grid
+    EXPECT_EQ(causallm::kvDecodeMirrorSpan(512u, 8192u), 640u);
+  }
+  {
+    ScopedEnv s("NNTR_KV_DECODE_SLACK", "8"); // floored at one 64-row band
+    EXPECT_EQ(causallm::kvDecodeMirrorSpan(512u, 8192u), 576u);
+  }
+  {
+    ScopedEnv s("NNTR_KV_DECODE_SLACK", "-3"); // rejected -> the default
+    EXPECT_EQ(causallm::kvDecodeMirrorSpan(512u, 8192u), 1024u);
+  }
+}
+
+/**
+ * @brief PREFILL capacity scales with the block; the DECODE window does not.
+ * @details Wcap is a multiple of the prefill chunk because a C-aligned chunk
+ * write must not straddle the wrap seam, so a bigger block is a bigger ring,
+ * and the mirror used to be Wcap rows high for the same reason. What ONE launch
+ * reads back is (W-1) + C + 63 (kvMirrorRows) and what ONE DECODE step reads is
+ * W + 63 + 1 (kvDecodeMirrorRows) -- the second is a function of W alone, which
+ * is the property this pins: three numbers derived from the same W, two of
+ * which move with the block and one of which must not.
+ */
+TEST(KVRing, decode_capacity_is_independent_of_the_prefill_block) {
+  RingOn on;
+  const unsigned int W = 512u, max_seq = 32768u;
+  for (unsigned int C : {512u, 1024u, 2048u, 4096u}) {
+    const unsigned int cap = causallm::kvRingCap(W, max_seq, C);
+    const unsigned int rows = causallm::kvMirrorRows(cap, W, C);
+    const unsigned int dec = causallm::kvDecodeMirrorRows(W);
+    // prefill side: both the ring and the mirror grow with the block
+    EXPECT_EQ(cap % C, 0u) << "C=" << C;
+    EXPECT_GE(cap, W + C) << "C=" << C;
+    EXPECT_GE(rows, W + C) << "C=" << C;
+    // decode side: one answer for every block, and always the smaller one
+    EXPECT_EQ(dec, 1024u) << "C=" << C;
+    EXPECT_LT(dec, cap) << "C=" << C;
+    EXPECT_LE(dec, rows) << "C=" << C;
+    // the eager-slide fallback agrees wherever the mirror is the taller of the
+    // two (it is only consulted when the mirror was not resized)
+    EXPECT_EQ(causallm::kvDecodeMirrorSpan(W, rows), dec) << "C=" << C;
+  }
+  // and the ring cap really does move with the block, so the invariance above
+  // is a decoupling rather than a constant on both sides
+  EXPECT_NE(causallm::kvRingCap(W, max_seq, 1024u),
+            causallm::kvRingCap(W, max_seq, 4096u));
+}
+
 int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

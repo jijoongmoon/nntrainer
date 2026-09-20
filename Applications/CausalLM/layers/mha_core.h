@@ -586,6 +586,14 @@ private:
    *  positions (absolute - base). Attention depends only on position
    *  DIFFERENCES once K is rotated, so the result is the linear one. */
   unsigned int kv_mirror_base = 0;
+  /** [kvring-decode] Rows the mirror is BUILT with for a ringed layer, from
+   *  causallm::kvMirrorRows(kv_ring_cap, W, chunk) -- what ONE launch reads
+   *  back ((W-1) + C + 63), not the whole ring. 0 = derive as before (the KV
+   *  cache height, i.e. max_timestep for a linear layer). Both mirror-creation
+   *  sites (the finalize prebuild and the lazy engage) read this one field, so
+   *  they cannot disagree -- a disagreement makes mirror_fits false, and a
+   *  ringed layer then throws rather than reading stale rows. */
+  unsigned int kv_mirror_rows_want = 0;
   int use_image_attn = -1;
 
   /**

@@ -810,14 +810,22 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
   // The model's default for the ring, the same boolean it sized the plane with.
   const bool ring_model_default =
     std::get<props::KvWindowRing>(mha_core_props).get();
+  const unsigned int prefill_chunk =
+    causallm::effectivePrefillChunk(init_seq_len, ring_model_default);
   kv_ring_cap =
     causallm::kvRingLayerEligible(
       std::get<props::UseSink>(mha_core_props).get(), use_external_cache)
-      ? causallm::kvRingCap(
-          (unsigned int)local_window_size, max_timestep,
-          causallm::effectivePrefillChunk(init_seq_len, ring_model_default),
-          ring_model_default)
+      ? causallm::kvRingCap((unsigned int)local_window_size, max_timestep,
+                            prefill_chunk, ring_model_default)
       : 0u;
+  /** [kvring-decode] The mirror is the linear window the Adreno OHWI image
+   * kernels address, not the ring: it only has to hold the rows ONE launch
+   * reads, so size it from W and the chunk instead of from Wcap (which is a
+   * multiple of the chunk and so up to 4x taller than any launch needs). 0 for
+   * a linear layer -- the mirror sites keep deriving that from the KV cache
+   * height. */
+  kv_mirror_rows_want = causallm::kvMirrorRows(
+    kv_ring_cap, (unsigned int)local_window_size, prefill_chunk);
 
   /** attention scaling computation */
   rope_scaling_type = std::get<props::RopeScalingType>(mha_core_props).get();
@@ -993,8 +1001,12 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
     // kv_ring_cap rows, so mirroring max_timestep both over-allocates and
     // disagrees with the lazy mirror-init site, which derives S_max from the
     // KV cache height (= the ring cap when ringed). Constant for the run.
-    unsigned int S_max =
-      nntrainer::ohwi_mirror_capacity(kv_ring_cap ? kv_ring_cap : max_timestep);
+    // [kvring-decode] and a ringed layer's mirror is tighter still -- one
+    // launch's span, kv_mirror_rows_want -- which the lazy site reads from the
+    // same field so the two still cannot disagree.
+    unsigned int S_max = nntrainer::ohwi_mirror_capacity(
+      kv_mirror_rows_want ? kv_mirror_rows_want
+                          : (kv_ring_cap ? kv_ring_cap : max_timestep));
     if (mirror_cap >= 8 && mirror_cap < S_max)
       S_max = (mirror_cap + 7u) & ~7u;
     kv_mirror_S_max = S_max;
@@ -3132,8 +3144,11 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             const char *e = std::getenv("NNTR_KV_MIRROR_CAP");
             return e ? (unsigned int)std::atoi(e) : 0u;
           }();
-          unsigned int S_max =
-            nntrainer::ohwi_mirror_capacity(cache_key_dim.height());
+          // [kvring-decode] A ringed layer's mirror is one launch's span, not
+          // the whole ring (kv_mirror_rows_want, set at finalize from W and the
+          // prefill chunk); a linear layer's is the KV cache height, as before.
+          unsigned int S_max = nntrainer::ohwi_mirror_capacity(
+            kv_mirror_rows_want ? kv_mirror_rows_want : cache_key_dim.height());
           if (mirror_cap >= 8 && mirror_cap < S_max)
             S_max = (mirror_cap + 7u) & ~7u;
           if (!kv_mirror_init) {
@@ -3166,12 +3181,25 @@ void MHACoreLayer::one_batch_incremental_forwarding(
           // forward to the oldest key this step can attend (cache_from-W+1):
           //  - prefill slides EAGERLY, which also keeps N_kv -- and with it the
           //    [hQ, M, N_kv] scores scratch -- near W + M instead of the cap;
-          //  - decode slides only when the mirror is full (once per cap-W
+          //  - decode slides only when the mirror is full (once per rows-W
           //    tokens), since a slide back-fills ~W rows from the cache.
           // The base is a multiple of 64 whenever that fits: the score band
           // and the row softmax partition the key axis on 8/64-aligned
           // boundaries, so a 64-aligned base makes the mirror-local grid the
           // absolute one shifted, and ring on == ring off bit for bit.
+          //
+          // [kvring-decode] This occupancy is NOT what a big prefill block
+          // costs decode, though the shape of the code invites that reading:
+          // the kernels below are handed N_kv = cache_to - base, so a mirror
+          // that slides only when full does let N_kv track the mirror height
+          // (~1536..2048 at a 1024 block, ~4608..8192 at a 4096 one). Measured
+          // on Adreno with the timer below, that costs almost nothing: decode
+          // per-call 0.2949 ms at N_kv 512 vs 0.3145 at 4608 vs 0.2985 at 1536,
+          // i.e. 0.3 ms of a 10 ms/step gap. Bounding it moved 0.3B 16K decode
+          // 31.6 -> 32.5 TPS and cost 3% at 4095 tokens, so it is not done.
+          // What the block really charges decode is the prefill GPU work it
+          // leaves queued -- see the commit message: end to end over 128 tokens
+          // the 1024- and 4096-row blocks are within 1%.
           bool mirror_fits = false;
           if (kv_mirror_init && S_max == kv_mirror_S_max) {
             if (kv_ring_cap == 0) {
@@ -3468,31 +3496,40 @@ void MHACoreLayer::one_batch_incremental_forwarding(
               if (sub < 64u)
                 sub = 64u;
             }
-            if (sub >= step_size) {
-              ok = nntrainer::two_conv_attention_prefill_f16_ohwi_kvimg_view_cl(
-                Q_p, reinterpret_cast<cl_mem>(k_image_ohwi),
-                reinterpret_cast<cl_mem>(v_img_use), O_p, step_size, m_to,
-                num_heads_Q, num_heads_KV, head_dim, kv_mirror_S_max, is_causal,
-                attn_logit_softcapping, /*q_clmem=*/q_clmem_use,
-                /*o_clmem=*/o_cl, win_img);
-              if (ok && o_cl != nullptr)
-                o_written_clmem = true;
-            } else {
-              const size_t q_row = (size_t)num_heads_Q * head_dim;
-              ok = true;
-              for (unsigned int a = 0; ok && a < step_size; a += sub) {
-                const unsigned int b = std::min(a + sub, step_size);
+            // [attn-timer] The image arm was the one arm the timer did not
+            // cover, which is why "which decode op grows with the ring cap" had
+            // to be read off the kernels instead of measured. N_kv here is the
+            // mirror OCCUPANCY (m_to), the number the cost actually follows.
+            {
+              MhaAttnTimerScope _img_attn_timer(step_size, m_to,
+                                                local_window_size != UINT_MAX);
+              if (sub >= step_size) {
                 ok =
                   nntrainer::two_conv_attention_prefill_f16_ohwi_kvimg_view_cl(
-                    Q_p + (size_t)a * q_row,
-                    reinterpret_cast<cl_mem>(k_image_ohwi),
-                    reinterpret_cast<cl_mem>(v_img_use),
-                    O_p + (size_t)a * q_row, b - a, m_from + b, num_heads_Q,
-                    num_heads_KV, head_dim, kv_mirror_S_max, is_causal,
-                    attn_logit_softcapping,
-                    /*q_clmem=*/nullptr, /*o_clmem=*/nullptr, win_img);
+                    Q_p, reinterpret_cast<cl_mem>(k_image_ohwi),
+                    reinterpret_cast<cl_mem>(v_img_use), O_p, step_size, m_to,
+                    num_heads_Q, num_heads_KV, head_dim, kv_mirror_S_max,
+                    is_causal, attn_logit_softcapping, /*q_clmem=*/q_clmem_use,
+                    /*o_clmem=*/o_cl, win_img);
+                if (ok && o_cl != nullptr)
+                  o_written_clmem = true;
+              } else {
+                const size_t q_row = (size_t)num_heads_Q * head_dim;
+                ok = true;
+                for (unsigned int a = 0; ok && a < step_size; a += sub) {
+                  const unsigned int b = std::min(a + sub, step_size);
+                  ok = nntrainer::
+                    two_conv_attention_prefill_f16_ohwi_kvimg_view_cl(
+                      Q_p + (size_t)a * q_row,
+                      reinterpret_cast<cl_mem>(k_image_ohwi),
+                      reinterpret_cast<cl_mem>(v_img_use),
+                      O_p + (size_t)a * q_row, b - a, m_from + b, num_heads_Q,
+                      num_heads_KV, head_dim, kv_mirror_S_max, is_causal,
+                      attn_logit_softcapping,
+                      /*q_clmem=*/nullptr, /*o_clmem=*/nullptr, win_img);
+                }
+                // O went to the SVM plane: the raise below lands it in o_cl.
               }
-              // O went to the SVM plane: the raise below lands it in o_cl.
             }
             if (_kvst_on())
               _kvst_mark_scatter(_kvst_t1, _kvst_tk, _kvst_tv, _kvst_now());
