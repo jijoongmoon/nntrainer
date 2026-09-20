@@ -3466,24 +3466,43 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             //
             //  - CHUNKED prefill, M rows against a span that keeps growing:
             //    [hQ, 4096, 16384] fp16 is 2 GiB for one launch, so this one
-            //    must be bounded -- and here the SMALLER budget is both cheaper
-            //    and faster, 256 vs 512 MiB:
-            //      0.3B 16K  4457 vs 4326 TPS   1073.6 vs 1330.2 MiB honest
-            //      1.5B  8K  1741 vs 1670 TPS   2211.0 vs 2467.3 MiB
-            //      1.5B 16K  1082 vs 1044 TPS   2211.9 vs 2468.1 MiB
-            //    -256 MiB and a hair faster on all three: a 256 MiB working set
-            //    sits better in the caches than a 512 MiB one.
+            //    must be bounded -- and the SMALLER the budget, the faster AND
+            //    the cheaper, monotonically, all the way down to 48 MiB. The
+            //    earlier 256-vs-512 reading was right about the direction and
+            //    stopped one step too early; it also divided by a
+            //    prefill/decode split taken before the GPU queue drained.
+            //    Re-swept end to end with the boundary drain armed
+            //    (NNTR_PERF_SPLIT_DRAIN=1), 128 tokens, Adreno 840 at 1300 MHz,
+            //    warm kernel cache, budget 48 / 96 / 256 / 512 MiB, e2e ms and
+            //    honest MiB:
+            //      0.3B  8191   3843  3840  4020  4102     960  958 1031 1287
+            //      0.3B 16383   7180  7116  7800  8157     961 1059 1032 1288
+            //      1.5B  8103   9056  9314  9746  9833    2073 2078 2151 2408
+            //      1.5B 16203  19111 20062 21977 22804    2129 2179 2153 2409
+            //    and at the plane-1024 block that prefillBlockPays() now
+            //    defaults to, where the same order holds and the footprint gap
+            //    widens (1.5B 16203, 32 tokens, repeated: 15535/15533 at 48 vs
+            //    16731 at 96 vs 18270/18289 at 256 ms; honest 1596 vs 1708 vs
+            //    2028 MiB). 48 vs 96 is a tie on the 0.3B (16383: 7032, 7011 vs
+            //    7002 ms; run-to-run spread is 0.5%) and a 1.2 s win on the
+            //    1.5B, so 48 it is.
             //
-            // NNTR_ATTN_SCORES_MB is that chunked-regime budget, default 256.
+            // NNTR_ATTN_SCORES_MB is that chunked-regime budget, default 48.
             // The regimes are told apart by the driver's span hint, and only a
             // hint that PROVES this launch is the whole prefill skips the
             // split -- with no hint (span 0) the old bounded behaviour stands,
             // because the first chunk of a chunked prefill is indistinguishable
-            // from a single-shot one by its own arguments alone.
+            // from a single-shot one by its own arguments alone. That exemption
+            // is what keeps the smaller budget from touching a single-shot
+            // prefill: at 999 and 919 tokens the budget changes neither TTFT
+            // (189.5 vs 185.7 ms, 503.4 vs 489.7 ms) nor the footprint (631.5
+            // vs 631.3, 1570.4 vs 1570.1 MiB) -- the scratch is never taken.
+            static const size_t kScoresBudgetMbDefault = 48;
             static const size_t scores_budget = []() -> size_t {
               const char *e = std::getenv("NNTR_ATTN_SCORES_MB");
-              const long mb = e ? std::atol(e) : 256;
-              return (size_t)(mb > 0 ? mb : 256) << 20;
+              const long mb = e ? std::atol(e) : (long)kScoresBudgetMbDefault;
+              return (size_t)(mb > 0 ? (size_t)mb : kScoresBudgetMbDefault)
+                     << 20;
             }();
             const unsigned int _span = prefillSpanHint();
             const bool one_block = (_span != 0u && _span <= step_size);

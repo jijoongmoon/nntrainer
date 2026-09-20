@@ -265,25 +265,52 @@ inline unsigned int effectivePrefillChunk(unsigned int plane_height,
  * where a launch carries a fixed per-launch cost that fewer, bigger launches
  * amortize. Measured, both directions:
  *
- *   Adreno image arm (NNTR_KV_IMG_ATTN) -- the arm re-materializes the K/V
- *   image per launch, so the block dominates:
- *     0.3B  2K   18.7K vs  9.8K TPS prefill   (block 4096 vs 1024)
- *     0.3B 16K    4370 vs  3078 TPS,  honest 1330 vs 1493 MiB (CHEAPER)
- *     1.5B 16K    1037 vs   776 TPS,  honest 2468 vs 2475 MiB (equal)
+ *   Adreno image arm (NNTR_KV_IMG_ATTN) -- WITHDRAWN. The prefill-TPS numbers
+ *   this used to cite (0.3B 16K 4370 vs 3078 TPS, 1.5B 16K 1037 vs 776) were
+ *   read off an instrument that stopped the prefill clock before the GPU queue
+ *   drained, so a bigger block -- which leaves more work in flight -- credited
+ *   its own tail to the first decode token. Re-measured with the boundary drain
+ *   armed (NNTR_PERF_SPLIT_DRAIN=1, see performance_metrics.h), end to end for
+ *   128 tokens, Adreno 840 at 1300 MHz, warm kernel cache, ids identical in
+ *   every pair, two orders (block 1024 first and block 4096 first):
  *
- *   CUDA tensor-core arm -- a small win at a small price:
- *     1.5B 1899-token prompt  8516 vs 8293 TPS, VRAM 1226 vs 1166 MiB
+ *     prompt          block 1024        block 4096        e2e     honest
+ *     0.3B  4095   2413 / 2501 ms    2824 / 2656 ms    -5.8%   826 vs 1286 MiB
+ *     0.3B  8191   3804 / 3806       3978 / 3947       -3.6%   858 vs 1031
+ *     0.3B 16383   7642 / 7622       7816 / 7809       -2.4%   858 vs 1032
+ *     1.5B  3925   5284 / 5183       5530 / 5490       -5.6%  1706 vs 2343
+ *     1.5B  8103   9266 / 9293       9775 / 9697       -4.2%  1963 vs 2151
+ *     1.5B 16203  21100             22068             -4.4%  1963 vs 2152
+ *   (the 1.5B 16K row is the only same-clock pair that cell yields -- 128
+ *   tokens on a 16K context throttles the GPU below 1300 MHz about half the
+ *   time, so cells at 1100 MHz or less were discarded rather than compared.)
  *
- *   Intel Xe flash/XMX arm -- a LOSS, twice measured, at two prompt lengths:
+ *   The big block is slower at every length on both packs and costs +140 to
+ *   +637 MiB, and it is slower on TTFT too, partly because growing the plane
+ *   rebuilds the graph and replays the weight load -- 188..578 ms of setup that
+ *   the plane-1024 arm does not pay. So: no growth on OpenCL, and the earlier
+ *   "the block dominates on the image arm" reading was the measurement, not the
+ *   machine.
+ *
+ *   Intel Xe flash/XMX arm -- was already a LOSS, at two prompt lengths:
  *     1.5B 1899 tok  xmx 4427 vs 4366 TPS (+1.4%), host peak 1663 vs 978 MiB
  *                    dp4a 1582 vs 1548 TPS (+2.2%), 1721 vs 972 MiB
  *     1.5B 3925 tok  xmx 3878 vs 3909 TPS (-0.8%), 1853 vs 1122 MiB
- *   i.e. ~+700 MiB for ~2%, and the +700 MiB is a STEP (the same at plane 1920
- *   and at 3968), so something on that arm allocates per-plane rather than
- *   per-row -- worth its own investigation before the block is opened there.
+ *   and with the drain armed the +2% goes away too: at 1919 tokens prefill is
+ *   439 vs 440 ms (xmx) and 1057 vs 1092 ms (dp4a) with the plane grown or not,
+ *   while the grow path's graph rebuild adds ~190 ms of TTFT.
+ *
+ *   CUDA tensor-core arm -- UNCHANGED here, deliberately. The claim it rests on
+ *   (1.5B 1899-token prompt, 8516 vs 8293 TPS prefill, VRAM 1226 vs 1166 MiB)
+ *   was not re-measured at a length that exercises the block: the host 1.5B
+ *   pack's window is 2048, so a prompt long enough to need more than one block
+ *   is truncated. What that length does show is 230 vs 231 ms of prefill with
+ *   the plane grown or not and ~140 ms more TTFT from the rebuild, i.e. no
+ *   prefill gain either -- so this arm is a candidate for the same treatment
+ *   once a long-window CUDA pack is available to measure it on.
  *
  * NNTR_PREFILL_GROW forces the answer either way (1 = grow anyway, 0 = never),
- * so the Intel arm stays one env away from an A/B rather than needing a build.
+ * so an arm stays one env away from an A/B rather than needing a build.
  */
 inline bool prefillBlockPays() {
   if (const char *g = std::getenv("NNTR_PREFILL_GROW"))
@@ -293,11 +320,11 @@ inline bool prefillBlockPays() {
   const std::string eng = (e != nullptr) ? std::string(e) : std::string();
   if (eng == "cuda")
     return nntr_env_on("NNTR_CUDA_ATTN");
-#if defined(ENABLE_OPENCL)
-  return nntr_env_on("NNTR_KV_IMG_ATTN");
-#else
+  // Every OpenCL arm measured -- Adreno image, Intel Xe flash/XMX, Intel dp4a
+  // -- is slower end to end AND larger with the plane grown, so the plane stays
+  // at the height the pack shipped and the chunk clamps to it.
+  // NNTR_PREFILL_GROW=1 opens it back up for an A/B.
   return false;
-#endif
 }
 
 /**

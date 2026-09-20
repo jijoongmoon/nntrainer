@@ -382,11 +382,13 @@ TEST(KVRing, prefill_block_pays_only_on_the_arms_it_was_measured_on) {
     // the Intel Xe flash/XMX arm: gpu engine WITHOUT the image arm -> no
     ScopedEnv gpu("NNTR_ENGINE", "gpu");
     EXPECT_FALSE(causallm::prefillBlockPays());
-    { // the Adreno image arm -> yes
+    { // the Adreno image arm -> ALSO no, since the re-measurement with the
+      // prefill/decode boundary drain armed: the block-4096 prefill TPS win was
+      // the undrained queue, and end to end the tall plane is 2.4-5.8% slower
+      // and +140..+637 MiB at every length on both models. See
+      // causallm::prefillBlockPays() for the table.
       ScopedEnv on("NNTR_KV_IMG_ATTN", "1");
-#if defined(ENABLE_OPENCL)
-      EXPECT_TRUE(causallm::prefillBlockPays());
-#endif
+      EXPECT_FALSE(causallm::prefillBlockPays());
     }
     { // cuda follows its own attention arm
       ScopedEnv cuda("NNTR_ENGINE", "cuda");
