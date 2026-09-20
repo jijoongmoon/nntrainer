@@ -206,6 +206,16 @@ public:
   int deallocate();
 
   /**
+   * @brief Release the backend-side caches this model's weights populated,
+   *        while the weight tensors those caches are keyed by are still alive.
+   * @note Called from deallocate() before the tensors go, and delegating to the
+   *       one hook that owns that state (cl_fc_release_caches), which the app's
+   *       CausalLM::releaseDeviceCaches() calls from the other end. No-op on a
+   *       build or a lane with no such cache.
+   */
+  void releaseGpuWeightCaches();
+
+  /**
    * @brief     Update graph to make batch normalization in-place
    * @note      This assumes that the batch normalization implementation does
    * not need input/output of itself while backwarding. The reason is that the

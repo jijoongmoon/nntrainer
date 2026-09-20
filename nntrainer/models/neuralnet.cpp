@@ -37,6 +37,9 @@
 #include <future>
 #include <iomanip>
 #include <load_trace.h>
+#if defined(ENABLE_OPENCL)
+#include <blas_kernel_interface.h> // cl_fc_release_caches
+#endif
 #include <mutex>
 #include <sstream>
 #include <thread>
@@ -2485,8 +2488,50 @@ int NeuralNetwork::allocate(ExecutionMode mode) {
   return ML_ERROR_NONE;
 }
 
+/**
+ * @brief Hand this model's cached GPU residency back before the tensors go.
+ *
+ * The OpenCL v8c FC path keeps a process-lifetime cache of packed int4 weight
+ * buffers keyed on each weight's host address, and nothing released it when a
+ * model was destroyed -- the plane stayed on the device until exit (measured
+ * 566 MiB per load of the dense 1.5B; the GPU ledger showed 619 -> 1110 -> 1599
+ * MiB live over three loads of the SAME model in one process). The next load
+ * then built a second plane beside the first, and the Intel driver's buffer
+ * create + upload cost grows with the live total, which is what made loads
+ * 2..N ~580 ms slower than load 1.
+ *
+ * The release itself is cl_fc_release_caches() -- the ONE hook that owns the
+ * FC path's process-lifetime state (the weight packs, the norm-site strike
+ * counters, the quantisation handoffs in the shared scratch, the handle epoch).
+ * It is the same hook CausalLM::releaseDeviceCaches() calls after the last
+ * model of a handle is gone; this is the engine-side entry point, so a consumer
+ * that only ever destroys a model still gets the device memory back. Both entry
+ * points are idempotent and a second call finds an empty state.
+ *
+ * Whole-cache, not per-weight: the arena release that follows in the app hook
+ * requires the pack cache to be EMPTY (every pack holds sub-buffers carved from
+ * the arena's chunks), which a per-weight sweep cannot promise for an entry
+ * whose tensor is already gone. The cost of the wider granularity is that a
+ * process holding two models rebuilds the surviving model's packs lazily; the
+ * app hook already clears at this granularity, and a pack is pure derived
+ * state.
+ *
+ * Still called BEFORE deallocateTensors(), where the per-weight release had to
+ * be: the packs' host-pointer keys name memory the tensors own.
+ */
+void NeuralNetwork::releaseGpuWeightCaches() {
+#if defined(ENABLE_OPENCL)
+  try {
+    cl_fc_release_caches();
+  } catch (...) {
+    // A teardown must not throw on a best-effort cache release.
+  }
+#endif
+}
+
 int NeuralNetwork::deallocate() {
   try {
+    releaseGpuWeightCaches();
     model_graph.deallocateTensors(true);
     return ML_ERROR_NONE;
   } catch (const std::exception &e) {

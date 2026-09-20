@@ -291,6 +291,12 @@ void v8cNormQuantAbort();
  * the next load -- and no driver call when nothing was cached. Call only when
  * no run is in flight, and before v8c_release_aux_arena(), whose chunks these
  * packs carve.
+ *
+ * This is the single release path for that state, and it has two callers:
+ * NeuralNetwork::deallocate(), so a consumer that only destroys a model gets
+ * its device memory back, and CausalLM::releaseDeviceCaches(), which is where
+ * the arena / lm_head / attention hooks are ordered after it. Idempotent:
+ * whichever runs second finds an empty state.
  */
 void cl_fc_release_caches();
 
