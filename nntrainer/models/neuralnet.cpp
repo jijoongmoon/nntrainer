@@ -717,8 +717,18 @@ sharedConstTensors NeuralNetwork::incremental_forwarding(
 #if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
       // Debug: NNTR_DUMP_ROWS_DIR=<dir> writes each node's output rows of the
       // prefill step (to - from > 1). Inert when unset.
-      static const char *dump_dir = std::getenv("NNTR_DUMP_ROWS_DIR");
-      if (dump_dir != nullptr && to - from > 1 && node->getNumOutputs() > 0) {
+      // NNTR_DUMP_ROWS_HASH prints a per-node hash instead of
+      // writing files, so it needs no directory; =2 covers the decode steps
+      // (to - from == 1) as well.
+      static const char *dump_hash = std::getenv("NNTR_DUMP_ROWS_HASH");
+      static const char *dump_dir_env = std::getenv("NNTR_DUMP_ROWS_DIR");
+      static const char *dump_dir = dump_dir_env != nullptr
+                                      ? dump_dir_env
+                                      : (dump_hash != nullptr ? "." : nullptr);
+      static const bool dump_decode =
+        dump_hash != nullptr && std::atoi(dump_hash) >= 2;
+      if (dump_dir != nullptr && (to - from > 1 || dump_decode) &&
+          node->getNumOutputs() > 0) {
         static const char *match = std::getenv("NNTR_DUMP_ROWS_MATCH");
         static unsigned int seq = 0;
         if (match == nullptr ||

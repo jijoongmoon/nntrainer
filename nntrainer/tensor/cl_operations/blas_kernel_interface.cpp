@@ -2244,7 +2244,7 @@ void debug_dump_rows_cl(const std::string &name, const Tensor &t,
     plane = "clmem";
     if (!cc->command_queue_inst_.EnqueueReadBufferRegion(
           static_cast<cl_mem>(t.getClMem()), bytes, buf.data(), 0,
-          t.getOffset() * es, false))
+          t.getOffset() * es, /*async=*/false))
       return;
   } else {
     if (cc)
@@ -2255,6 +2255,33 @@ void debug_dump_rows_cl(const std::string &name, const Tensor &t,
   std::snprintf(path, sizeof(path), "%s/%04u_%s.%s.%zux%zu.bin", dir, seq,
                 name.c_str(), es == 2 ? "f16" : "f32", (size_t)rows, W);
   static const bool all_rows = std::getenv("NNTR_DUMP_ROWS_ALL") != nullptr;
+  // NNTR_DUMP_ROWS_HASH=1 prints a hash per node instead of
+  // writing a file: comparing two runs' stderr then names the first node (and,
+  // with the seq counter, the first prefill chunk) whose output differs, which
+  // is what a nondeterminism hunt needs and a directory of 16 x N files is not.
+  static const bool hash_only = []() {
+    const char *e = std::getenv("NNTR_DUMP_ROWS_HASH");
+    return e != nullptr && e[0] != '0';
+  }();
+  if (hash_only) {
+    auto fnv = [](const uint8_t *p, size_t n) {
+      uint64_t h = 1469598103934665603ull;
+      for (size_t i = 0; i < n; ++i) {
+        h ^= p[i];
+        h *= 1099511628211ull;
+      }
+      return h;
+    };
+    const uint64_t hall = fnv(buf.data(), bytes);
+    const uint64_t hlast =
+      fnv(buf.data() + (size_t)(rows - 1) * W * es, W * es);
+    std::fprintf(stderr,
+                 "[ROWHASH] %04u %s plane=%s rows=%u W=%zu all=%016llx "
+                 "last=%016llx\n",
+                 seq, name.c_str(), plane, rows, W, (unsigned long long)hall,
+                 (unsigned long long)hlast);
+    return;
+  }
   if (std::FILE *f = std::fopen(path, "wb")) {
     if (all_rows)
       std::fwrite(buf.data(), 1, bytes, f);
