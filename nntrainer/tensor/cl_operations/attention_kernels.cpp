@@ -3366,10 +3366,21 @@ bool flash_attention_prefill_f16_cl(
   }
   // FBQ_TM: query rows per workgroup. Default 4 (=> acc+q 2*TM*VPL floats stays
   // in registers at LWS>=32). Only 1/2/4/8 supported.
-  // Default by head width: TM=2 measured best at d>=256; at d<=128 the 2*TM*VPL
-  // row state still fits the registers at TM=4 with LWS=16, measured -17% on
-  // the kernel (919-row prefill, 16 heads: sliding 6.4 -> 5.3 ms/call, full
-  // 7.6 -> 6.6 ms/call) with token-identical output. 0 = env unset.
+  // Default by head width: at d<=128 the 2*TM*VPL row state still fits the
+  // registers at TM=4 with LWS=16, measured -17% on the kernel (919-row
+  // prefill, 16 heads: sliding 6.4 -> 5.3 ms/call, full 7.6 -> 6.6 ms/call)
+  // with token-identical output. 0 = env unset.
+  // d=256 also takes TM=4: the older TM=2 default there predates the LWS rule
+  // that now follows head_dim alone (d=256 => LWS=32, VPL=8), and at LWS=32
+  // the 2*TM*VPL = 64 acc/q floats per lane are still spill-free -- the offline
+  // compiler (ocloc, ptl-h) reports no spill at FBQ_TM 1/2/4 and SIMD32 + 68
+  // registers of spill only at TM=8. Measured on gemma4's 12 sliding d=256
+  // calls over an 842-row prefill: TM2 4.909 -> TM4 4.419 ms/call (-10%),
+  // TM8 5.850 (the spill); prefill 4029 -> 4107 TPS. TM is BIT-NEUTRAL here --
+  // the per-row key walk order and the fp32 accumulation do not depend on it
+  // and the d-dot still reduces over the same 32 lanes -- and the 1K cell's
+  // output is unchanged, so this is a free win rather than a new reference.
+  // d>=512 keeps TM=2 (LWS=64, VPL=8 => 2*TM*VPL grows with LWS).
   static const int flash_blockq_tm_env = []() {
     const char *e = std::getenv("NNTR_FLASH_BLOCKQ_TM");
     const int v = (e && std::atoi(e) > 0) ? std::atoi(e) : 0;
@@ -3377,7 +3388,7 @@ bool flash_attention_prefill_f16_cl(
   }();
   const int flash_blockq_tm = flash_blockq_tm_env
                                 ? flash_blockq_tm_env
-                                : (((int)head_dim <= 128) ? 4 : 2);
+                                : (((int)head_dim <= 256) ? 4 : 2);
   // NNTR_FLASH_SG: Block-Q reduces the d-dot with sub_group_reduce_add
   // (LWS == subgroup size) instead of the LDS tree -> no red_sh, no barriers
   // (the dominant cost: ~512 barriers/WG). Intel only (cl_intel_subgroups).
@@ -3487,9 +3498,21 @@ bool flash_attention_prefill_f16_cl(
   // Sliding-window calls. The XMX kernel is window-aware (tile-aligned window
   // floor + per-key mask). At d=128 it halves the windowed call
   // (919 rows, W=512, 16 heads: 5.0 -> 2.85 ms; 1556 rows, W=1024, 12 heads:
-  // 12.3 -> 6.0 ms), so d<=128 takes it by DEFAULT. At d=256 it measured
-  // SLOWER than Block-Q + window-skip (842 rows, W=512: 5.7 vs 4.9 ms/call),
-  // so wider heads stay on Block-Q unless NNTR_FLASH_XMX_WIN=2.
+  // 12.3 -> 6.0 ms), so d<=128 takes it by DEFAULT.
+  //
+  // d=256 is no longer a SPEED question. It used to measure slower than
+  // Block-Q + window-skip (842 rows, W=512: 5.7 vs 4.9 ms/call) purely because
+  // FXA_NSG=1 spilled ~289 registers there; with the NSG=2 default below the
+  // same call is 3.564 ms/call against a Block-Q baseline that is itself now
+  // 4.419 (FBQ_TM=4) -- a 19% win, gemma4 842-row prefill 4107 -> ~4390 TPS.
+  // What keeps d=256 on Block-Q is the OUTPUT: the DPAS A operand is fp16, so
+  // routing 12 more layers through it forks gemma4's greedy 1K cell away from
+  // the reference output (the first 8 tokens already
+  // differ). d<=128 could be defaulted on because that model family had an
+  // HF teacher-forced margin profile to re-gate against; gemma4 has only the
+  // md5. Precondition for default-on at d=256: an HF-margin run for gemma4
+  // showing the fork is a tie-break at the fp16 output floor, and a re-recorded
+  // reference. Until then NNTR_FLASH_XMX_WIN=2 opts in and is now FAST.
   // Accuracy: scored against a host fp64 attention over the same fp16 Q/K/V
   // (NNTR_FLASH_XMX_CHECK_REF) both kernels sit on the fp16 OUTPUT rounding
   // floor (relF 2.06e-4); the XMX excess over it is 0.45e-4 with FXA_PREC=1
@@ -3533,8 +3556,29 @@ bool flash_attention_prefill_f16_cl(
   // d=512 default NSG=4: slice chunk count drops to the d=128 register
   // envelope (qa 128B + acc 256B/lane, spill-free) and lane residency per WG
   // quadruples -- measured 79.1->50.2s full-attn vs NSG=2 (-37%), beating
-  // even the exchange-free probe floor (55.4s). d<=256 stays NSG=1.
-  int xmx_nsg = xmx_nsg_env ? xmx_nsg_env : (((int)head_dim >= 512) ? 4 : 1);
+  // even the exchange-free probe floor (55.4s).
+  //
+  // d=256 WINDOWED also needs NSG=2, and that -- not the window handling -- is
+  // why this route used to lose to Block-Q at d=256. NSG=1 leaves
+  // FXA_KCH_SUB = 16, so acc[TM][16] alone is 16*16 floats = 1 KB per lane;
+  // ocloc (ptl-h) reports the d=256/TM16/NSG1 kernel "compiled SIMD16
+  // allocated 256 regs and spilled around 289" after an IGC retry, against NO
+  // spill at d=128/TM16 and 64 at d=512/TM16/NSG4. NSG=2 halves the slice to
+  // KCH_SUB=8 -- the same register envelope as d=128 -- leaving 18 registers of
+  // spill, and it doubles the lanes per WG, which matters because TM=16 at
+  // d=256 only produces M/16 * heads workgroups (842 rows, 8 heads = 424
+  // 16-lane threads on 32 Xe cores). Measured on gemma4's 12 sliding d=256
+  // calls, 842-row prefill: Block-Q 4.909 ms/call, XMX NSG1/TM16 5.765
+  // (the spill), XMX NSG2/TM16 3.564 (-27% vs Block-Q). Other points of the
+  // sweep, same cell: NSG1/TM8 4.168, NSG1/TM4 6.450, NSG2/TM8 3.926.
+  // Scoped to windowed calls so d=256 FULL attention (gemma2-class, XMX on by
+  // default and validated at NSG=1) keeps its exact arithmetic: the psum
+  // exchange changes the score reduction order, so NSG is NOT bit-neutral.
+  int xmx_nsg = xmx_nsg_env
+                  ? xmx_nsg_env
+                  : (((int)head_dim >= 512)
+                       ? 4
+                       : (((int)head_dim == 256 && win_i > 0) ? 2 : 1));
   // Guard: FXA_KCH_SUB truncates silently when 16*NSG does not
   // divide head_dim (no current dim hits this; env overrides could).
   if ((int)head_dim % (16 * xmx_nsg) != 0)
