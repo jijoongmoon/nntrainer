@@ -2943,13 +2943,41 @@ void MHACoreLayer::one_batch_incremental_forwarding(
       cache_value.getData<_FP16>() +
       (size_t)batch * cache_value_dim.getFeatureLen() +
       (size_t)kv_slab_synced_to * hd);
+    const unsigned int v_gs =
+      kv_v_cur_stride != 0 ? kv_v_cur_stride : kv_mirror_S_max;
+    // [kv-img-write] This boundary sync stays on the BUFFER read even when the
+    // mirror is written through the image, and that is a measurement, not an
+    // oversight. NNTR_KV_IMG_GATHER=1 routes it through the image instead
+    // (k/v_gather_ohwi_img) and 0.3B/2047 then leaves the reference ids
+    // with the KV slab bit-identical at the boundary --
+    // i.e. the gather's own image READ is what breaks the run: it pulls the
+    // mirror through the texture cache once per step, and the lines it leaves
+    // there are what the NEXT chunk's attention is served. An image read is a
+    // cache polluter on this driver; an image write is not. The gather is a
+    // drained boundary sync on the same in-order queue, so reading the buffer
+    // after image writes is ordered by the clFinish it already does.
+    static const bool _kvimg_gather_img =
+      std::getenv("NNTR_KV_IMG_GATHER") != nullptr &&
+      std::atoi(std::getenv("NNTR_KV_IMG_GATHER")) != 0;
+    if (_kvimg_gather_img && k_image_ohwi != nullptr) {
+      void *v_img = (v_image_tight != nullptr && kv_v_img_S == v_gs)
+                      ? v_image_tight
+                      : v_image_ohwi;
+      nntrainer::k_gather_ohwi_img_cl(k_image_ohwi, k_dst, n, num_heads_KV,
+                                      head_dim, kv_mirror_S_max,
+                                      kv_slab_synced_to, /*drain=*/false);
+      nntrainer::v_gather_ohwi_t_img_cl(v_img, v_dst, n, num_heads_KV, head_dim,
+                                        v_gs, kv_slab_synced_to,
+                                        /*drain=*/true);
+      kv_slab_synced_to = upto;
+      return;
+    }
     nntrainer::k_gather_ohwi_cl(reinterpret_cast<cl_mem>(k_buf_ohwi), k_dst, n,
                                 num_heads_KV, head_dim, kv_mirror_S_max,
                                 kv_slab_synced_to, /*drain=*/false);
-    nntrainer::v_gather_ohwi_t_cl(
-      reinterpret_cast<cl_mem>(v_buf_ohwi), v_dst, n, num_heads_KV, head_dim,
-      kv_v_cur_stride != 0 ? kv_v_cur_stride : kv_mirror_S_max,
-      kv_slab_synced_to, /*drain=*/true);
+    nntrainer::v_gather_ohwi_t_cl(reinterpret_cast<cl_mem>(v_buf_ohwi), v_dst,
+                                  n, num_heads_KV, head_dim, v_gs,
+                                  kv_slab_synced_to, /*drain=*/true);
     kv_slab_synced_to = upto;
 #else
     (void)upto;
@@ -3319,13 +3347,29 @@ void MHACoreLayer::one_batch_incremental_forwarding(
           auto mirror_backfill = [&](bool is_v, unsigned int abs_from,
                                      unsigned int abs_to, unsigned int stride) {
             const size_t hd = (size_t)num_heads_KV * head_dim;
+            // [kv-img-write] The image the V rows must be written through is
+            // the one the sv kernels read at this stride (the tight view once
+            // adopted); K always goes to the full-capacity K image.
+            const bool img_w =
+              nntrainer::kv_img_write_enabled() && v_image_ohwi != nullptr;
+            void *v_img_bf = (v_image_tight != nullptr && kv_v_img_S == stride)
+                               ? v_image_tight
+                               : v_image_ohwi;
             unsigned int pos = abs_from;
             while (pos < abs_to) {
               const size_t phys = cacheRow(pos);
               unsigned int seg = abs_to - pos;
               if (kv_ring_cap && (size_t)seg > (size_t)kv_ring_cap - phys)
                 seg = (unsigned int)((size_t)kv_ring_cap - phys);
-              if (is_v)
+              if (is_v && img_w)
+                nntrainer::v_scatter_ohwi_t_img_cl(
+                  reinterpret_cast<const uint16_t *>(
+                    cache_value.getData<_FP16>() +
+                    (size_t)batch * cache_value_dim.getFeatureLen() +
+                    phys * hd),
+                  v_img_bf, seg, num_heads_KV, head_dim, stride,
+                  pos - kv_mirror_base);
+              else if (is_v)
                 nntrainer::v_scatter_ohwi_t_cl(
                   reinterpret_cast<const uint16_t *>(
                     cache_value.getData<_FP16>() +
@@ -3333,6 +3377,13 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                     phys * hd),
                   reinterpret_cast<cl_mem>(v_buf_ohwi), seg, num_heads_KV,
                   head_dim, stride, pos - kv_mirror_base);
+              else if (img_w && k_image_ohwi != nullptr)
+                nntrainer::k_scatter_ohwi_img_cl(
+                  reinterpret_cast<const uint16_t *>(
+                    cache_key.getData<_FP16>() +
+                    (size_t)batch * cache_key_dim.getFeatureLen() + phys * hd),
+                  k_image_ohwi, seg, num_heads_KV, head_dim, kv_mirror_S_max,
+                  pos - kv_mirror_base);
               else
                 nntrainer::k_scatter_ohwi_cl(
                   reinterpret_cast<const uint16_t *>(
@@ -3471,10 +3522,35 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                 k_sc_off = (unsigned int)_kc_step_off;
               }
             }
-            nntrainer::k_scatter_ohwi_cl(
-              k_sc_src, reinterpret_cast<cl_mem>(k_buf_ohwi), step_size,
-              num_heads_KV, head_dim, kv_mirror_S_max, m_from,
-              /*src_clmem=*/k_stage, /*src_off=*/k_sc_off);
+            // [kv-img-write] Write the rows through the IMAGE the qk kernel
+            // reads (write_imageui) instead of the buffer that aliases it --
+            // same rows, same folded mapping, one memory path (the mirror's
+            // read/write path split is what makes a just-scattered row come
+            // back pre-write from the texture cache at a random chunk).
+            const bool kv_img_write =
+              nntrainer::kv_img_write_enabled() && k_image_ohwi != nullptr;
+            if (kv_img_write) {
+              static int _kvimg_logged = 0;
+              if (!_kvimg_logged) {
+                _kvimg_logged = 1;
+                std::fprintf(stderr,
+                             "[KV-IMG-WRITE] KVIMG_MARKER_A engaged: "
+                             "mirrors written with write_imageui (gsh=%u "
+                             "S_max=%u ring=%u vtightS=%u)\n",
+                             kv_kimg_gsh, kv_mirror_S_max, kv_ring_cap,
+                             kv_v_img_S);
+              }
+            }
+            if (kv_img_write)
+              nntrainer::k_scatter_ohwi_img_cl(
+                k_sc_src, k_image_ohwi, step_size, num_heads_KV, head_dim,
+                kv_mirror_S_max, m_from,
+                /*src_clmem=*/k_stage, /*src_off=*/k_sc_off);
+            else
+              nntrainer::k_scatter_ohwi_cl(
+                k_sc_src, reinterpret_cast<cl_mem>(k_buf_ohwi), step_size,
+                num_heads_KV, head_dim, kv_mirror_S_max, m_from,
+                /*src_clmem=*/k_stage, /*src_off=*/k_sc_off);
             kv_k_valid_to = cache_to;
             const double _kvst_tk = _kvst_on() ? _kvst_now() : 0;
             // [rq-scalar-off] Same as the K scatter above: when the source is
@@ -3494,10 +3570,20 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                 v_sc_off = (unsigned int)_vc_step_off;
               }
             }
-            nntrainer::v_scatter_ohwi_t_cl(
-              v_sc_src, reinterpret_cast<cl_mem>(v_buf_ohwi), step_size,
-              num_heads_KV, head_dim, v_stride, m_from,
-              /*src_clmem=*/v_stage_clmem, /*src_off=*/v_sc_off);
+            // [kv-img-write] V through the image in use (the tight view once it
+            // is adopted -- the image the sv kernels read IS the image the
+            // scatter must write), same source and same rows as the buffer
+            // scatter below.
+            if (kv_img_write)
+              nntrainer::v_scatter_ohwi_t_img_cl(
+                v_sc_src, v_img_use, step_size, num_heads_KV, head_dim,
+                v_stride, m_from,
+                /*src_clmem=*/v_stage_clmem, /*src_off=*/v_sc_off);
+            else
+              nntrainer::v_scatter_ohwi_t_cl(
+                v_sc_src, reinterpret_cast<cl_mem>(v_buf_ohwi), step_size,
+                num_heads_KV, head_dim, v_stride, m_from,
+                /*src_clmem=*/v_stage_clmem, /*src_off=*/v_sc_off);
             kv_v_valid_to = cache_to;
             const double _kvst_tv = _kvst_on() ? _kvst_now() : 0;
             // S3 decode: OHWI rotates Q on the HOST (query_step SVM, in-place);

@@ -448,5 +448,62 @@ bool v_scatter_ohwi_t_cl(const uint16_t *src_svm, cl_mem dst_buf,
                          unsigned int position, void *src_clmem = nullptr,
                          unsigned int src_off = 0);
 
+/**
+ * @brief [kv-img-write] Is the OHWI K/V mirror WRITTEN through the image the
+ *        attention reads (write_imageui) instead of the aliased buffer?
+ * @details NNTR_KV_IMG_WRITE=1 arms it (value-checked, read once). The mirror
+ * is written as a buffer and read as an image2d view over the same memory, and
+ * the driver cannot order the two paths: an image read may be served a
+ * texture-cache line fetched by an earlier launch, so a row the current chunk
+ * just scattered is read pre-write -- a nondeterministic per-node numeric
+ * perturbation at a random chunk, which a clFinish does not close. With this
+ * on, the producing and the consuming launch name the same cl_mem image.
+ * Layout, capacity and the folded K row mapping are unchanged.
+ * @return true when the image-write path is armed
+ */
+bool kv_img_write_enabled();
+
+/**
+ * @brief [kv-img-write] K scatter, image path: same source and the same OHWI
+ *        destination rows as k_scatter_ohwi_cl, written with write_imageui into
+ *        `dst_image` (the very image the qk kernel reads). One work item per
+ *        (t, head, d-texel); a K texel is 8 halves along d and is always full.
+ */
+bool k_scatter_ohwi_img_cl(const uint16_t *src_svm, void *dst_image,
+                           unsigned int M, unsigned int num_heads_KV,
+                           unsigned int head_dim, unsigned int max_S,
+                           unsigned int position, void *src_clmem = nullptr,
+                           unsigned int src_off = 0);
+
+/**
+ * @brief [kv-img-write] V scatter, image path: the same arguments as
+ *        v_scatter_ohwi_t_cl with the mirror's IMAGE in place of its buffer. A
+ *        reversed-OHWI texel is 8 SEQUENCE positions, so the span is rounded
+ * out to whole texels and the partial ones at both ends are read-modify-
+ *        written through a __read_write image (needs -cl-std=CL2.0): the lanes
+ *        outside [position, position+M) are written back unchanged, so this
+ *        touches exactly the elements the buffer scatter touches.
+ */
+bool v_scatter_ohwi_t_img_cl(const uint16_t *src_svm, void *dst_image,
+                             unsigned int M, unsigned int num_heads_KV,
+                             unsigned int head_dim, unsigned int max_S,
+                             unsigned int position, void *src_clmem = nullptr,
+                             unsigned int src_off = 0);
+
+/**
+ * @brief [kv-img-write] Inverse gathers on the image path: with the writes on
+ *        the image, a BUFFER read of the mirror is the same aliasing hazard
+ *        reversed, so the boundary sync reads the image too. Same semantics as
+ *        k_gather_ohwi_cl / v_gather_ohwi_t_cl.
+ */
+bool k_gather_ohwi_img_cl(void *src_image, uint16_t *dst_svm, unsigned int M,
+                          unsigned int num_heads_KV, unsigned int head_dim,
+                          unsigned int max_S, unsigned int position,
+                          bool drain = true);
+bool v_gather_ohwi_t_img_cl(void *src_image, uint16_t *dst_svm, unsigned int M,
+                            unsigned int num_heads_KV, unsigned int head_dim,
+                            unsigned int max_S, unsigned int position,
+                            bool drain = true);
+
 } // namespace nntrainer
 #endif /* __ATTENTION_KERNELS_H__ */

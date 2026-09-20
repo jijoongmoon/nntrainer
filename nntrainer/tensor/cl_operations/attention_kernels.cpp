@@ -153,6 +153,27 @@ static bool tca_ensure(cl_context ctx, cl_mem *buf, size_t *cap, size_t bytes,
     return false;
   }
   *cap = bytes;
+  // [kv-img-write, diagnostic] NNTR_ATTN_SCRATCH_ZERO=1 zeroes a freshly grown
+  // scratch. The scores scratch grows with the key span, so a long chunked
+  // prefill reallocates it mid-run and the new allocation holds whatever the
+  // driver last left there -- run-to-run variable. The banded qk grid writes
+  // only [n_lo, n_hi) of each score row while sv reads whole texels, so a lane
+  // the band does not cover is read as found. If the residual long-context
+  // nondeterminism is an uninitialized-scratch read, zeroing kills it.
+  static const bool zero_on = []() {
+    const char *e = std::getenv("NNTR_ATTN_SCRATCH_ZERO");
+    return e != nullptr && e[0] != '0';
+  }();
+  if (zero_on) {
+    auto *blas_cc =
+      static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+    if (blas_cc != nullptr) {
+      const uint16_t z = 0;
+      opencl::clEnqueueFillBuffer(
+        blas_cc->command_queue_inst_.GetCommandQueue(), *buf, &z,
+        sizeof(uint16_t), 0, bytes, 0, nullptr, nullptr);
+    }
+  }
   return true;
 }
 
@@ -413,6 +434,19 @@ bool two_conv_attention_prefill_f16_cl(
  * program cache key, so the two arms never share a compiled binary.
  * @return "" for the default, or the -D that selects the old rule
  */
+/// [kv-img-write] NNTR_KV_IMG_WRITE=1: write the OHWI K/V mirrors through
+/// write_imageui into the very image the attention reads, instead of writing
+/// the aliased buffer. Value-checked so =0 really disables it. Declared in
+/// attention_kernels.h; the mirror creation (image flags) and the layer (which
+/// scatter to call) both ask here so the two can never disagree.
+bool kv_img_write_enabled() {
+  static const bool on = []() {
+    const char *e = std::getenv("NNTR_KV_IMG_WRITE");
+    return e != nullptr && std::atoi(e) != 0;
+  }();
+  return on;
+}
+
 static const std::string &ropeCopts() {
   static const std::string opts = [] {
     const char *e = std::getenv("NNTR_ROPE_TAIL_FIX");
@@ -422,6 +456,138 @@ static const std::string &ropeCopts() {
   }();
   return opts;
 }
+
+// ===========================================================================
+// [kv-img-write] IMAGE-PATH mirror writes (NNTR_KV_IMG_WRITE=1).
+//
+// The OHWI mirror is WRITTEN by the scatters above as a buffer and READ by the
+// attention as an image2d view over the same memory (kimg_read /
+// read_imageui). Two paths over one allocation is what the driver cannot
+// order: an image read can be served a texture-cache line a previous launch
+// fetched, so a row THIS chunk just scattered comes back pre-write (per-node
+// output hashes differ run to run at a random chunk; a clFinish around the
+// attention does not close it, because the stale line is not a pending write
+// but a cached read). These kernels write the SAME cl_mem the attention reads,
+// through write_imageui, so the launch that produces a row and the launch that
+// consumes it name the same image object and the driver's own dependency
+// tracking has to cover the texture cache.
+//
+// Own program, so the default (and every non-Adreno runtime) keeps the
+// rope/scatter program it always had, byte for byte, and the CL2.0 option
+// below cannot change its codegen:
+//  - KIMG_GSH is the folded K row mapping, published by kimg_gsh_for(). Not
+//    cached, for the same reason tca_copts() is not: the prewarm pass can
+//    register a program before any layer has finalized, and a 0 frozen then
+//    would mismatch the mirrors created afterwards.
+//  - -cl-std=CL2.0 is for the V scatter's __read_write image2d_t. A reversed-
+//    OHWI texel is 8 SEQUENCE positions, so any step that does not start and
+//    end on a multiple of 8 (every decode step; any prefill chunk whose length
+//    is not a multiple of 8) covers partial texels whose other lanes hold rows
+//    an earlier step wrote. write_image has no sub-texel granularity, so the
+//    texel is read, the owned lanes replaced and the texel written back --
+//    which keeps the write EXACTLY as wide as the buffer scatter's. (Rebuilding
+//    those lanes from the concat V cache instead was measurably wrong: the
+//    NNTR_MHA_CLMEM boundary gather writes the slab at ABSOLUTE rows with no
+//    ring mapping, so on a ringed layer the slab rows past the ring cap are not
+//    the rows the mirror holds -- 0.3B/2047 moved off its reference ids, and
+//    NNTR_MHA_CLMEM=0 restored it.)
+// ===========================================================================
+static std::string kvImgCopts() {
+  return "-cl-std=CL2.0 -DKIMG_GSH=" + std::to_string(g_kimg_gsh);
+}
+
+static const std::string kv_img_write_kernel = R"CL(
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+#ifndef KIMG_GSH
+#define KIMG_GSH 0
+#endif
+__constant sampler_t kimgw_smp =
+  CLK_NORMALIZED_COORDS_FALSE | CLK_ADDRESS_CLAMP | CLK_FILTER_NEAREST;
+// K: one work item per (t, h, d-texel). A K texel is 8 halves along d and the
+// scatter writes every channel of every row it touches, so every texel it
+// covers is FULL -- no read-modify-write anywhere on the K side. Same source,
+// same rows, same folded mapping as k_scatter_ohwi.
+__kernel void k_scatter_ohwi_img(__global const half *src,
+                                 __write_only image2d_t dst, const int M,
+                                 const int hKV, const int d, const int max_S,
+                                 const int position, const int src_off) {
+  const int t = get_global_id(0);
+  const int h = get_global_id(1);
+  const int dt = get_global_id(2);
+  const int dtex = d >> 3;
+  if (t >= M || h >= hKV || dt >= dtex) return;
+  const long so =
+    (long)src_off + (long)t * hKV * d + (long)h * d + (long)(dt << 3);
+  half tmp[8];
+  for (int l = 0; l < 8; ++l) tmp[l] = src[so + l];
+  const int lin_row = h * max_S + position + t;
+  const int g = 1 << KIMG_GSH;
+  write_imageui(dst,
+                (int2)(((lin_row & (g - 1)) * dtex) + dt, lin_row >> KIMG_GSH),
+                as_uint4(vload8(0, tmp)));
+}
+// V: one work item per (sequence texel, h, channel). The texels touched are
+// [position>>3, (position+M+7)>>3); lanes inside [position, position+M) come
+// from src exactly as v_scatter_ohwi_t reads it, every other lane is read back
+// from the image and written unchanged -- so this writes precisely the elements
+// the buffer scatter writes and nothing else.
+__kernel void v_scatter_ohwi_t_img(__global const half *src,
+                                   __read_write image2d_t dst, const int M,
+                                   const int hKV, const int d, const int max_S,
+                                   const int position, const int src_off) {
+  const int j = get_global_id(0);
+  const int h = get_global_id(1);
+  const int x = get_global_id(2);
+  const int tex0 = position >> 3;
+  const int ntex = ((position + M + 7) >> 3) - tex0;
+  if (j >= ntex || h >= hKV || x >= d) return;
+  const int tex = tex0 + j;
+  const int2 c = (int2)(tex, h * d + x);
+  half tmp[8];
+  vstore8(as_half8(read_imageui(dst, c)), 0, tmp);
+  for (int l = 0; l < 8; ++l) {
+    const int p = (tex << 3) + l;
+    if (p >= position && p < position + M)
+      tmp[l] = src[(long)src_off + (long)(p - position) * hKV * d +
+                   (long)h * d + x];
+  }
+  write_imageui(dst, c, as_uint4(vload8(0, tmp)));
+}
+// Inverse gathers on the image path: with the writes on the image, a BUFFER
+// read of the mirror is the same aliasing hazard reversed (the boundary sync
+// would hand the host slab a pre-write row), so gather from the image too.
+__kernel void k_gather_ohwi_img(__read_only image2d_t src, __global half *dst,
+                                const int M, const int hKV, const int d,
+                                const int max_S, const int position) {
+  const int t = get_global_id(0);
+  const int h = get_global_id(1);
+  const int dt = get_global_id(2);
+  const int dtex = d >> 3;
+  if (t >= M || h >= hKV || dt >= dtex) return;
+  const int lin_row = h * max_S + position + t;
+  const int g = 1 << KIMG_GSH;
+  const uint4 vv = read_imageui(
+    src, kimgw_smp,
+    (int2)(((lin_row & (g - 1)) * dtex) + dt, lin_row >> KIMG_GSH));
+  half tmp[8];
+  vstore8(as_half8(vv), 0, tmp);
+  const long dof = (long)t * hKV * d + (long)h * d + (long)(dt << 3);
+  for (int l = 0; l < 8; ++l) dst[dof + l] = tmp[l];
+}
+__kernel void v_gather_ohwi_t_img(__read_only image2d_t src, __global half *dst,
+                                  const int M, const int hKV, const int d,
+                                  const int max_S, const int position) {
+  const int t = get_global_id(0);
+  const int h = get_global_id(1);
+  const int x = get_global_id(2);
+  if (t >= M || h >= hKV || x >= d) return;
+  const int p = position + t;
+  const uint4 vv = read_imageui(src, kimgw_smp, (int2)(p >> 3, h * d + x));
+  half tmp[8];
+  vstore8(as_half8(vv), 0, tmp);
+  dst[(long)t * hKV * d + (long)h * d + x] = tmp[p & 7];
+}
+)CL";
 
 static const std::string rope_inplace_kernel = R"CL(
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
@@ -1087,9 +1253,16 @@ bool create_ohwi_kv_mirror(bool is_v, unsigned int num_heads_KV,
   }
   d.buffer = buf;
   cl_int ie = CL_SUCCESS;
-  cl_mem image =
-    opencl::clCreateImageT(ctx, CL_MEM_READ_ONLY, &fmt, &d, nullptr, &ie);
+  // [kv-img-write] READ_WRITE when the scatters write through this image
+  // (write_imageui); READ_ONLY otherwise, byte for byte as before.
+  cl_mem image = opencl::clCreateImageT(
+    ctx, kv_img_write_enabled() ? CL_MEM_READ_WRITE : CL_MEM_READ_ONLY, &fmt,
+    &d, nullptr, &ie);
   if (ie != CL_SUCCESS || image == nullptr) {
+    if (kv_img_write_enabled())
+      ml_logw("[kv-img-write] KVIMG_MARKER_A: clCreateImage(READ_WRITE) "
+              "refused for the %s mirror (err %d); the layer falls back",
+              is_v ? "V" : "K", (int)ie);
     opencl::clReleaseMemObjectT(buf);
     return false;
   }
@@ -1150,8 +1323,11 @@ bool create_ohwi_v_image_view(void *v_buf, unsigned int num_heads_KV,
   d.image_row_pitch = (size_t)S * sizeof(uint16_t);
   d.buffer = reinterpret_cast<cl_mem>(v_buf);
   cl_int ie = CL_SUCCESS;
-  cl_mem image =
-    opencl::clCreateImageT(ctx, CL_MEM_READ_ONLY, &fmt, &d, nullptr, &ie);
+  // [kv-img-write] the tight view is the image the sv kernels read once it is
+  // adopted, so it is the image the V scatter must WRITE: same flags rule.
+  cl_mem image = opencl::clCreateImageT(
+    ctx, kv_img_write_enabled() ? CL_MEM_READ_WRITE : CL_MEM_READ_ONLY, &fmt,
+    &d, nullptr, &ie);
   if (ie != CL_SUCCESS || image == nullptr)
     return false;
   *out_image = image;
@@ -1292,6 +1468,129 @@ bool v_gather_ohwi_t_cl(cl_mem src_buf, uint16_t *dst_svm, unsigned int M,
                         unsigned int max_S, unsigned int position, bool drain) {
   return kv_gather_dispatch("v_gather_ohwi_t", src_buf, dst_svm, M,
                             num_heads_KV, head_dim, max_S, position, drain);
+}
+
+// ===========================================================================
+// [kv-img-write] IMAGE-PATH mirror writes/gathers (NNTR_KV_IMG_WRITE=1). Same
+// mirrors, same rows, same folded mapping as the buffer scatters above -- only
+// the memory path changes: these bind the IMAGE the attention reads.
+// ===========================================================================
+static ClContext::SharedPtrClKernel kvImgKernel(const char *kname) {
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  ClContext::SharedPtrClKernel kp =
+    blas_cc->registerClKernel(kv_img_write_kernel, kname, kvImgCopts());
+  if (!kp) {
+    // Loud: with the path armed and the kernel missing, the mirror would never
+    // be written at all. __read_write image2d_t needs -cl-std=CL2.0 and a
+    // device that reports read-write images.
+    static std::once_flag once;
+    std::call_once(once, [&]() {
+      ml_loge("[kv-img-write] KVIMG_MARKER_A: the image-write program did "
+              "not build (%s, opts '%s'); NNTR_KV_IMG_WRITE cannot run on this "
+              "driver",
+              kname, kvImgCopts().c_str());
+    });
+  }
+  return kp;
+}
+
+/// Shared dispatch for the four image-path kernels: identical argument order to
+/// the buffer scatters/gathers (the image handle simply takes the buffer's
+/// place), so a call site swaps one function name and nothing else.
+static bool kv_img_dispatch(const char *kname, const void *svm_ptr,
+                            void *clmem_arg, void *image, bool image_is_dst,
+                            unsigned int M, unsigned int num_heads_KV,
+                            unsigned int head_dim, unsigned int max_S,
+                            unsigned int position, unsigned int src_off,
+                            bool has_src_off, size_t gws_x, size_t gws_z,
+                            bool drain) {
+  if (M == 0 || num_heads_KV == 0 || head_dim == 0 || image == nullptr)
+    return false;
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  ClContext::SharedPtrClKernel kp = kvImgKernel(kname);
+  if (!kp)
+    return false;
+  cl_mem img = static_cast<cl_mem>(image);
+  const unsigned int a_img = image_is_dst ? 1u : 0u; // dst for a scatter
+  const unsigned int a_mem = image_is_dst ? 0u : 1u; // the SVM/cl_mem side
+  bool ok;
+  if (clmem_arg != nullptr) {
+    cl_mem sh = static_cast<cl_mem>(clmem_arg);
+    ok = kp->SetKernelArguments(a_mem, &sh, sizeof(cl_mem));
+  } else {
+    ok = kp->SetKernelSVMArguments(a_mem, const_cast<void *>(svm_ptr));
+  }
+  int Mi = (int)M, hKVi = (int)num_heads_KV, di = (int)head_dim,
+      maxSi = (int)max_S, posi = (int)position, soff = (int)src_off;
+  if (!ok || !kp->SetKernelArguments(a_img, &img, sizeof(cl_mem)) ||
+      !kp->SetKernelArguments(2, &Mi, sizeof(int)) ||
+      !kp->SetKernelArguments(3, &hKVi, sizeof(int)) ||
+      !kp->SetKernelArguments(4, &di, sizeof(int)) ||
+      !kp->SetKernelArguments(5, &maxSi, sizeof(int)) ||
+      !kp->SetKernelArguments(6, &posi, sizeof(int)))
+    return false;
+  if (has_src_off && !kp->SetKernelArguments(7, &soff, sizeof(int)))
+    return false;
+  constexpr size_t LWS_Z = 64;
+  std::array<size_t, 3> gws = {gws_x, (size_t)num_heads_KV,
+                               (gws_z + LWS_Z - 1) / LWS_Z * LWS_Z};
+  std::array<size_t, 3> lws = {1, 1, LWS_Z};
+  cl_command_queue q = blas_cc->command_queue_inst_.GetCommandQueue();
+  blas_cc->command_queue_inst_.enqueueKernel(kp->GetKernel(), 3, gws.data(),
+                                             lws.data(), 0, nullptr, nullptr);
+  if (drain)
+    opencl::clFinish(q);
+  return true;
+}
+
+bool k_scatter_ohwi_img_cl(const uint16_t *src_svm, void *dst_image,
+                           unsigned int M, unsigned int num_heads_KV,
+                           unsigned int head_dim, unsigned int max_S,
+                           unsigned int position, void *src_clmem,
+                           unsigned int src_off) {
+  // One work item per (t, head, d-texel).
+  return kv_img_dispatch("k_scatter_ohwi_img", src_svm, src_clmem, dst_image,
+                         /*image_is_dst=*/true, M, num_heads_KV, head_dim,
+                         max_S, position, src_off, /*has_src_off=*/true,
+                         /*gws_x=*/(size_t)M, /*gws_z=*/head_dim >> 3,
+                         /*drain=*/false);
+}
+
+bool v_scatter_ohwi_t_img_cl(const uint16_t *src_svm, void *dst_image,
+                             unsigned int M, unsigned int num_heads_KV,
+                             unsigned int head_dim, unsigned int max_S,
+                             unsigned int position, void *src_clmem,
+                             unsigned int src_off) {
+  // One work item per (sequence texel, head, channel): a V texel is 8 sequence
+  // positions, so the span is rounded out to whole texels and the partial ones
+  // are read-modify-written.
+  const size_t ntex = (size_t)(((position + M + 7u) >> 3) - (position >> 3));
+  return kv_img_dispatch("v_scatter_ohwi_t_img", src_svm, src_clmem, dst_image,
+                         /*image_is_dst=*/true, M, num_heads_KV, head_dim,
+                         max_S, position, src_off, /*has_src_off=*/true,
+                         /*gws_x=*/ntex, /*gws_z=*/head_dim, /*drain=*/false);
+}
+
+bool k_gather_ohwi_img_cl(void *src_image, uint16_t *dst_svm, unsigned int M,
+                          unsigned int num_heads_KV, unsigned int head_dim,
+                          unsigned int max_S, unsigned int position,
+                          bool drain) {
+  return kv_img_dispatch("k_gather_ohwi_img", dst_svm, nullptr, src_image,
+                         /*image_is_dst=*/false, M, num_heads_KV, head_dim,
+                         max_S, position, 0, /*has_src_off=*/false,
+                         /*gws_x=*/(size_t)M, /*gws_z=*/head_dim >> 3, drain);
+}
+
+bool v_gather_ohwi_t_img_cl(void *src_image, uint16_t *dst_svm, unsigned int M,
+                            unsigned int num_heads_KV, unsigned int head_dim,
+                            unsigned int max_S, unsigned int position,
+                            bool drain) {
+  return kv_img_dispatch("v_gather_ohwi_t_img", dst_svm, nullptr, src_image,
+                         /*image_is_dst=*/false, M, num_heads_KV, head_dim,
+                         max_S, position, 0, /*has_src_off=*/false,
+                         /*gws_x=*/(size_t)M, /*gws_z=*/head_dim, drain);
 }
 
 // =============================================================================
