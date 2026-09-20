@@ -2943,6 +2943,15 @@ void MHACoreLayer::one_batch_incremental_forwarding(
       cache_value.getData<_FP16>() +
       (size_t)batch * cache_value_dim.getFeatureLen() +
       (size_t)kv_slab_synced_to * hd);
+    // [kv-img-write] mode 2 rebuilds the partial V texels FROM this slab, so
+    // the gather below -- which writes it at absolute rows with no ring mapping
+    // -- must not run: on a ringed layer it fills rows past the ring cap with
+    // the wrong content. With the side-fills on (the default) the slab is
+    // already complete and the gather is a no-op by value anyway.
+    if (nntrainer::kv_img_write_mode() >= 2) {
+      kv_slab_synced_to = upto;
+      return;
+    }
     const unsigned int v_gs =
       kv_v_cur_stride != 0 ? kv_v_cur_stride : kv_mirror_S_max;
     // [kv-img-write] This boundary sync stays on the BUFFER read even when the
@@ -3361,7 +3370,15 @@ void MHACoreLayer::one_batch_incremental_forwarding(
               unsigned int seg = abs_to - pos;
               if (kv_ring_cap && (size_t)seg > (size_t)kv_ring_cap - phys)
                 seg = (unsigned int)((size_t)kv_ring_cap - phys);
-              if (is_v && img_w)
+              if (is_v && img_w && nntrainer::kv_img_write_mode() >= 2)
+                nntrainer::v_scatter_ohwi_t_img_slab_cl(
+                  reinterpret_cast<const uint16_t *>(
+                    cache_value.getData<_FP16>() +
+                    (size_t)batch * cache_value_dim.getFeatureLen()),
+                  v_img_bf, num_heads_KV, head_dim, pos - kv_mirror_base,
+                  pos - kv_mirror_base + seg, kv_mirror_base, kv_ring_cap,
+                  abs_to);
+              else if (is_v && img_w)
                 nntrainer::v_scatter_ohwi_t_img_cl(
                   reinterpret_cast<const uint16_t *>(
                     cache_value.getData<_FP16>() +
@@ -3574,7 +3591,16 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             // is adopted -- the image the sv kernels read IS the image the
             // scatter must write), same source and same rows as the buffer
             // scatter below.
-            if (kv_img_write)
+            if (kv_img_write && nntrainer::kv_img_write_mode() >= 2)
+              // mode 2: no image read in the write path -- the partial texels
+              // come from the slab, not from the mirror.
+              nntrainer::v_scatter_ohwi_t_img_slab_cl(
+                reinterpret_cast<const uint16_t *>(
+                  cache_value.getData<_FP16>() +
+                  (size_t)batch * cache_value_dim.getFeatureLen()),
+                v_img_use, num_heads_KV, head_dim, m_from, m_to, kv_mirror_base,
+                kv_ring_cap, cache_to);
+            else if (kv_img_write)
               nntrainer::v_scatter_ohwi_t_img_cl(
                 v_sc_src, v_img_use, step_size, num_heads_KV, head_dim,
                 v_stride, m_from,

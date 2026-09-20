@@ -464,6 +464,19 @@ bool v_scatter_ohwi_t_cl(const uint16_t *src_svm, cl_mem dst_buf,
 bool kv_img_write_enabled();
 
 /**
+ * @brief [kv-img-write] Which image-write arm: 0 = off (buffer scatters), 1 =
+ *        image writes with the partial V texels read-modify-written through a
+ *        __read_write image, 2 = image writes with the partial V texels rebuilt
+ *        from the concat V slab instead, so the write path contains NO image
+ *        read at all (an image read is what pollutes the texture cache on this
+ *        driver). Mode 2 also skips the NNTR_MHA_CLMEM boundary gather, which
+ *        writes the slab at absolute rows with no ring mapping and would feed
+ *        the rebuild wrong rows on a ringed layer.
+ * @return the value of NNTR_KV_IMG_WRITE (0 when unset)
+ */
+int kv_img_write_mode();
+
+/**
  * @brief [kv-img-write] K scatter, image path: same source and the same OHWI
  *        destination rows as k_scatter_ohwi_cl, written with write_imageui into
  *        `dst_image` (the very image the qk kernel reads). One work item per
@@ -496,6 +509,19 @@ bool v_scatter_ohwi_t_img_cl(const uint16_t *src_svm, void *dst_image,
  *        reversed, so the boundary sync reads the image too. Same semantics as
  *        k_gather_ohwi_cl / v_gather_ohwi_t_cl.
  */
+/**
+ * @brief [kv-img-write] mode 2 V scatter: rebuild the mirror-local texels
+ *        covering [m_from, m_to) from the concat V slab (`vcache_svm` = this
+ *        batch's slab base), mapping each lane's absolute position through the
+ *        ring like cacheRow() and writing +0.0h at or past `to_abs`. No image
+ *        read anywhere.
+ */
+bool v_scatter_ohwi_t_img_slab_cl(const uint16_t *vcache_svm, void *dst_image,
+                                  unsigned int num_heads_KV,
+                                  unsigned int head_dim, unsigned int m_from,
+                                  unsigned int m_to, unsigned int base_abs,
+                                  unsigned int ring_cap, unsigned int to_abs);
+
 bool k_gather_ohwi_img_cl(void *src_image, uint16_t *dst_svm, unsigned int M,
                           unsigned int num_heads_KV, unsigned int head_dim,
                           unsigned int max_S, unsigned int position,

@@ -439,12 +439,14 @@ bool two_conv_attention_prefill_f16_cl(
 /// the aliased buffer. Value-checked so =0 really disables it. Declared in
 /// attention_kernels.h; the mirror creation (image flags) and the layer (which
 /// scatter to call) both ask here so the two can never disagree.
-bool kv_img_write_enabled() {
-  static const bool on = []() {
+bool kv_img_write_enabled() { return kv_img_write_mode() != 0; }
+
+int kv_img_write_mode() {
+  static const int mode = []() {
     const char *e = std::getenv("NNTR_KV_IMG_WRITE");
-    return e != nullptr && std::atoi(e) != 0;
+    return e != nullptr ? std::atoi(e) : 0;
   }();
-  return on;
+  return mode;
 }
 
 static const std::string &ropeCopts() {
@@ -552,6 +554,43 @@ __kernel void v_scatter_ohwi_t_img(__global const half *src,
                    (long)h * d + x];
   }
   write_imageui(dst, c, as_uint4(vload8(0, tmp)));
+}
+// V, mode 2: the same rows, with NO image read anywhere in the write path. Mode
+// 1's read-modify-write is itself an image read, and an image read is what
+// pollutes the texture cache on this driver (see the gather), so at long spans
+// mode 1 may be re-introducing the very hazard it closes. Here the partial
+// texels are rebuilt from the concat V cache instead: lane p of texel `tex` is
+// absolute position base_abs + (tex<<3) + p, mapped through the ring exactly as
+// cacheRow() does, and +0.0h at or past the frontier (`to_abs`) -- what the
+// one-time mirror fill left there. This needs the slab to BE complete, which it
+// is with the side-fills on (NNTR_KV_STAGE off, the default) AND with the
+// NNTR_MHA_CLMEM boundary gather skipped: that gather writes the slab at
+// ABSOLUTE rows with no ring mapping, so on a ringed layer whose mirror is live
+// it fills rows past the ring cap with the wrong content (and past the
+// allocation) -- harmless while nothing reads them back, fatal here.
+__kernel void v_scatter_ohwi_t_img_slab(__global const half *vcache,
+                                        __write_only image2d_t dst,
+                                        const int hKV, const int d,
+                                        const int tex0, const int ntex,
+                                        const int base_abs, const int ring_cap,
+                                        const int to_abs) {
+  const int j = get_global_id(0);
+  const int h = get_global_id(1);
+  const int x = get_global_id(2);
+  if (j >= ntex || h >= hKV || x >= d) return;
+  const int tex = tex0 + j;
+  const long hd = (long)hKV * d;
+  half tmp[8];
+  for (int l = 0; l < 8; ++l) {
+    const int a = base_abs + (tex << 3) + l;
+    half v = (half)0.0h;
+    if (a >= 0 && a < to_abs) {
+      const int phys = ring_cap > 0 ? (a % ring_cap) : a;
+      v = vcache[(long)phys * hd + (long)h * d + x];
+    }
+    tmp[l] = v;
+  }
+  write_imageui(dst, (int2)(tex, h * d + x), as_uint4(vload8(0, tmp)));
 }
 // Inverse gathers on the image path: with the writes on the image, a BUFFER
 // read of the mirror is the same aliasing hazard reversed (the boundary sync
@@ -1556,6 +1595,44 @@ bool k_scatter_ohwi_img_cl(const uint16_t *src_svm, void *dst_image,
                          max_S, position, src_off, /*has_src_off=*/true,
                          /*gws_x=*/(size_t)M, /*gws_z=*/head_dim >> 3,
                          /*drain=*/false);
+}
+
+bool v_scatter_ohwi_t_img_slab_cl(const uint16_t *vcache_svm, void *dst_image,
+                                  unsigned int num_heads_KV,
+                                  unsigned int head_dim, unsigned int m_from,
+                                  unsigned int m_to, unsigned int base_abs,
+                                  unsigned int ring_cap, unsigned int to_abs) {
+  if (num_heads_KV == 0 || head_dim == 0 || dst_image == nullptr ||
+      vcache_svm == nullptr || m_to <= m_from)
+    return false;
+  const unsigned int tex0 = m_from >> 3;
+  const unsigned int ntex = ((m_to + 7u) >> 3) - tex0;
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  ClContext::SharedPtrClKernel kp = kvImgKernel("v_scatter_ohwi_t_img_slab");
+  if (!kp)
+    return false;
+  cl_mem dst = static_cast<cl_mem>(dst_image);
+  int hKVi = (int)num_heads_KV, di = (int)head_dim, t0 = (int)tex0,
+      nt = (int)ntex, base = (int)base_abs, ring = (int)ring_cap,
+      toa = (int)to_abs;
+  if (!kp->SetKernelSVMArguments(0, const_cast<uint16_t *>(vcache_svm)) ||
+      !kp->SetKernelArguments(1, &dst, sizeof(cl_mem)) ||
+      !kp->SetKernelArguments(2, &hKVi, sizeof(int)) ||
+      !kp->SetKernelArguments(3, &di, sizeof(int)) ||
+      !kp->SetKernelArguments(4, &t0, sizeof(int)) ||
+      !kp->SetKernelArguments(5, &nt, sizeof(int)) ||
+      !kp->SetKernelArguments(6, &base, sizeof(int)) ||
+      !kp->SetKernelArguments(7, &ring, sizeof(int)) ||
+      !kp->SetKernelArguments(8, &toa, sizeof(int)))
+    return false;
+  constexpr size_t LWS_Z = 64;
+  std::array<size_t, 3> gws = {(size_t)ntex, (size_t)num_heads_KV,
+                               ((size_t)head_dim + LWS_Z - 1) / LWS_Z * LWS_Z};
+  std::array<size_t, 3> lws = {1, 1, LWS_Z};
+  blas_cc->command_queue_inst_.enqueueKernel(kp->GetKernel(), 3, gws.data(),
+                                             lws.data(), 0, nullptr, nullptr);
+  return true;
 }
 
 bool v_scatter_ohwi_t_img_cl(const uint16_t *src_svm, void *dst_image,
