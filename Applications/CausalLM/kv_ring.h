@@ -37,6 +37,62 @@
 namespace causallm {
 
 /**
+ * @brief Has the caller asked for bit-identical output above everything else?
+ * @details NNTR_DETERMINISTIC is the cross-lane knob the API can set; it
+ * already pins the CUDA submission policy, the cuBLAS FP32 math mode and the
+ * OpenCL subgroup reduction order. On the Adreno image bundle it additionally
+ * means "take the arm that is actually reproducible" -- see
+ * imageAttnRequested().
+ */
+inline bool determinismFirst() { return nntr_env_on("NNTR_DETERMINISTIC"); }
+
+/**
+ * @brief Is the Adreno OHWI image-attention arm requested AND allowed?
+ * @details Value-checked: NNTR_KV_IMG_ATTN=0 disables, as before.
+ *
+ * Under NNTR_DETERMINISTIC the answer is NO, and that is the point of the flag
+ * here. Measured on Adreno 840, 8 consecutive runs per cell, per-node output
+ * hashes: the image arm is bit-reproducible only up to ~2K keys (0.3B 2047 and
+ * 1.5B 1K: 28/28 run pairs identical; 0.3B 8191 10/28, 0.3B 16383 1/28,
+ * 1.5B 3925 6/28, 1.5B 8103 3/28) even with the mirror image-written and the
+ * attention split removed. The reason is below our code: a read_imageui pass
+ * over many texel rows of a buffer-backed image2d is not coherently served on
+ * this driver. Every divergence originates in a FULL-attention layer, whose
+ * mirror read walks all keys, and never in a windowed layer, whose read walks
+ * ~512 + chunk rows however tall its mirror is.
+ *
+ * The buffer/flash arm IS bit-reproducible -- 0.3B 16383 and 1.5B 8103 both
+ * 28/28 pairs identical over 8 runs, E2B reproducible at 1024 tokens -- and it
+ * is the only arm that is. It is not free and it is not the same numbers:
+ * ~3.05x end to end on 1.5B 8103 (26783 vs 8777 ms), ~4.4x on the 0.3B, and
+ * E2B's sequence re-bases because the flash kernels are a
+ * different numeric path. So this is strictly opt-in and the substitution is
+ * announced once.
+ */
+inline bool imageAttnRequested() {
+  const char *e = std::getenv("NNTR_KV_IMG_ATTN");
+  if (e == nullptr || std::atoi(e) == 0)
+    return false;
+  if (determinismFirst()) {
+    static bool logged = false;
+    if (!logged) {
+      logged = true;
+      std::fprintf(stderr,
+                   "[DETERMINISM] NNTR_DETERMINISTIC=1: the Adreno image K/V "
+                   "attention arm "
+                   "is not bit-reproducible past ~2K keys on this driver, so "
+                   "it is disabled "
+                   "and the buffer/flash arm serves every layer. Expect ~3x "
+                   "end to end and "
+                   "a DIFFERENT (but reproducible) token sequence. Unset "
+                   "NNTR_DETERMINISTIC for the throughput default.\n");
+    }
+    return false;
+  }
+  return true;
+}
+
+/**
  * @brief Whether the engine this process resolved can host the ring at all.
  * @details The ring is only correct where the attention kernels modulo-map the
  * cache row, which today means the GPU attention paths. The host CPU attention
@@ -96,7 +152,17 @@ inline bool kvRingArmAvailable() {
     return false;
   if (nntr_env_on("NNTR_MHA_GPU_IMG"))
     return false;
-  if (nntr_env_on("NNTR_KV_IMG_ATTN")) {
+  if (determinismFirst() && std::getenv("NNTR_KV_IMG_ATTN") != nullptr &&
+      std::atoi(std::getenv("NNTR_KV_IMG_ATTN")) != 0)
+    // [determinism] The image bundle under NNTR_DETERMINISTIC falls back to the
+    // buffer/flash arm (imageAttnRequested), and the only arm measured
+    // bit-reproducible there is the one WITHOUT the ring: the flash kernels do
+    // modulo-map the row, but a 2048-row ring under the image bundle was
+    // measured WRONG on Adreno 840. The reproducible configuration is image off
+    // AND ring off, so refuse it here rather than leave a ringed allocation in
+    // a profile whose whole purpose is a guarantee.
+    return false;
+  if (imageAttnRequested()) {
     // The Adreno OHWI image arm serves a ringed layer through a SLIDING
     // mirror: the per-layer K/V mirror is ring-cap rows high and holds the
     // absolute rows [base, base + rows), re-based (and back-filled from the

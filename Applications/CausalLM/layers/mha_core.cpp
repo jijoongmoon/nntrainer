@@ -988,11 +988,12 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
   // serve (d > 256 → force NNTR_KV_IMG_ATTN=0) is made in the model class
   // before layers finalize; here we only honor the env uniformly
   // (value-checked).
-  if ([] {
-        const char *e = std::getenv("NNTR_KV_IMG_ATTN");
-        return e != nullptr && std::atoi(e) != 0; // value-checked: =0 disables
-      }() &&
-      !kv_int8 && head_dim % 8 == 0 && !kv_mirror_init) {
+  // [determinism] causallm::imageAttnRequested() is the ONE place the arm is
+  // decided (value-checked, and NO under NNTR_DETERMINISTIC), so the mirror
+  // prebuild, the Q staging, the decode-RoPE gate, the engage and the ring rule
+  // cannot disagree about which arm this process is on.
+  if (causallm::imageAttnRequested() && !kv_int8 && head_dim % 8 == 0 &&
+      !kv_mirror_init) {
     static const unsigned int mirror_cap = []() {
       const char *e = std::getenv("NNTR_KV_MIRROR_CAP");
       return e ? (unsigned int)std::atoi(e) : 0u;
@@ -1907,13 +1908,9 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   // (rope_lut_positions), is within ~2% of the broken-staged TPS at M=1024
   // (1520 vs 1556). Opt back into staging with NNTR_KV_STAGE=1 (to test an
   // SVM-backed staging fix); NNTR_NO_KV_STAGE still force-disables.
-  static const bool kv_stage_on =
-    [] {
-      const char *e = std::getenv("NNTR_KV_IMG_ATTN");
-      return e != nullptr && std::atoi(e) != 0; // value-checked: =0 disables
-    }() &&
-    std::getenv("NNTR_KV_STAGE") != nullptr &&
-    std::getenv("NNTR_NO_KV_STAGE") == nullptr;
+  static const bool kv_stage_on = causallm::imageAttnRequested() &&
+                                  std::getenv("NNTR_KV_STAGE") != nullptr &&
+                                  std::getenv("NNTR_NO_KV_STAGE") == nullptr;
   void *k_stage = nullptr;               // rope-K wrote the staging temp
   const uint16_t *v_stage_svm = nullptr; // v_scatter source (value_step)
   void *v_stage_clmem = nullptr;         // v_scatter cl_mem source (v_cl)
@@ -2028,10 +2025,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
     // (NNTR_KV_IMG_ATTN) GPU-RoPE-at-decode produces garbage (the image KV/attn
     // consumes host-RoPE'd Q/K in a different layout), so suppress the property
     // there. The explicit NNTR_MHA_GPU_DECODE env override is unaffected.
-    static const bool _kv_img_attn_env = [] {
-      const char *e = std::getenv("NNTR_KV_IMG_ATTN");
-      return e != nullptr && std::atoi(e) != 0; // value-checked: =0 disables
-    }();
+    static const bool _kv_img_attn_env = causallm::imageAttnRequested();
     const bool _gpu_rope_decode =
       _gpu_rope_decode_env ||
       (std::get<props::GpuDecodeRope>(mha_core_props).get() &&
@@ -3290,8 +3284,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
           // Value-checked so NNTR_KV_IMG_ATTN=0 really disables the image
           // path (the Adreno auto-default in cl_context uses overwrite=0 and
           // cannot override a user-provided 0).
-          const char *e = std::getenv("NNTR_KV_IMG_ATTN");
-          use_image_attn = (e != nullptr && std::atoi(e) != 0) ? 1 : 0;
+          use_image_attn = causallm::imageAttnRequested() ? 1 : 0;
         }
         // Sliding-window layers past their window must NOT take the image
         // path: qk_matmul_f16_ohwi_img has only the causal upper-bound mask
