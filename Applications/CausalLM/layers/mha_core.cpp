@@ -2824,6 +2824,86 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   unsigned int cache_from = cache_index;
   unsigned int cache_to = cache_from + step_size;
 
+  // NNTR_KVHASH: hash this layer's SVM K/V cache so two runs of
+  // the same prompt can be compared without pulling the caches off the device.
+  //   1 = at the prefill/decode boundary only (one drain, at the point decode
+  //       drains anyway, so what it hashes is an un-perturbed prefill);
+  //   2 = after every prefill chunk as well (one drain per chunk).
+  // Rows are hashed in 512-row blocks so the report names the first differing
+  // block, not just the layer. Inert unless the env is set.
+#if defined(ENABLE_OPENCL) && defined(ENABLE_FP16)
+  {
+    static const int kvhash_mode = []() {
+      const char *e = std::getenv("NNTR_KVHASH");
+      return e ? std::atoi(e) : 0;
+    }();
+    if (kvhash_mode > 0 && batch == 0 &&
+        cache_key.getDataType() == ml::train::TensorDim::DataType::FP16) {
+      static std::mutex kvh_mu;
+      static std::unordered_map<const void *, int> kvh_id;
+      static std::unordered_map<const void *, char> kvh_decoded;
+      std::lock_guard<std::mutex> _kvh_lock(kvh_mu);
+      auto it = kvh_id.find((const void *)this);
+      if (it == kvh_id.end())
+        it = kvh_id.emplace((const void *)this, (int)kvh_id.size()).first;
+      const bool boundary =
+        step_size == 1 &&
+        kvh_decoded.find((const void *)this) == kvh_decoded.end();
+      if (step_size == 1)
+        kvh_decoded[(const void *)this] = 1;
+      if (boundary || (kvhash_mode >= 2 && step_size > 1)) {
+        nntrainer::cl_queue_finish();
+        const size_t hd = (size_t)num_heads_KV * head_dim;
+        const unsigned int rows =
+          kv_ring_cap ? std::min<unsigned int>(cache_from, kv_ring_cap)
+                      : cache_from;
+        const uint16_t *kb =
+          reinterpret_cast<const uint16_t *>(cache_key.getData<_FP16>());
+        const uint16_t *vb =
+          reinterpret_cast<const uint16_t *>(cache_value.getData<_FP16>());
+        // Hash, and alongside it the magnitude summary that distinguishes a
+        // 1-ULP numeric difference from a garbage row.
+        struct Blk {
+          uint64_t h;
+          double absum;
+          double amax;
+          unsigned int nonfinite;
+        };
+        auto blk = [&](const uint16_t *base, unsigned int r0, unsigned int r1) {
+          Blk b{1469598103934665603ull, 0.0, 0.0, 0u};
+          for (size_t i = (size_t)r0 * hd; i < (size_t)r1 * hd; ++i) {
+            b.h ^= base[i];
+            b.h *= 1099511628211ull;
+            const float f = (float)*reinterpret_cast<const _FP16 *>(base + i);
+            if (!std::isfinite(f))
+              ++b.nonfinite;
+            else {
+              const double a = std::fabs((double)f);
+              b.absum += a;
+              if (a > b.amax)
+                b.amax = a;
+            }
+          }
+          return b;
+        };
+        for (unsigned int r0 = 0; r0 < rows; r0 += 512) {
+          const unsigned int r1 = std::min(rows, r0 + 512u);
+          const Blk bk = kb ? blk(kb, r0, r1) : Blk{0, 0, 0, 0};
+          const Blk bv = vb ? blk(vb, r0, r1) : Blk{0, 0, 0, 0};
+          std::fprintf(stderr,
+                       "[KVHASH] L%02d %s from=%u rows=%u blk=%u-%u "
+                       "k=%016llx v=%016llx ks=%.6e ka=%.6e kn=%u vs=%.6e "
+                       "va=%.6e vn=%u\n",
+                       it->second, boundary ? "bnd" : "chk", cache_from, rows,
+                       r0, r1, (unsigned long long)bk.h,
+                       (unsigned long long)bv.h, bk.absum, bk.amax,
+                       bk.nonfinite, bv.absum, bv.amax, bv.nonfinite);
+        }
+      }
+    }
+  }
+#endif
+
   // skip_prefill (Gemma4 KV-shared layers): K/V are now written + scattered
   // into this layer's own cache slab above, which is all decode needs (decode
   // re-derives cache_index from the absolute `from` each step, and attends to
