@@ -3757,8 +3757,26 @@ void MHACoreLayer::one_batch_incremental_forwarding(
               return (size_t)(mb > 0 ? (size_t)mb : kScoresBudgetMbDefault)
                      << 20;
             }();
+            // [attn-nondet] The split is the SECOND nondeterminism contributor
+            // on this driver: running a chunk's query rows in sub-blocks means
+            // many launches per chunk against the same K/V images, and a
+            // texture line one launch left is reused by the next (measured at
+            // 0.3B 16383: every run pair differs by 545-1138 of 5408 node
+            // hashes with the split, 2 of 3 runs identical without it; 1.5B
+            // 8103: 705 vs 15 of 4064). One launch per chunk is therefore the
+            // determinism arm, and NNTR_DETERMINISTIC -- the cross-lane knob
+            // the API can set -- selects it. It is NOT free here, unlike on the
+            // other lanes: it costs +24.6% prefill / +17.5% e2e / +500 MiB on
+            // 0.3B 16383 and +10.4% / +6.6% / +182 MiB on 1.5B 8103 (nothing on
+            // a single-shot prefill like E2B's 923 tokens, which never splits),
+            // so it stays opt-in and the throughput default keeps the budget.
+            static const bool scores_no_split = []() {
+              const char *d = std::getenv("NNTR_DETERMINISTIC");
+              return d != nullptr && d[0] != '0';
+            }();
             const unsigned int _span = prefillSpanHint();
-            const bool one_block = (_span != 0u && _span <= step_size);
+            const bool one_block =
+              scores_no_split || (_span != 0u && _span <= step_size);
             const size_t row_bytes =
               (size_t)num_heads_Q * (size_t)m_to * sizeof(uint16_t);
             unsigned int sub = step_size;
