@@ -451,14 +451,17 @@ bool v_scatter_ohwi_t_cl(const uint16_t *src_svm, cl_mem dst_buf,
 /**
  * @brief [kv-img-write] Is the OHWI K/V mirror WRITTEN through the image the
  *        attention reads (write_imageui) instead of the aliased buffer?
- * @details NNTR_KV_IMG_WRITE=1 arms it (value-checked, read once). The mirror
- * is written as a buffer and read as an image2d view over the same memory, and
- * the driver cannot order the two paths: an image read may be served a
+ * @details ON BY DEFAULT (mode 1); NNTR_KV_IMG_WRITE=0 is the opt-out back to
+ * the buffer scatters (value-checked, read once). Without it the mirror is
+ * written as a buffer and read as an image2d view over the same memory, and the
+ * driver cannot order the two paths: an image read may be served a
  * texture-cache line fetched by an earlier launch, so a row the current chunk
  * just scattered is read pre-write -- a nondeterministic per-node numeric
  * perturbation at a random chunk, which a clFinish does not close. With this
  * on, the producing and the consuming launch name the same cl_mem image.
- * Layout, capacity and the folded K row mapping are unchanged.
+ * Layout, capacity and the folded K row mapping are unchanged, and the cost is
+ * nil (measured on Adreno 840 over 0.3B 4095/16383 and 1.5B 3925/8103: prefill,
+ * TTFT, ms/token, e2e and footprint all within run-to-run noise).
  * @return true when the image-write path is armed
  */
 bool kv_img_write_enabled();
@@ -466,15 +469,28 @@ bool kv_img_write_enabled();
 /**
  * @brief [kv-img-write] Which image-write arm: 0 = off (buffer scatters), 1 =
  *        image writes with the partial V texels read-modify-written through a
- *        __read_write image, 2 = image writes with the partial V texels rebuilt
- *        from the concat V slab instead, so the write path contains NO image
- *        read at all (an image read is what pollutes the texture cache on this
- *        driver). Mode 2 also skips the NNTR_MHA_CLMEM boundary gather, which
- *        writes the slab at absolute rows with no ring mapping and would feed
- *        the rebuild wrong rows on a ringed layer.
- * @return the value of NNTR_KV_IMG_WRITE (0 when unset)
+ *        __read_write image (THE DEFAULT), 2 = image writes with the partial V
+ *        texels rebuilt from the concat V slab instead, so the write path
+ *        contains NO image read at all (an image read is what pollutes the
+ *        texture cache on this driver). Mode 2 also skips the NNTR_MHA_CLMEM
+ *        boundary gather.
+ * @return the value of NNTR_KV_IMG_WRITE (1 when unset), or 0 once the path has
+ *         been disarmed by kv_img_write_disarm()
  */
 int kv_img_write_mode();
+
+/**
+ * @brief [kv-img-write] Disarm the image-write path for the rest of the process
+ *        after the driver refused it, so every later ask answers 0 and the
+ * layer keeps writing the mirror through the buffer scatters.
+ * @details Two refusals are possible and both are the driver's, not ours:
+ * clCreateImage(CL_MEM_READ_WRITE) over the mirror buffer, and the
+ * -cl-std=CL2.0 program that carries the __read_write V texel update. Since the
+ * path became the default, neither may cost the mirror (or, with the KV ring
+ * on, the run) -- they only cost determinism, which is what the path buys.
+ * @param why short reason, logged once
+ */
+void kv_img_write_disarm(const char *why);
 
 /**
  * @brief [kv-img-write] K scatter, image path: same source and the same OHWI

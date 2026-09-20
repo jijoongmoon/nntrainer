@@ -3370,8 +3370,13 @@ void MHACoreLayer::one_batch_incremental_forwarding(
               unsigned int seg = abs_to - pos;
               if (kv_ring_cap && (size_t)seg > (size_t)kv_ring_cap - phys)
                 seg = (unsigned int)((size_t)kv_ring_cap - phys);
+              // [kv-img-write] Image write first (the default); a false return
+              // means the driver refused the CL2.0 program, which has already
+              // disarmed the path, so fall THROUGH to the buffer scatter rather
+              // than leave these rows unwritten.
+              bool written = false;
               if (is_v && img_w && nntrainer::kv_img_write_mode() >= 2)
-                nntrainer::v_scatter_ohwi_t_img_slab_cl(
+                written = nntrainer::v_scatter_ohwi_t_img_slab_cl(
                   reinterpret_cast<const uint16_t *>(
                     cache_value.getData<_FP16>() +
                     (size_t)batch * cache_value_dim.getFeatureLen()),
@@ -3379,14 +3384,21 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                   pos - kv_mirror_base + seg, kv_mirror_base, kv_ring_cap,
                   abs_to);
               else if (is_v && img_w)
-                nntrainer::v_scatter_ohwi_t_img_cl(
+                written = nntrainer::v_scatter_ohwi_t_img_cl(
                   reinterpret_cast<const uint16_t *>(
                     cache_value.getData<_FP16>() +
                     (size_t)batch * cache_value_dim.getFeatureLen() +
                     phys * hd),
                   v_img_bf, seg, num_heads_KV, head_dim, stride,
                   pos - kv_mirror_base);
-              else if (is_v)
+              else if (!is_v && img_w && k_image_ohwi != nullptr)
+                written = nntrainer::k_scatter_ohwi_img_cl(
+                  reinterpret_cast<const uint16_t *>(
+                    cache_key.getData<_FP16>() +
+                    (size_t)batch * cache_key_dim.getFeatureLen() + phys * hd),
+                  k_image_ohwi, seg, num_heads_KV, head_dim, kv_mirror_S_max,
+                  pos - kv_mirror_base);
+              if (!written && is_v)
                 nntrainer::v_scatter_ohwi_t_cl(
                   reinterpret_cast<const uint16_t *>(
                     cache_value.getData<_FP16>() +
@@ -3394,14 +3406,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                     phys * hd),
                   reinterpret_cast<cl_mem>(v_buf_ohwi), seg, num_heads_KV,
                   head_dim, stride, pos - kv_mirror_base);
-              else if (img_w && k_image_ohwi != nullptr)
-                nntrainer::k_scatter_ohwi_img_cl(
-                  reinterpret_cast<const uint16_t *>(
-                    cache_key.getData<_FP16>() +
-                    (size_t)batch * cache_key_dim.getFeatureLen() + phys * hd),
-                  k_image_ohwi, seg, num_heads_KV, head_dim, kv_mirror_S_max,
-                  pos - kv_mirror_base);
-              else
+              else if (!written)
                 nntrainer::k_scatter_ohwi_cl(
                   reinterpret_cast<const uint16_t *>(
                     cache_key.getData<_FP16>() +
@@ -3558,12 +3563,14 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                              kv_v_img_S);
               }
             }
-            if (kv_img_write)
-              nntrainer::k_scatter_ohwi_img_cl(
-                k_sc_src, k_image_ohwi, step_size, num_heads_KV, head_dim,
-                kv_mirror_S_max, m_from,
-                /*src_clmem=*/k_stage, /*src_off=*/k_sc_off);
-            else
+            // A false return means the driver refused the CL2.0 image-write
+            // program (which disarms the path process-wide); fall through to
+            // the buffer scatter so the rows are still written.
+            if (!kv_img_write ||
+                !nntrainer::k_scatter_ohwi_img_cl(
+                  k_sc_src, k_image_ohwi, step_size, num_heads_KV, head_dim,
+                  kv_mirror_S_max, m_from,
+                  /*src_clmem=*/k_stage, /*src_off=*/k_sc_off))
               nntrainer::k_scatter_ohwi_cl(
                 k_sc_src, reinterpret_cast<cl_mem>(k_buf_ohwi), step_size,
                 num_heads_KV, head_dim, kv_mirror_S_max, m_from,
@@ -3591,21 +3598,22 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             // is adopted -- the image the sv kernels read IS the image the
             // scatter must write), same source and same rows as the buffer
             // scatter below.
+            bool v_written = false;
             if (kv_img_write && nntrainer::kv_img_write_mode() >= 2)
               // mode 2: no image read in the write path -- the partial texels
               // come from the slab, not from the mirror.
-              nntrainer::v_scatter_ohwi_t_img_slab_cl(
+              v_written = nntrainer::v_scatter_ohwi_t_img_slab_cl(
                 reinterpret_cast<const uint16_t *>(
                   cache_value.getData<_FP16>() +
                   (size_t)batch * cache_value_dim.getFeatureLen()),
                 v_img_use, num_heads_KV, head_dim, m_from, m_to, kv_mirror_base,
                 kv_ring_cap, cache_to);
             else if (kv_img_write)
-              nntrainer::v_scatter_ohwi_t_img_cl(
+              v_written = nntrainer::v_scatter_ohwi_t_img_cl(
                 v_sc_src, v_img_use, step_size, num_heads_KV, head_dim,
                 v_stride, m_from,
                 /*src_clmem=*/v_stage_clmem, /*src_off=*/v_sc_off);
-            else
+            if (!v_written)
               nntrainer::v_scatter_ohwi_t_cl(
                 v_sc_src, reinterpret_cast<cl_mem>(v_buf_ohwi), step_size,
                 num_heads_KV, head_dim, v_stride, m_from,

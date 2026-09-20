@@ -14,6 +14,7 @@
 #include "attention_kernels_templates.h"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <blas_kernel_interface.h>
 #include <blas_kernels.h> // v8c_use_buffer_path()
 #include <chrono>
@@ -434,19 +435,35 @@ bool two_conv_attention_prefill_f16_cl(
  * program cache key, so the two arms never share a compiled binary.
  * @return "" for the default, or the -D that selects the old rule
  */
-/// [kv-img-write] NNTR_KV_IMG_WRITE=1: write the OHWI K/V mirrors through
-/// write_imageui into the very image the attention reads, instead of writing
-/// the aliased buffer. Value-checked so =0 really disables it. Declared in
-/// attention_kernels.h; the mirror creation (image flags) and the layer (which
-/// scatter to call) both ask here so the two can never disagree.
+/// [kv-img-write] Write the OHWI K/V mirrors through write_imageui into the
+/// very image the attention reads, instead of writing the aliased buffer.
+/// DEFAULT ON (mode 1); NNTR_KV_IMG_WRITE=0 is the opt-out back to the buffer
+/// scatters. Declared in attention_kernels.h; the mirror creation (image flags)
+/// and the layer (which scatter to call) both ask here so the two can never
+/// disagree.
 bool kv_img_write_enabled() { return kv_img_write_mode() != 0; }
+
+/// [kv-img-write] Process-wide latch, cleared once if the driver refuses the
+/// path: either clCreateImage(CL_MEM_READ_WRITE) over the mirror buffer, or the
+/// -cl-std=CL2.0 image-write program. Cleared, every ask answers 0 and the
+/// layer takes the buffer scatters -- exactly the pre-default behaviour --
+/// instead of leaving the mirror unwritten, which is what a bare "the kernel is
+/// missing" would have produced once the path became the default.
+static std::atomic<bool> kv_img_write_latch{true};
+
+void kv_img_write_disarm(const char *why) {
+  if (kv_img_write_latch.exchange(false))
+    ml_logw("[kv-img-write] KVIMG_MARKER_A disarmed (%s): the OHWI K/V "
+            "mirror falls back to the buffer scatters for this process",
+            why != nullptr ? why : "unspecified");
+}
 
 int kv_img_write_mode() {
   static const int mode = []() {
     const char *e = std::getenv("NNTR_KV_IMG_WRITE");
-    return e != nullptr ? std::atoi(e) : 0;
+    return e != nullptr ? std::atoi(e) : 1; // default: mode 1
   }();
-  return mode;
+  return kv_img_write_latch.load(std::memory_order_relaxed) ? mode : 0;
 }
 
 static const std::string &ropeCopts() {
@@ -1297,11 +1314,20 @@ bool create_ohwi_kv_mirror(bool is_v, unsigned int num_heads_KV,
   cl_mem image = opencl::clCreateImageT(
     ctx, kv_img_write_enabled() ? CL_MEM_READ_WRITE : CL_MEM_READ_ONLY, &fmt,
     &d, nullptr, &ie);
+  if ((ie != CL_SUCCESS || image == nullptr) && kv_img_write_enabled()) {
+    // [kv-img-write] Now that the path is the default, a driver that will not
+    // hand out a READ_WRITE view of a buffer must not cost us the mirror (and
+    // with the ring on, the run): disarm the write path process-wide and
+    // re-create the very READ_ONLY image the pre-default build made.
+    kv_img_write_disarm("clCreateImage(CL_MEM_READ_WRITE) refused");
+    ie = CL_SUCCESS;
+    image =
+      opencl::clCreateImageT(ctx, CL_MEM_READ_ONLY, &fmt, &d, nullptr, &ie);
+  }
   if (ie != CL_SUCCESS || image == nullptr) {
-    if (kv_img_write_enabled())
-      ml_logw("[kv-img-write] KVIMG_MARKER_A: clCreateImage(READ_WRITE) "
-              "refused for the %s mirror (err %d); the layer falls back",
-              is_v ? "V" : "K", (int)ie);
+    ml_logw("[kv-img-write] KVIMG_MARKER_A: clCreateImage refused for the "
+            "%s mirror (err %d); the layer falls back",
+            is_v ? "V" : "K", (int)ie);
     opencl::clReleaseMemObjectT(buf);
     return false;
   }
@@ -1367,6 +1393,13 @@ bool create_ohwi_v_image_view(void *v_buf, unsigned int num_heads_KV,
   cl_mem image = opencl::clCreateImageT(
     ctx, kv_img_write_enabled() ? CL_MEM_READ_WRITE : CL_MEM_READ_ONLY, &fmt,
     &d, nullptr, &ie);
+  if ((ie != CL_SUCCESS || image == nullptr) && kv_img_write_enabled()) {
+    // same fallback as the full-capacity mirror above
+    kv_img_write_disarm("clCreateImage(CL_MEM_READ_WRITE) refused (tight V)");
+    ie = CL_SUCCESS;
+    image =
+      opencl::clCreateImageT(ctx, CL_MEM_READ_ONLY, &fmt, &d, nullptr, &ie);
+  }
   if (ie != CL_SUCCESS || image == nullptr)
     return false;
   *out_image = image;
@@ -1520,16 +1553,21 @@ static ClContext::SharedPtrClKernel kvImgKernel(const char *kname) {
   ClContext::SharedPtrClKernel kp =
     blas_cc->registerClKernel(kv_img_write_kernel, kname, kvImgCopts());
   if (!kp) {
-    // Loud: with the path armed and the kernel missing, the mirror would never
-    // be written at all. __read_write image2d_t needs -cl-std=CL2.0 and a
-    // device that reports read-write images.
+    // Loud AND disarming: with the path armed and the kernel missing, the
+    // mirror would never be written at all. __read_write image2d_t needs
+    // -cl-std=CL2.0 and a device that reports read-write images, so on a driver
+    // without them the default must fall back to the buffer scatters rather
+    // than drop the writes. The latch makes every later ask answer 0, so the
+    // layer's own `kv_img_write` gate goes false from the next step on and the
+    // scatter call sites (which also fall through on a false return) stay on
+    // the buffer path for the rest of the process.
     static std::once_flag once;
     std::call_once(once, [&]() {
       ml_loge("[kv-img-write] KVIMG_MARKER_A: the image-write program did "
-              "not build (%s, opts '%s'); NNTR_KV_IMG_WRITE cannot run on this "
-              "driver",
+              "not build (%s, opts '%s'); falling back to the buffer scatters",
               kname, kvImgCopts().c_str());
     });
+    kv_img_write_disarm("the -cl-std=CL2.0 image-write program did not build");
   }
   return kp;
 }
