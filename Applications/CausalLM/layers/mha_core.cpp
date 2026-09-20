@@ -2934,26 +2934,59 @@ void MHACoreLayer::one_batch_incremental_forwarding(
     if (kv_slab_synced_to >= upto)
       return;
     const size_t hd = (size_t)num_heads_KV * head_dim;
-    const unsigned int n = upto - kv_slab_synced_to;
-    uint16_t *k_dst = reinterpret_cast<uint16_t *>(
-      cache_key.getData<_FP16>() +
-      (size_t)batch * cache_key_dim.getFeatureLen() +
-      (size_t)kv_slab_synced_to * hd);
-    uint16_t *v_dst = reinterpret_cast<uint16_t *>(
-      cache_value.getData<_FP16>() +
-      (size_t)batch * cache_value_dim.getFeatureLen() +
-      (size_t)kv_slab_synced_to * hd);
-    // [kv-img-write] mode 2 rebuilds the partial V texels FROM this slab, so
-    // the gather below -- which writes it at absolute rows with no ring mapping
-    // -- must not run: on a ringed layer it fills rows past the ring cap with
-    // the wrong content. With the side-fills on (the default) the slab is
-    // already complete and the gather is a no-op by value anyway.
-    if (nntrainer::kv_img_write_mode() >= 2) {
+    // [kv-slab-gather] The mirror is the ONLY K/V store just for the staged
+    // chain (NNTR_KV_STAGE): there the mha_clmem_mode branches above skip the
+    // SVM side-fill, and only there does the slab need gathering back. Unstaged
+    // -- the default -- the RoPE side-fill and the decode host writes have
+    // already made the slab complete, which the mirror-repair site right below
+    // states outright, so this gather is a no-op BY VALUE.
+    //
+    // It stopped being a no-op by MEMORY PATH the moment the mirror became
+    // image-written: it READS the mirror through the aliased BUFFER handle
+    // while the scatters WRITE it through the image -- the original hazard
+    // exactly reversed. A stale texture/buffer line then lands in the concat
+    // slab, and mirror_backfill re-scatters those rows straight back into the
+    // mirror. That is contributor (iii): it fires only where the mirror has
+    // slid (cache_from > kv_mirror_base), i.e. only past ~4K keys, at a chunk
+    // boundary -- which is exactly where the residual 12-15-node event was
+    // seen, and why 0.3B/2047 and E2B's 923-token prefill (mirror never slides)
+    // were already clean. So: with the mirror image-written, do not read it
+    // back through the buffer at all.
+    //
+    // Staged + image-written is the one combination that still needs the rows:
+    // there the gather must go through the IMAGE (kv_img_gather below), because
+    // the buffer read is unsound and the slab is genuinely stale.
+    // NNTR_KV_SLAB_GATHER=1 forces the old buffer gather back (A/B only).
+    static const bool _slab_gather_force =
+      std::getenv("NNTR_KV_SLAB_GATHER") != nullptr &&
+      std::atoi(std::getenv("NNTR_KV_SLAB_GATHER")) != 0;
+    const bool slab_authoritative = !kv_stage_on && !_slab_gather_force;
+    if (nntrainer::kv_img_write_mode() >= 2 ||
+        (nntrainer::kv_img_write_enabled() && slab_authoritative)) {
       kv_slab_synced_to = upto;
       return;
     }
     const unsigned int v_gs =
       kv_v_cur_stride != 0 ? kv_v_cur_stride : kv_mirror_S_max;
+    // [kv-slab-ring] This gather used to take the ABSOLUTE range to both sides:
+    // it wrote the concat slab at row `abs` and read the mirror at row `abs`.
+    // The slab of a RINGED layer is only kv_ring_cap rows tall, so the write
+    // ran past the layer's allocation as soon as abs >= kv_ring_cap; and a
+    // mirror that has slid holds [kv_mirror_base, +rows), so the read picked
+    // the wrong rows. Nothing consumed the result on today's image path, which
+    // is why it stayed latent -- it is still an out-of-allocation write. Map
+    // both sides the way every other consumer does (slab through cacheRow,
+    // mirror through
+    // - kv_mirror_base), split at the ring seam, and copy only rows the mirror
+    // actually holds. Ring off with an unslid mirror this is one segment with
+    // the old arguments, instruction for instruction.
+    const unsigned int mirror_rows = std::min(kv_mirror_S_max, v_gs);
+    const auto segs = causallm::kvSlabSyncSegments(
+      kv_slab_synced_to, upto, kv_ring_cap, kv_mirror_base, mirror_rows);
+    if (segs.empty()) {
+      kv_slab_synced_to = upto;
+      return;
+    }
     // [kv-img-write] This boundary sync stays on the BUFFER read even when the
     // mirror is written through the image, and that is a measurement, not an
     // oversight. NNTR_KV_IMG_GATHER=1 routes it through the image instead
@@ -2968,25 +3001,45 @@ void MHACoreLayer::one_batch_incremental_forwarding(
     static const bool _kvimg_gather_img =
       std::getenv("NNTR_KV_IMG_GATHER") != nullptr &&
       std::atoi(std::getenv("NNTR_KV_IMG_GATHER")) != 0;
-    if (_kvimg_gather_img && k_image_ohwi != nullptr) {
-      void *v_img = (v_image_tight != nullptr && kv_v_img_S == v_gs)
+    void *v_img_g = (v_image_tight != nullptr && kv_v_img_S == v_gs)
                       ? v_image_tight
                       : v_image_ohwi;
-      nntrainer::k_gather_ohwi_img_cl(k_image_ohwi, k_dst, n, num_heads_KV,
-                                      head_dim, kv_mirror_S_max,
-                                      kv_slab_synced_to, /*drain=*/false);
-      nntrainer::v_gather_ohwi_t_img_cl(v_img, v_dst, n, num_heads_KV, head_dim,
-                                        v_gs, kv_slab_synced_to,
-                                        /*drain=*/true);
-      kv_slab_synced_to = upto;
-      return;
+    // [kv-slab-gather] Reaching here with the mirror image-written means the
+    // staged chain really does need these rows (see above); the buffer read
+    // would be the reverse alias, so take the image.
+    const bool gather_img =
+      (_kvimg_gather_img ||
+       (nntrainer::kv_img_write_enabled() && !slab_authoritative)) &&
+      k_image_ohwi != nullptr;
+    uint16_t *const k_base = reinterpret_cast<uint16_t *>(
+      cache_key.getData<_FP16>() +
+      (size_t)batch * cache_key_dim.getFeatureLen());
+    uint16_t *const v_base = reinterpret_cast<uint16_t *>(
+      cache_value.getData<_FP16>() +
+      (size_t)batch * cache_value_dim.getFeatureLen());
+    for (size_t si = 0; si < segs.size(); ++si) {
+      const auto &s = segs[si];
+      const bool last = (si + 1 == segs.size());
+      uint16_t *k_dst = k_base + (size_t)s.slab_row * hd;
+      uint16_t *v_dst = v_base + (size_t)s.slab_row * hd;
+      if (gather_img) {
+        nntrainer::k_gather_ohwi_img_cl(k_image_ohwi, k_dst, s.rows,
+                                        num_heads_KV, head_dim, kv_mirror_S_max,
+                                        s.mirror_row,
+                                        /*drain=*/false);
+        nntrainer::v_gather_ohwi_t_img_cl(v_img_g, v_dst, s.rows, num_heads_KV,
+                                          head_dim, v_gs, s.mirror_row,
+                                          /*drain=*/last);
+      } else {
+        nntrainer::k_gather_ohwi_cl(reinterpret_cast<cl_mem>(k_buf_ohwi), k_dst,
+                                    s.rows, num_heads_KV, head_dim,
+                                    kv_mirror_S_max, s.mirror_row,
+                                    /*drain=*/false);
+        nntrainer::v_gather_ohwi_t_cl(reinterpret_cast<cl_mem>(v_buf_ohwi),
+                                      v_dst, s.rows, num_heads_KV, head_dim,
+                                      v_gs, s.mirror_row, /*drain=*/last);
+      }
     }
-    nntrainer::k_gather_ohwi_cl(reinterpret_cast<cl_mem>(k_buf_ohwi), k_dst, n,
-                                num_heads_KV, head_dim, kv_mirror_S_max,
-                                kv_slab_synced_to, /*drain=*/false);
-    nntrainer::v_gather_ohwi_t_cl(reinterpret_cast<cl_mem>(v_buf_ohwi), v_dst,
-                                  n, num_heads_KV, head_dim, v_gs,
-                                  kv_slab_synced_to, /*drain=*/true);
     kv_slab_synced_to = upto;
 #else
     (void)upto;

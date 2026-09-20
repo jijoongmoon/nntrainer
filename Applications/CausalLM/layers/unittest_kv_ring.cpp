@@ -661,6 +661,92 @@ TEST(KVRing, decode_capacity_is_independent_of_the_prefill_block) {
             causallm::kvRingCap(W, max_seq, 4096u));
 }
 
+/**
+ * @brief The mirror->slab boundary sync never addresses a row it does not own.
+ * @details sync_kv_slab used to take the ABSOLUTE range to both sides: it wrote
+ * the concat slab at row `abs` and read the mirror at row `abs`. On a ringed
+ * layer the slab is only `ring_cap` rows tall, so that write left the layer's
+ * allocation as soon as abs >= ring_cap -- a latent out-of-bounds write that
+ * nothing read back on the image path. The invariants pinned here are the two
+ * that make it safe again: every emitted slab row is < ring_cap, and every
+ * emitted mirror row is < mirror_rows.
+ */
+TEST(KVRing, slab_sync_segments_stay_inside_both_allocations) {
+  // (a) ring off, mirror at base 0: ONE segment with the old arguments. The
+  // pre-fix call is the thing that must not change.
+  {
+    const auto s = causallm::kvSlabSyncSegments(0, 843, /*ring_cap=*/0,
+                                                /*mirror_base=*/0,
+                                                /*mirror_rows=*/2048);
+    ASSERT_EQ(s.size(), 1u);
+    EXPECT_EQ(s[0].mirror_row, 0u);
+    EXPECT_EQ(s[0].slab_row, 0u);
+    EXPECT_EQ(s[0].rows, 843u);
+  }
+  // (b) the bug: a ringed layer past the cap. Every row must land inside the
+  // ring, and the mirror side must be base-relative.
+  {
+    const unsigned int cap = 3072u, base = 2048u, rows = 1536u;
+    const auto s = causallm::kvSlabSyncSegments(3000, 3200, cap, base, rows);
+    unsigned int total = 0;
+    for (const auto &g : s) {
+      EXPECT_LT(g.slab_row, cap);
+      EXPECT_LE((unsigned long)g.slab_row + g.rows, (unsigned long)cap)
+        << "a segment straddles the ring seam";
+      EXPECT_LE((unsigned long)g.mirror_row + g.rows, (unsigned long)rows)
+        << "a segment reads past the mirror";
+      total += g.rows;
+    }
+    EXPECT_EQ(total, 200u);
+    // the seam is really crossed here, so this is two pieces
+    ASSERT_EQ(s.size(), 2u);
+    EXPECT_EQ(s[0].slab_row, 3000u % cap);
+    EXPECT_EQ(s[0].rows, cap - (3000u % cap));
+    EXPECT_EQ(s[1].slab_row, 0u);
+    EXPECT_EQ(s[0].mirror_row, 3000u - base);
+    EXPECT_EQ(s[1].mirror_row, 3000u - base + s[0].rows);
+  }
+  // (c) rows the mirror does not hold are DROPPED, not read out of bounds.
+  {
+    const auto below = causallm::kvSlabSyncSegments(0, 100, 3072, 2048, 1536);
+    EXPECT_TRUE(below.empty()) << "rows below the mirror base were emitted";
+    const auto above =
+      causallm::kvSlabSyncSegments(2048, 2048 + 4096, 8192, 2048, 1536);
+    unsigned int total = 0;
+    for (const auto &g : above)
+      total += g.rows;
+    EXPECT_EQ(total, 1536u) << "the sync ran past the mirror height";
+    const auto empty = causallm::kvSlabSyncSegments(500, 500, 0, 0, 2048);
+    EXPECT_TRUE(empty.empty());
+  }
+  // (d) exhaustive: for a small ring/mirror, no emitted row ever leaves either
+  // allocation and the pieces tile the clamped range contiguously.
+  {
+    const unsigned int cap = 16u, rows = 12u;
+    for (unsigned int base = 0; base <= 40u; base += 4u)
+      for (unsigned int from = 0; from < 48u; ++from)
+        for (unsigned int to = from; to < 52u; ++to) {
+          const auto s =
+            causallm::kvSlabSyncSegments(from, to, cap, base, rows);
+          unsigned int prev_abs = 0;
+          bool first = true;
+          for (const auto &g : s) {
+            ASSERT_LE((unsigned long)g.slab_row + g.rows, (unsigned long)cap)
+              << " base=" << base << " [" << from << "," << to << ")";
+            ASSERT_LE((unsigned long)g.mirror_row + g.rows, (unsigned long)rows)
+              << " base=" << base << " [" << from << "," << to << ")";
+            ASSERT_GT(g.rows, 0u);
+            const unsigned int abs = g.mirror_row + base;
+            if (!first) {
+              ASSERT_EQ(abs, prev_abs) << "the pieces are not contiguous";
+            }
+            prev_abs = abs + g.rows;
+            first = false;
+          }
+        }
+  }
+}
+
 int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

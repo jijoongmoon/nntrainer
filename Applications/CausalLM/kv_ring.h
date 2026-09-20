@@ -30,6 +30,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <vector>
 
 #include <env_compat.h> // nntr_env_on (an auto-injected flag needs =0 to work)
 
@@ -542,6 +543,73 @@ inline unsigned int kvDecodeMirrorSpan(unsigned int local_window,
  */
 inline unsigned long kvCacheRow(unsigned long abs_pos, unsigned int cap) {
   return cap ? (abs_pos % static_cast<unsigned long>(cap)) : abs_pos;
+}
+
+/**
+ * @brief One contiguous piece of a mirror -> concat-slab boundary sync.
+ * @details `mirror_row` is the row inside the K/V mirror (mirror-base relative,
+ * which is how every mirror kernel addresses it), `slab_row` the PHYSICAL row
+ * in the concat cache slab (ring-mapped), and `rows` a count that is contiguous
+ * in both.
+ */
+struct KvSlabSegment {
+  unsigned int mirror_row;
+  unsigned int slab_row;
+  unsigned int rows;
+};
+
+/**
+ * @brief Split an ABSOLUTE position range into pieces a mirror->slab gather may
+ *        actually copy.
+ * @details The boundary sync (mha_core's sync_kv_slab, NNTR_MHA_CLMEM) used to
+ * take the absolute range straight to both sides: it wrote the concat slab at
+ * `abs` and read the mirror at `abs`. Both are wrong the moment either side
+ * moves:
+ *
+ *   - a RINGED layer's slab is only `ring_cap` rows tall, so writing row `abs`
+ *     runs past the layer's allocation once abs >= ring_cap -- an out-of-bounds
+ *     write, not a wrong answer;
+ *   - a mirror that has SLID holds absolute rows [mirror_base, +mirror_rows),
+ * so reading it at `abs` reads the wrong rows (and past its height).
+ *
+ * This maps both sides the way every other consumer does -- slab through
+ * `kvCacheRow`, mirror through `- mirror_base` -- splits at the ring seam so a
+ * piece is contiguous on both sides, and DROPS whatever the mirror does not
+ * hold instead of reading outside it. An empty result means "the mirror has
+ * nothing to contribute here", which is the correct refusal.
+ *
+ * @param from first absolute position to sync (inclusive)
+ * @param to one past the last absolute position (exclusive)
+ * @param ring_cap physical rows of the concat slab, 0 for a linear cache
+ * @param mirror_base first absolute position the mirror holds
+ * @param mirror_rows mirror height in rows; 0 means "unbounded" (do not clamp)
+ * @return the pieces to copy, in increasing absolute order
+ */
+inline std::vector<KvSlabSegment>
+kvSlabSyncSegments(unsigned int from, unsigned int to, unsigned int ring_cap,
+                   unsigned int mirror_base, unsigned int mirror_rows) {
+  std::vector<KvSlabSegment> out;
+  if (from < mirror_base)
+    from = mirror_base; // below the mirror: it does not hold these rows
+  if (mirror_rows != 0u) {
+    const unsigned long lim =
+      static_cast<unsigned long>(mirror_base) + mirror_rows;
+    if (static_cast<unsigned long>(to) > lim)
+      to = static_cast<unsigned int>(lim);
+  }
+  if (to <= from)
+    return out;
+  unsigned int pos = from;
+  while (pos < to) {
+    const unsigned int slab =
+      static_cast<unsigned int>(kvCacheRow(pos, ring_cap));
+    unsigned int rows = to - pos;
+    if (ring_cap != 0u && rows > ring_cap - slab)
+      rows = ring_cap - slab; // stop at the ring seam
+    out.push_back(KvSlabSegment{pos - mirror_base, slab, rows});
+    pos += rows;
+  }
+  return out;
 }
 
 } // namespace causallm
