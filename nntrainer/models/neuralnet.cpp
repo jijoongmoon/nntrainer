@@ -49,6 +49,7 @@
 #include <fcntl.h> // posix_fadvise: drop the weight file's page cache after the load
 #endif
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_context_manager.h> // cuda::drain_if_async
 #include <cuda_fc_qs4cx.h> // [wprefetch] cuda_fc_qs4cx_prefetch_weight
 #endif
 
@@ -732,9 +733,19 @@ sharedConstTensors NeuralNetwork::incremental_forwarding(
         static const char *match = std::getenv("NNTR_DUMP_ROWS_MATCH");
         static unsigned int seq = 0;
         if (match == nullptr ||
-            node->getName().find(match) != std::string::npos)
+            node->getName().find(match) != std::string::npos) {
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+          // On the cuda engine the dump reads the node output on the host, so
+          // the stream this node's kernels were submitted on has to have
+          // drained first or the hash is taken on rows the GPU has not written
+          // yet -- which reads as nondeterminism that belongs to the
+          // instrument, not to the model. Engine-gated: a no-op, and no CUDA
+          // context created, on every non-cuda run.
+          nntrainer::cuda::drain_if_async();
+#endif
           debug_dump_rows_cl(node->getName(), node->getOutput(0), to - from,
                              dump_dir, seq);
+        }
         ++seq;
       }
 #endif

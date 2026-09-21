@@ -391,6 +391,9 @@ int aminCl(const Tensor &input) { throwNoOpenCLKernel("aminCl"); }
 #include <cstring>
 #include <engine.h>
 #include <memory>
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_context_manager.h> // [nondet] cuda::dev_only / copy_any
+#endif
 #include <mutex>
 #include <unordered_map>
 
@@ -2229,8 +2232,22 @@ bool clmem_lower_cl(const Tensor &t, unsigned int valid_bytes) {
  */
 void debug_dump_rows_cl(const std::string &name, const Tensor &t,
                         unsigned int rows, const char *dir, unsigned int seq) {
-  auto *cc =
-    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  // The caller's gate is a COMPILE-time one (#if ENABLE_OPENCL), so a build
+  // that has OpenCL compiled in reaches here on every lane -- including a
+  // --lane cuda run, which never registers the "gpu" Context.
+  // getRegisteredContext() throws for a name that is not registered, which
+  // turned a debug lever into an abort
+  // ("[Engine] gpu Context is not registered"). Catch that: with no GPU Context
+  // the tensor cannot be a cl_mem either, so the host arm below is the whole of
+  // the work. On CUDA that arm needs two things the OpenCL one does not: a
+  // device-ONLY node output has to be staged rather than dereferenced (below),
+  // and the stream has to be drained first, which the caller does for us.
+  ClContext *cc = nullptr;
+  try {
+    cc = static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  } catch (...) {
+    cc = nullptr; // no OpenCL Context on this run: the host arm is all there is
+  }
   const size_t W = t.width();
   const size_t es = t.getDataType() == Tdatatype::FP16   ? 2
                     : t.getDataType() == Tdatatype::FP32 ? 4
@@ -2249,7 +2266,22 @@ void debug_dump_rows_cl(const std::string &name, const Tensor &t,
   } else {
     if (cc)
       opencl::clFinish(cc->command_queue_inst_.GetCommandQueue());
-    std::memcpy(buf.data(), t.getData<uint8_t>(), bytes);
+    const uint8_t *src = t.getData<uint8_t>();
+    if (src == nullptr)
+      return;
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+    // A cuda-engine node output can live in a device-ONLY pool (cudaMalloc, the
+    // NNTR_CUDA_DEV_ACT / KV pools), which the host cannot dereference: the
+    // memcpy below segfaults on it. Stage it instead. dev_only() is itself
+    // engine-gated, so this costs a branch and creates no CUDA context on a
+    // non-cuda run.
+    if (nntrainer::cuda::dev_only(src)) {
+      plane = "cudadev";
+      if (!nntrainer::cuda::copy_any(buf.data(), src, bytes))
+        return;
+    } else
+#endif
+      std::memcpy(buf.data(), src, bytes);
   }
   char path[1024];
   std::snprintf(path, sizeof(path), "%s/%04u_%s.%s.%zux%zu.bin", dir, seq,
