@@ -160,27 +160,43 @@ inline bool imageAttnRequested() {
 
 /**
  * @brief The widest attention window whose image-path read is measured
- *        bit-reproducible on this driver, in KV rows.
+ *        bit-reproducible on this driver, in KV rows. 0 = none, i.e. no layer
+ *        takes the image arm on a deterministic arm.
  * @details A safety bound on the per-layer split, not a tuning knob, and it is
  * load-bearing: it is what decides whether a pack gets the cheap per-layer
- * split at all or falls back to the all-layers arm.
+ * split at all or falls back to serving every layer from the buffer/flash
+ * kernels.
  *
- * 512, because that is the only window width the image arm is MEASURED
- * bit-reproducible at. The 0.3B/1.5B models and gemma4 are W=512, and
- * across every run pair of every cell their windowed layers never originate a
- * divergence -- thousands of calls, 0 events. E2B is W=1024, and it is NOT
- * reproducible on the split: 8 consecutive runs at 1024 generated tokens gave 2
- * distinct sequences (7 on one output, 1 on another), which is the same
- * decode-side flip the all-image default had. Its windowed layers walk ~1024 +
- * block rows, and an earlier run had already located E2B's flip at a ~1947-row
- * read span, so W=1024 is inside the failing regime and not outside it.
+ * 0, because there is no window width at which the image read is reproducible.
+ * The bound used to be 512, on the reading that "a window-bounded layer's pass
+ * walks ~W + block rows whatever the context, so it stays in the clean regime".
+ * Both halves of that are wrong:
  *
- * So a window wider than this is treated exactly like a full-attention read:
- * that layer takes the buffer/flash arm too. For a pack that is ALL wide-window
- * plus full layers -- E2B -- the split therefore degenerates, by this one rule,
- * into the all-layers arm, which IS measured reproducible there. That is the
- * intended fallback, and it happens per pack from the pack's own geometry
- * instead of from a hand-maintained list of pack names.
+ *  - The quantity the driver fails on is the number of texel rows ONE PASS
+ *    walks, and for a windowed layer that is the prefill CHUNK plus the window,
+ *    not the window: with C=1024 and W=512 the mirror span is 1024 rows at
+ *    chunk 0 and 1536 rows after, so a W=512 layer reads as far as a
+ *    full-attention layer at a 1536-token context does. The window bounds the
+ *    MASK, not the read.
+ *  - There is no clean regime, only a rate that falls with the span. Measured
+ * on the W=512 1.5B pack, DEFAULT arm, per-node hashes, prompt 3925 (pack 16K
+ * configuration, 4 generated tokens): 2 divergences in 28 consecutive
+ *    identical-env runs, and in both the FIRST differing node is a WINDOWED
+ *    layer's attention op in prefill chunk 0 -- layer22_attention once,
+ *    layer21_attention once -- with that layer's own K/V cache rows
+ *    bit-identical, i.e. the perturbation is on the image side of the mirror
+ *    and not in the cache. Over the 64 runs of the eight measured
+ *    cells that is 1 event per ~7,600 windowed image prefill calls: small
+ *    enough that 8 runs of most cells pass, far too large for a guarantee.
+ *
+ * So on a deterministic arm every layer takes the buffer/flash arm, and the
+ * per-layer split survives only as an A/B: NNTR_DET_IMG_WINDOW_MAX=512 restores
+ * it exactly. The KV ring is NOT given up with it -- the flash prefill/decode
+ * kernels modulo-map the cache row, so a windowed layer keeps its ring and its
+ * memory win; only the mirrors and the image kernels go.
+ *
+ * The throughput opt-out (NNTR_ALLOW_NONDETERMINISTIC=1 / NNTR_DETERMINISTIC=0)
+ * is unchanged and still puts every layer on the image arm.
  *
  * NNTR_DET_IMG_WINDOW_MAX overrides it, in both directions, for the A/B.
  */
@@ -196,7 +212,7 @@ inline unsigned int detImageWindowMax() {
     if (end != e && *end == '\0' && v >= 0)
       return (unsigned int)v;
   }
-  return 512u;
+  return 0u;
 }
 
 /**
@@ -218,11 +234,17 @@ inline unsigned int detImageWindowMax() {
  *                            4095     : 1 node in 1 of 3 runs
  *                            8191     : 32-462 nodes
  *                            16383    : 1-769 nodes
- * A window-bounded layer's pass walks ~W + block rows whatever the context, so
- * it stays in the clean regime at every context length. That is why the arm can
- * be chosen per layer instead of per process, and why doing so costs a small
- * fraction of the all-layers arm: the measured models are mostly windowed (0.3B
- * full at 7,15 of 16; 1.5B at 5,11,17,23 of 24; gemma4 3 of 15).
+ * A window-bounded layer's pass walks ~W + C rows -- the CHUNK plus the window,
+ * not the window -- so with C=1024 it is already 1024 rows at chunk 0 and 1536
+ * after, and RE-MEASURED at W=512 it does originate divergences there: 2 in 28
+ * consecutive runs of the 1.5B 3925 cell, both first-differing at a windowed
+ * layer's attention op in prefill chunk 0. There is no clean regime for it, so
+ * detImageWindowMax() now answers 0 and this function selects no layer on a
+ * deterministic arm; the split stays reachable as an A/B
+ * (NNTR_DET_IMG_WINDOW_MAX=512) and as the throughput opt-out's whole-process
+ * arm. The measured models are mostly windowed (0.3B full at 7,15 of 16; 1.5B
+ * at 5,11,17,23 of 24; gemma4 3 of 15), which is what the split would have
+ * bought and what it costs to give up.
  *
  * The decision is STATIC per layer -- taken once at finalize, never flipped per
  * call. It has to be: on the image arm this step's K/V is written into the
@@ -240,10 +262,15 @@ inline bool imageAttnLayer(size_t local_window_size,
     return true; // the old throughput default: every layer
   // kPerLayer: the read span must be bounded by the window, and the window must
   // be no wider than the span the image arm is measured reproducible over.
+  const unsigned int bound = detImageWindowMax();
+  if (bound == 0u)
+    return false; // no width qualifies: every layer takes the flash arm
   if (local_window_size == (size_t)UINT_MAX ||
       (max_timestep != 0u && local_window_size >= (size_t)max_timestep))
     return false; // full attention: the read walks every key
-  return local_window_size <= (size_t)detImageWindowMax();
+  if (local_window_size == 0u)
+    return false; // 0 spells "no window" -- a full read, not a zero-wide one
+  return local_window_size <= (size_t)bound;
 }
 
 /**
@@ -264,7 +291,7 @@ inline void announceDetArmOnce() {
                      : a == DetArm::kAllLayers ? "deterministic-all-layers"
                                                : "deterministic-per-layer";
   std::fprintf(stderr,
-               "[DETERMINISM] DETDEF_MARKER_D arm=%s image_bundle=%d "
+               "[DETERMINISM] DETDEF_MARKER_E arm=%s image_bundle=%d "
                "window_max=%u\n",
                name, (int)imageAttnRequested(), detImageWindowMax());
 }

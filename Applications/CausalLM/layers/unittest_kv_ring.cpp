@@ -753,8 +753,12 @@ TEST(KVRing, slab_sync_segments_stay_inside_both_allocations) {
  * @details This is the rule the Adreno determinism default rests on. Measured
  * (Adreno 840, per-node output hashes): 20 of 21 diverging run pairs originate
  * in a FULL-attention layer's attention op and a window-bounded layer never
- * originates one, because a windowed read walks ~W + block rows whatever the
- * context while a full read walks every key. So the arm is a per-LAYER fact.
+ * originates one MORE OFTEN, because a full read walks every key while a
+ * windowed read walks the chunk plus the window. Re-measured, a windowed read
+ * is not clean either (2 divergences in 28 runs of the 1.5B 3925 cell, both
+ * first differing at a windowed layer's attention op), so the bound is now 0
+ * and a deterministic arm puts EVERY layer on the flash kernels. The per-layer
+ * predicate stays, and stays pinned, because the bound is one env away.
  *
  * Pinned here because the whole guarantee is "a full layer is never on the
  * image path unless someone explicitly opted out", and that is a one-line
@@ -783,39 +787,47 @@ TEST(KVRing, det_arm_per_layer_rule) {
 
   ScopedEnv img("NNTR_KV_IMG_ATTN", "1");
 
-  // THE DEFAULT, no environment: windowed layers keep the image path, full
-  // layers take the reproducible buffer/flash kernels.
+  // THE DEFAULT, no environment: NO layer takes the image path. The bound is 0
+  // because the image read is not reproducible at any window width -- the pass
+  // walks the chunk plus the window, and a W=512 layer was measured originating
+  // divergences at chunk 0. The bundle is still "requested" at process level so
+  // the ring rule and the program build behave as before.
   EXPECT_EQ(causallm::detArm(), causallm::DetArm::kPerLayer);
   EXPECT_TRUE(causallm::determinismFirst());
   EXPECT_TRUE(causallm::imageAttnRequested()); // the bundle is still in play
-  EXPECT_TRUE(causallm::imageAttnLayer(512, MAXT));    // 0.3B/1.5B sliding
+  EXPECT_EQ(causallm::detImageWindowMax(), 0u);
+  EXPECT_FALSE(causallm::imageAttnLayer(512, MAXT));   // 0.3B/1.5B sliding
   EXPECT_FALSE(causallm::imageAttnLayer(kFull, MAXT)); // 0.3B L7/L15 etc.
+  EXPECT_FALSE(causallm::imageAttnLayer(1024, MAXT));  // E2B sliding
   // A window at least as wide as the context IS a full-attention read, however
   // it is spelled: the model may hand the window value through verbatim.
   EXPECT_FALSE(causallm::imageAttnLayer(MAXT, MAXT));
   EXPECT_FALSE(causallm::imageAttnLayer(MAXT + 1u, MAXT));
-  // ... and a window wide enough to be a full read in disguise is refused even
-  // when it does bound the context, because the split is not measured there.
-  // This is the rule that makes E2B (W=1024, measured NOT reproducible on the
-  // split: 8 runs, 2 distinct sequences) fall back to the all-layers arm from
-  // its own geometry, with no pack name anywhere in the decision.
-  EXPECT_EQ(causallm::detImageWindowMax(), 512u);
-  EXPECT_TRUE(causallm::imageAttnLayer(512, MAXT));   // the W=512 models
-  EXPECT_FALSE(causallm::imageAttnLayer(1024, MAXT)); // E2B
-  EXPECT_FALSE(causallm::imageAttnLayer(8192, MAXT));
-  EXPECT_TRUE(causallm::imageAttnLayer(causallm::detImageWindowMax(), MAXT));
-  EXPECT_FALSE(
-    causallm::imageAttnLayer(causallm::detImageWindowMax() + 1, MAXT));
-  { // the bound is overridable for experiments, both ways
+  // A bound of 0 must not read as "a zero-wide window qualifies": 0 spells
+  // "no window", which is a full read.
+  EXPECT_FALSE(causallm::imageAttnLayer(0, MAXT));
+  { // the bound is overridable for experiments, both ways -- 512 restores the
+    // per-layer split exactly, which is the A/B the cost rows were taken on.
+    ScopedEnv w("NNTR_DET_IMG_WINDOW_MAX", "512");
+    EXPECT_EQ(causallm::detImageWindowMax(), 512u);
+    EXPECT_TRUE(causallm::imageAttnLayer(512, MAXT));   // the W=512 models
+    EXPECT_FALSE(causallm::imageAttnLayer(1024, MAXT)); // E2B
+    EXPECT_FALSE(causallm::imageAttnLayer(8192, MAXT));
+    EXPECT_FALSE(causallm::imageAttnLayer(kFull, MAXT));
+    EXPECT_FALSE(causallm::imageAttnLayer(0, MAXT));
+    { // max_timestep unknown (0) must not turn every layer into a full one
+      EXPECT_TRUE(causallm::imageAttnLayer(512, 0u));
+      EXPECT_FALSE(causallm::imageAttnLayer(kFull, 0u));
+    }
+  }
+  {
     ScopedEnv w("NNTR_DET_IMG_WINDOW_MAX", "8192");
     EXPECT_TRUE(causallm::imageAttnLayer(8192, MAXT));
     EXPECT_TRUE(causallm::imageAttnLayer(1024, MAXT));
+  }
+  { // and 0 is what the default already is
     ScopedEnv w0("NNTR_DET_IMG_WINDOW_MAX", "0");
     EXPECT_FALSE(causallm::imageAttnLayer(512, MAXT));
-  }
-  { // max_timestep unknown (0) must not turn every layer into a full one
-    EXPECT_TRUE(causallm::imageAttnLayer(512, 0u));
-    EXPECT_FALSE(causallm::imageAttnLayer(kFull, 0u));
   }
 
   { // the ALL-LAYERS arm: nothing takes the image path
