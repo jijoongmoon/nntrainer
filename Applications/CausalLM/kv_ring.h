@@ -161,17 +161,28 @@ inline bool imageAttnRequested() {
 /**
  * @brief The widest attention window whose image-path read is measured
  *        bit-reproducible on this driver, in KV rows.
- * @details A safety bound on the per-layer split, not a tuning knob. The split
- * assumes "window-bounded read span == reproducible", which is measured for
- * W=512 against a 4096-row prefill block (a ~4.6K-row bounded span, 0 events in
- * every windowed layer of every run pair). It is NOT measured for a pack whose
- * window is itself long enough to be a full-attention read in disguise, and
- * such a pack must not silently inherit the assumption -- so a window wider
- * than this falls to the buffer/flash arm like a full layer. 2048 is the
- * longest read the image arm is bit-reproducible over as an UNBOUNDED span
- * (0.3B 2047: 28/28 run pairs identical; 4095: divergence appears), i.e. the
- * conservative reading of the same evidence. NNTR_DET_IMG_WINDOW_MAX overrides
- * it for experiments.
+ * @details A safety bound on the per-layer split, not a tuning knob, and it is
+ * load-bearing: it is what decides whether a pack gets the cheap per-layer
+ * split at all or falls back to the all-layers arm.
+ *
+ * 512, because that is the only window width the image arm is MEASURED
+ * bit-reproducible at. The 0.3B/1.5B models and gemma4 are W=512, and
+ * across every run pair of every cell their windowed layers never originate a
+ * divergence -- thousands of calls, 0 events. E2B is W=1024, and it is NOT
+ * reproducible on the split: 8 consecutive runs at 1024 generated tokens gave 2
+ * distinct sequences (7 on one output, 1 on another), which is the same
+ * decode-side flip the all-image default had. Its windowed layers walk ~1024 +
+ * block rows, and an earlier run had already located E2B's flip at a ~1947-row
+ * read span, so W=1024 is inside the failing regime and not outside it.
+ *
+ * So a window wider than this is treated exactly like a full-attention read:
+ * that layer takes the buffer/flash arm too. For a pack that is ALL wide-window
+ * plus full layers -- E2B -- the split therefore degenerates, by this one rule,
+ * into the all-layers arm, which IS measured reproducible there. That is the
+ * intended fallback, and it happens per pack from the pack's own geometry
+ * instead of from a hand-maintained list of pack names.
+ *
+ * NNTR_DET_IMG_WINDOW_MAX overrides it, in both directions, for the A/B.
  */
 inline unsigned int detImageWindowMax() {
   // Not cached, for the same reason detArm() is not: the arm rule must be a
@@ -185,7 +196,7 @@ inline unsigned int detImageWindowMax() {
     if (end != e && *end == '\0' && v >= 0)
       return (unsigned int)v;
   }
-  return 2048u;
+  return 512u;
 }
 
 /**
@@ -253,7 +264,7 @@ inline void announceDetArmOnce() {
                      : a == DetArm::kAllLayers ? "deterministic-all-layers"
                                                : "deterministic-per-layer";
   std::fprintf(stderr,
-               "[DETERMINISM] DETDEF_MARKER_C arm=%s image_bundle=%d "
+               "[DETERMINISM] DETDEF_MARKER_D arm=%s image_bundle=%d "
                "window_max=%u\n",
                name, (int)imageAttnRequested(), detImageWindowMax());
 }

@@ -796,6 +796,12 @@ TEST(KVRing, det_arm_per_layer_rule) {
   EXPECT_FALSE(causallm::imageAttnLayer(MAXT + 1u, MAXT));
   // ... and a window wide enough to be a full read in disguise is refused even
   // when it does bound the context, because the split is not measured there.
+  // This is the rule that makes E2B (W=1024, measured NOT reproducible on the
+  // split: 8 runs, 2 distinct sequences) fall back to the all-layers arm from
+  // its own geometry, with no pack name anywhere in the decision.
+  EXPECT_EQ(causallm::detImageWindowMax(), 512u);
+  EXPECT_TRUE(causallm::imageAttnLayer(512, MAXT));   // the W=512 models
+  EXPECT_FALSE(causallm::imageAttnLayer(1024, MAXT)); // E2B
   EXPECT_FALSE(causallm::imageAttnLayer(8192, MAXT));
   EXPECT_TRUE(causallm::imageAttnLayer(causallm::detImageWindowMax(), MAXT));
   EXPECT_FALSE(
@@ -803,6 +809,7 @@ TEST(KVRing, det_arm_per_layer_rule) {
   { // the bound is overridable for experiments, both ways
     ScopedEnv w("NNTR_DET_IMG_WINDOW_MAX", "8192");
     EXPECT_TRUE(causallm::imageAttnLayer(8192, MAXT));
+    EXPECT_TRUE(causallm::imageAttnLayer(1024, MAXT));
     ScopedEnv w0("NNTR_DET_IMG_WINDOW_MAX", "0");
     EXPECT_FALSE(causallm::imageAttnLayer(512, MAXT));
   }
