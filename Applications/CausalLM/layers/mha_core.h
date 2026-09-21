@@ -595,6 +595,18 @@ private:
    *  ringed layer then throws rather than reading stale rows. */
   unsigned int kv_mirror_rows_want = 0;
   int use_image_attn = -1;
+  /** [determinism] Whether THIS layer's attention arm is the image path, from
+   *  causallm::imageAttnLayer(local_window_size, max_timestep) at finalize.
+   *  Bit-identical output is the default, and the default routes a
+   *  FULL-attention layer to the reproducible buffer/flash kernels while a
+   *  window-bounded layer keeps the image path -- so the arm is a per-LAYER
+   *  fact, not a per-process one. Everything that used to read the process-wide
+   *  env answer (the decode-RoPE suppression, the Q-staging target, the
+   *  no-drain K/V chain, the OHWI decode RoPE) reads this instead, so the
+   *  stages of one layer cannot disagree about which arm it is on. Distinct
+   *  from use_image_attn, which is the RUNTIME state (-1 unprobed, and it
+   *  latches to 0 when mirror creation is refused). */
+  bool img_arm_want = false;
 
   /**
    * @brief Tight-stride V image view + mirror content tracking (texture-cache

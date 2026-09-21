@@ -27,6 +27,7 @@
 #define __CAUSALLM_KV_RING_H__
 
 #include <algorithm>
+#include <climits> // UINT_MAX -- the full-attention window sentinel
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -37,59 +38,224 @@
 namespace causallm {
 
 /**
- * @brief Has the caller asked for bit-identical output above everything else?
- * @details NNTR_DETERMINISTIC is the cross-lane knob the API can set; it
- * already pins the CUDA submission policy, the cuBLAS FP32 math mode and the
- * OpenCL subgroup reduction order. On the Adreno image bundle it additionally
- * means "take the arm that is actually reproducible" -- see
- * imageAttnRequested().
+ * @brief Which reproducibility arm this process runs.
+ * @details Bit-identical output is the BASELINE, not a flag. The three arms:
+ *
+ *   kPerLayer   (the DEFAULT, no environment)
+ *               Per-layer arm selection on the Adreno image bundle: a
+ *               FULL-attention layer takes the reproducible buffer/flash
+ *               kernels, a window-bounded layer keeps the image path (and its
+ *               ring). See imageAttnLayer() for the rule and the evidence.
+ *   kAllLayers  (NNTR_DETERMINISTIC=1)
+ *               The strongest arm: the buffer/flash kernels serve EVERY layer
+ *               and the image bundle is off process-wide. Kept because it is
+ *               the arm with the longest measurement history, and as the
+ *               fallback if a pack's geometry defeats the per-layer split.
+ *   kFast       (NNTR_ALLOW_NONDETERMINISTIC=1, or NNTR_DETERMINISTIC=0, or the
+ *               pack's own nntr_config opt-out)
+ *               The old throughput default: the image path serves every layer.
+ *               NOT bit-reproducible past ~2K keys on this driver. The opt-out
+ *               exists for a throughput-critical consumer that has accepted
+ *               that; it announces itself once on stderr.
+ *
+ * Every consumer -- the mirror prebuild, the Q staging, the decode-RoPE gate,
+ * the engage and the ring rule -- resolves the arm through this one function,
+ * so they cannot disagree about which arm the process is on.
  */
-inline bool determinismFirst() { return nntr_env_on("NNTR_DETERMINISTIC"); }
+enum class DetArm { kFast = 0, kPerLayer = 1, kAllLayers = 2 };
 
 /**
- * @brief Is the Adreno OHWI image-attention arm requested AND allowed?
- * @details Value-checked: NNTR_KV_IMG_ATTN=0 disables, as before.
+ * @brief The pack's own opt-out, from nntr_config.json.
+ * @details A pack that has accepted non-reproducible output for throughput says
+ * so in its own config ("allow_nondeterministic": true), which the Transformer
+ * base feeds here before any layer finalizes. It is weaker than an explicit
+ * NNTR_DETERMINISTIC (the caller outranks the pack) and stronger than the
+ * default. Reference semantics so the getter and the setter cannot drift.
+ */
+inline bool &packAllowsNondeterministic() {
+  static bool allow = false;
+  return allow;
+}
+
+/**
+ * @brief Resolve the reproducibility arm (see DetArm).
+ * @details NNTR_DETERMINISTIC is value-checked in BOTH directions, because it
+ * is the pre-existing cross-lane knob: =1 asks for the strongest arm, =0 is the
+ * explicit opt-out that used to be "just don't set it".
+ * NNTR_ALLOW_NONDETERMINISTIC is the new, positively-named opt-out. Neither is
+ * needed for the default.
+ */
+inline DetArm detArm() {
+  DetArm arm = DetArm::kPerLayer; // the baseline: no environment needed
+  const char *d = std::getenv("NNTR_DETERMINISTIC");
+  if (d != nullptr && d[0] != '\0')
+    // Explicit, both ways: =1 asks for the whole-process arm, =0 is the
+    // pre-existing spelling of the opt-out and keeps working as one.
+    arm =
+      nntr_env_on("NNTR_DETERMINISTIC") ? DetArm::kAllLayers : DetArm::kFast;
+  else if (nntr_env_on("NNTR_ALLOW_NONDETERMINISTIC") ||
+           packAllowsNondeterministic())
+    arm = DetArm::kFast;
+  // Not cached: every input is a pure read, and a cache would make the answer
+  // depend on WHO asked first -- which is exactly the failure mode the pack
+  // opt-out (set at model construction, consumed at layer finalize) would hit,
+  // and which would make the rule untestable across environments in one
+  // process. The announcement, which must happen once, is the only state.
+  if (arm == DetArm::kFast) {
+    static bool logged = false;
+    if (!logged) {
+      logged = true;
+      std::fprintf(
+        stderr,
+        "[DETERMINISM] the FAST non-deterministic attention arm is selected "
+        "(NNTR_ALLOW_NONDETERMINISTIC=1, NNTR_DETERMINISTIC=0, or the pack's "
+        "nntr_config \"allow_nondeterministic\"). Output is NOT "
+        "bit-reproducible "
+        "run to run past ~2K keys on this driver. Unset it for the "
+        "reproducible "
+        "default.\n");
+    }
+  }
+  return arm;
+}
+
+/**
+ * @brief Has the caller asked for bit-identical output above everything else?
+ * @details True for both reproducible arms; it is what the CUDA submission
+ * policy, the cuBLAS FP32 math mode and the OpenCL subgroup reduction order
+ * key on, and those want the guarantee whichever Adreno arm is in play. Only
+ * the explicit opt-out turns it off.
+ */
+inline bool determinismFirst() { return detArm() != DetArm::kFast; }
+
+/**
+ * @brief Is the Adreno OHWI image-attention arm in play for ANY layer?
+ * @details Value-checked: NNTR_KV_IMG_ATTN=0 disables, as before. This is the
+ * PROCESS-level question -- "was the image bundle asked for, and can some layer
+ * take it" -- which is what the shared program build, the RoPE LUT and the ring
+ * rule need. Whether a GIVEN layer takes it is imageAttnLayer().
  *
- * Under NNTR_DETERMINISTIC the answer is NO, and that is the point of the flag
- * here. Measured on Adreno 840, 8 consecutive runs per cell, per-node output
- * hashes: the image arm is bit-reproducible only up to ~2K keys (0.3B 2047 and
- * 1.5B 1K: 28/28 run pairs identical; 0.3B 8191 10/28, 0.3B 16383 1/28,
- * 1.5B 3925 6/28, 1.5B 8103 3/28) even with the mirror image-written and the
- * attention split removed. The reason is below our code: a read_imageui pass
- * over many texel rows of a buffer-backed image2d is not coherently served on
- * this driver. Every divergence originates in a FULL-attention layer, whose
- * mirror read walks all keys, and never in a windowed layer, whose read walks
- * ~512 + chunk rows however tall its mirror is.
- *
- * The buffer/flash arm IS bit-reproducible -- 0.3B 16383 and 1.5B 8103 both
- * 28/28 pairs identical over 8 runs, E2B reproducible at 1024 tokens -- and it
- * is the only arm that is. It is not free and it is not the same numbers:
- * ~3.05x end to end on 1.5B 8103 (26783 vs 8777 ms), ~4.4x on the 0.3B, and
- * E2B's sequence re-bases because the flash kernels are a
- * different numeric path. So this is strictly opt-in and the substitution is
- * announced once.
+ * Only the all-layers arm answers NO outright: there the buffer/flash kernels
+ * serve every layer.
  */
 inline bool imageAttnRequested() {
   const char *e = std::getenv("NNTR_KV_IMG_ATTN");
   if (e == nullptr || std::atoi(e) == 0)
     return false;
-  if (determinismFirst()) {
+  if (detArm() == DetArm::kAllLayers) {
     static bool logged = false;
     if (!logged) {
       logged = true;
-      std::fprintf(stderr,
-                   "[DETERMINISM] NNTR_DETERMINISTIC=1: the Adreno image K/V "
-                   "attention arm "
-                   "is not bit-reproducible past ~2K keys on this driver, so "
-                   "it is disabled "
-                   "and the buffer/flash arm serves every layer. Expect ~3x "
-                   "end to end and "
-                   "a DIFFERENT (but reproducible) token sequence. Unset "
-                   "NNTR_DETERMINISTIC for the throughput default.\n");
+      std::fprintf(
+        stderr,
+        "[DETERMINISM] NNTR_DETERMINISTIC=1: the buffer/flash attention arm "
+        "serves EVERY layer (the Adreno image K/V arm is off process-wide). "
+        "This is the strongest arm and the most expensive one; the default "
+        "(no environment) routes only the full-attention layers here.\n");
     }
     return false;
   }
   return true;
+}
+
+/**
+ * @brief The widest attention window whose image-path read is measured
+ *        bit-reproducible on this driver, in KV rows.
+ * @details A safety bound on the per-layer split, not a tuning knob. The split
+ * assumes "window-bounded read span == reproducible", which is measured for
+ * W=512 against a 4096-row prefill block (a ~4.6K-row bounded span, 0 events in
+ * every windowed layer of every run pair). It is NOT measured for a pack whose
+ * window is itself long enough to be a full-attention read in disguise, and
+ * such a pack must not silently inherit the assumption -- so a window wider
+ * than this falls to the buffer/flash arm like a full layer. 2048 is the
+ * longest read the image arm is bit-reproducible over as an UNBOUNDED span
+ * (0.3B 2047: 28/28 run pairs identical; 4095: divergence appears), i.e. the
+ * conservative reading of the same evidence. NNTR_DET_IMG_WINDOW_MAX overrides
+ * it for experiments.
+ */
+inline unsigned int detImageWindowMax() {
+  // Not cached, for the same reason detArm() is not: the arm rule must be a
+  // pure function of the environment at the moment it is asked, or the answer
+  // depends on who asked first and the rule cannot be tested across
+  // environments.
+  const char *e = std::getenv("NNTR_DET_IMG_WINDOW_MAX");
+  if (e != nullptr && e[0] != '\0') {
+    char *end = nullptr;
+    const long v = std::strtol(e, &end, 10);
+    if (end != e && *end == '\0' && v >= 0)
+      return (unsigned int)v;
+  }
+  return 2048u;
+}
+
+/**
+ * @brief Does THIS layer take the Adreno image attention arm?
+ * @param local_window_size the layer's props::SlidingWindow (UINT_MAX = full).
+ * @param max_timestep the model's max sequence; a window at least this wide is
+ *        a full-attention layer however it is spelled.
+ * @details The per-layer rule, and the whole point of the default.
+ *
+ * MEASURED (Adreno 840, per-node output hashes over whole runs,
+ * an earlier attribution): with the mirror image-written and the attention
+ * split removed, 20 of 21 diverging run pairs have their FIRST differing node
+ * in a FULL-attention layer's attention op, and a window-bounded layer NEVER
+ * originates a divergence -- including with the ring forced off, so that its
+ * mirror is full-context height and only its READ stays short. The failing
+ * thing is a read_imageui pass over many texel rows of a buffer-backed
+ * image2d, and its rate grows with the number of rows one pass walks:
+ *   full-attention read span 2047 rows: 0 events in 15 pairs
+ *                            4095     : 1 node in 1 of 3 runs
+ *                            8191     : 32-462 nodes
+ *                            16383    : 1-769 nodes
+ * A window-bounded layer's pass walks ~W + block rows whatever the context, so
+ * it stays in the clean regime at every context length. That is why the arm can
+ * be chosen per layer instead of per process, and why doing so costs a small
+ * fraction of the all-layers arm: the measured models are mostly windowed (0.3B
+ * full at 7,15 of 16; 1.5B at 5,11,17,23 of 24; gemma4 3 of 15).
+ *
+ * The decision is STATIC per layer -- taken once at finalize, never flipped per
+ * call. It has to be: on the image arm this step's K/V is written into the
+ * image, not the buffer that aliases it, so a layer that served one call from
+ * the image and the next from the flash kernels would read a mirror the buffer
+ * does not have. Per-layer is safe for exactly the reason per-call is not: each
+ * layer owns its own K/V cache and its own mirror, so the two arms never share
+ * a store.
+ */
+inline bool imageAttnLayer(size_t local_window_size,
+                           unsigned int max_timestep) {
+  if (!imageAttnRequested())
+    return false; // bundle off, or the all-layers arm
+  if (detArm() == DetArm::kFast)
+    return true; // the old throughput default: every layer
+  // kPerLayer: the read span must be bounded by the window, and the window must
+  // be no wider than the span the image arm is measured reproducible over.
+  if (local_window_size == (size_t)UINT_MAX ||
+      (max_timestep != 0u && local_window_size >= (size_t)max_timestep))
+    return false; // full attention: the read walks every key
+  return local_window_size <= (size_t)detImageWindowMax();
+}
+
+/**
+ * @brief Say once, on stderr, which reproducibility arm this process resolved.
+ * @details The arm changes both the numbers and (on some packs) the token
+ * sequence, so a log that does not say which arm produced it is not evidence.
+ * Called from the first mha_core finalize; idempotent. The marker string is
+ * also what a deployment check greps for to prove the deployed .so is this
+ * build.
+ */
+inline void announceDetArmOnce() {
+  static bool done = false;
+  if (done)
+    return;
+  done = true;
+  const DetArm a = detArm();
+  const char *name = a == DetArm::kFast        ? "fast-NONDETERMINISTIC"
+                     : a == DetArm::kAllLayers ? "deterministic-all-layers"
+                                               : "deterministic-per-layer";
+  std::fprintf(stderr,
+               "[DETERMINISM] DETDEF_MARKER_B arm=%s image_bundle=%d "
+               "window_max=%u\n",
+               name, (int)imageAttnRequested(), detImageWindowMax());
 }
 
 /**
@@ -152,15 +318,23 @@ inline bool kvRingArmAvailable() {
     return false;
   if (nntr_env_on("NNTR_MHA_GPU_IMG"))
     return false;
-  if (determinismFirst() && std::getenv("NNTR_KV_IMG_ATTN") != nullptr &&
+  if (detArm() == DetArm::kAllLayers &&
+      std::getenv("NNTR_KV_IMG_ATTN") != nullptr &&
       std::atoi(std::getenv("NNTR_KV_IMG_ATTN")) != 0)
-    // [determinism] The image bundle under NNTR_DETERMINISTIC falls back to the
-    // buffer/flash arm (imageAttnRequested), and the only arm measured
-    // bit-reproducible there is the one WITHOUT the ring: the flash kernels do
-    // modulo-map the row, but a 2048-row ring under the image bundle was
-    // measured WRONG on Adreno 840. The reproducible configuration is image off
-    // AND ring off, so refuse it here rather than leave a ringed allocation in
-    // a profile whose whole purpose is a guarantee.
+    // [determinism] The image bundle under the ALL-LAYERS arm falls back to the
+    // buffer/flash kernels for everything (imageAttnRequested), and the only
+    // configuration measured bit-reproducible there is the one WITHOUT the
+    // ring: the flash kernels do modulo-map the row, but a 2048-row ring under
+    // the image bundle was measured WRONG on Adreno 840. The reproducible
+    // configuration is image off AND ring off, so refuse it here rather than
+    // leave a ringed allocation in a profile whose whole purpose is a
+    // guarantee.
+    //
+    // The DEFAULT per-layer arm does NOT refuse: there the windowed layers are
+    // still on the image path with their sliding mirrors, which is the ring's
+    // validated reader, and the full-attention layers are not ringed anyway
+    // (kvRingCap returns 0 for them), so each layer's store and reader match.
+    // Keeping the ring is what makes the default a memory win as well.
     return false;
   if (imageAttnRequested()) {
     // The Adreno OHWI image arm serves a ringed layer through a SLIDING

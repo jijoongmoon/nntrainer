@@ -827,6 +827,18 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
   kv_mirror_rows_want = causallm::kvMirrorRows(
     kv_ring_cap, (unsigned int)local_window_size, prefill_chunk);
 
+  /** [determinism] This layer's attention arm, decided ONCE here from facts the
+   * layer already has. Bit-identical output is the default, and the default
+   * routes a FULL-attention layer to the reproducible buffer/flash kernels
+   * while a window-bounded layer keeps the image path;
+   * causallm::imageAttnLayer() holds the rule and the measurement behind it.
+   * Every later stage of THIS layer reads this one field, so the mirror
+   * prebuild, the Q staging, the two RoPE gates and the engage cannot disagree
+   * -- which is the only reason the arm had to be a per-process decision
+   * before. */
+  img_arm_want = causallm::imageAttnLayer(local_window_size, max_timestep);
+  causallm::announceDetArmOnce();
+
   /** attention scaling computation */
   rope_scaling_type = std::get<props::RopeScalingType>(mha_core_props).get();
   scale = std::get<props::RopeScalingFactor>(mha_core_props).get();
@@ -979,21 +991,25 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
 #if defined(ENABLE_OPENCL)
   // OHWI K/V mirror + image-view prebuild (create_ohwi_kv_mirror etc.) is
   // OpenCL-only.
-  // NOTE: image attn is ALL-OR-NOTHING per process. use_image_attn is the
-  // switch the whole pipeline keys on (concat-RoPE drain mode, Q staging,
-  // OHWI decode RoPE, engage); mixing image and flash layers (or flipping
-  // per call) desyncs those stages — empirically garbage even at short
-  // context. Sliding windows are handled IN the OHWI kernels (local_window
-  // arg); the per-MODEL safety decision for geometry the kernels cannot
-  // serve (d > 256 → force NNTR_KV_IMG_ATTN=0) is made in the model class
-  // before layers finalize; here we only honor the env uniformly
-  // (value-checked).
-  // [determinism] causallm::imageAttnRequested() is the ONE place the arm is
-  // decided (value-checked, and NO under NNTR_DETERMINISTIC), so the mirror
-  // prebuild, the Q staging, the decode-RoPE gate, the engage and the ring rule
-  // cannot disagree about which arm this process is on.
-  if (causallm::imageAttnRequested() && !kv_int8 && head_dim % 8 == 0 &&
-      !kv_mirror_init) {
+  // NOTE: the arm is all-or-nothing per LAYER, never per call. use_image_attn
+  // is the switch the whole pipeline keys on (concat-RoPE drain mode, Q
+  // staging, OHWI decode RoPE, engage); flipping it per call desyncs those
+  // stages — empirically garbage even at short context, because this step's
+  // K/V is written into the image rather than the buffer that aliases it, so a
+  // call served by the flash kernels would read a mirror the buffer does not
+  // have. Per LAYER is safe for exactly the reason per call is not: each layer
+  // owns its own K/V cache and its own mirror, so the two arms never share a
+  // store. Sliding windows are handled IN the OHWI kernels (local_window arg);
+  // the per-MODEL safety decision for geometry the kernels cannot serve
+  // (d > 256 → force NNTR_KV_IMG_ATTN=0) is made in the model class before
+  // layers finalize.
+  // [determinism] img_arm_want (= causallm::imageAttnLayer above) is the ONE
+  // place this layer's arm is decided, so the mirror prebuild, the Q staging,
+  // the decode-RoPE gate, the engage and the ring rule cannot disagree about
+  // which arm this LAYER is on. A full-attention layer answers false and takes
+  // the reproducible buffer/flash kernels -- no mirror is built for it, which
+  // is also why the default is a memory win over the old throughput default.
+  if (img_arm_want && !kv_int8 && head_dim % 8 == 0 && !kv_mirror_init) {
     static const unsigned int mirror_cap = []() {
       const char *e = std::getenv("NNTR_KV_MIRROR_CAP");
       return e ? (unsigned int)std::atoi(e) : 0u;
@@ -2025,19 +2041,22 @@ void MHACoreLayer::one_batch_incremental_forwarding(
     // (NNTR_KV_IMG_ATTN) GPU-RoPE-at-decode produces garbage (the image KV/attn
     // consumes host-RoPE'd Q/K in a different layout), so suppress the property
     // there. The explicit NNTR_MHA_GPU_DECODE env override is unaffected.
-    static const bool _kv_img_attn_env = causallm::imageAttnRequested();
+    // [determinism] PER-LAYER, not the process env: under the default arm a
+    // full-attention layer is on the buffer/flash path, where the
+    // gpu_decode_rope property IS validated, so suppressing it there would cost
+    // the layer its GPU decode RoPE for a hazard it does not have.
+    const bool _img_arm = img_arm_want;
     const bool _gpu_rope_decode =
       _gpu_rope_decode_env ||
-      (std::get<props::GpuDecodeRope>(mha_core_props).get() &&
-       !_kv_img_attn_env);
+      (std::get<props::GpuDecodeRope>(mha_core_props).get() && !_img_arm);
     // Image path (Adreno): a GPU RoPE kernel dispatch per layer for the M=1
     // decode step is SLOWER than the trivial host rotation of a single row
     // (measured ~14.7 vs ~18 TPS); keep the GPU path for prefill (the big win)
     // and let decode fall to the host RoPE. Non-image (Intel/CUDA) unchanged.
     // NNTR_MHA_GPU_DECODE still forces the GPU decode path (_gpu_rope_decode).
-    const bool _rope_len_ok = ((to - from) >= ROPE_MIN_PREFILL &&
-                               !(_kv_img_attn_env && (to - from) == 1)) ||
-                              (_gpu_rope_decode && (to - from) == 1);
+    const bool _rope_len_ok =
+      ((to - from) >= ROPE_MIN_PREFILL && !(_img_arm && (to - from) == 1)) ||
+      (_gpu_rope_decode && (to - from) == 1);
     if (!_gpu_rope_off && _mha_gpu_on && use_gemm_attention && !kv_int8 &&
         !kv_ohwi_now && _rope_len_ok &&
         query_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
@@ -2182,10 +2201,9 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                                        ? (_kv_nodrain_override == 1)
                                        : !prefillKvDrain();
         const bool kv_chain_gpu_only =
-          _kv_nodrain_env && _kv_img_attn_env && use_image_attn == 1;
-        void *q_rope_out = q_out_stage != nullptr
-                             ? q_out_stage
-                             : (_kv_img_attn_env ? nullptr : q_cl);
+          _kv_nodrain_env && _img_arm && use_image_attn == 1;
+        void *q_rope_out =
+          q_out_stage != nullptr ? q_out_stage : (_img_arm ? nullptr : q_cl);
         bool ok =
           nntrainer::rope_inplace_f16_cl(
             q_p, q_p, cos_lut, sin_lut, to - from, num_heads_Q, head_dim,
@@ -2196,7 +2214,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             // only a submission flush is needed (no full clFinish drain).
             // This is the pre-regression cost (a drain here cost ~5 TPS
             // of decode). Non-image keeps the default drain.
-            /*drain_svm_out=*/!_kv_img_attn_env) &&
+            /*drain_svm_out=*/!_img_arm) &&
           nntrainer::rope_inplace_f16_cl(
             k_p, kc_p, cos_lut, sin_lut, to - from, num_heads_KV, head_dim,
             cache_index, mp, kc_svm, /*in_clmem=*/k_cl,
@@ -2361,8 +2379,8 @@ void MHACoreLayer::one_batch_incremental_forwarding(
     // it only when this layer's attention actually takes the image path
     // (use_image_attn == 1; uniform per process, see the prebuild note).
     if (!gpu_rope_done && _ohwi_gpu_rope && !_gpu_rope_off && _mha_gpu_on &&
-        _kv_img_attn_env && use_image_attn == 1 && use_gemm_attention &&
-        !kv_int8 && (to - from) == 1 &&
+        _img_arm && use_image_attn == 1 && use_gemm_attention && !kv_int8 &&
+        (to - from) == 1 &&
         query_step.getDataType() == ml::train::TensorDim::DataType::FP16 &&
         key_step.getDataType() == ml::train::TensorDim::DataType::FP16 &&
         value_step.getDataType() == ml::train::TensorDim::DataType::FP16 &&
@@ -3284,7 +3302,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
           // Value-checked so NNTR_KV_IMG_ATTN=0 really disables the image
           // path (the Adreno auto-default in cl_context uses overwrite=0 and
           // cannot override a user-provided 0).
-          use_image_attn = causallm::imageAttnRequested() ? 1 : 0;
+          use_image_attn = img_arm_want ? 1 : 0;
         }
         // Sliding-window layers past their window must NOT take the image
         // path: qk_matmul_f16_ohwi_img has only the causal upper-bound mask
