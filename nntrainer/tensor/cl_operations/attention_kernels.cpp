@@ -3371,10 +3371,29 @@ bool flash_attention_prefill_f16_cl(
     const char *e = std::getenv("NNTR_FLASH_BLOCKQ");
     if (e)
       return std::atoi(e) != 0 ? 1 : 0;
-    // Default ON for the Intel/buffer path (NNTR_V8C_BUF) — Block-Q +
-    // subgroup-reduce is the measured-best Intel attention (M=1024 ~2075 TPS
-    // vs vec-flash ~1119, token-identical). Adreno (unset) uses the image path.
-    return v8c_use_buffer_path() ? 1 : 0; // Intel buffer path => 1
+    // Default ON everywhere. Intel: Block-Q + subgroup-reduce is the
+    // measured-best Intel attention (M=1024 ~2075 TPS vs vec-flash ~1119,
+    // token-identical).
+    //
+    // Adreno used to default OFF here, on the reading that "Adreno uses the
+    // image path anyway". That reading is now wrong in the case that matters.
+    // Bit-identical output is the DEFAULT on the Adreno lane, and it is bought
+    // by routing the FULL-attention layers off the image path onto these flash
+    // kernels (Applications/CausalLM/kv_ring.h, imageAttnLayer). A
+    // full-attention prefill CHUNK 0 is square and unwindowed, so
+    // flash_needs_blockq below is false for it and it alone fell through to
+    // flash_attention_prefill_f16_skeleton: one work-item per (head, query
+    // row), scalar half loads, and a float[FLASH_MAX_D] q_row + acc pair in
+    // private memory that spills. Measured on Adreno 840 (0.3B, d=64, 2047
+    // keys, NNTR_MHA_ATTN_TIMER): 118.5 ms per full-attention prefill call
+    // against 4.5 ms for a windowed layer on the image kernels. The skeleton
+    // was never meant to be a production kernel -- its own header says
+    // "CORRECTNESS-FIRST DESIGN ... Tiling/LDS cooperation is a follow-up".
+    // Block-Q is that follow-up, it is already the arm every other Adreno
+    // flash call takes (flash_needs_blockq fires for chunk >= 1, for every
+    // windowed layer and for every ringed one), and its LDS-tree reduction is a
+    // fixed order, so it is bit-reproducible run to run.
+    return 1;
   }();
   // Block-Q (and XMX on top of it) is the ONLY variant that declares the chunk
   // offset (q_off = N_kv - M), the sliding window, the logit soft-cap and the
@@ -3476,6 +3495,20 @@ bool flash_attention_prefill_f16_cl(
       // (intel_reqd_sub_group_size (64) is INVALID — Intel subgroups are
       // {8,16,32}).
       v = ((int)head_dim >= 512) ? 64 : (((int)head_dim > 128) ? 32 : 16);
+      // The Intel width turns out to be the right one on Adreno too, which is
+      // worth recording because the opposite is the obvious guess: an Adreno
+      // 840 wave is 64 lanes, so LWS=16 is a quarter-wave group and pays
+      // log2(16)=4 LDS barrier rounds per key tile, and widening it to the wave
+      // looks free. MEASURED on Adreno 840 (full-attention prefill at
+      // 8103/16383 keys, NNTR_MHA_ATTN_TIMER, whole-run prefill ms), it is a
+      // LOSS at both dense widths:
+      //   d=64,  16383 keys: LWS 16 -> 22432 ms prefill, LWS 64 -> 27866
+      //   d=128,  8103 keys: LWS 16 -> 16008 ms prefill, LWS 64 -> 17173
+      // because VPL = d / LWS falls with the width: at d=64 LWS 64 means VPL 1,
+      // i.e. a scalar 2-byte load per lane instead of a 8-byte vload4, and the
+      // reduction tree grows to 6 barrier rounds. The occupancy does not pay
+      // for the lost vector width. So the width stays as it is and
+      // NNTR_FLASH_COOP_LWS remains the way to A/B it per device.
     } else {
       // Intel/buffer path default LWS=16 => VPL = d/16 = 8 (half8 vloads),
       // the measured Intel-Arc optimum (1153 TPS @ M=1024 vs 981 at LWS=64).
@@ -3494,6 +3527,14 @@ bool flash_attention_prefill_f16_cl(
   // use the LDS-tree reduction (reqd_work_group_size only -> 64 is fine). The
   // d=256 sliding path keeps LWS=32 + SG (untouched). The kernel cache keys on
   // name+copts, so d256(LWS32,SG) and d512(LWS64,no-SG) are distinct variants.
+  // [determinism] Deliberately NOT extended to the Adreno
+  // qcom_reqd_sub_group_size path, even though the kernel has one and it would
+  // remove the LDS barrier tree. sub_group_reduce_add's internal summation
+  // order is vendor-opaque (see the NNTR_DETERMINISTIC note at flash_blockq_sg
+  // above), and on this lane bit-identical output is now the DEFAULT rather
+  // than an opt-in, so an arm whose reduction order we cannot state is not
+  // eligible to be the default. The width widening above buys the occupancy
+  // without giving that up.
   const int flash_blockq_sg_eff =
     (flash_blockq_sg && flash_coop_lws <= 32) ? 1 : 0;
   // FLASH_COOP_BLOCK_KV: keys reduced per phase (tunable; 1 = no blocking).

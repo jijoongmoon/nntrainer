@@ -253,7 +253,7 @@ inline void announceDetArmOnce() {
                      : a == DetArm::kAllLayers ? "deterministic-all-layers"
                                                : "deterministic-per-layer";
   std::fprintf(stderr,
-               "[DETERMINISM] DETDEF_MARKER_B arm=%s image_bundle=%d "
+               "[DETERMINISM] DETDEF_MARKER_C arm=%s image_bundle=%d "
                "window_max=%u\n",
                name, (int)imageAttnRequested(), detImageWindowMax());
 }

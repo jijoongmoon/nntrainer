@@ -394,8 +394,28 @@ flash_attention_prefill_f16_coop(
 #define FV_CVT_H(v) convert_half2(v)
 #define FV_VLOAD_F(p, off) vload2((off), (p))
 #define FV_VSTORE_F(v, off, p) vstore2((v), (off), (p))
+#elif FLASH_VEC_VPL == 1
+// One d-element per lane: the work group is as wide as head_dim. There is no
+// vector load here by construction; a scalar deref IS the whole lane's work, and
+// the element type stays the same so every FV_ user is unchanged.
+//
+// This exists so that LWS = head_dim is a legal configuration at all -- before
+// it, the host had to reject it and the widest group at d=64 was 32 (VPL 2). It
+// is NOT the default anywhere: measured on Adreno 840 it is a loss at both dense
+// widths (see the Adreno note beside flash_coop_lws in attention_kernels.cpp),
+// because losing the vector load costs more than the extra occupancy buys. It is
+// kept so that NNTR_FLASH_COOP_LWS=<head_dim> remains an A/B a future device can
+// re-run rather than a configuration that fails to compile.
+#define FVHALF half
+#define FVFLOAT float
+#define FV_VLOAD(p, off) ((p)[(off)])
+#define FV_VSTORE(v, off, p) ((p)[(off)] = (v))
+#define FV_CVT_F(v) ((float)(v))
+#define FV_CVT_H(v) ((half)(v))
+#define FV_VLOAD_F(p, off) ((p)[(off)])
+#define FV_VSTORE_F(v, off, p) ((p)[(off)] = (v))
 #else
-#error FLASH_VEC_VPL must be 2 4 or 8 set FLASH_VEC_LWS to half quarter eighth of d
+#error FLASH_VEC_VPL must be 1 2 4 or 8 set FLASH_VEC_LWS to d half quarter eighth of d
 #endif
 
 // Horizontal fp32 sum of a FVFLOAT register (compile-time unrolled per VPL).
@@ -404,8 +424,10 @@ static inline float fv_hsum(FVFLOAT v) {
   return (v.s0 + v.s1) + (v.s2 + v.s3) + ((v.s4 + v.s5) + (v.s6 + v.s7));
 #elif FLASH_VEC_VPL == 4
   return (v.s0 + v.s1) + (v.s2 + v.s3);
-#else
+#elif FLASH_VEC_VPL == 2
   return v.s0 + v.s1;
+#else
+  return v; // VPL 1: the "vector" is the scalar, and the sum is itself
 #endif
 }
 
