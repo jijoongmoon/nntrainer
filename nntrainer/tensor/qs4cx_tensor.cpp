@@ -512,7 +512,11 @@ bool qs4cxHeapBypassOn() {
     const char *e = std::getenv("NNTR_QS4CX_HEAP_BYPASS");
     if (e != nullptr)
       return e[0] != '0';
+#if defined(__ANDROID__)
+    return true;
+#else
     return false;
+#endif
   }();
   return on;
 }

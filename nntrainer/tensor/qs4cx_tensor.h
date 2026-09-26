@@ -394,9 +394,14 @@ void refuseIfQs4cxPayloadDropped(const void *payload, const char *who);
  *        heap allocation instead of a slice of the shared weight pool?
  *
  * Set in the environment, the value wins (=0 opts out, anything else opts
- * in); unset is off. One resolver for the three readers (the pool request,
- * the uninitialized-payload allocation and the payload release), so they can
- * never disagree about whether a payload is self-owned.
+ * in). Unset, the default is ON on Android and OFF elsewhere. On Android the
+ * weight pool is an OpenCL SVM arena that the kgsl driver maps and pins for
+ * the GPU, so a QS4CX weight placed there stays resident on the GPU for the
+ * life of the process even though the v8c kernels only ever read the device
+ * repack built from it: a full second copy of every FC weight. A self-owned
+ * heap payload is the only shape whose pages can be given back after that
+ * repack (see NNTR_V8C_DROP_PLAIN). Elsewhere the bypass stays opt-in, as the
+ * SDK bundles that were measured with it already set the variable.
  *
  * Read once; the first call latches the answer for the process.
  */
