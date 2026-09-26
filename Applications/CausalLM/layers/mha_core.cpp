@@ -828,9 +828,9 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
     kv_ring_cap, (unsigned int)local_window_size, prefill_chunk);
 
   /** [determinism] This layer's attention arm, decided ONCE here from facts the
-   * layer already has. Bit-identical output is the default, and the default
-   * routes a FULL-attention layer to the reproducible buffer/flash kernels
-   * while a window-bounded layer keeps the image path;
+   * layer already has. The fast default puts every layer on the image path;
+   * the reproducible arm (NNTR_DETERMINISTIC=1) routes a layer to the
+   * buffer/flash kernels by a per-layer rule;
    * causallm::imageAttnLayer() holds the rule and the measurement behind it.
    * Every later stage of THIS layer reads this one field, so the mirror
    * prebuild, the Q staging, the two RoPE gates and the engage cannot disagree
@@ -1006,9 +1006,9 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
   // [determinism] img_arm_want (= causallm::imageAttnLayer above) is the ONE
   // place this layer's arm is decided, so the mirror prebuild, the Q staging,
   // the decode-RoPE gate, the engage and the ring rule cannot disagree about
-  // which arm this LAYER is on. A full-attention layer answers false and takes
-  // the reproducible buffer/flash kernels -- no mirror is built for it, which
-  // is also why the default is a memory win over the old throughput default.
+  // which arm this LAYER is on. A layer that answers false takes the
+  // reproducible buffer/flash kernels and no mirror is built for it, which is
+  // why the reproducible arm is also a small memory win over the fast default.
   if (img_arm_want && !kv_int8 && head_dim % 8 == 0 && !kv_mirror_init) {
     static const unsigned int mirror_cap = []() {
       const char *e = std::getenv("NNTR_KV_MIRROR_CAP");

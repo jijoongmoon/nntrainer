@@ -748,21 +748,22 @@ TEST(KVRing, slab_sync_segments_stay_inside_both_allocations) {
 }
 
 /**
- * @brief The per-layer attention arm rule: bit-identical output is the DEFAULT,
- *        and the default pays for it in the full-attention layers only.
- * @details This is the rule the Adreno determinism default rests on. Measured
- * (Adreno 840, per-node output hashes): 20 of 21 diverging run pairs originate
- * in a FULL-attention layer's attention op and a window-bounded layer never
- * originates one MORE OFTEN, because a full read walks every key while a
- * windowed read walks the chunk plus the window. Re-measured, a windowed read
- * is not clean either (2 divergences in 28 runs of the 1.5B 3925 cell, both
- * first differing at a windowed layer's attention op), so the bound is now 0
- * and a deterministic arm puts EVERY layer on the flash kernels. The per-layer
- * predicate stays, and stays pinned, because the bound is one env away.
+ * @brief The attention arm rule: the fast image arm is the DEFAULT, and
+ *        NNTR_DETERMINISTIC=1 is the opt-in reproducible per-layer arm.
+ * @details Measured (Adreno 840, per-node output hashes): 20 of 21 diverging
+ * run pairs originate in a FULL-attention layer's attention op, and re-measured
+ * a windowed read is not clean either (2 divergences in 28 runs of the 1.5B
+ * 3925 cell, both first differing at a windowed layer's attention op), so the
+ * bound is 0 and the reproducible arm puts EVERY layer on the flash kernels.
+ * That arm was the default until its cost was measured (+20~22 % end-to-end,
+ * prefill 2~4x slower on Adreno at equal tokens); the fast arm is the default
+ * now and reproducibility is one env away. The per-layer predicate stays, and
+ * stays pinned, because the bound is one env away too.
  *
- * Pinned here because the whole guarantee is "a full layer is never on the
- * image path unless someone explicitly opted out", and that is a one-line
- * predicate that a later refactor could invert without any test noticing.
+ * Pinned here because the whole contract is "no environment = the fast arm,
+ * NNTR_DETERMINISTIC=1 = no layer on the image path", and both halves are
+ * one-line predicates that a later refactor could invert without any test
+ * noticing.
  */
 TEST(KVRing, det_arm_per_layer_rule) {
   const size_t kFull = (size_t)UINT_MAX;
@@ -774,10 +775,13 @@ TEST(KVRing, det_arm_per_layer_rule) {
 
   { // the image bundle is not in play at all -> no layer takes it, any arm
     ScopedEnv img("NNTR_KV_IMG_ATTN", nullptr);
-    EXPECT_EQ(causallm::detArm(), causallm::DetArm::kPerLayer);
+    EXPECT_EQ(causallm::detArm(), causallm::DetArm::kFast);
     EXPECT_FALSE(causallm::imageAttnRequested());
     EXPECT_FALSE(causallm::imageAttnLayer(512, MAXT));
     EXPECT_FALSE(causallm::imageAttnLayer(kFull, MAXT));
+    ScopedEnv on("NNTR_DETERMINISTIC", "1");
+    EXPECT_FALSE(causallm::imageAttnRequested());
+    EXPECT_FALSE(causallm::imageAttnLayer(512, MAXT));
   }
   { // value-checked, as before
     ScopedEnv img("NNTR_KV_IMG_ATTN", "0");
@@ -787,11 +791,48 @@ TEST(KVRing, det_arm_per_layer_rule) {
 
   ScopedEnv img("NNTR_KV_IMG_ATTN", "1");
 
-  // THE DEFAULT, no environment: NO layer takes the image path. The bound is 0
-  // because the image read is not reproducible at any window width -- the pass
-  // walks the chunk plus the window, and a W=512 layer was measured originating
-  // divergences at chunk 0. The bundle is still "requested" at process level so
-  // the ring rule and the program build behave as before.
+  // THE DEFAULT, no environment: the fast arm, EVERY layer on the image path
+  // (windowed, full, however the window is spelled).
+  EXPECT_EQ(causallm::detArm(), causallm::DetArm::kFast);
+  EXPECT_FALSE(causallm::determinismFirst());
+  EXPECT_TRUE(causallm::imageAttnRequested());
+  EXPECT_TRUE(causallm::imageAttnLayer(512, MAXT));   // 0.3B/1.5B sliding
+  EXPECT_TRUE(causallm::imageAttnLayer(kFull, MAXT)); // 0.3B L7/L15 etc.
+  EXPECT_TRUE(causallm::imageAttnLayer(1024, MAXT));  // E2B sliding
+  EXPECT_TRUE(causallm::imageAttnLayer(MAXT, MAXT));
+  EXPECT_TRUE(causallm::imageAttnLayer(0, MAXT));
+  { // the bound is not consulted on the fast arm
+    ScopedEnv w0("NNTR_DET_IMG_WINDOW_MAX", "0");
+    EXPECT_TRUE(causallm::imageAttnLayer(512, MAXT));
+    EXPECT_TRUE(causallm::imageAttnLayer(kFull, MAXT));
+  }
+  { // the explicit spellings of the default resolve to it, unchanged
+    ScopedEnv on("NNTR_ALLOW_NONDETERMINISTIC", "1");
+    EXPECT_EQ(causallm::detArm(), causallm::DetArm::kFast);
+    EXPECT_FALSE(causallm::determinismFirst());
+    EXPECT_TRUE(causallm::imageAttnLayer(512, MAXT));
+    EXPECT_TRUE(causallm::imageAttnLayer(kFull, MAXT));
+  }
+  {
+    ScopedEnv off("NNTR_DETERMINISTIC", "0");
+    EXPECT_EQ(causallm::detArm(), causallm::DetArm::kFast);
+    EXPECT_TRUE(causallm::imageAttnLayer(kFull, MAXT));
+  }
+  { // the pack's own opt-out (nntr_config "allow_nondeterministic") too
+    causallm::packAllowsNondeterministic() = true;
+    EXPECT_EQ(causallm::detArm(), causallm::DetArm::kFast);
+    EXPECT_TRUE(causallm::imageAttnLayer(kFull, MAXT));
+    causallm::packAllowsNondeterministic() = false;
+    EXPECT_EQ(causallm::detArm(), causallm::DetArm::kFast);
+  }
+
+  // NNTR_DETERMINISTIC=1: the reproducible per-layer arm. NO layer takes the
+  // image path, because the bound is 0 -- the image read is not reproducible
+  // at any window width (the pass walks the chunk plus the window, and a W=512
+  // layer was measured originating divergences at chunk 0). The bundle is
+  // still "requested" at process level so the ring rule and the program build
+  // behave as before.
+  ScopedEnv on("NNTR_DETERMINISTIC", "1");
   EXPECT_EQ(causallm::detArm(), causallm::DetArm::kPerLayer);
   EXPECT_TRUE(causallm::determinismFirst());
   EXPECT_TRUE(causallm::imageAttnRequested()); // the bundle is still in play
@@ -825,58 +866,31 @@ TEST(KVRing, det_arm_per_layer_rule) {
     EXPECT_TRUE(causallm::imageAttnLayer(8192, MAXT));
     EXPECT_TRUE(causallm::imageAttnLayer(1024, MAXT));
   }
-  { // and 0 is what the default already is
+  { // and 0 is what the arm already is
     ScopedEnv w0("NNTR_DET_IMG_WINDOW_MAX", "0");
     EXPECT_FALSE(causallm::imageAttnLayer(512, MAXT));
   }
-
-  { // the ALL-LAYERS arm: nothing takes the image path
-    ScopedEnv on("NNTR_DETERMINISTIC", "1");
-    EXPECT_EQ(causallm::detArm(), causallm::DetArm::kAllLayers);
-    EXPECT_TRUE(causallm::determinismFirst());
-    EXPECT_FALSE(causallm::imageAttnRequested());
-    EXPECT_FALSE(causallm::imageAttnLayer(512, MAXT));
-    EXPECT_FALSE(causallm::imageAttnLayer(kFull, MAXT));
-  }
-  { // the FAST opt-out: EVERY layer takes the image path (the old default)
-    ScopedEnv on("NNTR_ALLOW_NONDETERMINISTIC", "1");
-    EXPECT_EQ(causallm::detArm(), causallm::DetArm::kFast);
-    EXPECT_FALSE(causallm::determinismFirst());
-    EXPECT_TRUE(causallm::imageAttnLayer(512, MAXT));
-    EXPECT_TRUE(causallm::imageAttnLayer(kFull, MAXT));
-    EXPECT_TRUE(causallm::imageAttnLayer(8192, MAXT));
-  }
-  { // NNTR_DETERMINISTIC=0 keeps working as the opt-out it used to be
-    ScopedEnv off("NNTR_DETERMINISTIC", "0");
-    EXPECT_EQ(causallm::detArm(), causallm::DetArm::kFast);
-    EXPECT_TRUE(causallm::imageAttnLayer(kFull, MAXT));
-    { // and an explicit request outranks the pack's opt-out, either way
-      causallm::packAllowsNondeterministic() = true;
-      ScopedEnv on("NNTR_DETERMINISTIC", "1");
-      EXPECT_EQ(causallm::detArm(), causallm::DetArm::kAllLayers);
-      causallm::packAllowsNondeterministic() = false;
-    }
-  }
-  { // the pack's own opt-out (nntr_config "allow_nondeterministic")
+  { // an explicit request outranks the pack's opt-out and the old opt-out
     causallm::packAllowsNondeterministic() = true;
-    EXPECT_EQ(causallm::detArm(), causallm::DetArm::kFast);
-    EXPECT_TRUE(causallm::imageAttnLayer(kFull, MAXT));
-    causallm::packAllowsNondeterministic() = false;
+    ScopedEnv allow1("NNTR_ALLOW_NONDETERMINISTIC", "1");
     EXPECT_EQ(causallm::detArm(), causallm::DetArm::kPerLayer);
+    EXPECT_FALSE(causallm::imageAttnLayer(512, MAXT));
+    causallm::packAllowsNondeterministic() = false;
   }
 }
 
 /**
- * @brief The ring survives the reproducible DEFAULT and is refused only by the
- *        all-layers arm.
- * @details The default leaves the windowed layers on the image path with their
- * sliding mirrors -- the ring's validated reader -- and a full-attention layer
- * is not ringed anyway (kvRingCap returns 0 for it), so store and reader match
- * per layer and the ring stays a memory win. The all-layers arm moves every
- * layer to the buffer/flash kernels, and the only configuration measured
- * reproducible there is image off AND ring off.
+ * @brief The ring survives BOTH arms.
+ * @details On the fast default the windowed layers are on the image path with
+ * their sliding mirrors -- the ring's validated reader -- and a full-attention
+ * layer is not ringed anyway (kvRingCap returns 0 for it), so store and reader
+ * match per layer. On the reproducible arm no layer is on the image kernels and
+ * the flash prefill/decode kernels modulo-map the cache row; that configuration
+ * (bundle requested, ring on) was measured bit-identical run to run on every
+ * cell, so the ring is not refused there either -- refusing it only cost
+ * memory. Pinned so neither arm silently loses the memory win.
  */
-TEST(KVRing, ring_survives_the_reproducible_default) {
+TEST(KVRing, ring_survives_both_arms) {
   ScopedEnv ring("NNTR_KV_WINDOW_RING", "1");
   ScopedEnv engine("NNTR_ENGINE", "gpu");
   ScopedEnv mha("NNTR_MHA_GPU", "1");
@@ -888,16 +902,22 @@ TEST(KVRing, ring_survives_the_reproducible_default) {
   ScopedEnv allow("NNTR_ALLOW_NONDETERMINISTIC", nullptr);
   causallm::packAllowsNondeterministic() = false;
   {
-    ScopedEnv det("NNTR_DETERMINISTIC", nullptr); // the default
+    ScopedEnv det("NNTR_DETERMINISTIC", nullptr); // the fast default
     EXPECT_TRUE(causallm::kvRingArmAvailable());
     // a windowed layer is ringed; a full-attention one never is, on any arm
     EXPECT_GT(causallm::kvRingCap(512, 16896, 4096, true), 0u);
     EXPECT_EQ(causallm::kvRingCap(UINT_MAX, 16896, 4096, true), 0u);
   }
   {
-    ScopedEnv det("NNTR_DETERMINISTIC", "1"); // the all-layers arm
+    ScopedEnv det("NNTR_DETERMINISTIC", "1"); // the reproducible arm
+    EXPECT_TRUE(causallm::kvRingArmAvailable());
+    EXPECT_GT(causallm::kvRingCap(512, 16896, 4096, true), 0u);
+    EXPECT_EQ(causallm::kvRingCap(UINT_MAX, 16896, 4096, true), 0u);
+  }
+  { // the control arms still close the ring under the image bundle
+    ScopedEnv det("NNTR_DETERMINISTIC", nullptr);
+    ScopedEnv ir("NNTR_KV_IMG_RING", "0");
     EXPECT_FALSE(causallm::kvRingArmAvailable());
-    EXPECT_EQ(causallm::kvRingCap(512, 16896, 4096, true), 0u);
   }
 }
 

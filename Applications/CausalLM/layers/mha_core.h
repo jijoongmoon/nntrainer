@@ -597,10 +597,10 @@ private:
   int use_image_attn = -1;
   /** [determinism] Whether THIS layer's attention arm is the image path, from
    *  causallm::imageAttnLayer(local_window_size, max_timestep) at finalize.
-   *  Bit-identical output is the default, and the default routes a
-   *  FULL-attention layer to the reproducible buffer/flash kernels while a
-   *  window-bounded layer keeps the image path -- so the arm is a per-LAYER
-   *  fact, not a per-process one. Everything that used to read the process-wide
+   *  The fast default puts every layer on the image path; the reproducible
+   *  arm (NNTR_DETERMINISTIC=1) routes a layer to the buffer/flash kernels by
+   *  a per-layer rule -- so the arm is a per-LAYER fact, not a per-process
+   *  one. Everything that used to read the process-wide
    *  env answer (the decode-RoPE suppression, the Q-staging target, the
    *  no-drain K/V chain, the OHWI decode RoPE) reads this instead, so the
    *  stages of one layer cannot disagree about which arm it is on. Distinct

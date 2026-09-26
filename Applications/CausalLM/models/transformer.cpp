@@ -127,16 +127,17 @@ Transformer::Transformer(json &cfg, json &generation_cfg, json &nntr_cfg,
   const bool skip_tokenizer = nntr_cfg.contains("skip_tokenizer") &&
                               nntr_cfg["skip_tokenizer"].get<bool>();
 
-  /** [determinism] The pack's own opt-out from the reproducible default.
-   * Bit-identical output is the baseline behaviour, so there is no key to turn
-   * it ON; this is how a throughput-critical pack declares that it has accepted
-   * non-reproducible output instead. Read here, in the base constructor, so it
-   * lands before any layer finalizes (which is where the arm is decided) and so
-   * every model class gets it from one place rather than each one re-reading a
-   * key. An explicit NNTR_DETERMINISTIC from the caller still outranks it --
-   * see causallm::detArm(). Absent or false leaves the default alone; the flag
-   * is never cleared here, so one pack opting out cannot be undone by the next
-   * pack in the same process, which is the safe direction for a process-wide
+  /** [determinism] The pack's own opt-out from the reproducible arm. The fast
+   * arm is the default now, so the key is redundant and only kept so a pack
+   * written against the previous contract keeps loading; there is still no
+   * key to turn the reproducible arm ON from a pack. Read here, in the base
+   * constructor, so it lands before any layer finalizes (which is where the
+   * arm is decided) and so every model class gets it from one place rather
+   * than each one re-reading a key. An explicit NNTR_DETERMINISTIC from the
+   * caller still outranks it -- see causallm::detArm(). Absent or false leaves
+   * the default alone; the flag is never cleared here, so one pack opting out
+   * cannot be undone by the next pack in the same process, which is the safe
+   * direction for a process-wide
    * answer. detArm() does not cache, so the flag takes effect wherever it is
    * read after this point -- and every arm decision (layer finalize) is after
    * it. */
