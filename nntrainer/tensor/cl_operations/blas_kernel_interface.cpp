@@ -1404,6 +1404,18 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
   // Mode 1 (default on the image path): trailing flush after every FC,
   // recovering the norm->FC idle band. Mode 0 (default on the buffer path):
   // no explicit flush. NNTR_FC_FLUSH overrides.
+  static const bool fc_flush_env_set = std::getenv("NNTR_FC_FLUSH") != nullptr;
+  // The decode skip below pays only where the layer chain submits itself:
+  // the image-attention arm flushes once per layer. The deterministic arm
+  // (NNTR_DETERMINISTIC=1) runs the buffer attention, which drains the queue
+  // per layer, and there the per-FC flush is what lets the GPU start the
+  // layer's GEMVs while the host is still enqueueing them: without it the
+  // 1.5B dense decode on that arm fell from 38.7 to 31.5 TPS. Same switch
+  // the attention kernels read for their reduction order.
+  static const bool fc_flush_decode_keep = []() {
+    const char *det = std::getenv("NNTR_DETERMINISTIC");
+    return det != nullptr && det[0] == '1';
+  }();
   static const int fc_flush_mode = []() {
     const char *e = std::getenv("NNTR_FC_FLUSH");
     if (e)
@@ -1689,7 +1701,14 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
 
     // Mode 1: submit this FC's enqueue chain now instead of at the next
     // blocking call -- recovers the norm->FC idle band on the image path.
-    if (fc_flush_mode == 1)
+    // Decode (M == 1) skips the per-FC submission: a token is ~580 launches,
+    // and a flush after each of its 169 GEMVs cost 4.0 ms of host time per
+    // token on an Adreno 840 (15 us each, 1.5B dense, 200-token cell) for a
+    // batch of one or two kernels; the attention block's own flush once per
+    // layer keeps the queue fed. Steady decode 58.1 -> 60.2 TPS, token ids
+    // unchanged. NNTR_FC_FLUSH=1 restores the per-FC flush for decode too.
+    if (fc_flush_mode == 1 &&
+        (M > 1 || fc_flush_env_set || fc_flush_decode_keep))
       opencl::clFlush(q);
   } catch (...) {
     return false;
