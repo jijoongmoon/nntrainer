@@ -49,6 +49,11 @@ namespace nntrainer::opencl {
  * code that knows where they are. Inert unless NNTR_GPU_MEM_ACCT is set.
  */
 void clMemAcctDump(const char *phase);
+/** Launch ledger (NNTR_CL_LAUNCH_STAT): the decode loop names its token
+ *  boundaries so the per-token launch table is over steady tokens only. */
+void clLaunchStatBegin(const char *phase);
+void clLaunchStatTick();
+void clLaunchStatDump(const char *phase);
 } // namespace nntrainer::opencl
 #endif
 #include <common.h>
@@ -650,6 +655,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
    *  first token is out", and which side of the prefill it peaks on decides
    *  which lever is worth building. Name the boundary. */
   nntrainer::opencl::clMemAcctDump("after-prefill");
+  nntrainer::opencl::clLaunchStatBegin("decode");
 #endif
   auto start_generation = std::chrono::high_resolution_clock::now();
 
@@ -675,6 +681,9 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     registerOutputs(tokenizer, ids_list, token_generation_idx, eos_list,
                     log_output);
     ++generation_cnt;
+#if defined(ENABLE_OPENCL)
+    nntrainer::opencl::clLaunchStatTick();
+#endif
 
     // output should be deallocated after use
     for (auto out : output_interval) {
@@ -722,6 +731,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     finish_total - start_total);
 #if defined(ENABLE_OPENCL)
   nntrainer::opencl::clMemAcctDump("after-decode");
+  nntrainer::opencl::clLaunchStatDump("after-decode");
 #endif
   const size_t maxrss_kb = getPeakMemoryKb();
   const size_t honest_kb = FootprintSampler::get().finish();

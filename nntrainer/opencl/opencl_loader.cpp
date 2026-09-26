@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <dynamic_library_loader.h>
@@ -48,6 +49,26 @@ extern PFN_clSVMFree clSVMFree_raw;
  * @param libopencl
  */
 void LoadOpenCLFunctions(void *libopencl);
+
+/// The queue entry points the launch ledger wraps (NNTR_CL_LAUNCH_STAT). They
+/// are loaded as *_raw and the plain names are bound by
+/// InstallLaunchStatWrappers.
+extern PFN_clEnqueueNDRangeKernel clEnqueueNDRangeKernel_raw;
+extern PFN_clFinish clFinish_raw;
+extern PFN_clFlush clFlush_raw;
+extern PFN_clEnqueueReadBuffer clEnqueueReadBuffer_raw;
+extern PFN_clEnqueueWriteBuffer clEnqueueWriteBuffer_raw;
+extern PFN_clEnqueueReadBufferRect clEnqueueReadBufferRect_raw;
+extern PFN_clEnqueueWriteBufferRect clEnqueueWriteBufferRect_raw;
+extern PFN_clEnqueueFillBuffer clEnqueueFillBuffer_raw;
+extern PFN_clEnqueueMapBuffer clEnqueueMapBuffer_raw;
+extern PFN_clEnqueueUnmapMemObject clEnqueueUnmapMemObject_raw;
+extern PFN_clEnqueueSVMMap clEnqueueSVMMap_raw;
+extern PFN_clEnqueueSVMUnmap clEnqueueSVMUnmap_raw;
+extern PFN_clWaitForEvents clWaitForEvents_raw;
+extern PFN_clEnqueueBarrierWithWaitList clEnqueueBarrierWithWaitList_raw;
+extern PFN_clCreateCommandQueue clCreateCommandQueue_raw;
+void InstallLaunchStatWrappers();
 
 static bool open_cl_initialized = false;
 
@@ -222,17 +243,17 @@ void LoadOpenCLFunctions(void *libopencl) {
   LoadFunction(clGetDeviceInfo);
   LoadFunction(clGetImageInfo);
   LoadFunction(clCreateContext);
-  LoadFunction(clCreateCommandQueue);
+  LoadRawFunction(clCreateCommandQueue);
   LoadFunction(clCreateBuffer);
   LoadFunction(clCreateSubBuffer);
   LoadFunction(clCreateImage);
-  LoadFunction(clEnqueueWriteBuffer);
-  LoadFunction(clEnqueueFillBuffer);
-  LoadFunction(clEnqueueReadBuffer);
-  LoadFunction(clEnqueueMapBuffer);
-  LoadFunction(clEnqueueUnmapMemObject);
-  LoadFunction(clEnqueueWriteBufferRect);
-  LoadFunction(clEnqueueReadBufferRect);
+  LoadRawFunction(clEnqueueWriteBuffer);
+  LoadRawFunction(clEnqueueFillBuffer);
+  LoadRawFunction(clEnqueueReadBuffer);
+  LoadRawFunction(clEnqueueMapBuffer);
+  LoadRawFunction(clEnqueueUnmapMemObject);
+  LoadRawFunction(clEnqueueWriteBufferRect);
+  LoadRawFunction(clEnqueueReadBufferRect);
   LoadFunction(clCreateProgramWithSource);
   LoadFunction(clCreateProgramWithBinary);
   LoadFunction(clBuildProgram);
@@ -241,23 +262,25 @@ void LoadOpenCLFunctions(void *libopencl) {
   LoadFunction(clRetainProgram);
   LoadFunction(clCreateKernel);
   LoadFunction(clSetKernelArg);
-  LoadFunction(clEnqueueNDRangeKernel);
+  LoadRawFunction(clEnqueueNDRangeKernel);
   LoadFunction(clGetEventProfilingInfo);
   LoadFunction(clRetainContext);
   LoadFunction(clReleaseContext);
   LoadFunction(clRetainCommandQueue);
   LoadFunction(clReleaseCommandQueue);
   LoadRawFunction(clReleaseMemObject);
-  LoadFunction(clFlush);
-  LoadFunction(clFinish);
+  LoadRawFunction(clFlush);
+  LoadRawFunction(clFinish);
   LoadFunction(clSVMAlloc);
   LoadRawFunction(clSVMFree);
-  LoadFunction(clEnqueueSVMMap);
-  LoadFunction(clEnqueueSVMUnmap);
+  LoadRawFunction(clEnqueueSVMMap);
+  LoadRawFunction(clEnqueueSVMUnmap);
   LoadFunction(clSetKernelArgSVMPointer);
-  LoadFunction(clWaitForEvents);
+  LoadRawFunction(clWaitForEvents);
   LoadFunction(clReleaseEvent);
-  LoadFunction(clEnqueueBarrierWithWaitList);
+  LoadRawFunction(clEnqueueBarrierWithWaitList);
+  LoadFunction(clGetKernelInfo);
+  InstallLaunchStatWrappers();
 }
 
 PFN_clGetPlatformIDs clGetPlatformIDs;
@@ -301,6 +324,7 @@ PFN_clSetKernelArgSVMPointer clSetKernelArgSVMPointer;
 PFN_clWaitForEvents clWaitForEvents;
 PFN_clReleaseEvent clReleaseEvent;
 PFN_clEnqueueBarrierWithWaitList clEnqueueBarrierWithWaitList;
+PFN_clGetKernelInfo clGetKernelInfo;
 
 // ---------------------------------------------------------------------------
 // Handle epoch.
@@ -585,4 +609,541 @@ void *clSVMAllocT(cl_context context, cl_svm_mem_flags flags, size_t size,
     MemAcct::get().note("svm", p, size, /*view=*/false);
   return p;
 }
+// ---------------------------------------------------------------------------
+// Launch ledger (NNTR_CL_LAUNCH_STAT).
+//
+// The question this answers is "how many times per decode token does the host
+// talk to the queue, and how long does each of those calls hold the host":
+// the difference between a token's wall and the GPU's busy time is host gaps,
+// and a host gap is made of exactly these calls. The wrappers are installed
+// at load time only when the variable is set; otherwise the plain driver
+// pointers are bound and the dispatch path is what it always was.
+//
+// Attribution: every NDRange is keyed by its kernel's function name, and a
+// clFinish/clFlush is charged both to its own API row and to the kernel that
+// was enqueued last -- a per-dispatch drain is a property of that dispatch.
+// Blocking reads, maps and SVM maps are the other ways a host call waits on
+// the device, so they are counted as API rows with their wall time.
+//
+// Level 2 asks the queue for CL_QUEUE_PROFILING_ENABLE and hands the driver an
+// event per NDRange that the caller did not want one for; the tick collects
+// them (the token is complete by then, so the wait is free) and sums each
+// kernel's START..END. An in-order queue runs kernels back to back, so the
+// sum is the GPU busy time and wall - sum is the idle the host left it.
+namespace {
+
+/** wall clock for the wrappers */
+inline double launchNowMs() {
+  return std::chrono::duration<double, std::milli>(
+           std::chrono::steady_clock::now().time_since_epoch())
+    .count();
+}
+
+struct LaunchRow {
+  unsigned long long n = 0;        ///< calls
+  double host_ms = 0;              ///< host wall inside the call
+  unsigned long long n_finish = 0; ///< clFinish issued right after (kernels)
+  double finish_ms = 0;            ///< host wall of those finishes
+  unsigned long long n_flush = 0;  ///< clFlush issued right after (kernels)
+  double gpu_ms = 0;               ///< device START..END (level 2)
+  unsigned long long n_gpu = 0;    ///< events collected (level 2)
+};
+
+struct PendingEvent {
+  cl_event ev;
+  const std::string *name;
+};
+
+struct LaunchStat {
+  static LaunchStat &get() {
+    static LaunchStat s;
+    return s;
+  }
+  int level = 0;
+  std::atomic<bool> counting{false};
+  std::mutex mu;
+  std::unordered_map<std::string, LaunchRow> kernels;
+  std::unordered_map<std::string, LaunchRow> calls;
+  std::unordered_map<cl_kernel, std::string> names;
+  const std::string *last_kernel = nullptr;
+  std::vector<PendingEvent> pending;
+  unsigned long long tokens = 0;
+  unsigned long long dropped_tokens = 0;
+  double phase_begin_ms = 0;
+  double tokens_begin_ms = 0;
+  double last_tick_ms = 0;
+  std::string phase;
+
+  LaunchStat() {
+    if (const char *e = std::getenv("NNTR_CL_LAUNCH_STAT"))
+      level = std::atoi(e);
+    if (level < 0)
+      level = 0;
+  }
+
+  const std::string &kernelName(cl_kernel k) {
+    auto it = names.find(k);
+    if (it != names.end())
+      return it->second;
+    char buf[256] = {0};
+    size_t ret = 0;
+    std::string name;
+    if (clGetKernelInfo != nullptr &&
+        clGetKernelInfo(k, CL_KERNEL_FUNCTION_NAME, sizeof(buf) - 1, buf,
+                        &ret) == CL_SUCCESS &&
+        ret > 0) {
+      name.assign(buf, ret > 0 && buf[ret - 1] == '\0' ? ret - 1 : ret);
+    } else {
+      char tmp[64];
+      snprintf(tmp, sizeof(tmp), "kernel@%p", static_cast<void *>(k));
+      name = tmp;
+    }
+    return names.emplace(k, std::move(name)).first->second;
+  }
+
+  void noteKernel(cl_kernel k, double ms, cl_event own) {
+    std::lock_guard<std::mutex> lk(mu);
+    const std::string &name = kernelName(k);
+    LaunchRow &r = kernels[name];
+    ++r.n;
+    r.host_ms += ms;
+    last_kernel = &kernels.find(name)->first;
+    if (own != nullptr)
+      pending.push_back({own, last_kernel});
+  }
+
+  /** an API call; `after_kernel` charges it to the last dispatch too */
+  void noteCall(const char *api, double ms, int after_kernel /*1 fin 2 fl*/) {
+    std::lock_guard<std::mutex> lk(mu);
+    LaunchRow &r = calls[api];
+    ++r.n;
+    r.host_ms += ms;
+    if (after_kernel != 0 && last_kernel != nullptr) {
+      LaunchRow &k = kernels[*last_kernel];
+      if (after_kernel == 1) {
+        ++k.n_finish;
+        k.finish_ms += ms;
+      } else {
+        ++k.n_flush;
+      }
+    }
+  }
+
+  void reset() {
+    kernels.clear();
+    calls.clear();
+    pending.clear();
+    last_kernel = nullptr;
+    tokens = 0;
+  }
+
+  /** level 2: fold the completed events into their kernels' gpu_ms */
+  void collectEvents() {
+    if (pending.empty())
+      return;
+    std::vector<cl_event> evs;
+    evs.reserve(pending.size());
+    for (const PendingEvent &p : pending)
+      evs.push_back(p.ev);
+    // The raw entry point: the wrapper would count this wait as a token cost
+    // and take the ledger mutex this thread already holds.
+    if (clWaitForEvents_raw != nullptr)
+      clWaitForEvents_raw(static_cast<cl_uint>(evs.size()), evs.data());
+    for (const PendingEvent &p : pending) {
+      cl_ulong t0 = 0, t1 = 0;
+      if (clGetEventProfilingInfo != nullptr &&
+          clGetEventProfilingInfo(p.ev, CL_PROFILING_COMMAND_START, sizeof(t0),
+                                  &t0, nullptr) == CL_SUCCESS &&
+          clGetEventProfilingInfo(p.ev, CL_PROFILING_COMMAND_END, sizeof(t1),
+                                  &t1, nullptr) == CL_SUCCESS &&
+          t1 >= t0) {
+        LaunchRow &r = kernels[*p.name];
+        r.gpu_ms += static_cast<double>(t1 - t0) * 1e-6;
+        ++r.n_gpu;
+      }
+      if (clReleaseEvent != nullptr)
+        clReleaseEvent(p.ev);
+    }
+    pending.clear();
+  }
+
+  void begin(const char *ph) {
+    std::lock_guard<std::mutex> lk(mu);
+    reset();
+    dropped_tokens = 0;
+    phase = ph ? ph : "";
+    phase_begin_ms = tokens_begin_ms = last_tick_ms = launchNowMs();
+    counting.store(true, std::memory_order_release);
+  }
+
+  void tick() {
+    if (!counting.load(std::memory_order_acquire))
+      return;
+    const double now = launchNowMs();
+    std::lock_guard<std::mutex> lk(mu);
+    if (level >= 2)
+      collectEvents();
+    if (dropped_tokens == 0) {
+      // The first token of a phase pays for whatever the previous phase left
+      // in flight; it is not a steady token, so it is measured and dropped.
+      reset();
+      dropped_tokens = 1;
+      tokens_begin_ms = now;
+    } else {
+      ++tokens;
+    }
+    last_tick_ms = now;
+  }
+
+  static void printRow(const char *name, const LaunchRow &r, double per,
+                       bool gpu) {
+    if (gpu)
+      fprintf(stderr,
+              "[CL-LAUNCH]   %-44s n/tok=%8.2f enq_ms/tok=%7.3f "
+              "fin/tok=%7.2f fin_ms/tok=%7.3f flush/tok=%6.2f "
+              "gpu_ms/tok=%7.3f\n",
+              name, r.n / per, r.host_ms / per, r.n_finish / per,
+              r.finish_ms / per, r.n_flush / per, r.gpu_ms / per);
+    else
+      fprintf(stderr,
+              "[CL-LAUNCH]   %-44s n/tok=%8.2f enq_ms/tok=%7.3f "
+              "fin/tok=%7.2f fin_ms/tok=%7.3f flush/tok=%6.2f\n",
+              name, r.n / per, r.host_ms / per, r.n_finish / per,
+              r.finish_ms / per, r.n_flush / per);
+  }
+
+  void dump(const char *ph) {
+    std::lock_guard<std::mutex> lk(mu);
+    counting.store(false, std::memory_order_release);
+    if (level >= 2)
+      collectEvents();
+    const double per = tokens > 0 ? static_cast<double>(tokens) : 1.0;
+    const double wall = tokens > 0 ? (last_tick_ms - tokens_begin_ms) / per
+                                   : (launchNowMs() - phase_begin_ms);
+    LaunchRow tot;
+    for (const auto &kv : kernels) {
+      tot.n += kv.second.n;
+      tot.host_ms += kv.second.host_ms;
+      tot.n_finish += kv.second.n_finish;
+      tot.finish_ms += kv.second.finish_ms;
+      tot.n_flush += kv.second.n_flush;
+      tot.gpu_ms += kv.second.gpu_ms;
+      tot.n_gpu += kv.second.n_gpu;
+    }
+    double api_ms = 0;
+    unsigned long long api_n = 0;
+    for (const auto &kv : calls) {
+      api_ms += kv.second.host_ms;
+      api_n += kv.second.n;
+    }
+    fprintf(stderr,
+            "[CL-LAUNCH] phase=%s(%s) level=%d tokens=%llu (first dropped) "
+            "wall_ms/tok=%.3f launches/tok=%.1f enq_ms/tok=%.3f "
+            "finish/tok=%.1f finish_ms/tok=%.3f flush/tok=%.1f "
+            "api_calls/tok=%.1f api_ms/tok=%.3f host_in_cl_ms/tok=%.3f",
+            phase.c_str(), ph ? ph : "", level, tokens, wall, tot.n / per,
+            tot.host_ms / per, tot.n_finish / per, tot.finish_ms / per,
+            tot.n_flush / per, api_n / per, api_ms / per,
+            (tot.host_ms + api_ms) / per);
+    if (level >= 2)
+      fprintf(stderr, " gpu_ms/tok=%.3f gpu_busy=%.1f%% events=%llu",
+              tot.gpu_ms / per, wall > 0 ? 100.0 * tot.gpu_ms / per / wall : 0,
+              tot.n_gpu);
+    fprintf(stderr, "\n");
+    std::vector<std::pair<std::string, LaunchRow>> rows(kernels.begin(),
+                                                        kernels.end());
+    std::sort(rows.begin(), rows.end(), [](const auto &a, const auto &b) {
+      const double ca = a.second.host_ms + a.second.finish_ms;
+      const double cb = b.second.host_ms + b.second.finish_ms;
+      return ca != cb ? ca > cb : a.second.n > b.second.n;
+    });
+    fprintf(stderr, "[CL-LAUNCH] kernels by host cost (enqueue + finish "
+                    "charged to it), per token:\n");
+    for (const auto &kv : rows)
+      printRow(kv.first.c_str(), kv.second, per, level >= 2);
+    std::vector<std::pair<std::string, LaunchRow>> apis(calls.begin(),
+                                                        calls.end());
+    std::sort(apis.begin(), apis.end(), [](const auto &a, const auto &b) {
+      return a.second.host_ms > b.second.host_ms;
+    });
+    fprintf(stderr, "[CL-LAUNCH] queue API calls, per token:\n");
+    for (const auto &kv : apis)
+      fprintf(stderr, "[CL-LAUNCH]   %-44s n/tok=%8.2f ms/tok=%7.3f\n",
+              kv.first.c_str(), kv.second.n / per, kv.second.host_ms / per);
+  }
+};
+
+const int g_launch_level = LaunchStat::get().level;
+
+inline bool launchCounting() {
+  return LaunchStat::get().counting.load(std::memory_order_acquire);
+}
+
+} // namespace
+
+// The driver entry points the ledger wraps. Bound by LoadOpenCLFunctions to
+// the driver symbol; the plain name is the wrapper only when the ledger is on.
+PFN_clEnqueueNDRangeKernel clEnqueueNDRangeKernel_raw;
+PFN_clFinish clFinish_raw;
+PFN_clFlush clFlush_raw;
+PFN_clEnqueueReadBuffer clEnqueueReadBuffer_raw;
+PFN_clEnqueueWriteBuffer clEnqueueWriteBuffer_raw;
+PFN_clEnqueueReadBufferRect clEnqueueReadBufferRect_raw;
+PFN_clEnqueueWriteBufferRect clEnqueueWriteBufferRect_raw;
+PFN_clEnqueueFillBuffer clEnqueueFillBuffer_raw;
+PFN_clEnqueueMapBuffer clEnqueueMapBuffer_raw;
+PFN_clEnqueueUnmapMemObject clEnqueueUnmapMemObject_raw;
+PFN_clEnqueueSVMMap clEnqueueSVMMap_raw;
+PFN_clEnqueueSVMUnmap clEnqueueSVMUnmap_raw;
+PFN_clWaitForEvents clWaitForEvents_raw;
+PFN_clEnqueueBarrierWithWaitList clEnqueueBarrierWithWaitList_raw;
+PFN_clCreateCommandQueue clCreateCommandQueue_raw;
+
+namespace {
+
+cl_int CL_API_CALL clEnqueueNDRangeKernel_stat(
+  cl_command_queue q, cl_kernel k, cl_uint work_dim, const size_t *goff,
+  const size_t *gws, const size_t *lws, cl_uint n_wait, const cl_event *wait,
+  cl_event *event) {
+  if (!launchCounting())
+    return clEnqueueNDRangeKernel_raw(q, k, work_dim, goff, gws, lws, n_wait,
+                                      wait, event);
+  cl_event own = nullptr;
+  cl_event *evp = event;
+  if (g_launch_level >= 2 && event == nullptr)
+    evp = &own;
+  const double t0 = launchNowMs();
+  const cl_int rc = clEnqueueNDRangeKernel_raw(q, k, work_dim, goff, gws, lws,
+                                               n_wait, wait, evp);
+  const double ms = launchNowMs() - t0;
+  LaunchStat::get().noteKernel(k, ms, rc == CL_SUCCESS ? own : nullptr);
+  return rc;
+}
+
+cl_int CL_API_CALL clFinish_stat(cl_command_queue q) {
+  if (!launchCounting())
+    return clFinish_raw(q);
+  const double t0 = launchNowMs();
+  const cl_int rc = clFinish_raw(q);
+  LaunchStat::get().noteCall("clFinish", launchNowMs() - t0, 1);
+  return rc;
+}
+
+cl_int CL_API_CALL clFlush_stat(cl_command_queue q) {
+  if (!launchCounting())
+    return clFlush_raw(q);
+  const double t0 = launchNowMs();
+  const cl_int rc = clFlush_raw(q);
+  LaunchStat::get().noteCall("clFlush", launchNowMs() - t0, 2);
+  return rc;
+}
+
+cl_int CL_API_CALL clEnqueueReadBuffer_stat(
+  cl_command_queue q, cl_mem b, cl_bool blocking, size_t off, size_t size,
+  void *ptr, cl_uint n_wait, const cl_event *wait, cl_event *event) {
+  if (!launchCounting())
+    return clEnqueueReadBuffer_raw(q, b, blocking, off, size, ptr, n_wait, wait,
+                                   event);
+  const double t0 = launchNowMs();
+  const cl_int rc = clEnqueueReadBuffer_raw(q, b, blocking, off, size, ptr,
+                                            n_wait, wait, event);
+  LaunchStat::get().noteCall(blocking ? "clEnqueueReadBuffer(blocking)"
+                                      : "clEnqueueReadBuffer",
+                             launchNowMs() - t0, blocking ? 1 : 0);
+  return rc;
+}
+
+cl_int CL_API_CALL clEnqueueWriteBuffer_stat(
+  cl_command_queue q, cl_mem b, cl_bool blocking, size_t off, size_t size,
+  const void *ptr, cl_uint n_wait, const cl_event *wait, cl_event *event) {
+  if (!launchCounting())
+    return clEnqueueWriteBuffer_raw(q, b, blocking, off, size, ptr, n_wait,
+                                    wait, event);
+  const double t0 = launchNowMs();
+  const cl_int rc = clEnqueueWriteBuffer_raw(q, b, blocking, off, size, ptr,
+                                             n_wait, wait, event);
+  LaunchStat::get().noteCall(blocking ? "clEnqueueWriteBuffer(blocking)"
+                                      : "clEnqueueWriteBuffer",
+                             launchNowMs() - t0, 0);
+  return rc;
+}
+
+cl_int CL_API_CALL clEnqueueReadBufferRect_stat(
+  cl_command_queue q, cl_mem b, cl_bool blocking, const size_t *boff,
+  const size_t *hoff, const size_t *region, size_t brp, size_t bsp, size_t hrp,
+  size_t hsp, void *ptr, cl_uint n_wait, const cl_event *wait,
+  cl_event *event) {
+  if (!launchCounting())
+    return clEnqueueReadBufferRect_raw(q, b, blocking, boff, hoff, region, brp,
+                                       bsp, hrp, hsp, ptr, n_wait, wait, event);
+  const double t0 = launchNowMs();
+  const cl_int rc =
+    clEnqueueReadBufferRect_raw(q, b, blocking, boff, hoff, region, brp, bsp,
+                                hrp, hsp, ptr, n_wait, wait, event);
+  LaunchStat::get().noteCall(blocking ? "clEnqueueReadBufferRect(blocking)"
+                                      : "clEnqueueReadBufferRect",
+                             launchNowMs() - t0, blocking ? 1 : 0);
+  return rc;
+}
+
+cl_int CL_API_CALL clEnqueueWriteBufferRect_stat(
+  cl_command_queue q, cl_mem b, cl_bool blocking, const size_t *boff,
+  const size_t *hoff, const size_t *region, size_t brp, size_t bsp, size_t hrp,
+  size_t hsp, const void *ptr, cl_uint n_wait, const cl_event *wait,
+  cl_event *event) {
+  if (!launchCounting())
+    return clEnqueueWriteBufferRect_raw(q, b, blocking, boff, hoff, region, brp,
+                                        bsp, hrp, hsp, ptr, n_wait, wait,
+                                        event);
+  const double t0 = launchNowMs();
+  const cl_int rc =
+    clEnqueueWriteBufferRect_raw(q, b, blocking, boff, hoff, region, brp, bsp,
+                                 hrp, hsp, ptr, n_wait, wait, event);
+  LaunchStat::get().noteCall(blocking ? "clEnqueueWriteBufferRect(blocking)"
+                                      : "clEnqueueWriteBufferRect",
+                             launchNowMs() - t0, 0);
+  return rc;
+}
+
+cl_int CL_API_CALL clEnqueueFillBuffer_stat(
+  cl_command_queue q, cl_mem b, const void *pattern, size_t psz, size_t off,
+  size_t size, cl_uint n_wait, const cl_event *wait, cl_event *event) {
+  if (!launchCounting())
+    return clEnqueueFillBuffer_raw(q, b, pattern, psz, off, size, n_wait, wait,
+                                   event);
+  const double t0 = launchNowMs();
+  const cl_int rc =
+    clEnqueueFillBuffer_raw(q, b, pattern, psz, off, size, n_wait, wait, event);
+  LaunchStat::get().noteCall("clEnqueueFillBuffer", launchNowMs() - t0, 0);
+  return rc;
+}
+
+void *CL_API_CALL clEnqueueMapBuffer_stat(cl_command_queue q, cl_mem b,
+                                          cl_bool blocking, cl_map_flags flags,
+                                          size_t off, size_t size,
+                                          cl_uint n_wait, const cl_event *wait,
+                                          cl_event *event, cl_int *err) {
+  if (!launchCounting())
+    return clEnqueueMapBuffer_raw(q, b, blocking, flags, off, size, n_wait,
+                                  wait, event, err);
+  const double t0 = launchNowMs();
+  void *p = clEnqueueMapBuffer_raw(q, b, blocking, flags, off, size, n_wait,
+                                   wait, event, err);
+  LaunchStat::get().noteCall(blocking ? "clEnqueueMapBuffer(blocking)"
+                                      : "clEnqueueMapBuffer",
+                             launchNowMs() - t0, blocking ? 1 : 0);
+  return p;
+}
+
+cl_int CL_API_CALL clEnqueueUnmapMemObject_stat(cl_command_queue q, cl_mem b,
+                                                void *ptr, cl_uint n_wait,
+                                                const cl_event *wait,
+                                                cl_event *event) {
+  if (!launchCounting())
+    return clEnqueueUnmapMemObject_raw(q, b, ptr, n_wait, wait, event);
+  const double t0 = launchNowMs();
+  const cl_int rc = clEnqueueUnmapMemObject_raw(q, b, ptr, n_wait, wait, event);
+  LaunchStat::get().noteCall("clEnqueueUnmapMemObject", launchNowMs() - t0, 0);
+  return rc;
+}
+
+cl_int CL_API_CALL clEnqueueSVMMap_stat(cl_command_queue q, cl_bool blocking,
+                                        cl_map_flags flags, void *ptr,
+                                        size_t size, cl_uint n_wait,
+                                        const cl_event *wait, cl_event *event) {
+  if (!launchCounting())
+    return clEnqueueSVMMap_raw(q, blocking, flags, ptr, size, n_wait, wait,
+                               event);
+  const double t0 = launchNowMs();
+  const cl_int rc =
+    clEnqueueSVMMap_raw(q, blocking, flags, ptr, size, n_wait, wait, event);
+  LaunchStat::get().noteCall(blocking ? "clEnqueueSVMMap(blocking)"
+                                      : "clEnqueueSVMMap",
+                             launchNowMs() - t0, blocking ? 1 : 0);
+  return rc;
+}
+
+cl_int CL_API_CALL clEnqueueSVMUnmap_stat(cl_command_queue q, void *ptr,
+                                          cl_uint n_wait, const cl_event *wait,
+                                          cl_event *event) {
+  if (!launchCounting())
+    return clEnqueueSVMUnmap_raw(q, ptr, n_wait, wait, event);
+  const double t0 = launchNowMs();
+  const cl_int rc = clEnqueueSVMUnmap_raw(q, ptr, n_wait, wait, event);
+  LaunchStat::get().noteCall("clEnqueueSVMUnmap", launchNowMs() - t0, 0);
+  return rc;
+}
+
+cl_int CL_API_CALL clWaitForEvents_stat(cl_uint n, const cl_event *evs) {
+  if (!launchCounting())
+    return clWaitForEvents_raw(n, evs);
+  const double t0 = launchNowMs();
+  const cl_int rc = clWaitForEvents_raw(n, evs);
+  LaunchStat::get().noteCall("clWaitForEvents", launchNowMs() - t0, 1);
+  return rc;
+}
+
+cl_int CL_API_CALL clEnqueueBarrierWithWaitList_stat(cl_command_queue q,
+                                                     cl_uint n_wait,
+                                                     const cl_event *wait,
+                                                     cl_event *event) {
+  if (!launchCounting())
+    return clEnqueueBarrierWithWaitList_raw(q, n_wait, wait, event);
+  const double t0 = launchNowMs();
+  const cl_int rc = clEnqueueBarrierWithWaitList_raw(q, n_wait, wait, event);
+  LaunchStat::get().noteCall("clEnqueueBarrierWithWaitList", launchNowMs() - t0,
+                             0);
+  return rc;
+}
+
+/** level 2 needs event profiling on the queue; the queue is created once */
+cl_command_queue CL_API_CALL
+clCreateCommandQueue_stat(cl_context ctx, cl_device_id dev,
+                          cl_command_queue_properties props, cl_int *err) {
+  if (g_launch_level >= 2)
+    props |= CL_QUEUE_PROFILING_ENABLE;
+  return clCreateCommandQueue_raw(ctx, dev, props, err);
+}
+
+} // namespace
+
+/// Bind the ledger wrappers over the driver symbols loaded as *_raw.
+void InstallLaunchStatWrappers() {
+#define BindStat(function)                                                     \
+  function = g_launch_level > 0 ? &function##_stat : function##_raw
+  BindStat(clEnqueueNDRangeKernel);
+  BindStat(clFinish);
+  BindStat(clFlush);
+  BindStat(clEnqueueReadBuffer);
+  BindStat(clEnqueueWriteBuffer);
+  BindStat(clEnqueueReadBufferRect);
+  BindStat(clEnqueueWriteBufferRect);
+  BindStat(clEnqueueFillBuffer);
+  BindStat(clEnqueueMapBuffer);
+  BindStat(clEnqueueUnmapMemObject);
+  BindStat(clEnqueueSVMMap);
+  BindStat(clEnqueueSVMUnmap);
+  BindStat(clWaitForEvents);
+  BindStat(clEnqueueBarrierWithWaitList);
+  BindStat(clCreateCommandQueue);
+#undef BindStat
+  if (g_launch_level > 0)
+    ml_logi("NNTR_CL_LAUNCH_STAT=%d: OpenCL launch ledger installed",
+            g_launch_level);
+}
+
+bool clLaunchStatOn() { return g_launch_level > 0; }
+void clLaunchStatBegin(const char *phase) {
+  if (g_launch_level > 0)
+    LaunchStat::get().begin(phase);
+}
+void clLaunchStatTick() {
+  if (g_launch_level > 0)
+    LaunchStat::get().tick();
+}
+void clLaunchStatDump(const char *phase) {
+  if (g_launch_level > 0)
+    LaunchStat::get().dump(phase);
+}
+
 } // namespace nntrainer::opencl

@@ -234,6 +234,11 @@ typedef cl_int(CL_API_CALL *PFN_clEnqueueBarrierWithWaitList)(
   cl_uint /**< num_events_in_wait_list */,
   const cl_event * /**< event_wait_list */, cl_event * /**< event */);
 
+typedef cl_int(CL_API_CALL *PFN_clGetKernelInfo)(
+  cl_kernel /**< kernel */, cl_kernel_info /**< param_name */,
+  size_t /**< param_value_size */, void * /**< param_value */,
+  size_t * /**< param_value_size_ret */);
+
 extern PFN_clGetPlatformIDs clGetPlatformIDs;
 extern PFN_clGetDeviceIDs clGetDeviceIDs;
 extern PFN_clGetDeviceInfo clGetDeviceInfo;
@@ -284,6 +289,29 @@ extern PFN_clSetKernelArgSVMPointer clSetKernelArgSVMPointer;
 extern PFN_clWaitForEvents clWaitForEvents;
 extern PFN_clReleaseEvent clReleaseEvent;
 extern PFN_clEnqueueBarrierWithWaitList clEnqueueBarrierWithWaitList;
+extern PFN_clGetKernelInfo clGetKernelInfo;
+
+/**
+ * @brief Launch ledger -- what the host asked the queue for, per kernel name.
+ *
+ * @details NNTR_CL_LAUNCH_STAT=1 installs counting wrappers over the queue
+ * entry points (NDRange, finish, flush, blocking reads/writes, maps) at load
+ * time; with the variable unset the driver pointers are bound directly and
+ * nothing on the dispatch path changes. Between clLaunchStatBegin() and
+ * clLaunchStatDump() every call is counted and its host wall time summed by
+ * kernel function name; a clFinish is also charged to the kernel enqueued
+ * just before it, which is how a per-dispatch drain shows up next to the
+ * dispatch that caused it. clLaunchStatTick() marks one decode token; the
+ * first token of a phase is dropped (it pays for whatever prefill left in
+ * flight) and the dump reports per-token averages over the rest.
+ * NNTR_CL_LAUNCH_STAT=2 additionally creates the queue with profiling
+ * enabled and collects each kernel's device time from its event at the tick,
+ * so the dump can say how much of the token's wall the GPU was busy.
+ */
+bool clLaunchStatOn();
+void clLaunchStatBegin(const char *phase);
+void clLaunchStatTick();
+void clLaunchStatDump(const char *phase);
 
 /**
  * @brief Monotonic epoch of OpenCL memory-object handle allocation.
