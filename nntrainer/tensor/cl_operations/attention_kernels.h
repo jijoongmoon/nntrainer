@@ -137,6 +137,24 @@ bool rope_inplace_f16_cl(const uint16_t *in, uint16_t *out,
                          void *in_clmem = nullptr, void *out_clmem = nullptr,
                          bool drain_svm_out = true, unsigned int write_off = 0);
 
+/// One-launch decode commit of a token's Q/K/V: rope_inplace_f16 over Q in
+/// place, rope_inplace_f16 over K into k_dst[k_write_off + ..], and the flat V
+/// copy into v_dst[v_write_off + ..] (the scatter_copy_f16_row store), all in
+/// the M == 1 form and byte-identical to the three separate launches. The
+/// sources bind their planner cl_mem when given (q_clmem / k_clmem / v_clmem),
+/// the SVM pointer otherwise; the destinations are SVM cache bases. No drain;
+/// `flush` submits the batch. Returns false (nothing enqueued) when a
+/// precondition fails, so the caller can take the separate launches instead.
+bool qkv_rope_commit_f16_cl(const uint16_t *q, void *q_clmem, const uint16_t *k,
+                            void *k_clmem, uint16_t *k_dst,
+                            unsigned int k_write_off, const uint16_t *v,
+                            void *v_clmem, uint16_t *v_dst,
+                            unsigned int v_write_off, const uint16_t *cos_lut,
+                            const uint16_t *sin_lut, unsigned int num_heads_q,
+                            unsigned int num_heads_kv, unsigned int head_dim,
+                            unsigned int start_pos, unsigned int max_positions,
+                            bool flush);
+
 /// SVM-direct flat FP16 copy (out[i] = in[i], i in [0, N)). Used to scatter a
 /// V projection slice into its KV-cache window on the device without a host
 /// round-trip (residency). `svm_inputs == true` binds in/out via SVM pointers;
@@ -491,6 +509,19 @@ int kv_img_write_mode();
  * @param why short reason, logged once
  */
 void kv_img_write_disarm(const char *why);
+
+/// One-launch decode (M == 1) form of k_scatter_ohwi_img_cl followed by
+/// v_scatter_ohwi_t_img_cl: the same texels, reads and stores, so the mirrors
+/// hold the same bytes as after the two launches. v_max_S is the V image's
+/// sequence stride (the K and V images may differ). Returns false (nothing
+/// enqueued) on a precondition, so the caller can take the two launches.
+bool kv_scatter_ohwi_img_cl(const uint16_t *k_src_svm, void *k_src_clmem,
+                            unsigned int k_src_off, void *k_dst_image,
+                            unsigned int k_max_S, const uint16_t *v_src_svm,
+                            void *v_src_clmem, unsigned int v_src_off,
+                            void *v_dst_image, unsigned int v_max_S,
+                            unsigned int num_heads_KV, unsigned int head_dim,
+                            unsigned int position);
 
 /**
  * @brief [kv-img-write] K scatter, image path: same source and the same OHWI

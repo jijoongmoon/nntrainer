@@ -572,6 +572,47 @@ __kernel void v_scatter_ohwi_t_img(__global const half *src,
   }
   write_imageui(dst, c, as_uint4(vload8(0, tmp)));
 }
+// Decode-step K and V image scatters in ONE launch (M == 1): lanes
+// [0, d/8) of get_global_id(2) are k_scatter_ohwi_img's (head, d-texel) work
+// items, lanes [d/8, d/8 + d) are v_scatter_ohwi_t_img's (head, channel) work
+// items for the single texel a one-row step touches. Same reads, same texel
+// coordinates, same stores as the two kernels above.
+__kernel void kv_scatter_ohwi_img(__global const half *k_src,
+                                  __write_only image2d_t k_dst,
+                                  __global const half *v_src,
+                                  __read_write image2d_t v_dst, const int hKV,
+                                  const int d, const int k_max_S,
+                                  const int v_max_S, const int position,
+                                  const int k_src_off, const int v_src_off) {
+  const int h = get_global_id(1);
+  const int z = get_global_id(2);
+  const int dtex = d >> 3;
+  if (h >= hKV) return;
+  if (z < dtex) {
+    const int dt = z;
+    const long so = (long)k_src_off + (long)h * d + (long)(dt << 3);
+    half tmp[8];
+    for (int l = 0; l < 8; ++l) tmp[l] = k_src[so + l];
+    const int lin_row = h * k_max_S + position;
+    const int g = 1 << KIMG_GSH;
+    write_imageui(k_dst,
+                  (int2)(((lin_row & (g - 1)) * dtex) + dt, lin_row >> KIMG_GSH),
+                  as_uint4(vload8(0, tmp)));
+  } else if (z < dtex + d) {
+    const int x = z - dtex;
+    const int tex = position >> 3;
+    const int2 c = (int2)(tex, h * d + x);
+    half tmp[8];
+    vstore8(as_half8(read_imageui(v_dst, c)), 0, tmp);
+    for (int l = 0; l < 8; ++l) {
+      const int p = (tex << 3) + l;
+      if (p >= position && p < position + 1)
+        tmp[l] = v_src[(long)v_src_off + (long)(p - position) * hKV * d +
+                       (long)h * d + x];
+    }
+    write_imageui(v_dst, c, as_uint4(vload8(0, tmp)));
+  }
+}
 // V, mode 2: the same rows, with NO image read anywhere in the write path. Mode
 // 1's read-modify-write is itself an image read, and an image read is what
 // pollutes the texture cache on this driver (see the gather), so at long spans
@@ -723,6 +764,50 @@ __kernel void scatter_copy_f16_row(__global const half *in, __global half *out,
                                    const int N, const int write_off) {
   int i = get_global_id(0);
   if (i < N) out[write_off + i] = in[i];
+}
+// Decode-step Q/K/V commit in ONE launch: rope_inplace_f16 over Q (in place),
+// rope_inplace_f16 over K into the key cache at k_write_off, and the flat V
+// copy into the value cache at v_write_off. One work item per (head lane,
+// half_d), heads laid out along get_global_id(1) as [Q heads | K heads | V
+// heads]; each lane runs the M == 1 (fp32) rotation of rope_inplace_f16 or the
+// scatter_copy_f16_row store verbatim, so the bytes written are the same as
+// the three launches this replaces.
+__kernel void qkv_rope_commit_f16(__global const half *q_in,
+                                  __global       half *q_out,
+                                  __global const half *k_in,
+                                  __global       half *k_out,
+                                  __global const half *v_in,
+                                  __global       half *v_out,
+                                  __global const half *cos_lut,
+                                  __global const half *sin_lut,
+                                  const int num_heads_q, const int num_heads_kv,
+                                  const int half_d, const int start_pos,
+                                  const int k_write_off, const int v_write_off) {
+  const int h = get_global_id(1);
+  const int k = get_global_id(2);
+  if (k >= half_d) return;
+  const int d = 2 * half_d;
+  if (h < num_heads_q + num_heads_kv) {
+    const int hh = h < num_heads_q ? h : h - num_heads_q;
+    __global const half *in = h < num_heads_q ? q_in : k_in;
+    __global half *out = h < num_heads_q ? q_out : k_out;
+    const int write_off = h < num_heads_q ? 0 : k_write_off;
+    long row = (long)hh * d;
+    long lut = (long)start_pos * half_d + k;
+    half c = cos_lut[lut];
+    half s = sin_lut[lut];
+    half lo = in[row + k];
+    half hi = in[row + k + half_d];
+    float cf = (float)c, sf = (float)s, lof = (float)lo, hif = (float)hi;
+    out[write_off + row + k]          = (half)(lof * cf - hif * sf);
+    out[write_off + row + k + half_d] = (half)(hif * cf + lof * sf);
+  } else {
+    const int hv = h - num_heads_q - num_heads_kv;
+    if (hv >= num_heads_kv) return;
+    const long row = (long)hv * d;
+    v_out[v_write_off + row + k] = v_in[row + k];
+    v_out[v_write_off + row + k + half_d] = v_in[row + k + half_d];
+  }
 }
 // OHWI K scatter: src concat [t, hKV, d] -> dst OHWI [hKV, max_S, d] at
 // (position+t). Feeds the K image2d view (qk_matmul_f16_ohwi_img). Mirrors
@@ -1026,6 +1111,104 @@ bool ensure_cl_stage_buf(void **buf, size_t *cap, size_t bytes) {
   cl_context ctx = blas_cc->context_inst_.GetContextNoRetain();
   return tca_ensure(ctx, reinterpret_cast<cl_mem *>(buf), cap, bytes,
                     CL_MEM_READ_WRITE);
+}
+
+bool qkv_rope_commit_f16_cl(const uint16_t *q, void *q_clmem, const uint16_t *k,
+                            void *k_clmem, uint16_t *k_dst,
+                            unsigned int k_write_off, const uint16_t *v,
+                            void *v_clmem, uint16_t *v_dst,
+                            unsigned int v_write_off, const uint16_t *cos_lut,
+                            const uint16_t *sin_lut, unsigned int num_heads_q,
+                            unsigned int num_heads_kv, unsigned int head_dim,
+                            unsigned int start_pos, unsigned int max_positions,
+                            bool flush) {
+  if (num_heads_q == 0 || num_heads_kv == 0 || head_dim == 0 || (head_dim & 1u))
+    return false;
+  if (q == nullptr || k == nullptr || v == nullptr || k_dst == nullptr ||
+      v_dst == nullptr || cos_lut == nullptr || sin_lut == nullptr)
+    return false;
+  if (start_pos + 1 > max_positions)
+    return false;
+  const int half_d = (int)(head_dim / 2);
+
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  cl_context ctx = blas_cc->context_inst_.GetContextNoRetain();
+  cl_command_queue q_ = blas_cc->command_queue_inst_.GetCommandQueue();
+  ClContext::SharedPtrClKernel kp = blas_cc->registerClKernel(
+    rope_inplace_kernel, "qkv_rope_commit_f16", ropeCopts());
+  if (!kp)
+    return false;
+
+  // Same resident LUT slot as rope_inplace_f16_cl: uploaded once per
+  // (cos, sin, half_d), drained only on the upload.
+  const size_t lut_bytes = (size_t)max_positions * half_d * sizeof(uint16_t);
+  RopeScratch &sc = rope_scratch();
+  RopeScratch::LutSlot &slot =
+    sc.lut_slots[RopeScratch::LutKey{cos_lut, sin_lut, half_d}];
+  if (!tca_ensure(ctx, &slot.cos, &slot.cos_bytes, lut_bytes,
+                  CL_MEM_READ_ONLY) ||
+      !tca_ensure(ctx, &slot.sin, &slot.sin_bytes, lut_bytes, CL_MEM_READ_ONLY))
+    return false;
+  if (!slot.uploaded || slot.positions < max_positions) {
+    if (opencl::clEnqueueWriteBuffer(q_, slot.cos, CL_FALSE, 0, lut_bytes,
+                                     cos_lut, 0, nullptr,
+                                     nullptr) != CL_SUCCESS ||
+        opencl::clEnqueueWriteBuffer(q_, slot.sin, CL_FALSE, 0, lut_bytes,
+                                     sin_lut, 0, nullptr,
+                                     nullptr) != CL_SUCCESS)
+      return false;
+    slot.positions = max_positions;
+    slot.uploaded = true;
+    opencl::clFinish(q_);
+  }
+
+  // Each source binds its own plane (the FC's device sub-buffer when given,
+  // the SVM pointer otherwise); the destinations are the SVM cache bases with
+  // the row offsets as kernel scalars, exactly as the three separate launches
+  // bind them.
+  auto bind_in = [&](cl_uint idx, const uint16_t *p, void *clmem) {
+    if (clmem != nullptr) {
+      cl_mem h = static_cast<cl_mem>(clmem);
+      return kp->SetKernelArguments(idx, &h, sizeof(cl_mem));
+    }
+    return kp->SetKernelSVMArguments(idx, const_cast<uint16_t *>(p));
+  };
+  bool okb = bind_in(0, q, q_clmem) &&
+             kp->SetKernelSVMArguments(1, const_cast<uint16_t *>(q)) &&
+             bind_in(2, k, k_clmem) && kp->SetKernelSVMArguments(3, k_dst) &&
+             bind_in(4, v, v_clmem) && kp->SetKernelSVMArguments(5, v_dst) &&
+             kp->SetKernelArguments(6, &slot.cos, sizeof(cl_mem)) &&
+             kp->SetKernelArguments(7, &slot.sin, sizeof(cl_mem));
+  int nq = (int)num_heads_q, nkv = (int)num_heads_kv, hd = half_d,
+      sp = (int)start_pos, kwo = (int)k_write_off, vwo = (int)v_write_off;
+  okb = okb && kp->SetKernelArguments(8, &nq, sizeof(int)) &&
+        kp->SetKernelArguments(9, &nkv, sizeof(int)) &&
+        kp->SetKernelArguments(10, &hd, sizeof(int)) &&
+        kp->SetKernelArguments(11, &sp, sizeof(int)) &&
+        kp->SetKernelArguments(12, &kwo, sizeof(int)) &&
+        kp->SetKernelArguments(13, &vwo, sizeof(int));
+  if (!okb)
+    return false;
+
+  constexpr size_t LWS_K = 64;
+  const size_t kx_pad = (((size_t)half_d + LWS_K - 1) / LWS_K) * LWS_K;
+  std::array<size_t, 3> gws = {1, (size_t)num_heads_q + 2 * num_heads_kv,
+                               kx_pad};
+  std::array<size_t, 3> lws = {1, 1, LWS_K};
+  blas_cc->command_queue_inst_.enqueueKernel(kp->GetKernel(), 3, gws.data(),
+                                             lws.data(), 0, nullptr, nullptr);
+  // The rotated K and the V row are undrained shared-plane writes consumed by
+  // the same-queue scatters; declare them for the (opt-in) hazard check, as
+  // the separate launches do.
+  const size_t row_bytes = (size_t)num_heads_kv * head_dim * sizeof(uint16_t);
+  opencl::Kernel::noteUndrainedSvmPlane(
+    k_dst, (size_t)k_write_off * sizeof(uint16_t) + row_bytes);
+  opencl::Kernel::noteUndrainedSvmPlane(
+    v_dst, (size_t)v_write_off * sizeof(uint16_t) + row_bytes);
+  if (flush)
+    opencl::clFlush(q_);
+  return true;
 }
 
 bool gpu_copy_f16_cl(const uint16_t *in, uint16_t *out, unsigned int N,
@@ -1686,6 +1869,58 @@ bool v_scatter_ohwi_t_img_cl(const uint16_t *src_svm, void *dst_image,
                          /*image_is_dst=*/true, M, num_heads_KV, head_dim,
                          max_S, position, src_off, /*has_src_off=*/true,
                          /*gws_x=*/ntex, /*gws_z=*/head_dim, /*drain=*/false);
+}
+
+bool kv_scatter_ohwi_img_cl(const uint16_t *k_src_svm, void *k_src_clmem,
+                            unsigned int k_src_off, void *k_dst_image,
+                            unsigned int k_max_S, const uint16_t *v_src_svm,
+                            void *v_src_clmem, unsigned int v_src_off,
+                            void *v_dst_image, unsigned int v_max_S,
+                            unsigned int num_heads_KV, unsigned int head_dim,
+                            unsigned int position) {
+  if (num_heads_KV == 0 || head_dim == 0 || (head_dim & 7u) ||
+      k_dst_image == nullptr || v_dst_image == nullptr)
+    return false;
+  if ((k_src_clmem == nullptr && k_src_svm == nullptr) ||
+      (v_src_clmem == nullptr && v_src_svm == nullptr))
+    return false;
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  ClContext::SharedPtrClKernel kp = kvImgKernel("kv_scatter_ohwi_img");
+  if (!kp)
+    return false;
+  auto bind_src = [&](cl_uint idx, const uint16_t *p, void *clmem) {
+    if (clmem != nullptr) {
+      cl_mem h = static_cast<cl_mem>(clmem);
+      return kp->SetKernelArguments(idx, &h, sizeof(cl_mem));
+    }
+    return kp->SetKernelSVMArguments(idx, const_cast<uint16_t *>(p));
+  };
+  cl_mem kimg = static_cast<cl_mem>(k_dst_image);
+  cl_mem vimg = static_cast<cl_mem>(v_dst_image);
+  int hKVi = (int)num_heads_KV, di = (int)head_dim, kS = (int)k_max_S,
+      vS = (int)v_max_S, posi = (int)position, ko = (int)k_src_off,
+      vo = (int)v_src_off;
+  if (!bind_src(0, k_src_svm, k_src_clmem) ||
+      !kp->SetKernelArguments(1, &kimg, sizeof(cl_mem)) ||
+      !bind_src(2, v_src_svm, v_src_clmem) ||
+      !kp->SetKernelArguments(3, &vimg, sizeof(cl_mem)) ||
+      !kp->SetKernelArguments(4, &hKVi, sizeof(int)) ||
+      !kp->SetKernelArguments(5, &di, sizeof(int)) ||
+      !kp->SetKernelArguments(6, &kS, sizeof(int)) ||
+      !kp->SetKernelArguments(7, &vS, sizeof(int)) ||
+      !kp->SetKernelArguments(8, &posi, sizeof(int)) ||
+      !kp->SetKernelArguments(9, &ko, sizeof(int)) ||
+      !kp->SetKernelArguments(10, &vo, sizeof(int)))
+    return false;
+  constexpr size_t LWS_Z = 64;
+  const size_t lanes = (size_t)(head_dim >> 3) + (size_t)head_dim;
+  std::array<size_t, 3> gws = {1, (size_t)num_heads_KV,
+                               (lanes + LWS_Z - 1) / LWS_Z * LWS_Z};
+  std::array<size_t, 3> lws = {1, 1, LWS_Z};
+  blas_cc->command_queue_inst_.enqueueKernel(kp->GetKernel(), 3, gws.data(),
+                                             lws.data(), 0, nullptr, nullptr);
+  return true;
 }
 
 bool k_gather_ohwi_img_cl(void *src_image, uint16_t *dst_svm, unsigned int M,

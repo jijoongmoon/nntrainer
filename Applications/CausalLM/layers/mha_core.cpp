@@ -2437,18 +2437,47 @@ void MHACoreLayer::one_batch_incremental_forwarding(
         // double-rotated. K: rotate key_step -> b_cache_key_step SVM slice (the
         // OHWI scatter source). cl_mem-in (k_cl) -> SVM-out. key_step left
         // unmodified.
-        bool ok = nntrainer::rope_inplace_f16_cl(
-          k_p, _kv_soff_k ? kc_base : kc_p, cos_lut, sin_lut, to - from,
-          num_heads_KV, head_dim, cache_index, mp, kc_svm, /*in_clmem=*/k_cl,
-          /*out_clmem=*/nullptr, /*drain_svm_out=*/false,
-          /*write_off=*/_kv_soff_k ? (unsigned int)_kc_step_off : 0u);
+        // [qkv-commit] The three launches below (rope-K, V copy, rope-Q) in
+        // ONE kernel, byte-identical: on an Adreno 840 decode step they were
+        // 3 of ~24 launches per layer plus 2 submissions, ~0.5 ms of host
+        // time per token (1.5B model). Falls through to the separate
+        // launches when a source is neither SVM nor device-resident (nothing
+        // has been enqueued at that point). NNTR_QKV_COMMIT_FUSE=0 disables;
+        // NNTR_QKV_COMMIT_FLUSH=1 submits right after it.
+        static const bool _qkv_fuse = []() {
+          const char *e = std::getenv("NNTR_QKV_COMMIT_FUSE");
+          return e == nullptr || e[0] != '0';
+        }();
+        static const bool _qkv_flush = []() {
+          const char *e = std::getenv("NNTR_QKV_COMMIT_FLUSH");
+          return e != nullptr && e[0] == '1';
+        }();
+        const bool k_svm =
+          key_step.getMemoryData() && key_step.getMemoryData()->isSVM();
+        bool fused = false;
+        if (_qkv_fuse && (q_cl != nullptr || q_svm) &&
+            (k_cl != nullptr || k_svm) && (v_cl != nullptr || v_svm)) {
+          fused = nntrainer::qkv_rope_commit_f16_cl(
+            q_p, q_cl, k_p, k_cl, _kv_soff_k ? kc_base : kc_p,
+            _kv_soff_k ? (unsigned int)_kc_step_off : 0u, v_in, v_cl,
+            _kv_soff_v ? vc_base : v_out,
+            _kv_soff_v ? (unsigned int)_vc_step_off : 0u, cos_lut, sin_lut,
+            num_heads_Q, num_heads_KV, head_dim, cache_index, mp, _qkv_flush);
+        }
+        bool ok = fused;
+        if (!fused)
+          ok = nntrainer::rope_inplace_f16_cl(
+            k_p, _kv_soff_k ? kc_base : kc_p, cos_lut, sin_lut, to - from,
+            num_heads_KV, head_dim, cache_index, mp, kc_svm, /*in_clmem=*/k_cl,
+            /*out_clmem=*/nullptr, /*drain_svm_out=*/false,
+            /*write_off=*/_kv_soff_k ? (unsigned int)_kc_step_off : 0u);
         // Enqueued without a drain: the SVM/host fallbacks below must drain
         // once if the image attention ends up missing this step.
         if (ok)
           kv_write_undrained = true;
         // V: flat copy value_step -> b_cache_value_step SVM slice (no RoPE, the
         // OHWI v-scatter source). value_step left unmodified.
-        if (ok)
+        if (ok && !fused)
           ok = _kv_soff_v ? nntrainer::gpu_copy_f16_row_cl(
                               v_in, vc_base, kv_n, (int)_vc_step_off,
                               /*svm_inputs=*/true,
@@ -2462,7 +2491,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
         // with q_clmem=null). cl_mem-in -> SVM-out when the FC parked Q in
         // cl_mem. Only run once K+V are committed so a Q failure cannot leave a
         // half-rotated, then re-rotated, Q.
-        if (ok)
+        if (ok && !fused)
           ok = nntrainer::rope_inplace_f16_cl(
             q_p, q_p, cos_lut, sin_lut, to - from, num_heads_Q, head_dim,
             cache_index, mp, q_svm, /*in_clmem=*/q_cl, /*out_clmem=*/nullptr,
@@ -3629,21 +3658,10 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             }
             // A false return means the driver refused the CL2.0 image-write
             // program (which disarms the path process-wide); fall through to
-            // the buffer scatter so the rows are still written.
-            if (!kv_img_write ||
-                !nntrainer::k_scatter_ohwi_img_cl(
-                  k_sc_src, k_image_ohwi, step_size, num_heads_KV, head_dim,
-                  kv_mirror_S_max, m_from,
-                  /*src_clmem=*/k_stage, /*src_off=*/k_sc_off))
-              nntrainer::k_scatter_ohwi_cl(
-                k_sc_src, reinterpret_cast<cl_mem>(k_buf_ohwi), step_size,
-                num_heads_KV, head_dim, kv_mirror_S_max, m_from,
-                /*src_clmem=*/k_stage, /*src_off=*/k_sc_off);
-            kv_k_valid_to = cache_to;
-            const double _kvst_tk = _kvst_on() ? _kvst_now() : 0;
-            // [rq-scalar-off] Same as the K scatter above: when the source is
-            // the V cache's step slice (no stage), address the stable base with
-            // a scalar row offset.
+            // the buffer scatter so the rows are still written. [rq-scalar-off]
+            // Same as the K scatter below: when the source is the V cache's
+            // step slice (no stage), address the stable base with a scalar row
+            // offset.
             const uint16_t *v_sc_src =
               v_stage_svm != nullptr ? v_stage_svm
                                      : reinterpret_cast<const uint16_t *>(
@@ -3658,12 +3676,44 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                 v_sc_off = (unsigned int)_vc_step_off;
               }
             }
+            // [kv-scatter-fuse] A one-row decode step writes one K texel row
+            // and one V texel per head; the two image scatters below are the
+            // same reads and stores in ONE launch (byte-identical mirrors),
+            // one launch per layer less. Only the mode-1 V write path (the
+            // slab rebuild of mode 2 stays separate). NNTR_KV_SCATTER_FUSE=0
+            // disables.
+            static const bool _kv_scatter_fuse = []() {
+              const char *e = std::getenv("NNTR_KV_SCATTER_FUSE");
+              return e == nullptr || e[0] != '0';
+            }();
+            bool kv_fused = false;
+            if (_kv_scatter_fuse && kv_img_write && step_size == 1 &&
+                nntrainer::kv_img_write_mode() < 2 && v_img_use != nullptr)
+              kv_fused = nntrainer::kv_scatter_ohwi_img_cl(
+                k_sc_src, /*k_src_clmem=*/k_stage, k_sc_off, k_image_ohwi,
+                kv_mirror_S_max, v_sc_src, /*v_src_clmem=*/v_stage_clmem,
+                v_sc_off, v_img_use, v_stride, num_heads_KV, head_dim, m_from);
+            if (kv_fused) {
+              // both mirrors written; the separate scatters are skipped below
+            } else if (!kv_img_write ||
+                       !nntrainer::k_scatter_ohwi_img_cl(
+                         k_sc_src, k_image_ohwi, step_size, num_heads_KV,
+                         head_dim, kv_mirror_S_max, m_from,
+                         /*src_clmem=*/k_stage, /*src_off=*/k_sc_off))
+              nntrainer::k_scatter_ohwi_cl(
+                k_sc_src, reinterpret_cast<cl_mem>(k_buf_ohwi), step_size,
+                num_heads_KV, head_dim, kv_mirror_S_max, m_from,
+                /*src_clmem=*/k_stage, /*src_off=*/k_sc_off);
+            kv_k_valid_to = cache_to;
+            const double _kvst_tk = _kvst_on() ? _kvst_now() : 0;
             // [kv-img-write] V through the image in use (the tight view once it
             // is adopted -- the image the sv kernels read IS the image the
             // scatter must write), same source and same rows as the buffer
             // scatter below.
-            bool v_written = false;
-            if (kv_img_write && nntrainer::kv_img_write_mode() >= 2)
+            bool v_written = kv_fused;
+            if (kv_fused) {
+              // written by the fused launch above
+            } else if (kv_img_write && nntrainer::kv_img_write_mode() >= 2)
               // mode 2: no image read in the write path -- the partial texels
               // come from the slab, not from the mirror.
               v_written = nntrainer::v_scatter_ohwi_t_img_slab_cl(
