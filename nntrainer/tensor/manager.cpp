@@ -49,6 +49,7 @@
 #include <optimized_v1_planner.h>
 #include <optimized_v2_planner.h>
 #include <optimized_v3_planner.h>
+#include <qs4cx_tensor.h> // qs4cxHeapBypassOn
 #include <residency_policy.h>
 #include <tensor_pool.h>
 #include <tensor_wrap_specs.h>
@@ -161,16 +162,6 @@ void Manager::allocateWeights(unsigned int max_exec_order_, bool init) {
 }
 
 void Manager::deallocateWeights() { weight_pool.deallocate(); }
-
-/**
- * @brief VALUE-checked env truthiness: set AND not starting with '0'.
- * @note  Local to this translation unit rather than a shared env-compat
- *        helper, since this branch does not carry one yet.
- */
-[[maybe_unused]] static bool manager_env_on(const char *name) {
-  const char *e = std::getenv(name);
-  return e != nullptr && e[0] != '0';
-}
 
 static Tensor *requestTensor_(const TensorSpecV2 &spec,
                               const GraphNode::ExecutionOrder &exec_order,
@@ -508,11 +499,16 @@ std::vector<Weight *> Manager::requestWeights(
       // been arch-neutral -- QS4CX_Tensor::allocate() is a plain new uint8_t[]
       // off Windows -- so this gate was only ever naming where the family had
       // been measured.
+      //
+      // The decision itself (env value, else the platform default: ON on
+      // Android, OFF elsewhere) lives in qs4cxHeapBypassOn(), which the
+      // allocator's uninitialized-payload arm resolves off as well, so the two
+      // can never disagree about whether a payload is self-owned.
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) ||             \
   defined(_M_IX86) || defined(__aarch64__) || defined(_M_ARM64)
       const bool qs4cx_heap_bypass =
         dim_v.getDataType() == ml::train::TensorDim::DataType::QS4CX &&
-        !enable_fsu && manager_env_on("NNTR_QS4CX_HEAP_BYPASS");
+        !enable_fsu && qs4cxHeapBypassOn();
 #else
       const bool qs4cx_heap_bypass = false;
 #endif

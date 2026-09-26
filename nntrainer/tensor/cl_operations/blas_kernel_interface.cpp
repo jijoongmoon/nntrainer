@@ -28,6 +28,7 @@
 #include <load_trace.h>
 #include <nntrainer_error.h>
 #include <opencl_loader.h>
+#include <qs4cx_tensor.h> // the dropped-payload registry (DROP_PLAIN)
 
 namespace nntrainer {
 void dotBatchedCl(Tensor const &input, Tensor const &m, Tensor &result,
@@ -782,6 +783,15 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
     (nib_override != nullptr) ? nib_override : weight.getData<uint8_t>();
   if (!nibbles)
     return nullptr;
+  // A rebuild from the tensor's own payload after that payload was released
+  // (DROP_PLAIN below) would permute zeros into a device weight and every FC
+  // through it would answer wrong with rc = 0. The only way here is a cache
+  // entry that was dropped without its tensor going away (the teardown hook
+  // cl_fc_release_caches() runs after the model objects are freed, so a
+  // healthy run never takes this). Refuse, do not decline: a nullptr return
+  // would send the call to the host fallback, which is guarded the same way.
+  if (nib_override == nullptr)
+    refuseIfQs4cxPayloadDropped(nibbles, "v8c weight rebuild");
   // int4 weights are QS4CX: row-major plain nibbles (uint4 = int4+8, no XOR) +
   // per-output-channel fp32 scale. A legacy QINT4 .bin is re-laid-out to this
   // form at load (QS4CX_Tensor::read), so the v8c backing has a single source.
@@ -917,24 +927,28 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
   }
   auto inserted = cache.emplace(key, std::move(e));
 
-  // [NNTR_V8C_DROP_PLAIN=1, x86-only, OPT-IN] The device backing + scale buf +
-  // row-sum built above are the only things the v8c GPU path reads from now
-  // on, so dropping the plain QS4CX pages after the build reclaims ~the whole
-  // FC weight footprint from host RSS. INWARD page alignment so pages shared
-  // with neighboring pool tensors are never touched. May silently no-op if the
+  // [NNTR_V8C_DROP_PLAIN] The device backing + scale buf + row-sum built
+  // above are the only things the v8c GPU path reads from now on, so dropping
+  // the plain QS4CX pages after the build reclaims ~the whole FC weight
+  // footprint from host RSS. INWARD page alignment so pages shared with
+  // neighboring pool tensors are never touched. May silently no-op if the
   // driver pinned the SVM pages (result is logged).
   //
-  // DANGEROUS, hence opt-in everywhere: dropped pages read back as ZEROS, and
-  // a live host consumer of the plain payload still exists on x86 -- the
-  // ClComputeOps QS4CX fallback calls Tensor::dot, and FloatTensor::dot
-  // dispatches QS4CX to dotQs4cx(), which reads exactly these nibbles plus the
-  // fp32 scale tail (float_tensor.cpp). That fallback is reachable: dotCl_v8c
-  // returns false from ~10 sites AFTER the weight has been built, cached and
-  // dropped (allocation failures, kernel-registration failures, and the
-  // imageless untied-lm_head branch, which returns false unconditionally on an
-  // fp16-disabled build). The result would be a well-formed, entirely wrong
-  // output with no exception and no log. Re-enabling by default needs the
-  // fallback to fail loudly on a dropped weight first.
+  // Dropped pages read back as ZEROS, and host consumers of the plain payload
+  // exist: the ClComputeOps QS4CX fallback calls Tensor::dot, whose
+  // FloatTensor::dotQs4cx / HalfTensor::dot QS4CX arms read exactly these
+  // nibbles plus the fp32 scale tail, and the KAI pack() paths read them too.
+  // Those fallbacks are reachable: dotCl_v8c returns false from ~10 sites
+  // AFTER the weight has been built, cached and dropped (allocation failures,
+  // kernel-registration failures, the imageless untied-lm_head branch on an
+  // fp16-disabled build). Every one of them therefore consults the
+  // dropped-payload registry (qs4cx_tensor.h) and throws on a released weight
+  // instead of returning a well-formed, entirely wrong output. The registry
+  // is written HERE, right after a successful release, and only for a payload
+  // the tensor owns (the heap bypass): a pool slice on Linux refuses the
+  // madvise (EINVAL) and on a kgsl SVM arena "succeeds" without giving
+  // anything back, so a slice is never recorded as unreadable.
+  //
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) ||             \
   defined(_M_IX86)
   {
@@ -943,20 +957,20 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
       if (v != nullptr)
         return v[0] == '1';
       // Opt-in on every platform. DiscardVirtualMemory does work on the WDDM
-      // SVM host shadow (verified on every weight, goldens byte-identical),
-      // but the win is throughput/footprint while the failure mode is silent
-      // wrong output through the host fallback described above, so it must not
-      // be the default until that fallback rejects a dropped weight.
+      // SVM host shadow (verified on every weight, goldens byte-identical);
+      // the bundles that ship it set the variable, and a bare run keeps the
+      // long-measured residency it always had.
       return false;
     }();
     // Announce the resolved decision once. The drop is otherwise invisible in
     // a run log -- same outputs, same caches, only the residency differs --
     // which makes "was it actually on?" unanswerable after the fact.
     static const bool announced = [&]() {
-      ml_logi("[v8c] DROP_PLAIN %s (NNTR_V8C_DROP_PLAIN)",
+      ml_logi("[v8c] DROP_PLAIN %s (NNTR_V8C_DROP_PLAIN, heap bypass %s)",
               drop_plain
                 ? "ON: the plain QS4CX payload is released after the repack"
-                : "OFF: the plain QS4CX payload stays resident");
+                : "OFF: the plain QS4CX payload stays resident",
+              qs4cxHeapBypassOn() ? "on" : "off");
       return true;
     }();
     (void)announced;
@@ -998,6 +1012,9 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
           (void)::madvise((void *)lo, (size_t)(hi - lo), MADV_DONTNEED);
 #endif
         }
+        // The nibble half was never written at all, so whatever the release
+        // did, no host consumer may read this payload: record it.
+        markQs4cxPayloadDropped(host, payload);
       }
     } else if (drop_plain && droppable) {
       const size_t payload = (size_t)N * (((size_t)K + 1) / 2) // nibbles
@@ -1026,6 +1043,10 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
                      "rc=%ld errno=%d\n",
                      N, K, payload, (size_t)(hi > lo ? hi - lo : 0), rc,
                      rc == 0 ? 0 : errno);
+      // Record the release for the host-side guards -- only for a self-owned
+      // payload, whose pages really are gone (see the block comment above).
+      if (rc == 0 && qs4cxHeapBypassOn())
+        markQs4cxPayloadDropped(nibbles, payload);
     }
   }
 #endif

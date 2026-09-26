@@ -24,6 +24,8 @@
 #include <int4_utils.h>
 #include <limits>
 #include <mutex>
+#include <stdexcept>
+#include <string>
 #include <util_func.h>
 #include <utility>
 #include <vector>
@@ -93,8 +95,8 @@ void readLegacyQint4ToQs4cx(
  * Escape hatch: NNTR_QS4CX_ALLOC_ZERO=1 restores the old double zero-fill.
  */
 bool qs4cxAllocUninitialized() {
-  static const bool v = nntr_env_on("NNTR_QS4CX_HEAP_BYPASS") &&
-                        !nntr_env_on("NNTR_QS4CX_ALLOC_ZERO");
+  static const bool v =
+    qs4cxHeapBypassOn() && !nntr_env_on("NNTR_QS4CX_ALLOC_ZERO");
   return v;
 }
 
@@ -160,12 +162,13 @@ void QS4CX_Tensor::allocate() {
     // VirtualAlloc regions; running it on HeapAlloc pages corrupts the heap.
     // DiscardVirtualMemory (residency only) works on either. The deleter
     // releases the whole reservation.
-    if (nntr_env_on("NNTR_QS4CX_HEAP_BYPASS")) {
+    if (qs4cxHeapBypassOn()) {
       void *va =
         VirtualAlloc(nullptr, size(), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
       if (va != nullptr) {
         mem_data = new MemoryData(va);
         data = std::shared_ptr<MemoryData>(mem_data, [](auto *md) {
+          unmarkQs4cxPayloadDropped(md->template getAddr<uint8_t>());
           VirtualFree(md->template getAddr<uint8_t>(), 0, MEM_RELEASE);
           delete md;
         });
@@ -196,6 +199,9 @@ void QS4CX_Tensor::allocate() {
     mem_data = new MemoryData(uninit ? (void *)(new uint8_t[size()])
                                      : (void *)(new uint8_t[size()]{}));
     data = std::shared_ptr<MemoryData>(mem_data, [](auto *mem_data) {
+      // The drop registry is keyed by this address; retract it before the
+      // allocator can hand the block to the next weight.
+      unmarkQs4cxPayloadDropped(mem_data->template getAddr<uint8_t>());
       delete[] mem_data->template getAddr<uint8_t>();
       delete mem_data;
     });
@@ -222,6 +228,8 @@ void QS4CX_Tensor::pack() {
   if (packed_data) {
     return;
   }
+  // Host reader of the plain nibbles + scales (the KAI rhs pack).
+  refuseIfQs4cxPayloadDropped(getData(), "QS4CX_Tensor::pack");
 
   size_t opt_kernel_idx = 8;
   /**
@@ -259,6 +267,8 @@ void QS4CX_Tensor::packF16Activation() {
   if (packed_data) {
     return;
   }
+  // Host reader of the plain nibbles + scales (the fp16-activation KAI rhs).
+  refuseIfQs4cxPayloadDropped(getData(), "QS4CX_Tensor::packF16Activation");
 
   // fp16-activation KAI rhs, built once at load. Byte-identical to the buffer
   // HalfTensor::dot's QS4CX case used to assemble lazily on its first forward
@@ -467,6 +477,44 @@ bool isQs4cxPayloadDropped(const void *ptr) {
     if (p >= r.first && p < r.second)
       return true;
   return false;
+}
+
+void unmarkQs4cxPayloadDropped(const void *base) {
+  if (!anyQs4cxPayloadDropped() || base == nullptr)
+    return;
+  const uintptr_t lo = reinterpret_cast<uintptr_t>(base);
+  std::lock_guard<std::mutex> lock(qs4cx_dropped_mtx());
+  auto &v = qs4cx_dropped_ranges();
+  for (auto it = v.begin(); it != v.end();) {
+    if (it->first == lo)
+      it = v.erase(it);
+    else
+      ++it;
+  }
+  // `dropped_any` stays set: it is only the fast-path gate, and clearing it
+  // while another range is still live would skip that range's check.
+}
+
+void refuseIfQs4cxPayloadDropped(const void *payload, const char *who) {
+  if (!isQs4cxPayloadDropped(payload))
+    return;
+  throw std::runtime_error(
+    std::string("[") + (who ? who : "QS4CX") +
+    "] refusing to read a QS4CX weight whose plain payload was released after "
+    "its device repack (NNTR_QS4CX_HEAP_BYPASS + NNTR_V8C_DROP_PLAIN): the "
+    "pages read back as zeros and the result would be silently wrong. A host "
+    "consumer reached a weight the GPU path was expected to own; run with "
+    "NNTR_V8C_DROP_PLAIN=0 to keep the payload resident");
+}
+
+bool qs4cxHeapBypassOn() {
+  static const bool on = []() {
+    const char *e = std::getenv("NNTR_QS4CX_HEAP_BYPASS");
+    if (e != nullptr)
+      return e[0] != '0';
+    return false;
+  }();
+  return on;
 }
 
 } // namespace nntrainer

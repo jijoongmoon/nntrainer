@@ -400,6 +400,58 @@ TEST(nntrainer_Tensor, QS4CXTensor_01_p) {
 }
 
 /**
+ * @brief The dropped-payload registry: a released QS4CX payload is refused by
+ *        every host reader, and forgotten again once the payload is freed so
+ *        a recycled address is never refused by mistake.
+ */
+TEST(nntrainer_Tensor, QS4CXTensor_dropped_payload_registry_p) {
+  // A stand-in payload: the registry is keyed by address span only.
+  std::vector<uint8_t> payload(8192, 0);
+  const uint8_t *base = payload.data();
+  EXPECT_FALSE(nntrainer::isQs4cxPayloadDropped(base));
+  EXPECT_NO_THROW(nntrainer::refuseIfQs4cxPayloadDropped(base, "test"));
+
+  nntrainer::markQs4cxPayloadDropped(base, 4096);
+  EXPECT_TRUE(nntrainer::anyQs4cxPayloadDropped());
+  EXPECT_TRUE(nntrainer::isQs4cxPayloadDropped(base));
+  EXPECT_TRUE(nntrainer::isQs4cxPayloadDropped(base + 4095));
+  EXPECT_FALSE(nntrainer::isQs4cxPayloadDropped(base + 4096));
+  EXPECT_THROW(nntrainer::refuseIfQs4cxPayloadDropped(base, "test"),
+               std::runtime_error);
+  EXPECT_THROW(nntrainer::refuseIfQs4cxPayloadDropped(base + 100, "test"),
+               std::runtime_error);
+
+  // The deleter's retraction: the same address is readable again.
+  nntrainer::unmarkQs4cxPayloadDropped(base);
+  EXPECT_FALSE(nntrainer::isQs4cxPayloadDropped(base));
+  EXPECT_NO_THROW(nntrainer::refuseIfQs4cxPayloadDropped(base, "test"));
+  // Retracting an address that was never marked is a no-op.
+  EXPECT_NO_THROW(nntrainer::unmarkQs4cxPayloadDropped(base + 1));
+}
+
+/**
+ * @brief A self-owned QS4CX payload retracts its dropped range when it is
+ *        freed (the allocate() deleter), so the registry never outlives the
+ *        tensor whose pages it describes.
+ */
+TEST(nntrainer_Tensor, QS4CXTensor_dropped_payload_freed_p) {
+  const unsigned int K = 64, N = 8;
+  const uint8_t *base = nullptr;
+  {
+    nntrainer::Tensor tensor(
+      {1, 1, K, N, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QS4CX}},
+      true, nntrainer::Initializer::NONE, "w");
+    base = tensor.getData<uint8_t>();
+    ASSERT_NE(base, nullptr);
+    nntrainer::markQs4cxPayloadDropped(base, tensor.bytes());
+    EXPECT_TRUE(nntrainer::isQs4cxPayloadDropped(base));
+    EXPECT_THROW(tensor.pack(), std::runtime_error); // a host reader refuses
+  }
+  // The tensor is gone; its deleter retracted the range.
+  EXPECT_FALSE(nntrainer::isQs4cxPayloadDropped(base));
+}
+
+/**
  * @brief QS4CX_Tensor is a 2 dimensional weight type
  */
 TEST(nntrainer_Tensor, QS4CXTensor_02_n) {

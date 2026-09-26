@@ -18,6 +18,7 @@
 #include <cpu_backend.h>
 #include <fp16.h>
 #include <half_tensor.h>
+#include <qs4cx_tensor.h> // refuseIfQs4cxPayloadDropped
 #include <tensor.h>
 #include <thread_manager.h>
 #include <util_func.h>
@@ -761,6 +762,10 @@ Tensor &HalfTensor::dot(Tensor const &input, Tensor &output, bool trans,
     NNTR_THROW_IF(trans || trans_in, std::invalid_argument)
       << "[HalfTensor::dot] a QS4CX weight cannot be transposed: trans and "
          "trans_in must both be false";
+    // Both arms read the plain nibbles (the x86 loop directly, the Arm arm
+    // through packF16Activation). Refuse a payload a GPU backend released.
+    refuseIfQs4cxPayloadDropped(input.getData<uint8_t>(),
+                                "HalfTensor::dot QS4CX");
 #if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) ||              \
   defined(__i386__)
     // x86 reference GEMM: the KAI fp16 micro-kernel is ARM i8mm only and the

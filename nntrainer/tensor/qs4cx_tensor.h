@@ -360,6 +360,48 @@ bool anyQs4cxPayloadDropped();
  */
 bool isQs4cxPayloadDropped(const void *ptr);
 
+/**
+ * @brief Forget the dropped range that starts at @a base.
+ *
+ * Called from the payload deleter: the ranges are keyed by host address, and
+ * the allocator hands a freed address to the next weight (a model reloaded
+ * into the same process lands its weights on the previous model's heap
+ * blocks). Without this a fresh, fully readable payload would be refused as
+ * "dropped" the moment it recycled a released one's address. No-op for an
+ * address that was never marked.
+ *
+ * @param base first byte of the payload that is being freed
+ */
+void unmarkQs4cxPayloadDropped(const void *base);
+
+/**
+ * @brief Refuse a host read of a QS4CX payload whose pages were released.
+ *
+ * The one guard every host consumer of the plain payload calls before it
+ * reads the nibbles. It throws instead of returning a flag so that no caller
+ * can forget to act on the answer: a released payload reads back as zeros on
+ * an anonymous mapping, and a GEMM over zeros finishes with rc = 0 and a
+ * plausible-looking wrong answer, which no automated gate catches.
+ *
+ * @param payload the payload base the caller is about to read
+ * @param who     the consumer, for the message (e.g. "FloatTensor::dotQs4cx")
+ * @throws std::runtime_error when @a payload lies in a dropped range
+ */
+void refuseIfQs4cxPayloadDropped(const void *payload, const char *who);
+
+/**
+ * @brief Resolved NNTR_QS4CX_HEAP_BYPASS: does a QS4CX weight get its own
+ *        heap allocation instead of a slice of the shared weight pool?
+ *
+ * Set in the environment, the value wins (=0 opts out, anything else opts
+ * in); unset is off. One resolver for the three readers (the pool request,
+ * the uninitialized-payload allocation and the payload release), so they can
+ * never disagree about whether a payload is self-owned.
+ *
+ * Read once; the first call latches the answer for the process.
+ */
+bool qs4cxHeapBypassOn();
+
 } // namespace nntrainer
 
 #endif /* __cplusplus */

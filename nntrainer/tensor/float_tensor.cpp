@@ -18,6 +18,7 @@
 #include <float_tensor.h>
 #include <int4_utils.h>
 #include <q4_0_utils.h>
+#include <qs4cx_tensor.h> // refuseIfQs4cxPayloadDropped
 #include <thread_manager.h>
 
 #include <tensor.h>
@@ -1044,6 +1045,11 @@ Tensor &FloatTensor::dotQs4cx(Tensor const &input, Tensor &output, bool trans,
   unsigned int M = getDim().height();
   unsigned int K = getDim().width();
   unsigned int N = output.getDim().width();
+  // Every arm below reads the plain nibbles (directly, or through a pack that
+  // was built from them). A weight whose payload a GPU backend released after
+  // its device repack must be refused here, not multiplied as zeros.
+  refuseIfQs4cxPayloadDropped(input.getData<uint8_t>(),
+                              "FloatTensor::dotQs4cx");
 #if defined(__aarch64__) || defined(__ARM_ARCH_7A__) ||                        \
   defined(__ANDROID__) || defined(__arm__) || defined(_M_ARM) ||               \
   defined(_M_ARM64)

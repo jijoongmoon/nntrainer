@@ -47,6 +47,7 @@
 #include <geglu_cl_op.h>
 #include <gelu_cl_op.h>
 #include <layernorm_cl_op.h>
+#include <qs4cx_tensor.h> // refuseIfQs4cxPayloadDropped
 #include <sigmoid_add_cl_op.h>
 #include <sigmoid_glu_cl_op.h>
 #include <swiglu_cl_op.h>
@@ -140,8 +141,17 @@ public:
       return;
 
     switch (weight.getDataType()) {
-    case ml::train::TensorDim::DataType::QINT4:
     case ml::train::TensorDim::DataType::QS4CX:
+      // This is the fallback boundary the plain-payload release is guarded
+      // at: once the v8c repack exists, NNTR_V8C_DROP_PLAIN may have handed
+      // the nibbles' pages back, and the host dot below would then multiply
+      // zeros and return a well-formed wrong output with rc = 0. Refuse
+      // loudly instead. Free when nothing was ever dropped (one atomic load).
+      refuseIfQs4cxPayloadDropped(weight.getData<uint8_t>(),
+                                  "ClComputeOps::fc host fallback");
+      input.dot(weight, output, false, false);
+      break;
+    case ml::train::TensorDim::DataType::QINT4:
     case ml::train::TensorDim::DataType::Q4_0:
     case ml::train::TensorDim::DataType::Q4_K:
     case ml::train::TensorDim::DataType::Q6_K:
