@@ -22,6 +22,7 @@
 #include "opencl_loader.h"
 
 #include <nntrainer_log.h>
+#include <util_func.h>
 
 #define stringify(s) stringify2(s)
 #define stringify2(s) #s
@@ -35,9 +36,11 @@ namespace {
  *
  * The configured opencl-kernel-path is a bare relative name by default, which
  * would place the cache in the process's working directory. That is the wrong
- * home for it now that caching is on by default, for two reasons. It is a
+ * home for it now that caching is on by default, for three reasons. It is a
  * surprising side effect: merely initialising the library would create a
- * directory and write files wherever the caller happened to be standing. And
+ * directory and write files wherever the caller happened to be standing. It
+ * fails outright when the caller stands somewhere it cannot write -- a Windows
+ * application launched from C:\Windows\System32 is the reported case. And
  * it is a hazard, because these files are handed to clCreateProgramWithBinary
  * -- a process started in a directory another local user can write to would
  * load that user's chosen binary into the GPU driver, under a file name anyone
@@ -45,38 +48,19 @@ namespace {
  * device strings.
  *
  * A relative configured path is therefore resolved under the invoking user's
- * own cache directory: XDG_CACHE_HOME when set, else $HOME/.cache. An absolute
+ * own cache directory (resolveUserDataDir(): XDG_CACHE_HOME or $HOME/.cache
+ * on POSIX, %LOCALAPPDATA%, %APPDATA% or %TEMP% on Windows). An absolute
  * configured path is honoured exactly as given -- that is a deployment saying
  * where it wants the cache. Android keeps the relative behaviour, where the
  * working directory is the app's own and the existing flow prepares it.
  *
- * With no per-user directory determinable, the relative name stands and the
- * caller's own directory permissions are what protect it.
+ * With no per-user directory determinable the result is empty, which leaves
+ * the cache disabled rather than falling back to the working directory.
  *
- * @return the cache directory to use
+ * @return the cache directory to use, or "" for none
  */
 std::string resolveKernelCachePath() {
-  const std::string configured = stringify(OPENCL_KERNEL_PATH);
-
-#if defined(__ANDROID__)
-  return configured;
-#else
-  if (configured.empty() || std::filesystem::path(configured).is_absolute())
-    return configured;
-
-  std::string base;
-  const char *xdg = std::getenv("XDG_CACHE_HOME");
-  const char *home = std::getenv("HOME");
-  if (xdg != nullptr && xdg[0] != '\0') {
-    base = xdg;
-  } else if (home != nullptr && home[0] != '\0') {
-    base = std::string(home) + "/.cache";
-  } else {
-    return configured;
-  }
-
-  return (std::filesystem::path(base) / "nntrainer" / configured).string();
-#endif
+  return resolveUserDataDir(nullptr, stringify(OPENCL_KERNEL_PATH));
 }
 
 } // namespace

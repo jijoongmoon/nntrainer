@@ -40,6 +40,7 @@
 #include <system_error>
 #include <unordered_map>
 #include <unordered_set>
+#include <util_func.h>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -133,10 +134,12 @@ std::vector<std::byte> readBinaryFile(const std::string &path) {
 /**
  * @brief Directory the kernel binary cache lives in.
  *
- * NNTR_KERNEL_CACHE_DIR names it outright; with the variable unset or empty,
- * Program::DEFAULT_KERNEL_PATH stands, which is the configured path already
- * resolved under the user's own cache directory on every platform that has
- * one.
+ * NNTR_KERNEL_CACHE_DIR names it outright; set to the empty string or "off" it
+ * disables the cache (kernels are compiled from source every launch). With
+ * the variable unset, Program::DEFAULT_KERNEL_PATH stands, which is the
+ * configured path already resolved under the user's own cache directory on
+ * every platform that has one -- and empty, i.e. no cache, where none can be
+ * determined. It is never the working directory, except on Android.
  *
  * The override is the integration point for an embedder that knows its own
  * private storage and cannot rely on either -- an Android application passing
@@ -147,13 +150,12 @@ std::vector<std::byte> readBinaryFile(const std::string &path) {
  * Program::DEFAULT_KERNEL_PATH is still READ when the override points
  * somewhere else, so setting it does not orphan a cache that is already there;
  * new entries go only to the resolved directory.
+ *
+ * @return the directory, or "" when caching is disabled
  */
 static const std::string &kernelCacheDir() {
-  static const std::string dir = []() -> std::string {
-    if (const char *e = std::getenv("NNTR_KERNEL_CACHE_DIR"); e && *e)
-      return std::string(e);
-    return opencl::Program::DEFAULT_KERNEL_PATH;
-  }();
+  static const std::string dir = resolveUserDataDir(
+    "NNTR_KERNEL_CACHE_DIR", opencl::Program::DEFAULT_KERNEL_PATH);
   return dir;
 }
 
@@ -175,7 +177,10 @@ void ClContext::initialize() noexcept {
       ml_loge("Error: ClContext::initialize() failed");
       return;
     }
-    if (KERNEL_CACHE_ENABLED) {
+    if (KERNEL_CACHE_ENABLED && kernelCacheDir().empty()) {
+      ml_logi("Kernel binary cache disabled (NNTR_KERNEL_CACHE_DIR=off, or no "
+              "per-user cache directory); compiling kernels from source");
+    } else if (KERNEL_CACHE_ENABLED) {
       // Best effort: the binary cache is an optimisation. A read-only or
       // otherwise unwritable directory must not take the whole context down
       // with it -- create_directories throws std::filesystem::filesystem_error,
@@ -184,7 +189,22 @@ void ClContext::initialize() noexcept {
       // function, leaving a context that registers no layer and hands out no
       // allocator.
       std::error_code ec;
-      std::filesystem::create_directories(kernelCacheDir(), ec);
+      const bool created =
+        std::filesystem::create_directories(kernelCacheDir(), ec);
+#if !defined(_WIN32)
+      // A directory this call just created holds nothing yet, so it can be
+      // made owner-only safely. create_directories applies the process
+      // umask, and the common 002 leaves it group-writable, which
+      // kernelCacheDirIsPrivate() then rightly declines -- i.e. the per-user
+      // default would never cache at all. A directory that already existed
+      // is left as found: tightening it now would not un-plant anything.
+      if (!ec && created)
+        std::filesystem::permissions(
+          kernelCacheDir(), std::filesystem::perms::owner_all,
+          std::filesystem::perm_options::replace, ec);
+#else
+      (void)created;
+#endif
       if (ec) {
         ml_logw("Could not create the kernel cache directory %s (%s); "
                 "compiling kernels from source without caching them",
@@ -568,8 +588,11 @@ bool ClContext::clCreateKernel(std::string &kernel_string,
       const std::lock_guard<std::mutex> lk(failed_kernels_mtx);
       known_bad = failed_kernels.count(neg_key) != 0;
     }
+    // error_code overload: the throwing one raises filesystem_error when the
+    // marker cannot be stat'ed (e.g. EACCES), which would abort this build.
+    std::error_code neg_ec;
     if (!known_bad && KERNEL_CACHE_ENABLED && kernel_cache_usable &&
-        std::filesystem::exists(neg_file_path)) {
+        std::filesystem::exists(neg_file_path, neg_ec)) {
       known_bad = true;
       const std::lock_guard<std::mutex> lk(failed_kernels_mtx);
       failed_kernels.insert(neg_key);
@@ -589,6 +612,7 @@ bool ClContext::clCreateKernel(std::string &kernel_string,
   std::string binary_read_path = binary_file_path;
   bool served_from_legacy_dir = false;
   if (KERNEL_CACHE_ENABLED && kernel_cache_usable && binary_data.empty() &&
+      !opencl::Program::DEFAULT_KERNEL_PATH.empty() &&
       kernelCacheDir() != opencl::Program::DEFAULT_KERNEL_PATH) {
     // Fall back to the legacy working-directory location so a cache written
     // before the directory was resolvable is still used.
