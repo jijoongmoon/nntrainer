@@ -100,6 +100,23 @@ public:
   static bool openLogFile(const std::string &dir, const std::string &file_name,
                           std::ofstream &out) noexcept;
 
+  /**
+   * @brief     Bound the number and total size of rotated log files under
+   *            @a dir, deleting the oldest ones first. Never throws.
+   *
+   * Only files matching @a logfile_name + "*.out" are considered, so nothing
+   * else in @a dir is ever touched. The limits are read from NNTR_LOG_KEEP
+   * (file count, default 20) and NNTR_LOG_MAX_MB (total size in MiB, default
+   * 64); either set to "0" disables that limit. A file that fails to delete
+   * is reported to stderr once per call and otherwise left in place.
+   *
+   * @param     dir directory to prune; "" is a no-op
+   * @param     keep_file full path of the file just opened for this process,
+   *            if any; it is counted toward both limits but never deleted
+   */
+  static void pruneLogDir(const std::string &dir,
+                          const std::string &keep_file = "") noexcept;
+
 protected:
   /**
    * @brief     Logging instance

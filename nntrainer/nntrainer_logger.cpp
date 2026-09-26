@@ -21,6 +21,9 @@
  * @bug No known bugs except for NYI items
  */
 
+#include <algorithm>
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
@@ -33,8 +36,40 @@
 #include <stdexcept>
 #include <system_error>
 #include <util_func.h>
+#include <vector>
 
 namespace nntrainer {
+
+namespace {
+
+/**
+ * @brief     Retention defaults for the per-user log directory: at most this
+ *            many rotated files, and at most this many MiB total. See
+ *            docs/ENV_FLAGS.md (NNTR_LOG_KEEP / NNTR_LOG_MAX_MB).
+ */
+constexpr std::uintmax_t default_log_keep_count = 20;
+constexpr std::uintmax_t default_log_max_mb = 64;
+
+/**
+ * @brief     Parse a non-negative integer out of @a v (as read from an
+ *            environment variable), falling back to @a fallback when @a v is
+ *            null, empty, or not a valid non-negative integer.
+ */
+std::uintmax_t parseUintOr(const char *v, std::uintmax_t fallback) {
+  if (v == nullptr || *v == '\0')
+    return fallback;
+  try {
+    size_t pos = 0;
+    long long parsed = std::stoll(v, &pos);
+    if (pos != std::strlen(v) || parsed < 0)
+      return fallback;
+    return static_cast<std::uintmax_t>(parsed);
+  } catch (...) {
+    return fallback;
+  }
+}
+
+} // namespace
 
 /**
  * @brief     logfile name
@@ -104,6 +139,98 @@ bool Logger::openLogFile(const std::string &dir, const std::string &file_name,
   }
 }
 
+void Logger::pruneLogDir(const std::string &dir,
+                         const std::string &keep_file) noexcept {
+  try {
+    if (dir.empty())
+      return;
+
+    const std::uintmax_t keep_count =
+      parseUintOr(std::getenv("NNTR_LOG_KEEP"), default_log_keep_count);
+    const std::uintmax_t max_mb =
+      parseUintOr(std::getenv("NNTR_LOG_MAX_MB"), default_log_max_mb);
+    if (keep_count == 0 && max_mb == 0)
+      return; // both limits disabled
+
+    const std::uintmax_t max_bytes = max_mb * 1024ull * 1024ull;
+    const std::string prefix = logfile_name; // "log_nntrainer_"
+    const std::string suffix = ".out";
+
+    std::filesystem::path keep_path;
+    if (!keep_file.empty())
+      keep_path = std::filesystem::path(keep_file);
+
+    struct Entry {
+      std::filesystem::path path;
+      std::filesystem::file_time_type mtime;
+      std::uintmax_t size;
+    };
+    std::vector<Entry> entries;
+
+    std::error_code ec;
+    auto it = std::filesystem::directory_iterator(dir, ec);
+    if (ec)
+      return;
+    for (; it != std::filesystem::directory_iterator(); it.increment(ec)) {
+      if (ec)
+        break;
+      const std::filesystem::path p = it->path();
+      const std::string fname = p.filename().string();
+      if (fname.rfind(prefix, 0) != 0 || fname.size() < suffix.size() ||
+          fname.compare(fname.size() - suffix.size(), suffix.size(), suffix) !=
+            0)
+        continue;
+      if (!keep_path.empty()) {
+        std::error_code eq_ec;
+        if (std::filesystem::equivalent(p, keep_path, eq_ec) && !eq_ec)
+          continue;
+      }
+      std::error_code type_ec;
+      if (!it->is_regular_file(type_ec) || type_ec)
+        continue;
+      std::error_code size_ec, time_ec;
+      const std::uintmax_t size = std::filesystem::file_size(p, size_ec);
+      const auto mtime = std::filesystem::last_write_time(p, time_ec);
+      if (size_ec || time_ec)
+        continue;
+      entries.push_back(Entry{p, mtime, size});
+    }
+
+    std::sort(entries.begin(), entries.end(),
+              [](const Entry &a, const Entry &b) { return a.mtime < b.mtime; });
+
+    // the file just opened for this process is not in `entries` (it was
+    // excluded above), but it still counts toward both limits.
+    std::uintmax_t count = entries.size() + (keep_path.empty() ? 0 : 1);
+    std::uintmax_t size_total = 0;
+    for (const auto &e : entries)
+      size_total += e.size;
+
+    bool warned = false;
+    for (const auto &e : entries) {
+      const bool over_count = keep_count != 0 && count > keep_count;
+      const bool over_size = max_mb != 0 && size_total > max_bytes;
+      if (!over_count && !over_size)
+        break;
+      std::error_code rm_ec;
+      std::filesystem::remove(e.path, rm_ec);
+      if (rm_ec) {
+        if (!warned) {
+          std::cerr << "nntrainer: could not prune old log file "
+                    << e.path.string() << ": " << rm_ec.message() << std::endl;
+          warned = true;
+        }
+        continue;
+      }
+      count -= 1;
+      size_total -= e.size;
+    }
+  } catch (...) {
+    // Fail-soft: pruning is housekeeping and must never take model load
+    // down with it.
+  }
+}
+
 Logger::Logger() : ts_type(NNTRAINER_LOG_TIMESTAMP_SEC) {
   struct tm now;
   getLocaltime(&now);
@@ -118,10 +245,18 @@ Logger::Logger() : ts_type(NNTRAINER_LOG_TIMESTAMP_SEC) {
   // must never cost the caller its model load. Without a log file, warnings
   // and errors go to stderr (see log()) and the rest is dropped.
   const std::string dir = resolveLogDir();
-  if (!dir.empty() && !openLogFile(dir, ss.str(), outputstream))
+  const std::string file_name = ss.str();
+  const bool opened = !dir.empty() && openLogFile(dir, file_name, outputstream);
+  if (!dir.empty() && !opened) {
     std::cerr << "nntrainer: cannot write log files under " << dir
               << "; file logging disabled, warnings and errors go to stderr"
               << std::endl;
+  } else if (opened) {
+    // A performance run that spawns many short-lived processes (each one a
+    // Logger) otherwise leaves one file per process forever under the
+    // per-user directory; keep it bounded the same way the kernel cache is.
+    pruneLogDir(dir, (std::filesystem::path(dir) / file_name).string());
+  }
 }
 
 void Logger::log(const std::string &message,

@@ -22,12 +22,14 @@
  */
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <string>
 #include <system_error>
+#include <vector>
 #if !defined(_WIN32)
 #include <unistd.h>
 #endif
@@ -481,6 +483,144 @@ TEST(nntrainer_user_dir, no_user_dir_disables_n) {
   EXPECT_EQ(nntrainer::Logger::resolveLogDir(), "");
 }
 #endif // !__ANDROID__
+
+/**
+ * @brief Give @a p a distinct mtime, offset from now by @a seconds_ago
+ *        seconds (larger == older), so pruning order is deterministic
+ *        regardless of filesystem mtime resolution or test wall-clock time.
+ */
+static void setAge(const std::filesystem::path &p, long seconds_ago) {
+  std::error_code ec;
+  std::filesystem::last_write_time(
+    p,
+    std::filesystem::file_time_type::clock::now() -
+      std::chrono::seconds(seconds_ago),
+    ec);
+  ASSERT_FALSE(ec) << "failed to set mtime on " << p;
+}
+
+/**
+ * @brief NNTR_LOG_KEEP bounds the number of log_nntrainer_*.out files kept
+ *        under the log directory; the oldest are removed first and anything
+ *        that does not match the logger's own file-name pattern is left
+ *        alone.
+ */
+TEST(nntrainer_user_dir, logger_prune_count_cap_p) {
+  ScopedTempDir tmp;
+  const auto dir = tmp.path() / "logs";
+  std::filesystem::create_directories(dir);
+
+  const auto other = dir / "not_a_log_file.txt";
+  {
+    std::ofstream f(other);
+    f << "unrelated";
+  }
+
+  constexpr int total = 25;
+  constexpr int keep = 10;
+  std::vector<std::filesystem::path> files;
+  for (int i = 0; i < total; ++i) {
+    auto p = dir / ("log_nntrainer_" + std::to_string(1000 + i) + ".out");
+    {
+      std::ofstream f(p);
+      f << "x";
+    }
+    // i == 0 is the oldest, i == total - 1 is the newest.
+    setAge(p, total - i);
+    files.push_back(p);
+  }
+
+  ScopedEnv keep_env("NNTR_LOG_KEEP", std::to_string(keep).c_str());
+  ScopedEnv size_env("NNTR_LOG_MAX_MB", "0"); // isolate the count cap
+
+  nntrainer::Logger::pruneLogDir(dir.string());
+
+  int remaining = 0;
+  for (int i = 0; i < total; ++i) {
+    const bool exists = std::filesystem::exists(files[i]);
+    remaining += exists ? 1 : 0;
+    // the `keep` newest (highest index) files must survive; the rest must
+    // be gone.
+    EXPECT_EQ(exists, i >= total - keep) << "index " << i;
+  }
+  EXPECT_EQ(remaining, keep);
+  EXPECT_TRUE(std::filesystem::exists(other));
+}
+
+/**
+ * @brief NNTR_LOG_MAX_MB bounds the total size of log_nntrainer_*.out files;
+ *        the oldest are removed first until the total fits.
+ */
+TEST(nntrainer_user_dir, logger_prune_size_cap_p) {
+  ScopedTempDir tmp;
+  const auto dir = tmp.path() / "logs";
+  std::filesystem::create_directories(dir);
+
+  const auto other = dir / "not_a_log_file.txt";
+  {
+    std::ofstream f(other);
+    f << std::string(1024 * 1024, 'y');
+  }
+
+  constexpr int total = 10;
+  constexpr std::uintmax_t file_bytes = 1024ull * 1024ull; // 1 MiB each
+  constexpr int cap_mb = 5;                                // keep 5 MiB
+  std::vector<std::filesystem::path> files;
+  for (int i = 0; i < total; ++i) {
+    auto p = dir / ("log_nntrainer_" + std::to_string(2000 + i) + ".out");
+    {
+      std::ofstream f(p, std::ios::binary);
+      std::string buf(file_bytes, 'z');
+      f.write(buf.data(), buf.size());
+    }
+    setAge(p, total - i);
+    files.push_back(p);
+  }
+
+  ScopedEnv keep_env("NNTR_LOG_KEEP", "0"); // isolate the size cap
+  ScopedEnv size_env("NNTR_LOG_MAX_MB", std::to_string(cap_mb).c_str());
+
+  nntrainer::Logger::pruneLogDir(dir.string());
+
+  const int expected_kept = cap_mb; // 1 MiB per file
+  for (int i = 0; i < total; ++i)
+    EXPECT_EQ(std::filesystem::exists(files[i]), i >= total - expected_kept)
+      << "index " << i;
+  EXPECT_TRUE(std::filesystem::exists(other));
+}
+
+/**
+ * @brief NNTR_LOG_KEEP=0 together with NNTR_LOG_MAX_MB=0 disables pruning
+ *        entirely: nothing in the directory is touched.
+ */
+TEST(nntrainer_user_dir, logger_prune_disabled_n) {
+  ScopedTempDir tmp;
+  const auto dir = tmp.path() / "logs";
+  std::filesystem::create_directories(dir);
+
+  const auto other = dir / "not_a_log_file.txt";
+  {
+    std::ofstream f(other);
+    f << "unrelated";
+  }
+
+  std::vector<std::filesystem::path> files;
+  for (int i = 0; i < 25; ++i) {
+    auto p = dir / ("log_nntrainer_" + std::to_string(3000 + i) + ".out");
+    std::ofstream f(p);
+    f << "x";
+    files.push_back(p);
+  }
+
+  ScopedEnv keep_env("NNTR_LOG_KEEP", "0");
+  ScopedEnv size_env("NNTR_LOG_MAX_MB", "0");
+
+  nntrainer::Logger::pruneLogDir(dir.string());
+
+  for (const auto &p : files)
+    EXPECT_TRUE(std::filesystem::exists(p));
+  EXPECT_TRUE(std::filesystem::exists(other));
+}
 
 /**
  * @brief Main gtest
