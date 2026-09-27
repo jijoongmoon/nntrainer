@@ -24,6 +24,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <mutex>
 #include <nntrainer_log.h>
@@ -31,6 +32,13 @@
 #include <opencl_loader.h>
 #include <tuple>
 #include <vector>
+
+// Default of NNTR_QK_IMG_RW (the K mirror bound __read_write in the image qk
+// kernels; see qk_imgrw_program()). Off: no K-side event was observed with
+// the sampled read, and the binding costs prefill (numbers at the launch site).
+#ifndef QK_IMG_RW_DEFAULT
+#define QK_IMG_RW_DEFAULT false
+#endif
 
 namespace nntrainer {
 static ClContext::SharedPtrClKernel kvImgKernel(const char *kname);
@@ -3102,6 +3110,104 @@ __kernel void sv_matmul_f16_ohwi_imgrw_tm2(__global const half *scores,
 }
 )CL";
 
+// The qk kernels with the OHWI K mirror bound as a __read_write image2d_t
+// and read with the sampler-less read_imageui (qk_matmul_f16_ohwi_imgrw and
+// its banded twin, their own -cl-std=CL2.0 program). This is the K side of
+// the sv kernel's read-write V binding above: the same __read_only + sampler
+// read path that was served stale V texels inside one launch. The program is
+// not a second copy of the kernels: it is derived from two_conv_attention.cl's
+// own text -- the file's preamble (fp16 pragma, TM_QK/TN_QK), SOFTMAX_LWS,
+// and the contiguous run from tca_score_band() through the two image qk
+// kernels -- with exactly three edits: the image qualifier, the sampler
+// argument, and the kernel names. Same loop, same accumulation order, same
+// texel addressing (KIMG_GSH is passed through the compile options), so the
+// scores are the sampled kernels' scores bit for bit wherever the sampled
+// read was not stale. An anchor that is missing yields an empty program and
+// the call site keeps the sampled kernels, with one warning.
+static const std::string &qk_imgrw_program() {
+  static const std::string prog = []() -> std::string {
+    const std::string &src = two_conv_attention_kernel;
+    auto cut = [&](const char *from, const char *to, bool incl_to,
+                   std::string &out) {
+      const size_t a = src.find(from);
+      if (a == std::string::npos)
+        return false;
+      const size_t b = src.find(to, a);
+      if (b == std::string::npos)
+        return false;
+      out = src.substr(a, b - a + (incl_to ? std::strlen(to) : 0));
+      return true;
+    };
+    auto sub = [](std::string &t, const char *from, const char *to,
+                  size_t n_expect) {
+      size_t n = 0, pos = 0;
+      const size_t lf = std::strlen(from), lt = std::strlen(to);
+      while ((pos = t.find(from, pos)) != std::string::npos) {
+        t.replace(pos, lf, to);
+        pos += lt;
+        n++;
+      }
+      return n == n_expect;
+    };
+    std::string pre, lws, body;
+    if (!cut("#pragma OPENCL EXTENSION cl_khr_fp16 : enable",
+             "__kernel void\nqk_matmul_f16(", false, pre) ||
+        !cut("#define SOFTMAX_LWS ", "\n", true, lws) ||
+        !cut("static inline void tca_score_band(",
+             "#endif // TCA_BUFFER_ONLY (qk_matmul_f16_ohwi_img)", true, body))
+      return std::string();
+    // kimg_read(): __read_write image, no sampler (2 read_imageui forms).
+    if (!sub(body, "__read_only image2d_t", "__read_write image2d_t", 3) ||
+        !sub(body, "const sampler_t s,", "", 1) ||
+        !sub(body, "img, s, (int2)", "img, (int2)", 2) ||
+        !sub(body, "kimg_read(K_img, smp, ", "kimg_read(K_img, ", 2) ||
+        !sub(body,
+             "  const sampler_t smp =\n    CLK_NORMALIZED_COORDS_FALSE | "
+             "CLK_ADDRESS_CLAMP | CLK_FILTER_NEAREST;\n",
+             "", 2) ||
+        !sub(body, "qk_matmul_f16_ohwi_img(", "qk_matmul_f16_ohwi_imgrw(", 1) ||
+        !sub(body, "qk_matmul_f16_ohwi_img_band(",
+             "qk_matmul_f16_ohwi_imgrw_band(", 1))
+      return std::string();
+    return pre + "\n" + lws + "\n" + body + "\n";
+  }();
+  return prog;
+}
+
+// Compile options of that program: CL2.0 for the __read_write qualifier, and
+// the K mirror's packing shift exactly as tca_copts() passes it to the
+// sampled kernels (the handle cache below is dropped when the shift moves).
+static std::string qk_imgrw_copts() {
+  std::string o = "-cl-std=CL2.0";
+  if (g_kimg_gsh != 0)
+    o += " -DKIMG_GSH=" + std::to_string(g_kimg_gsh);
+  return o;
+}
+
+// NNTR_QK_IMG_RW: 1 binds the K mirror read-write in the image qk kernels
+// (above), 0 keeps the sampled read. Default off (QK_IMG_RW_DEFAULT): the
+// sampled K read has shown no event -- GPU-side stage hashes over 46 runs on
+// the V-read-write tree (8103 tokens 10 of 10 one trace, 919 tokens with 200
+// generated 30 of 30, 16203 tokens 6 of 6; 49,200 to 66,832 probes per run,
+// every stage identical), where the same instrumentation put the V read at
+// fault on every 8103-token run -- and the binding costs prefill at 1300 MHz,
+// two interleaved runs per cell: 1.5B 919 tokens 460/464 -> 478/488 ms
+// (+4.6 %), 8103 tokens 5908/5891 -> 6279/6239 ms (+6.1 %), gemma4 842
+// tokens 308/306 -> 322/324 ms (+5.2 %), E2B 923 tokens 732/723 -> 734 ms
+// (one outlier run dropped), 0.3B 2047 tokens 354 -> 344 ms (noise); decode
+// within noise. Its output is the sampled kernel's bit for bit (8103 tokens
+// 6 of 6 and 919 tokens 10 of 10 runs give the sampled arm's trace), so it
+// is a switch to flip, not a change of numbers, should a K event ever show.
+static bool qk_img_rw_on() {
+  static const bool v = []() {
+    const char *e = std::getenv("NNTR_QK_IMG_RW");
+    if (e != nullptr && e[0] != '\0')
+      return e[0] != '0';
+    return QK_IMG_RW_DEFAULT;
+  }();
+  return v;
+}
+
 static bool two_conv_attention_prefill_f16_ohwi_img_impl(
   const uint16_t *Q_svm, const uint16_t *K_svm, cl_mem v_buf_in,
   cl_mem v_image_in, cl_mem k_image_in, uint16_t *O_svm, unsigned int M,
@@ -3445,17 +3551,49 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
     // handle kept across that would read the new mirrors with the old
     // addressing. Drop them when the published shift moves (rare: once per
     // load at most).
+    static ClContext::SharedPtrClKernel kp_imgrw, kp_imgrw_band;
     static unsigned int kp_gsh = 0;
     if (kp_gsh != g_kimg_gsh) {
       kp_gsh = g_kimg_gsh;
       kp_img.reset();
       kp_img_band.reset();
+      kp_imgrw.reset();
+      kp_imgrw_band.reset();
     }
-    ClContext::SharedPtrClKernel &kp =
-      (k_image_in != nullptr) ? (qk_band_on ? kp_img_band : kp_img) : kp_buf;
-    if (!kp)
-      kp = blas_cc->registerClKernel(two_conv_attention_kernel, k1_name,
-                                     tca_copts());
+    // K mirror bound __read_write (qk_imgrw_program above) when the image
+    // was created CL_MEM_READ_WRITE, i.e. the image-write scatter path is
+    // armed -- a READ_ONLY image cannot be bound to a __read_write argument.
+    // A program or argument the driver refuses drops this process to the
+    // sampled kernels with one warning; nothing else changes.
+    static bool imgrw_disarmed = false;
+    ClContext::SharedPtrClKernel kp;
+    if (k_image_in != nullptr && qk_img_rw_on() && !imgrw_disarmed &&
+        kv_img_write_enabled()) {
+      ClContext::SharedPtrClKernel &kr = qk_band_on ? kp_imgrw_band : kp_imgrw;
+      if (!kr) {
+        const std::string &prog = qk_imgrw_program();
+        if (!prog.empty())
+          kr = blas_cc->registerClKernel(prog,
+                                         qk_band_on
+                                           ? "qk_matmul_f16_ohwi_imgrw_band"
+                                           : "qk_matmul_f16_ohwi_imgrw",
+                                         qk_imgrw_copts());
+        if (!kr) {
+          imgrw_disarmed = true;
+          ml_logw("[image-attn] the read-write qk program did not build; "
+                  "falling back to the sampled K read");
+        }
+      }
+      kp = kr;
+    }
+    if (!kp) {
+      ClContext::SharedPtrClKernel &ks =
+        (k_image_in != nullptr) ? (qk_band_on ? kp_img_band : kp_img) : kp_buf;
+      if (!ks)
+        ks = blas_cc->registerClKernel(two_conv_attention_kernel, k1_name,
+                                       tca_copts());
+      kp = ks;
+    }
     if (!kp)
       return false;
     // Static GPU_CLMEM residency: bind Q as its planner cl_mem sub-buffer
@@ -3467,8 +3605,30 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
     } else if (!kp->SetKernelSVMArguments(0, const_cast<uint16_t *>(Q_svm)))
       return false;
     if (k_image_in != nullptr) {
-      if (!kp->SetKernelArguments(1, &k_image_in, sizeof(cl_mem)))
-        return false;
+      if (!kp->SetKernelArguments(1, &k_image_in, sizeof(cl_mem))) {
+        if (imgrw_disarmed || kp != (qk_band_on ? kp_imgrw_band : kp_imgrw))
+          return false;
+        // The driver would not take this image as __read_write: sampled
+        // kernels from here on (the Q argument is re-set below the same way).
+        imgrw_disarmed = true;
+        ml_logw("[image-attn] the K mirror was refused as a __read_write "
+                "argument; falling back to the sampled K read");
+        ClContext::SharedPtrClKernel &ks = qk_band_on ? kp_img_band : kp_img;
+        if (!ks)
+          ks = blas_cc->registerClKernel(two_conv_attention_kernel, k1_name,
+                                         tca_copts());
+        kp = ks;
+        if (!kp)
+          return false;
+        if (q_clmem != nullptr) {
+          cl_mem qh = static_cast<cl_mem>(q_clmem);
+          if (!kp->SetKernelArguments(0, &qh, sizeof(cl_mem)))
+            return false;
+        } else if (!kp->SetKernelSVMArguments(0, const_cast<uint16_t *>(Q_svm)))
+          return false;
+        if (!kp->SetKernelArguments(1, &k_image_in, sizeof(cl_mem)))
+          return false;
+      }
     } else {
       if (!kp->SetKernelSVMArguments(1, const_cast<uint16_t *>(K_svm)))
         return false;
