@@ -3421,6 +3421,10 @@ static bool cl_dev_argmax_enabled() {
   return on;
 }
 
+// defined in attention_kernels.cpp; declared here to avoid
+// pulling that header into this translation unit.
+void attn_gpuhash_step_flush(unsigned int step, unsigned int tok);
+
 /** @brief An lm_head logits row left on the device, its host row unwritten. */
 struct ClLmHeadPending {
   cl_mem buf = nullptr; /**< device fp16 logits [n] -- the GEMV's out_buf */
@@ -4044,6 +4048,50 @@ bool cl_lmhead_dev_argmax(unsigned int vocab, unsigned int *token_out) {
   // caller falls back to reading and scanning it.
   if (tok < 0 || (unsigned int)tok >= vocab)
     return false;
+
+  // Per-step fingerprints, taken where the step already blocks
+  // (the token read above drained the queue), so they add no ordering.
+  //   NNTR_CL_LOGITS_HASH=1: FNV-1a over the fp16 logits row + top-2 margin.
+  //   NNTR_ATTN_GPUHASH: print the GPU-side stage hashes enqueued this step.
+  {
+    static const bool logits_hash =
+      std::getenv("NNTR_CL_LOGITS_HASH") != nullptr;
+    static unsigned int det_step = 0;
+    if (logits_hash) {
+      std::vector<uint16_t> row(vocab);
+      if (opencl::clEnqueueReadBuffer(
+            q, src, CL_TRUE, 0, sizeof(uint16_t) * (size_t)vocab, row.data(), 0,
+            nullptr, nullptr) == CL_SUCCESS) {
+        uint64_t h = 1469598103934665603ull;
+        const uint8_t *p = reinterpret_cast<const uint8_t *>(row.data());
+        for (size_t i = 0; i < sizeof(uint16_t) * (size_t)vocab; ++i) {
+          h ^= p[i];
+          h *= 1099511628211ull;
+        }
+        int i1 = -1, i2 = -1;
+        float v1 = -INFINITY, v2 = -INFINITY;
+        for (unsigned int i = 0; i < vocab; ++i) {
+          const float v = compute_fp16_to_fp32(row[i]);
+          if (v > v1) {
+            v2 = v1;
+            i2 = i1;
+            v1 = v;
+            i1 = (int)i;
+          } else if (v > v2) {
+            v2 = v;
+            i2 = (int)i;
+          }
+        }
+        std::fprintf(stderr,
+                     "[LOGITS] step=%u tok=%d fnv=%016llx top1=%d:%.6g "
+                     "top2=%d:%.6g gap=%.6g\n",
+                     det_step, tok, (unsigned long long)h, i1, v1, i2, v2,
+                     v1 - v2);
+      }
+    }
+    attn_gpuhash_step_flush(det_step, (unsigned int)tok);
+    ++det_step;
+  }
 
   // NNTR_CL_ARGMAX_VERIFY: cross-check the reduction against a host scan of
   // the same row (softcap included), on the first few tokens. Diagnostic only

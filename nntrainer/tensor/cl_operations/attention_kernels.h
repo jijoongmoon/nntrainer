@@ -512,6 +512,22 @@ int kv_img_write_mode();
  */
 void kv_img_write_disarm(const char *why);
 
+/**
+ * @brief NNTR_ATTN_GPUHASH: enqueue a GPU-side hash of a buffer
+ *        (SVM pointer or cl_mem) into a slot; printed by
+ * attn_gpuhash_step_flush at the decode loop's own blocking point. Inert unless
+ * the env is set.
+ */
+void attn_gpuhash_note(const char *tag, const void *svm, void *clmem,
+                       size_t bytes, unsigned int M);
+/** @brief strided form: `rows` rows of `n_h` halves, `row_stride_h` apart,
+ *        starting `off_h` halves in */
+void attn_gpuhash_note2(const char *tag, const void *svm, void *clmem,
+                        size_t off_h, size_t n_h, size_t row_stride_h,
+                        unsigned int rows, unsigned int M);
+/** @brief read back and print every hash enqueued since the last flush */
+void attn_gpuhash_step_flush(unsigned int step, unsigned int tok);
+
 /// One-launch decode (M == 1) form of k_scatter_ohwi_img_cl followed by
 /// v_scatter_ohwi_t_img_cl: the same texels, reads and stores, so the mirrors
 /// hold the same bytes as after the two launches. v_max_S is the V image's

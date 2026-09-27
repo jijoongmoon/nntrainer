@@ -2497,6 +2497,15 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             cache_index, mp, q_svm, /*in_clmem=*/q_cl, /*out_clmem=*/nullptr,
             /*drain_svm_out=*/false);
         if (ok) {
+          // GPU-side hashes of what the commit left behind
+          // (inert unless NNTR_ATTN_GPUHASH).
+          nntrainer::attn_gpuhash_note(
+            "qc", q_p, nullptr,
+            (size_t)num_heads_Q * head_dim * sizeof(uint16_t), to - from);
+          nntrainer::attn_gpuhash_note(
+            "kc", kc_p, nullptr, (size_t)kv_n * sizeof(uint16_t), to - from);
+          nntrainer::attn_gpuhash_note(
+            "vc", v_out, nullptr, (size_t)kv_n * sizeof(uint16_t), to - from);
           // All committed. Q/K/V no longer read on the host: null their cl_mem
           // handles (the GPU rotation already read them, SVM shadows are fresh)
           // so no later lower_q/lower_kv fires.

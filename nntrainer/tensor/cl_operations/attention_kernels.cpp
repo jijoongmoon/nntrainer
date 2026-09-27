@@ -78,6 +78,12 @@ struct TcaScratch {
   // Score matrix - always cl_mem, never SVM. Shape [H, M, N_kv] fp16.
   cl_mem scores = nullptr;
   size_t scores_bytes = 0;
+  // NNTR_SCORES_PINGPONG=1: alternate two score scratches per
+  // image-attention call (diagnostic arm: is a stale line of the ONE reused
+  // scratch what the sv kernel reads?).
+  cl_mem scores_pp = nullptr;
+  size_t scores_pp_bytes = 0;
+  int scores_pp_i = 0;
   // int8-KV variant: separate scale buffers; K/V byte buffers reuse k_buf/v_buf
   // (size halved relative to the fp16 path).
   cl_mem k_scale_buf = nullptr;
@@ -132,6 +138,17 @@ static std::string tca_copts() {
     if (!o.empty())
       o += " ";
     o += "-DKIMG_GSH=" + std::to_string(gsh);
+  }
+  // NNTR_SV_SCORES_CONST=0: compile the sv kernels' scores
+  // argument without `const` (diagnostic arm).
+  static const bool sv_scores_const = []() {
+    const char *e = std::getenv("NNTR_SV_SCORES_CONST");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  if (!sv_scores_const) {
+    if (!o.empty())
+      o += " ";
+    o += "-DSV_SCORES_QUAL=";
   }
   return o;
 }
@@ -1466,8 +1483,15 @@ bool create_ohwi_kv_mirror(bool is_v, unsigned int num_heads_KV,
   // 2x/layer = ~10s regression at prefill — the very host-sync anti-pattern we
   // avoid). Strictly the kernel only reads [0, N_kv) so the fill is defensive.
   const uint16_t zero = 0;
-  opencl::clEnqueueFillBuffer(q, buf, &zero, sizeof(uint16_t), 0, bytes, 0,
-                              nullptr, nullptr);
+  // NNTR_KV_MIRROR_FILL=0 skips the zero fill (diagnostic arm:
+  // is the stale content the fill's lines?).
+  static const bool mirror_fill = []() {
+    const char *e = std::getenv("NNTR_KV_MIRROR_FILL");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  if (mirror_fill)
+    opencl::clEnqueueFillBuffer(q, buf, &zero, sizeof(uint16_t), 0, bytes, 0,
+                                nullptr, nullptr);
 
   cl_image_format fmt{CL_RGBA, CL_UNSIGNED_INT32};
   cl_image_desc d{};
@@ -1753,6 +1777,172 @@ static ClContext::SharedPtrClKernel kvImgKernel(const char *kname) {
     kv_img_write_disarm("the -cl-std=CL2.0 image-write program did not build");
   }
   return kp;
+}
+
+// =============================================================================
+// NNTR_ATTN_GPUHASH: GPU-side hashes of the image attention's
+// intermediates with NO host synchronisation. A host-side probe (a node
+// output read between layers) settles the very queue whose ordering is under
+// test, so it can turn an irreproducible run into a reproducible one and then
+// report nothing. This one enqueues a
+// one-workgroup reduction after the stage it observes, into a slot buffer that
+// the decode loop reads back only where it already blocks (the argmax token
+// read), so the queue is neither split nor drained anywhere new. Diagnostic
+// only: off unless NNTR_ATTN_GPUHASH is set; =1 hashes the M == 1 (decode)
+// calls, =2 the prefill calls as well.
+// =============================================================================
+namespace {
+constexpr unsigned int kGhSlots = 1u << 16;
+constexpr size_t kGhLws = 256;
+const std::string gpuhash_kernel = R"CL(
+__kernel void gpuhash_u16(__global const ushort *src, uint n,
+                          __global uint *out, uint slot, uint off,
+                          uint row_stride, uint rows) {
+  __local uint part[256];
+  const uint lid = get_local_id(0);
+  uint h = 2166136261u;
+  for (uint r = 0; r < rows; ++r) {
+    const uint base = off + r * row_stride;
+    for (uint i = lid; i < n; i += 256u) {
+      h ^= (uint)src[base + i];
+      h *= 16777619u;
+    }
+  }
+  part[lid] = h;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (lid == 0) {
+    uint acc = 2166136261u;
+    for (uint j = 0; j < 256u; ++j) {
+      acc ^= part[j];
+      acc *= 16777619u;
+    }
+    out[slot] = acc;
+  }
+}
+)CL";
+struct GhLabel {
+  const char *tag;
+  unsigned int M;
+  unsigned int bytes;
+};
+struct GhState {
+  int mode = -1;
+  cl_mem slots = nullptr;
+  ClContext::SharedPtrClKernel kp;
+  std::vector<GhLabel> labels; // enqueued since the last flush
+  unsigned int next_slot = 0;
+  unsigned int flush_from = 0;
+};
+GhState &gh_state() {
+  static GhState s;
+  return s;
+}
+int gh_mode() {
+  GhState &s = gh_state();
+  if (s.mode < 0) {
+    const char *e = std::getenv("NNTR_ATTN_GPUHASH");
+    s.mode = (e == nullptr || e[0] == '0') ? 0 : std::atoi(e);
+  }
+  return s.mode;
+}
+} // namespace
+
+void attn_gpuhash_note(const char *tag, const void *svm, void *clmem,
+                       size_t bytes, unsigned int M) {
+  attn_gpuhash_note2(tag, svm, clmem, 0, bytes / 2, 0, 1, M);
+}
+
+void attn_gpuhash_note2(const char *tag, const void *svm, void *clmem,
+                        size_t off_h, size_t n_h, size_t row_stride_h,
+                        unsigned int rows, unsigned int M) {
+  const int mode = gh_mode();
+  if (mode == 0 || (M != 1 && mode < 2) || n_h == 0 || rows == 0 ||
+      (svm == nullptr && clmem == nullptr))
+    return;
+  const size_t bytes = n_h * rows * 2;
+  GhState &s = gh_state();
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  if (!blas_cc)
+    return;
+  cl_context ctx = blas_cc->context_inst_.GetContextNoRetain();
+  cl_command_queue q = blas_cc->command_queue_inst_.GetCommandQueue();
+  if (!s.kp) {
+    s.kp = blas_cc->registerClKernel(gpuhash_kernel, "gpuhash_u16");
+    if (!s.kp)
+      return;
+  }
+  if (s.slots == nullptr) {
+    cl_int e = CL_SUCCESS;
+    s.slots = opencl::clCreateBufferT(ctx, CL_MEM_READ_WRITE,
+                                      sizeof(cl_uint) * kGhSlots, nullptr, &e);
+    if (e != CL_SUCCESS || s.slots == nullptr) {
+      s.slots = nullptr;
+      return;
+    }
+  }
+  if (s.labels.size() >= kGhSlots)
+    return; // nobody flushed for a whole ring: stop rather than wrap
+  cl_kernel k = s.kp->GetKernel();
+  const cl_uint n_words = (cl_uint)n_h;
+  const cl_uint off_u = (cl_uint)off_h, rs_u = (cl_uint)row_stride_h,
+                rows_u = (cl_uint)rows;
+  const cl_uint slot = s.next_slot;
+  cl_int err;
+  if (clmem != nullptr) {
+    cl_mem h = static_cast<cl_mem>(clmem);
+    err = opencl::clSetKernelArg(k, 0, sizeof(cl_mem), &h);
+  } else {
+    err = opencl::clSetKernelArgSVMPointer(k, 0, svm);
+  }
+  if (err != CL_SUCCESS)
+    return;
+  if (opencl::clSetKernelArg(k, 1, sizeof(cl_uint), &n_words) != CL_SUCCESS ||
+      opencl::clSetKernelArg(k, 2, sizeof(cl_mem), &s.slots) != CL_SUCCESS ||
+      opencl::clSetKernelArg(k, 3, sizeof(cl_uint), &slot) != CL_SUCCESS ||
+      opencl::clSetKernelArg(k, 4, sizeof(cl_uint), &off_u) != CL_SUCCESS ||
+      opencl::clSetKernelArg(k, 5, sizeof(cl_uint), &rs_u) != CL_SUCCESS ||
+      opencl::clSetKernelArg(k, 6, sizeof(cl_uint), &rows_u) != CL_SUCCESS)
+    return;
+  const size_t gws = kGhLws, lws = kGhLws;
+  if (opencl::clEnqueueNDRangeKernel(q, k, 1, nullptr, &gws, &lws, 0, nullptr,
+                                     nullptr) != CL_SUCCESS)
+    return;
+  s.labels.push_back({tag, M, (unsigned int)bytes});
+  s.next_slot = (s.next_slot + 1) % kGhSlots;
+}
+
+void attn_gpuhash_step_flush(unsigned int step, unsigned int tok) {
+  if (gh_mode() == 0)
+    return;
+  GhState &s = gh_state();
+  if (s.labels.empty() || s.slots == nullptr)
+    return;
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  if (!blas_cc)
+    return;
+  cl_command_queue q = blas_cc->command_queue_inst_.GetCommandQueue();
+  const unsigned int n = (unsigned int)s.labels.size();
+  std::vector<cl_uint> h(n, 0u);
+  const unsigned int first = s.flush_from;
+  const unsigned int n1 = std::min(n, kGhSlots - first);
+  bool ok =
+    opencl::clEnqueueReadBuffer(q, s.slots, CL_TRUE, sizeof(cl_uint) * first,
+                                sizeof(cl_uint) * n1, h.data(), 0, nullptr,
+                                nullptr) == CL_SUCCESS;
+  if (ok && n1 < n)
+    ok = opencl::clEnqueueReadBuffer(q, s.slots, CL_TRUE, 0,
+                                     sizeof(cl_uint) * (n - n1), h.data() + n1,
+                                     0, nullptr, nullptr) == CL_SUCCESS;
+  if (ok) {
+    for (unsigned int i = 0; i < n; ++i)
+      std::fprintf(stderr, "[GH] step=%u tok=%u i=%u %s M=%u B=%u h=%08x\n",
+                   step, tok, i, s.labels[i].tag, s.labels[i].M,
+                   s.labels[i].bytes, (unsigned)h[i]);
+  }
+  s.flush_from = (s.flush_from + n) % kGhSlots;
+  s.labels.clear();
 }
 
 /// Shared dispatch for the four image-path kernels: identical argument order to
@@ -2953,6 +3143,19 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
   if (!tca_ensure(ctx, &sc.scores, &sc.scores_bytes, scores_bytes,
                   CL_MEM_READ_WRITE))
     return false;
+  static const bool scores_pingpong = []() {
+    const char *e = std::getenv("NNTR_SCORES_PINGPONG");
+    return e != nullptr && e[0] == '1';
+  }();
+  cl_mem scores_buf = sc.scores;
+  if (scores_pingpong) {
+    if (!tca_ensure(ctx, &sc.scores_pp, &sc.scores_pp_bytes, scores_bytes,
+                    CL_MEM_READ_WRITE))
+      return false;
+    sc.scores_pp_i ^= 1;
+    if (sc.scores_pp_i)
+      scores_buf = sc.scores_pp;
+  }
 
   // ---- The score band.
   // qk's n grid and softmax's n loop are both restricted to the band sv_matmul
@@ -3045,6 +3248,8 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
     const char *e = std::getenv("NNTR_ATTN_DRAIN");
     return e && std::atoi(e) != 0;
   }();
+  attn_gpuhash_note("q", Q_svm, q_clmem, (size_t)M * HD_Q * sizeof(uint16_t),
+                    M);
   if (attn_drain)
     opencl::clFinish(q);
 
@@ -3092,7 +3297,7 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
       if (!kp->SetKernelSVMArguments(1, const_cast<uint16_t *>(K_svm)))
         return false;
     }
-    if (!kp->SetKernelArguments(2, &sc.scores, sizeof(cl_mem)))
+    if (!kp->SetKernelArguments(2, &scores_buf, sizeof(cl_mem)))
       return false;
     int Mi = (int)M, Nkvi = (int)N_kv, di = (int)head_dim;
     int hdq = (int)HD_Q, smax = (int)max_seq_len;
@@ -3228,6 +3433,17 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
       t_a = t;
     }
   }
+  if (M == 1 || scores_bytes <= (32u << 20))
+    attn_gpuhash_note("qk", nullptr, scores_buf, scores_bytes, M);
+  if (M == 1 && N_kv > 16) {
+    // the newest 8-9 keys of every head vs the older ones: which half of
+    // the K mirror read moved
+    const size_t new_lo = (size_t)((N_kv - 8) & ~1u);
+    attn_gpuhash_note2("qkN", nullptr, scores_buf, new_lo,
+                       (size_t)N_kv - new_lo, N_kv, num_heads_Q, M);
+    attn_gpuhash_note2("qkO", nullptr, scores_buf, 0, new_lo, N_kv, num_heads_Q,
+                       M);
+  }
 
   // ---- K2: row softmax (scores cl_mem, in-place) ----
   {
@@ -3248,7 +3464,7 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
                      t - t_a);
       t_a = t;
     }
-    if (!kp->SetKernelArguments(0, &sc.scores, sizeof(cl_mem)))
+    if (!kp->SetKernelArguments(0, &scores_buf, sizeof(cl_mem)))
       return false;
     int Mi = (int)M, Nkvi = (int)N_kv;
     if (!kp->SetKernelArguments(1, &Mi, sizeof(int)) ||
@@ -3287,6 +3503,8 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
     }
   }
 
+  if (M == 1 || scores_bytes <= (32u << 20))
+    attn_gpuhash_note("sm", nullptr, scores_buf, scores_bytes, M);
   // ---- K3: scores @ V_image -> O via sv_matmul_f16_ohwi_img ----
   {
     // M-tiled sv: 2 query rows/WI, reuse V across both. DEFAULT-ON
@@ -3335,7 +3553,7 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
     if (!sv_buf && !kp)
       return false;
     ClContext::SharedPtrClKernel &kpu = sv_buf ? kp_buf : kp;
-    if (!kpu->SetKernelArguments(0, &sc.scores, sizeof(cl_mem)))
+    if (!kpu->SetKernelArguments(0, &scores_buf, sizeof(cl_mem)))
       return false;
     if (sv_buf) {
       if (!kpu->SetKernelArguments(1, &v_buf_read, sizeof(cl_mem)))
@@ -3432,6 +3650,20 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
     }
   }
 
+  attn_gpuhash_note("o", O_svm, o_clmem, (size_t)M * HD_Q * sizeof(uint16_t),
+                    M);
+  if (M > 8) {
+    // prefill: O in 4-row blocks (all heads) and per head (all rows), so a
+    // single event names its (query rows, head) pair
+    for (unsigned int b0 = 0; b0 < M; b0 += 4u) {
+      const unsigned int rows = std::min(4u, M - b0);
+      attn_gpuhash_note2("oB", O_svm, o_clmem, (size_t)b0 * HD_Q,
+                         (size_t)rows * HD_Q, 0, 1, M);
+    }
+    for (unsigned int h = 0; h < num_heads_Q; ++h)
+      attn_gpuhash_note2("oH", O_svm, o_clmem, (size_t)h * head_dim, head_dim,
+                         HD_Q, M, M);
+  }
   if (attn_drain)
     opencl::clFinish(q);
   else

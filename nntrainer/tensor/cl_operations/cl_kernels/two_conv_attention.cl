@@ -34,6 +34,12 @@
 #define TN_QK 8
 #endif
 
+// SV_SCORES_QUAL: the qualifier on the sv kernels' scores
+// argument. Default `const`; NNTR_SV_SCORES_CONST=0 compiles it away (the
+// diagnostic arm for a read-only-path load of a buffer another kernel wrote).
+#ifndef SV_SCORES_QUAL
+#define SV_SCORES_QUAL const
+#endif
 __kernel void
 qk_matmul_f16(__global const half *Q, // [M, HD_Q] fp16, row-major
               __global const half *K, // [N_kv, HD_KV] fp16, row-major
@@ -1242,7 +1248,7 @@ __kernel void sv_matmul_f16_img(
 // per WI minimizes register pressure.
 // =============================================================
 __kernel void sv_matmul_f16_ohwi_img(
-  __global const half *scores, // [H_q, M, N_kv] fp16, row-major
+  __global SV_SCORES_QUAL half *scores, // [H_q, M, N_kv] fp16, row-major
   __read_only image2d_t V_img, // see comment above
   __global half *O,            // [M, HD_Q] fp16, row-major
   const int M, const int N_kv, const int d, const int HD_Q, const int S_max,
@@ -1333,7 +1339,7 @@ __kernel void sv_matmul_f16_ohwi_img(
 
 // buffer-read twin of sv_matmul_f16_ohwi_img (NNTR_SV_TM2=0 arm).
 __kernel void sv_matmul_f16_ohwi_buf(
-  __global const half *scores, // [H_q, M, N_kv] fp16, row-major
+  __global SV_SCORES_QUAL half *scores, // [H_q, M, N_kv] fp16, row-major
   __global const half *V_buf,   // the mirror buffer, pitch v_stride
   __global half *O,            // [M, HD_Q] fp16, row-major
   const int M, const int N_kv, const int d, const int HD_Q, const int S_max,
@@ -1425,7 +1431,7 @@ __kernel void sv_matmul_f16_ohwi_buf(
 // rows (the V image is independent of m). Halves the V re-fetch that bounds
 // sv_matmul_f16_ohwi_img (it reloads V once per m). Causal: use the larger
 // row's tile cap; the extra n for m0 have score 0 (softmax-masked) -> add 0.
-__kernel void sv_matmul_f16_ohwi_img_tm2(__global const half *scores,
+__kernel void sv_matmul_f16_ohwi_img_tm2(__global SV_SCORES_QUAL half *scores,
                                          __read_only image2d_t V_img,
                                          __global half *O, const int M,
                                          const int N_kv, const int d,
@@ -1522,7 +1528,7 @@ __kernel void sv_matmul_f16_ohwi_img_tm2(__global const half *scores,
 // is read through its BUFFER (vload8 of one texel = 8 sequence positions)
 // instead of through the image2d view; v_stride is the row pitch in halves.
 // Diagnostic arm for the image-read incoherence (NNTR_SV_IMG_READ=0).
-__kernel void sv_matmul_f16_ohwi_buf_tm2(__global const half *scores,
+__kernel void sv_matmul_f16_ohwi_buf_tm2(__global SV_SCORES_QUAL half *scores,
                                          __global const half *V_buf,
                                          __global half *O, const int M,
                                          const int N_kv, const int d,
