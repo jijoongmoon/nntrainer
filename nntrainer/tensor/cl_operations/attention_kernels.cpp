@@ -3725,21 +3725,46 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
       if (!kp_buf)
         return false;
     } else if (!kp) {
-      // image-read variants (diagnostic arms, tm2 only):
-      // NNTR_SV_IMG_RW=1 binds V as a __read_write image (CL2.0 program),
-      // NNTR_SV_IMG_NOSAMP=1 reads it sampler-less.
+      // DEFAULT (tm2): bind the V mirror as a __read_write image2d_t and read
+      // it with the sampler-less read_imageui (sv_matmul_f16_ohwi_imgrw_tm2,
+      // its own -cl-std=CL2.0 program). On Adreno 840 the __read_only +
+      // sampler read of the same image is served a stale texel rarely and at
+      // random inside one sv launch -- with Q and the scores bit-identical the
+      // sv output differs for a block of query rows (13 of 13 located events;
+      // every run of an 8103-token prompt differs from every other). The
+      // read-write binding takes the coherent image-load path instead and is
+      // reproducible: 8103 tokens 6 of 6 runs one trace (the same trace the
+      // buffer read gives), 919 tokens 30 of 30 runs hash-identical, E2B 1K
+      // 6 of 6, where the sampled read gives 6 of 6 distinct; a sampler-less
+      // read of the __read_only image still varies (4 of 4), as do a
+      // driver-owned image, two alternating views, image-only writes and
+      // fills, and every drain arm. Same object, same texels, same
+      // arithmetic, so the numbers do not move. Cost, 1300 MHz: prefill
+      // +4 % (1.5B 919 tok) to +6.4 % (8103 tok), decode within noise.
+      // NNTR_SV_IMG_RW=0 restores the sampled read; a driver that refuses
+      // the CL2.0 program falls back to it on its own. NNTR_SV_IMG_NOSAMP=1
+      // is the diagnostic arm that reads the __read_only image sampler-less.
       static const bool sv_img_rw = []() {
         const char *e = std::getenv("NNTR_SV_IMG_RW");
-        return e != nullptr && e[0] == '1';
+        return !(e != nullptr && e[0] == '0');
       }();
       static const bool sv_img_nosamp = []() {
         const char *e = std::getenv("NNTR_SV_IMG_NOSAMP");
         return e != nullptr && e[0] == '1';
       }();
-      if (sv_tm2 && sv_img_rw)
+      if (sv_tm2 && sv_img_rw) {
         kp = blas_cc->registerClKernel(
           sv_imgrw_kernel, "sv_matmul_f16_ohwi_imgrw_tm2", "-cl-std=CL2.0");
-      else if (sv_tm2 && sv_img_nosamp)
+        if (!kp) {
+          static int logged = 0;
+          if (!logged++)
+            ml_logw("[image-attn] the read-write sv program did not build; "
+                    "falling back to the sampled V read (not reproducible on "
+                    "Adreno 840)");
+        }
+      }
+      if (kp) {
+      } else if (sv_tm2 && sv_img_nosamp)
         kp = blas_cc->registerClKernel(two_conv_attention_kernel,
                                        "sv_matmul_f16_ohwi_imgns_tm2",
                                        tca_copts());
