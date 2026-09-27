@@ -31,6 +31,11 @@
 #include <qs4cx_tensor.h> // the dropped-payload registry (DROP_PLAIN)
 
 namespace nntrainer {
+// defined in attention_kernels.cpp; declared here rather than
+// pulling that header into this translation unit.
+int attn_gpuhash_mode();
+void attn_gpuhash_note(const char *tag, const void *svm, void *clmem,
+                       size_t bytes, unsigned int M);
 void dotBatchedCl(Tensor const &input, Tensor const &m, Tensor &result,
                   bool trans, bool trans_m) {
   if (!result.isAllocated())
@@ -2167,6 +2172,20 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
     if (fc_flush_mode == 1 &&
         (M > 1 || fc_flush_env_set || fc_flush_decode_keep))
       opencl::clFlush(q);
+    // NNTR_ATTN_GPUHASH>=3: hash this FC's device-resident
+    // output behind its own launches (no host sync; see attention_kernels).
+    if (attn_gpuhash_mode() >= 3 && output.getMemoryData()) {
+      const size_t words =
+        (size_t)M * N *
+        (output.getDataType() == ml::train::TensorDim::DataType::FP16 ? 1 : 2);
+      if (output.getMemoryData()->isClMem() &&
+          output.getMemoryData()->deviceMem() != nullptr)
+        attn_gpuhash_note("fc", nullptr, output.getMemoryData()->deviceMem(),
+                          words * 2, M);
+      else if (output.getMemoryData()->isSVM())
+        attn_gpuhash_note("fc", output.getData<uint8_t>(), nullptr, words * 2,
+                          M);
+    }
   } catch (...) {
     return false;
   }

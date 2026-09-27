@@ -1911,6 +1911,8 @@ int gh_mode() {
 }
 } // namespace
 
+int attn_gpuhash_mode() { return gh_mode(); }
+
 void attn_gpuhash_note(const char *tag, const void *svm, void *clmem,
                        size_t bytes, unsigned int M) {
   attn_gpuhash_note2(tag, svm, clmem, 0, bytes / 2, 0, 1, M);
@@ -4944,6 +4946,20 @@ bool flash_attention_prefill_f16_cl(
   // No post-kernel drain: the flash output O is consumed by the next GPU op
   // (the o_proj FC), which the in-order queue already orders after this
   // kernel, and nothing reads O from the host here.
+  // Buffer/flash-path stage hashes (NNTR_ATTN_GPUHASH=2 for
+  // prefill calls): the rotated Q, the concat K/V cache rows this call reads
+  // and the O it wrote, hashed on the GPU behind this launch and read back
+  // only where the step already blocks. Inert (one static load) when unset.
+  if (gh_mode() != 0) {
+    const unsigned int rows =
+      (ring_cap > 0 && ring_cap < N_kv) ? ring_cap : N_kv;
+    attn_gpuhash_note("fq", Q_host, nullptr, (size_t)M * HD_Q * 2, M);
+    if (k_stride == 0) {
+      attn_gpuhash_note("fk", K_host, nullptr, (size_t)rows * HD_KV * 2, M);
+      attn_gpuhash_note("fv", V_host, nullptr, (size_t)rows * HD_KV * 2, M);
+    }
+    attn_gpuhash_note("fo", O_host, nullptr, (size_t)M * HD_Q * 2, M);
+  }
   return true;
 }
 
@@ -5088,6 +5104,18 @@ bool flash_decode_f16_cl(const uint16_t *Q_host, const uint16_t *K_host,
       kr->GetKernel(), 1, gws.data(), lwsa.data(), 0, nullptr, nullptr);
   }
   // The reduce kernel's output is consumed on the same in-order queue.
+  // Decode stage hashes (NNTR_ATTN_GPUHASH=1): see the prefill
+  // entry above. The K/V rows are the ring-resident ones.
+  if (gh_mode() != 0) {
+    const unsigned int rows =
+      (ring_cap > 0 && ring_cap < N_kv) ? ring_cap : N_kv;
+    attn_gpuhash_note("fq", Q_host, nullptr, (size_t)HD_Q * 2, 1);
+    if (k_stride == 0) {
+      attn_gpuhash_note("fk", K_host, nullptr, (size_t)rows * HD_KV * 2, 1);
+      attn_gpuhash_note("fv", V_host, nullptr, (size_t)rows * HD_KV * 2, 1);
+    }
+    attn_gpuhash_note("fo", O_host, nullptr, (size_t)HD_Q * 2, 1);
+  }
   return true;
 }
 

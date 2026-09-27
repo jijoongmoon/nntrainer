@@ -527,6 +527,8 @@ void attn_gpuhash_note2(const char *tag, const void *svm, void *clmem,
                         unsigned int rows, unsigned int M);
 /** @brief read back and print every hash enqueued since the last flush */
 void attn_gpuhash_step_flush(unsigned int step, unsigned int tok);
+/** @brief NNTR_ATTN_GPUHASH level (0 = off); for probes outside this file. */
+int attn_gpuhash_mode();
 
 /// One-launch decode (M == 1) form of k_scatter_ohwi_img_cl followed by
 /// v_scatter_ohwi_t_img_cl: the same texels, reads and stores, so the mirrors
