@@ -293,7 +293,9 @@ bool two_conv_attention_prefill_f16_ohwi_kvimg_view_cl(
   unsigned int num_heads_KV, unsigned int head_dim, unsigned int max_seq_len,
   bool causal, float attn_softcap = 0.0f, // Gemma2-style QK soft-cap (0=off)
   void *q_clmem = nullptr, void *o_clmem = nullptr,
-  unsigned int local_window = 0); // >0: sliding-window mask (n+W <= q_pos)
+  unsigned int local_window = 0,  // >0: sliding-window mask (n+W <= q_pos)
+  void *v_buf_read = nullptr,     // the V mirror's buffer, for
+  unsigned int v_buf_stride = 0); // NNTR_SV_IMG_READ=0 (pitch in halves)
 
 /// Fused single-kernel attention over the SAME two OHWI images as
 /// _ohwi_kvimg_view_cl (K image [H_kv,S_max,d], reversed-V image

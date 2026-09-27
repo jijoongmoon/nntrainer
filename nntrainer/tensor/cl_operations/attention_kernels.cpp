@@ -2764,7 +2764,8 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
   unsigned int head_dim, unsigned int max_seq_len, bool causal,
   float attn_softcap = 0.0f, // Gemma2-style QK soft-cap (image-K)
   void *q_clmem = nullptr, void *o_clmem = nullptr,
-  unsigned int local_window = 0); // >0: sliding-window mask (n+W <= q_pos)
+  unsigned int local_window = 0, // >0: sliding-window mask (n+W <= q_pos)
+  cl_mem v_buf_read = nullptr, unsigned int v_buf_stride = 0);
 
 bool two_conv_attention_prefill_f16_ohwi_img_cl(
   const uint16_t *Q_svm, const uint16_t *K_svm, cl_mem V_buf_ohwi,
@@ -2795,13 +2796,14 @@ bool two_conv_attention_prefill_f16_ohwi_kvimg_view_cl(
   uint16_t *O_svm, unsigned int M, unsigned int N_kv, unsigned int num_heads_Q,
   unsigned int num_heads_KV, unsigned int head_dim, unsigned int max_seq_len,
   bool causal, float attn_softcap, void *q_clmem, void *o_clmem,
-  unsigned int local_window) {
+  unsigned int local_window, void *v_buf_read, unsigned int v_buf_stride) {
   if (!K_image_ohwi || !V_image_ohwi)
     return false;
   return two_conv_attention_prefill_f16_ohwi_img_impl(
     Q_svm, /** K_svm */ nullptr, /** v_buf_in */ nullptr, V_image_ohwi,
     K_image_ohwi, O_svm, M, N_kv, num_heads_Q, num_heads_KV, head_dim,
-    max_seq_len, causal, attn_softcap, q_clmem, o_clmem, local_window);
+    max_seq_len, causal, attn_softcap, q_clmem, o_clmem, local_window,
+    static_cast<cl_mem>(v_buf_read), v_buf_stride);
 }
 
 // =============================================================================
@@ -2915,7 +2917,8 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
   cl_mem v_image_in, cl_mem k_image_in, uint16_t *O_svm, unsigned int M,
   unsigned int N_kv, unsigned int num_heads_Q, unsigned int num_heads_KV,
   unsigned int head_dim, unsigned int max_seq_len, bool causal,
-  float attn_softcap, void *q_clmem, void *o_clmem, unsigned int local_window) {
+  float attn_softcap, void *q_clmem, void *o_clmem, unsigned int local_window,
+  cl_mem v_buf_read, unsigned int v_buf_stride) {
   if (head_dim == 0 || M == 0 || N_kv == 0 || max_seq_len == 0)
     return false;
   if (num_heads_KV == 0 || num_heads_Q % num_heads_KV != 0)
@@ -3294,37 +3297,70 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
       const char *e = std::getenv("NNTR_SV_TM2");
       return e ? (std::atoi(e) != 0) : true;
     }();
+    // Read the V mirror through its BUFFER (sv_matmul_f16_ohwi_buf[_tm2]),
+    // not through the image2d view the scatters write. DEFAULT. On Adreno 840
+    // the image read of the V mirror is served stale, rarely and at random,
+    // inside one sv launch: with q/scores bit-identical, O differs for a
+    // block of query rows -- 8/8 events over 42 instrumented 919-token runs
+    // and every run of an 8103-token prompt, on both mirror views, with and
+    // without an image read in the write path, with two score scratches, with
+    // and without `const` on the scores argument, and under every drain arm
+    // (so it is cache visibility inside the launch, not ordering). The same
+    // texel bytes read with vload8 from the buffer are bit-identical when the
+    // image read is not stale and reproducible when it would have been (8103
+    // tokens: 4/4 runs one trace against 6/6 distinct). NNTR_SV_IMG_READ=1
+    // restores the image read (the A/B arm).
+    static const bool sv_img_read = []() {
+      const char *e = std::getenv("NNTR_SV_IMG_READ");
+      return e != nullptr && e[0] == '1';
+    }();
+    const bool sv_buf =
+      !sv_img_read && v_buf_read != nullptr && v_buf_stride != 0;
     static ClContext::SharedPtrClKernel kp; // call-site handle cache (sv_tm2
                                             // is process-constant)
-    if (!kp)
+    static ClContext::SharedPtrClKernel kp_buf;
+    if (sv_buf) {
+      if (!kp_buf)
+        kp_buf = blas_cc->registerClKernel(two_conv_attention_kernel,
+                                           sv_tm2 ? "sv_matmul_f16_ohwi_buf_tm2"
+                                                  : "sv_matmul_f16_ohwi_buf",
+                                           tca_copts());
+      if (!kp_buf)
+        return false;
+    } else if (!kp)
       kp = blas_cc->registerClKernel(two_conv_attention_kernel,
                                      sv_tm2 ? "sv_matmul_f16_ohwi_img_tm2"
                                             : "sv_matmul_f16_ohwi_img",
                                      tca_copts());
-    if (!kp)
+    if (!sv_buf && !kp)
       return false;
-    if (!kp->SetKernelArguments(0, &sc.scores, sizeof(cl_mem)) ||
-        !kp->SetKernelArguments(1, &v_image, sizeof(cl_mem)))
+    ClContext::SharedPtrClKernel &kpu = sv_buf ? kp_buf : kp;
+    if (!kpu->SetKernelArguments(0, &sc.scores, sizeof(cl_mem)))
+      return false;
+    if (sv_buf) {
+      if (!kpu->SetKernelArguments(1, &v_buf_read, sizeof(cl_mem)))
+        return false;
+    } else if (!kpu->SetKernelArguments(1, &v_image, sizeof(cl_mem)))
       return false;
     // Static GPU_CLMEM residency: write O straight into its planner cl_mem
     // sub-buffer when given (the wo FC consumes it device-direct).
     if (o_clmem != nullptr) {
       cl_mem oh = static_cast<cl_mem>(o_clmem);
-      if (!kp->SetKernelArguments(2, &oh, sizeof(cl_mem)))
+      if (!kpu->SetKernelArguments(2, &oh, sizeof(cl_mem)))
         return false;
-    } else if (!kp->SetKernelSVMArguments(2, O_svm))
+    } else if (!kpu->SetKernelSVMArguments(2, O_svm))
       return false;
     int Mi = (int)M, Nkvi = (int)N_kv, di = (int)head_dim;
     int hdq = (int)HD_Q, smax = (int)max_seq_len;
     int gqa = (int)(num_heads_Q / num_heads_KV);
     int causal_i = causal ? 1 : 0;
-    if (!kp->SetKernelArguments(3, &Mi, sizeof(int)) ||
-        !kp->SetKernelArguments(4, &Nkvi, sizeof(int)) ||
-        !kp->SetKernelArguments(5, &di, sizeof(int)) ||
-        !kp->SetKernelArguments(6, &hdq, sizeof(int)) ||
-        !kp->SetKernelArguments(7, &smax, sizeof(int)) ||
-        !kp->SetKernelArguments(8, &gqa, sizeof(int)) ||
-        !kp->SetKernelArguments(9, &causal_i, sizeof(int)))
+    if (!kpu->SetKernelArguments(3, &Mi, sizeof(int)) ||
+        !kpu->SetKernelArguments(4, &Nkvi, sizeof(int)) ||
+        !kpu->SetKernelArguments(5, &di, sizeof(int)) ||
+        !kpu->SetKernelArguments(6, &hdq, sizeof(int)) ||
+        !kpu->SetKernelArguments(7, &smax, sizeof(int)) ||
+        !kpu->SetKernelArguments(8, &gqa, sizeof(int)) ||
+        !kpu->SetKernelArguments(9, &causal_i, sizeof(int)))
       return false;
     // arg 10 = the sliding window, the same value K1 already gets. Both sv
     // kernels start their n loop at the window floor instead of 0; on the 28
@@ -3333,8 +3369,13 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
     // masked to -INFINITY. NNTR_SV_WIN=0 is the control arm (pass 0 = the old
     // full-range loop) and leaves the binary otherwise identical.
     int sv_lw = attn_sv_win_on() ? (int)local_window : 0;
-    if (!kp->SetKernelArguments(10, &sv_lw, sizeof(int)))
+    if (!kpu->SetKernelArguments(10, &sv_lw, sizeof(int)))
       return false;
+    if (sv_buf) {
+      const int vs = (int)v_buf_stride;
+      if (!kpu->SetKernelArguments(11, &vs, sizeof(int)))
+        return false;
+    }
     // TDX=8 tiled: each WI computes 8 output channels, so the x grid is
     // head_dim/8 work-items. Workgroup (LWS_X x's, LWS_Y=4 m's).
     // The LWS is env-overridable + measured (NNTR_SV_LWS="x,y,z"); default
@@ -3381,7 +3422,7 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
     const bool lws_ok = LWS_X > 0 && LWS_Y > 0 && LWS_Z > 0 &&
                         (gws[0] % LWS_X == 0) && (gws[1] % LWS_Y == 0) &&
                         (gws[2] % LWS_Z == 0);
-    blas_cc->command_queue_inst_.enqueueKernel(kp->GetKernel(), 3, gws.data(),
+    blas_cc->command_queue_inst_.enqueueKernel(kpu->GetKernel(), 3, gws.data(),
                                                lws_ok ? lws.data() : nullptr, 0,
                                                nullptr, nullptr);
     if (attn_tprof) {

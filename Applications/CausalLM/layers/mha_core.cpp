@@ -3861,7 +3861,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                     reinterpret_cast<cl_mem>(v_img_use), O_p, step_size, m_to,
                     num_heads_Q, num_heads_KV, head_dim, kv_mirror_S_max,
                     is_causal, attn_logit_softcapping, /*q_clmem=*/q_clmem_use,
-                    /*o_clmem=*/o_cl, win_img);
+                    /*o_clmem=*/o_cl, win_img, v_buf_ohwi, v_stride);
                 if (ok && o_cl != nullptr)
                   o_written_clmem = true;
               } else {
@@ -3877,7 +3877,8 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                       O_p + (size_t)a * q_row, b - a, m_from + b, num_heads_Q,
                       num_heads_KV, head_dim, kv_mirror_S_max, is_causal,
                       attn_logit_softcapping,
-                      /*q_clmem=*/nullptr, /*o_clmem=*/nullptr, win_img);
+                      /*q_clmem=*/nullptr, /*o_clmem=*/nullptr, win_img,
+                      v_buf_ohwi, v_stride);
                 }
                 // O went to the SVM plane: the raise below lands it in o_cl.
               }
