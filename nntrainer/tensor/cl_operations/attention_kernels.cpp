@@ -33,6 +33,7 @@
 #include <vector>
 
 namespace nntrainer {
+static ClContext::SharedPtrClKernel kvImgKernel(const char *kname);
 
 void rotary_emb_cl(float *in, float *out,
                    const std::vector<std::vector<float>> &freqs_cos,
@@ -670,6 +671,17 @@ __kernel void v_scatter_ohwi_t_img_slab(__global const half *vcache,
 // Inverse gathers on the image path: with the writes on the image, a BUFFER
 // read of the mirror is the same aliasing hazard reversed (the boundary sync
 // would hand the host slab a pre-write row), so gather from the image too.
+__kernel void mirror_fill_img(__write_only image2d_t dst, const int w,
+                              const int h, const uint v) {
+  const int x = get_global_id(0);
+  const int y = get_global_id(1);
+  if (x >= w || y >= h) return;
+  write_imageui(dst, (int2)(x, y), (uint4)(v, v, v, v));
+}
+__kernel void mirror_touch_img(__write_only image2d_t dst, const int x,
+                               const int y) {
+  write_imageui(dst, (int2)(x, y), (uint4)(0u, 0u, 0u, 0u));
+}
 __kernel void k_gather_ohwi_img(__read_only image2d_t src, __global half *dst,
                                 const int M, const int hKV, const int d,
                                 const int max_S, const int position) {
@@ -1473,24 +1485,50 @@ bool create_ohwi_kv_mirror(bool is_v, unsigned int num_heads_KV,
 
   cl_int err = CL_SUCCESS;
   opencl::ClMemAcctScope _acct(is_v ? "kv:mirror_v" : "kv:mirror_k");
-  cl_mem buf =
-    opencl::clCreateBufferT(ctx, CL_MEM_READ_WRITE, bytes, nullptr, &err);
-  if (err != CL_SUCCESS || buf == nullptr)
-    return false;
+  // NNTR_KV_VIMG_NOBUF=1: the V mirror is a plain image (no
+  // buffer underneath, no buffer-path write ever, filled through the image),
+  // so the driver owns its layout and sees nothing but image traffic on it.
+  // Diagnostic arm; the tight view and the buffer read need the buffer and
+  // fall back to the full image.
+  static const bool v_nobuf = []() {
+    const char *e = std::getenv("NNTR_KV_VIMG_NOBUF");
+    return e != nullptr && e[0] == '1';
+  }();
+  const bool nobuf = is_v && v_nobuf;
+  cl_mem buf = nullptr;
+  if (!nobuf) {
+    buf = opencl::clCreateBufferT(ctx, CL_MEM_READ_WRITE, bytes, nullptr, &err);
+    if (err != CL_SUCCESS || buf == nullptr)
+      return false;
+  }
   // Zero the padding rows once. Enqueued non-blocking: this runs on the
   // in-order SVM queue ahead of any scatter/attention that touches the mirror,
   // so no clFinish drain is needed (a per-layer drain here would bubble the GPU
   // 2x/layer = ~10s regression at prefill — the very host-sync anti-pattern we
   // avoid). Strictly the kernel only reads [0, N_kv) so the fill is defensive.
-  const uint16_t zero = 0;
-  // NNTR_KV_MIRROR_FILL=0 skips the zero fill (diagnostic arm:
-  // is the stale content the fill's lines?).
-  static const bool mirror_fill = []() {
+  // NNTR_KV_MIRROR_FILL: unset = zero fill through the buffer
+  // (the default behaviour); 0 = no fill; img = fill through an image-write
+  // kernel over the whole image (the driver then sees only image writes);
+  // 0xNNNN = fill the buffer with that 16-bit pattern (init-hazard arm).
+  static const std::string mirror_fill = []() {
     const char *e = std::getenv("NNTR_KV_MIRROR_FILL");
-    return !(e != nullptr && e[0] == '0');
+    return std::string(e != nullptr ? e : "");
   }();
-  if (mirror_fill)
-    opencl::clEnqueueFillBuffer(q, buf, &zero, sizeof(uint16_t), 0, bytes, 0,
+  uint16_t fillv = 0;
+  bool fill_buf = true, fill_img = false;
+  if (mirror_fill == "0")
+    fill_buf = false;
+  else if (mirror_fill == "img") {
+    fill_buf = false;
+    fill_img = true;
+  } else if (mirror_fill.rfind("0x", 0) == 0)
+    fillv = (uint16_t)std::strtoul(mirror_fill.c_str(), nullptr, 16);
+  if (nobuf) {
+    fill_buf = false;
+    fill_img = true;
+  }
+  if (fill_buf)
+    opencl::clEnqueueFillBuffer(q, buf, &fillv, sizeof(uint16_t), 0, bytes, 0,
                                 nullptr, nullptr);
 
   cl_image_format fmt{CL_RGBA, CL_UNSIGNED_INT32};
@@ -1507,14 +1545,17 @@ bool create_ohwi_kv_mirror(bool is_v, unsigned int num_heads_KV,
     // KIMG_GSH in the kernel -- both come from kimg_gsh_for().
     const size_t g = (size_t)1u << k_gsh;
     if (((size_t)num_heads_KV * max_S) % g != 0) {
-      opencl::clReleaseMemObjectT(buf);
+      if (buf)
+        opencl::clReleaseMemObjectT(buf);
       return false;
     }
     d.image_width = ((size_t)head_dim / 8) * g;
     d.image_height = ((size_t)num_heads_KV * max_S) / g;
     d.image_row_pitch = (size_t)head_dim * sizeof(uint16_t) * g;
   }
-  d.buffer = buf;
+  d.buffer = buf; // nullptr under NNTR_KV_VIMG_NOBUF: a driver-owned image
+  if (nobuf)
+    d.image_row_pitch = 0;
   cl_int ie = CL_SUCCESS;
   // [kv-img-write] READ_WRITE when the scatters write through this image
   // (write_imageui); READ_ONLY otherwise, byte for byte as before.
@@ -1535,8 +1576,23 @@ bool create_ohwi_kv_mirror(bool is_v, unsigned int num_heads_KV,
     ml_logw("[kv-img-write] KVIMG_MARKER_A: clCreateImage refused for the "
             "%s mirror (err %d); the layer falls back",
             is_v ? "V" : "K", (int)ie);
-    opencl::clReleaseMemObjectT(buf);
+    if (buf)
+      opencl::clReleaseMemObjectT(buf);
     return false;
+  }
+  if (fill_img) {
+    ClContext::SharedPtrClKernel kp = kvImgKernel("mirror_fill_img");
+    int w = (int)d.image_width, h = (int)d.image_height;
+    cl_uint v = 0u;
+    if (kp && kp->SetKernelArguments(0, &image, sizeof(cl_mem)) &&
+        kp->SetKernelArguments(1, &w, sizeof(int)) &&
+        kp->SetKernelArguments(2, &h, sizeof(int)) &&
+        kp->SetKernelArguments(3, &v, sizeof(cl_uint))) {
+      std::array<size_t, 3> gws = {((size_t)w + 63) / 64 * 64, (size_t)h, 1};
+      std::array<size_t, 3> lws = {64, 1, 1};
+      blas_cc->command_queue_inst_.enqueueKernel(
+        kp->GetKernel(), 3, gws.data(), lws.data(), 0, nullptr, nullptr);
+    }
   }
   *out_buf = buf;
   *out_image = image;
@@ -2947,6 +3003,105 @@ bool two_conv_attention_prefill_f16_ohwi_full_cl(
 // `v_buf_in`. Similarly, when `k_image_in` is non-null we dispatch the
 // image2d-K kernel (qk_matmul_f16_ohwi_img); otherwise we use the
 // SVM-K kernel (qk_matmul_f16_ohwi) with K_svm.
+// NNTR_SV_IMG_RW=1: the sv kernel with the V mirror bound as a
+// __read_write image (CL2.0, own program): on this driver a read-write image
+// cannot be served by the sampler's texture path, so the arm asks whether the
+// stale read is specific to that path.
+static const std::string sv_imgrw_kernel = std::string(R"CL(
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+)CL") + R"CL(
+__kernel void sv_matmul_f16_ohwi_imgrw_tm2(__global const half *scores,
+                                         __read_write image2d_t V_img,
+                                         __global half *O, const int M,
+                                         const int N_kv, const int d,
+                                         const int HD_Q, const int S_max,
+                                         const int gqa, const int causal,
+                                         const int local_window) {
+  const int x0 = get_global_id(0) * 8;
+  const int m0 = get_global_id(1) * 2;
+  const int head_q = get_global_id(2);
+  if (m0 >= M || x0 >= d)
+    return;
+  const int m1 = m0 + 1;
+  const int has1 = (m1 < M);
+  const int head_kv = head_q / gqa;
+  const int v_row0 = head_kv * d + x0;
+  const long sb0 = (long)head_q * (long)M * (long)N_kv + (long)m0 * (long)N_kv;
+  const long sb1 = (long)head_q * (long)M * (long)N_kv + (long)m1 * (long)N_kv;
+  // Causal cap on the query's ABSOLUTE position (q_off=N_kv-M); decode (M=1)
+  // sits at N-1 and must sum ALL keys, not just V[0..7]. See the non-tm2
+  // kernel; a non-causal call keeps the full range.
+  int N_kv_tex = (N_kv + 7) >> 3;
+  int n_tex0 = 0;
+  if (causal) {
+    const int q_off = N_kv - M;
+    const int cap_m = has1 ? m1 : m0;
+    const int N_kv_tex_causal = ((q_off + cap_m) >> 3) + 1;
+    if (N_kv_tex_causal < N_kv_tex)
+      N_kv_tex = N_kv_tex_causal;
+    // Sliding-window LOWER bound (see sv_matmul_f16_ohwi_img above). This WI
+    // owns rows m0 and m1=m0+1; m0 has the SMALLER absolute query position and
+    // therefore the smaller window floor, so bounding on m0 is the safe (and
+    // for m1 merely conservative) choice — the extra texels m1 does not need
+    // are exactly the +0.0 ones it would have skipped.
+    if (local_window > 0) {
+      const int n_first = q_off + m0 - local_window + 1;
+      if (n_first > 0)
+        n_tex0 = n_first >> 3;
+      if (n_tex0 > N_kv_tex)
+        n_tex0 = N_kv_tex;
+    }
+  }
+
+  float acc0[8], acc1[8];
+#pragma unroll
+  for (int t = 0; t < 8; t++) {
+    acc0[t] = 0.0f;
+    acc1[t] = 0.0f;
+  }
+
+  for (int n_tex = n_tex0; n_tex < N_kv_tex; n_tex++) {
+    const int n0 = n_tex * 8;
+    half8 s0, s1;
+    if (n0 + 8 <= N_kv) {
+      s0 = vload8(0, scores + sb0 + n0);
+      s1 = has1 ? vload8(0, scores + sb1 + n0) : (half8)((half)0.0h);
+    } else {
+      half t0[8], t1[8];
+#pragma unroll
+      for (int k = 0; k < 8; k++) {
+        t0[k] = (n0 + k < N_kv) ? scores[sb0 + n0 + k] : (half)0.0h;
+        t1[k] = (has1 && n0 + k < N_kv) ? scores[sb1 + n0 + k] : (half)0.0h;
+      }
+      s0 = vload8(0, t0);
+      s1 = vload8(0, t1);
+    }
+    const float4 s0lo = convert_float4(s0.s0123);
+    const float4 s0hi = convert_float4(s0.s4567);
+    const float4 s1lo = convert_float4(s1.s0123);
+    const float4 s1hi = convert_float4(s1.s4567);
+#pragma unroll
+    for (int t = 0; t < 8; t++) {
+      const uint4 vv = read_imageui(V_img, (int2)(n_tex, v_row0 + t));
+      const half8 vp = as_half8(vv);
+      const float4 vlo = convert_float4(vp.s0123);
+      const float4 vhi = convert_float4(vp.s4567);
+      acc0[t] += dot(s0lo, vlo) + dot(s0hi, vhi);
+      acc1[t] += dot(s1lo, vlo) + dot(s1hi, vhi);
+    }
+  }
+#pragma unroll
+  for (int t = 0; t < 8; t++) {
+    const int x = x0 + t;
+    if (x < d) {
+      O[(long)m0 * HD_Q + head_q * d + x] = (half)acc0[t];
+      if (has1)
+        O[(long)m1 * HD_Q + head_q * d + x] = (half)acc1[t];
+    }
+  }
+}
+)CL";
+
 static bool two_conv_attention_prefill_f16_ohwi_img_impl(
   const uint16_t *Q_svm, const uint16_t *K_svm, cl_mem v_buf_in,
   cl_mem v_image_in, cl_mem k_image_in, uint16_t *O_svm, unsigned int M,
@@ -2989,6 +3144,27 @@ bool two_conv_attention_prefill_f16_ohwi_kvimg_view_cl(
   unsigned int local_window, void *v_buf_read, unsigned int v_buf_stride) {
   if (!K_image_ohwi || !V_image_ohwi)
     return false;
+  // NNTR_KV_VIMG_TOUCH=1: one image write to the V image's last
+  // texel (never read below max_seq_len - 8 keys) right before the attention,
+  // so the driver sees an image write on this object immediately before the
+  // read (diagnostic arm for "is the texture cache invalidated on a write?").
+  static const bool vimg_touch = []() {
+    const char *e = std::getenv("NNTR_KV_VIMG_TOUCH");
+    return e != nullptr && e[0] == '1';
+  }();
+  if (vimg_touch && N_kv + 8 <= max_seq_len) {
+    ClContext::SharedPtrClKernel kp = kvImgKernel("mirror_touch_img");
+    int x = (int)(max_seq_len / 8) - 1, y = (int)(num_heads_KV * head_dim) - 1;
+    if (kp && kp->SetKernelArguments(0, &V_image_ohwi, sizeof(cl_mem)) &&
+        kp->SetKernelArguments(1, &x, sizeof(int)) &&
+        kp->SetKernelArguments(2, &y, sizeof(int))) {
+      auto *cc =
+        static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+      std::array<size_t, 3> gws = {1, 1, 1};
+      cc->command_queue_inst_.enqueueKernel(kp->GetKernel(), 3, gws.data(),
+                                            nullptr, 0, nullptr, nullptr);
+    }
+  }
   return two_conv_attention_prefill_f16_ohwi_img_impl(
     Q_svm, /** K_svm */ nullptr, /** v_buf_in */ nullptr, V_image_ohwi,
     K_image_ohwi, O_svm, M, N_kv, num_heads_Q, num_heads_KV, head_dim,
@@ -3515,8 +3691,8 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
       const char *e = std::getenv("NNTR_SV_TM2");
       return e ? (std::atoi(e) != 0) : true;
     }();
-    // Read the V mirror through its BUFFER (sv_matmul_f16_ohwi_buf[_tm2]),
-    // not through the image2d view the scatters write. DEFAULT. On Adreno 840
+    // NNTR_SV_IMG_READ=0: read the V mirror through its BUFFER
+    // (sv_matmul_f16_ohwi_buf[_tm2]) instead of the image2d view. On Adreno 840
     // the image read of the V mirror is served stale, rarely and at random,
     // inside one sv launch: with q/scores bit-identical, O differs for a
     // block of query rows -- 8/8 events over 42 instrumented 919-token runs
@@ -3526,11 +3702,14 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
     // (so it is cache visibility inside the launch, not ordering). The same
     // texel bytes read with vload8 from the buffer are bit-identical when the
     // image read is not stale and reproducible when it would have been (8103
-    // tokens: 4/4 runs one trace against 6/6 distinct). NNTR_SV_IMG_READ=1
-    // restores the image read (the A/B arm).
+    // tokens: 4/4 runs one trace against 6/6 distinct). The image read stays
+    // the default for its speed (see below).
+    // DEFAULT: the image read (the fast path; the buffer read costs +5~10 %
+    // of prefill, measured 1.5B/E2B/gemma4/0.3B). NNTR_SV_IMG_READ=0 selects
+    // the buffer read, which is the reproducible fallback.
     static const bool sv_img_read = []() {
       const char *e = std::getenv("NNTR_SV_IMG_READ");
-      return e != nullptr && e[0] == '1';
+      return !(e != nullptr && e[0] == '0');
     }();
     const bool sv_buf =
       !sv_img_read && v_buf_read != nullptr && v_buf_stride != 0;
@@ -3545,11 +3724,31 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
                                            tca_copts());
       if (!kp_buf)
         return false;
-    } else if (!kp)
-      kp = blas_cc->registerClKernel(two_conv_attention_kernel,
-                                     sv_tm2 ? "sv_matmul_f16_ohwi_img_tm2"
-                                            : "sv_matmul_f16_ohwi_img",
-                                     tca_copts());
+    } else if (!kp) {
+      // image-read variants (diagnostic arms, tm2 only):
+      // NNTR_SV_IMG_RW=1 binds V as a __read_write image (CL2.0 program),
+      // NNTR_SV_IMG_NOSAMP=1 reads it sampler-less.
+      static const bool sv_img_rw = []() {
+        const char *e = std::getenv("NNTR_SV_IMG_RW");
+        return e != nullptr && e[0] == '1';
+      }();
+      static const bool sv_img_nosamp = []() {
+        const char *e = std::getenv("NNTR_SV_IMG_NOSAMP");
+        return e != nullptr && e[0] == '1';
+      }();
+      if (sv_tm2 && sv_img_rw)
+        kp = blas_cc->registerClKernel(
+          sv_imgrw_kernel, "sv_matmul_f16_ohwi_imgrw_tm2", "-cl-std=CL2.0");
+      else if (sv_tm2 && sv_img_nosamp)
+        kp = blas_cc->registerClKernel(two_conv_attention_kernel,
+                                       "sv_matmul_f16_ohwi_imgns_tm2",
+                                       tca_copts());
+      else
+        kp = blas_cc->registerClKernel(two_conv_attention_kernel,
+                                       sv_tm2 ? "sv_matmul_f16_ohwi_img_tm2"
+                                              : "sv_matmul_f16_ohwi_img",
+                                       tca_copts());
+    }
     if (!sv_buf && !kp)
       return false;
     ClContext::SharedPtrClKernel &kpu = sv_buf ? kp_buf : kp;

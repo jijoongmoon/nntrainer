@@ -573,6 +573,9 @@ private:
   void *v_buf_ohwi = nullptr;
   void *k_image_ohwi = nullptr;
   void *v_image_ohwi = nullptr;
+  void *v_image_ohwi_pp = nullptr; /**< NNTR_KV_VIMG_PP second
+                                       full view over the same buffer */
+  unsigned int v_img_pp_n = 0;     /**< calls so far (alternates the view) */
   bool kv_mirror_init = false;
   unsigned int kv_mirror_S_max = 0;
   /** [kimg-pack] shift folded into the K image view; see kimg_gsh_for(). Set

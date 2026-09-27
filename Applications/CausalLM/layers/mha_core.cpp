@@ -628,6 +628,7 @@ MHACoreLayer::~MHACoreLayer() {
   // release_cl_mem is OpenCL-only; the mirror handles stay null without it.
   nntrainer::release_cl_mem(k_image_ohwi);
   nntrainer::release_cl_mem(v_image_ohwi);
+  nntrainer::release_cl_mem(v_image_ohwi_pp);
   nntrainer::release_cl_mem(v_image_tight);
   nntrainer::release_cl_mem(k_buf_ohwi);
   nntrainer::release_cl_mem(v_buf_ohwi);
@@ -1048,6 +1049,23 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
       // mirrors prebuilt the earlier GPU-RoPE block needs the answer too
       // (the q_stage gate runs before the engage block on the same call).
       use_image_attn = 1;
+      // NNTR_KV_VIMG_PP=1: a second full-size image view over
+      // the same V buffer, alternated per attention call (with the tight view
+      // off), so two consecutive layers/calls never bind the same image object.
+      static const bool vimg_pp = []() {
+        const char *e = std::getenv("NNTR_KV_VIMG_PP");
+        return e != nullptr && e[0] == '1';
+      }();
+      if (vimg_pp) {
+        unsigned int s_full = S_max;
+        void *img2 = nullptr;
+        if (nntrainer::create_ohwi_v_image_view(v_buf_ohwi, num_heads_KV,
+                                                head_dim, &s_full, &img2) &&
+            s_full == S_max)
+          v_image_ohwi_pp = img2;
+        else if (img2)
+          nntrainer::release_cl_mem(img2);
+      }
       // Tight V view at the typical prefill capacity (the engage path grows
       // it on demand if the live sequence exceeds the guess).
       unsigned int s_tight = S_max < 1024u ? S_max : 1024u;
@@ -3455,6 +3473,12 @@ void MHACoreLayer::one_batch_incremental_forwarding(
           // the mirror. The cache is ring-indexed for a ringed layer, so the
           // span may cross the seam: one scatter per contiguous segment. With
           // no ring this is the single scatter it always was.
+          // the full V view this call binds (alternates under
+          // NNTR_KV_VIMG_PP)
+          void *v_img_full_sel =
+            (v_image_ohwi_pp != nullptr && ((v_img_pp_n++) & 1u))
+              ? v_image_ohwi_pp
+              : v_image_ohwi;
           auto mirror_backfill = [&](bool is_v, unsigned int abs_from,
                                      unsigned int abs_to, unsigned int stride) {
             const size_t hd = (size_t)num_heads_KV * head_dim;
@@ -3465,7 +3489,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
               nntrainer::kv_img_write_enabled() && v_image_ohwi != nullptr;
             void *v_img_bf = (v_image_tight != nullptr && kv_v_img_S == stride)
                                ? v_image_tight
-                               : v_image_ohwi;
+                               : v_img_full_sel;
             unsigned int pos = abs_from;
             while (pos < abs_to) {
               const size_t phys = cacheRow(pos);
@@ -3542,7 +3566,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
               const char *e = std::getenv("NNTR_KV_VTIGHT");
               return !(e && e[0] == '0');
             }();
-            void *v_img_use = v_image_ohwi;
+            void *v_img_use = v_img_full_sel;
             unsigned int v_stride = kv_mirror_S_max;
             // A ringed layer keeps ONE stride for the whole run: its mirror is
             // already small (ring-cap rows) and constant, so there is no cliff
