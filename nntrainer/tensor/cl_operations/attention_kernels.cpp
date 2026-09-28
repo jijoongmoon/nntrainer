@@ -34,10 +34,11 @@
 #include <vector>
 
 // Default of NNTR_QK_IMG_RW (the K mirror bound __read_write in the image qk
-// kernels; see qk_imgrw_program()). Off: no K-side event was observed with
-// the sampled read, and the binding costs prefill (numbers at the launch site).
+// kernels; see qk_imgrw_program()). On: the sampled read is the path that
+// served stale V texels, so K takes the coherent binding too, pre-emptively,
+// for a small prefill cost (numbers at qk_img_rw_on()).
 #ifndef QK_IMG_RW_DEFAULT
-#define QK_IMG_RW_DEFAULT false
+#define QK_IMG_RW_DEFAULT true
 #endif
 
 namespace nntrainer {
@@ -3187,19 +3188,21 @@ static std::string qk_imgrw_copts() {
 }
 
 // NNTR_QK_IMG_RW: 1 binds the K mirror read-write in the image qk kernels
-// (above), 0 keeps the sampled read. Default off (QK_IMG_RW_DEFAULT): the
-// sampled K read has shown no event -- GPU-side stage hashes over 46 runs on
-// the V-read-write tree (8103 tokens 10 of 10 one trace, 919 tokens with 200
-// generated 30 of 30, 16203 tokens 6 of 6; 49,200 to 66,832 probes per run,
-// every stage identical), where the same instrumentation put the V read at
-// fault on every 8103-token run -- and the binding costs prefill at 1300 MHz,
-// two interleaved runs per cell: 1.5B 919 tokens 460/464 -> 478/488 ms
-// (+4.6 %), 8103 tokens 5908/5891 -> 6279/6239 ms (+6.1 %), gemma4 842
-// tokens 308/306 -> 322/324 ms (+5.2 %), E2B 923 tokens 732/723 -> 734 ms
+// (above), 0 keeps the sampled read. Default on (QK_IMG_RW_DEFAULT) as a
+// pre-emptive measure: the sampled read is the path that returned stale V
+// texels, and a wrong answer is not an acceptable trade for prefill time.
+// The sampled K read itself has shown no event -- GPU-side stage hashes over
+// 46 runs on the V-read-write tree (8103 tokens 10 of 10 one trace, 919 tokens
+// with 200 generated 30 of 30, 16203 tokens 6 of 6; 49,200 to 66,832 probes
+// per run, every stage identical), where the same instrumentation put the V
+// read at fault on every 8103-token run -- and the binding costs prefill at
+// 1300 MHz, two interleaved runs per cell: 1.5B 919 tokens 460/464 ->
+// 478/488 ms (+4.6 %), 8103 tokens 5908/5891 -> 6279/6239 ms (+6.1 %), gemma4
+// 842 tokens 308/306 -> 322/324 ms (+5.2 %), E2B 923 tokens 732/723 -> 734 ms
 // (one outlier run dropped), 0.3B 2047 tokens 354 -> 344 ms (noise); decode
 // within noise. Its output is the sampled kernel's bit for bit (8103 tokens
-// 6 of 6 and 919 tokens 10 of 10 runs give the sampled arm's trace), so it
-// is a switch to flip, not a change of numbers, should a K event ever show.
+// 6 of 6 and 919 tokens 10 of 10 runs give the sampled arm's trace), so the
+// default changes time, not numbers.
 static bool qk_img_rw_on() {
   static const bool v = []() {
     const char *e = std::getenv("NNTR_QK_IMG_RW");
