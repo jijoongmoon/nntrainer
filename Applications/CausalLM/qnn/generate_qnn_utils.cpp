@@ -353,6 +353,23 @@ void fill_attention_mask_with_prev_length(int rows, int columns, int length,
   }
 }
 
+void fill_sliding_mask_with_prev_length(int rows, int columns, int past_len,
+                                        int window, uint16_t *attention_mask) {
+  if (window <= 0) {
+    fill_attention_mask_with_prev_length(rows, columns, past_len,
+                                         attention_mask);
+    return;
+  }
+  for (int i = 0; i < rows; i++) {
+    int j0 = i + past_len - window;
+    if (j0 < 0)
+      j0 = 0;
+    for (int j = j0; j < past_len; j++) {
+      attention_mask[i * columns + j] = std::numeric_limits<uint16_t>::max();
+    }
+  }
+}
+
 uint16_t *get_zero_memory(int size, int zero_point) {
   uint16_t *memory = (uint16_t *)allocate(size * sizeof(uint16_t));
   for (int i = 0; i < size; i++)

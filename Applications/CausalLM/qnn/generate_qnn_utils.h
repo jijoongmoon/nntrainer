@@ -119,6 +119,26 @@ void fill_attention_mask_with_length(int rows, int columns, int length,
 void fill_attention_mask_with_prev_length(int rows, int columns, int length,
                                           uint16_t *attention_mask);
 
+/**
+ * @brief Sliding-window aware variant of fill_attention_mask_with_prev_length.
+ *
+ * Past column j is absolute position kv_len - past_len + j and query row i is
+ * kv_len + i, so row i may only attend j >= i + past_len - window. Opening the
+ * whole past for every query row (what fill_attention_mask_with_prev_length
+ * does) lets the tail rows of a prefill chunk attend up to `rows` keys that are
+ * OLDER than the window. When past_len + rows <= window this is exactly
+ * fill_attention_mask_with_prev_length, so short prompts are bit-identical.
+ *
+ * @param rows            query rows (chunk context size)
+ * @param columns         mask row stride
+ * @param past_len        number of valid past columns
+ * @param window          sliding attention window; <= 0 falls back to the
+ *                        non-windowed helper
+ * @param attention_mask  destination mask
+ */
+void fill_sliding_mask_with_prev_length(int rows, int columns, int past_len,
+                                        int window, uint16_t *attention_mask);
+
 uint16_t *get_zero_memory(int size, int zero_point);
 
 void fill_generation_inputs(

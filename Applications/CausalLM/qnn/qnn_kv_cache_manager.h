@@ -55,6 +55,15 @@ public:
   void resetPrefillInputs();
   void syncGenerationToPrefill();
 
+  // Ring-convention sibling of syncGenerationToPrefill(). For models that keep
+  // the generation caches in ring layout end-to-end (slot = position % cap),
+  // the prefill inputs must be copied slot-preserving rather than
+  // tail-compacted the way copy_kv_cache_window() shifts them. Throws when the
+  // prefill and generation capacities differ and kv_len has grown past the
+  // smaller of the two: there the two rings alias differently and no
+  // slot-preserving copy exists.
+  void syncGenerationToPrefillRing();
+
   void appendPrefillOutputs(const std::vector<IO_TensorType> &step_outputs,
                             int target_position, int rows, int src_row_length,
                             const std::string &graph_name);
