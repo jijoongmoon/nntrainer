@@ -7,6 +7,13 @@ VENDOR_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__fil
 SAMPLEAPP_SRC_PREFIX = 'examples/QNN/SampleApp/SampleApp/src'
 GENIE_SRC_PREFIX = 'examples/Genie/Genie/src'
 
+# vendor/QNN/QnnCommon.h is the sentinel nntrainer/qnn/meson.build tests to
+# decide whether the vendor tree still has to be generated, so it must only
+# appear once the whole tree is known good.
+SENTINEL_REL_PATH = 'QNN/QnnCommon.h'
+EXPECTED_API_VERSION_MINOR = 36
+EXPECTED_SDK_VERSION_TEXT = 'QNN SDK 2.47.x'
+
 def is_from_qnn(file_path):
 	if not file_path.endswith(('.cpp', '.hpp', '.h')):
 		return False
@@ -31,6 +38,33 @@ def find_replace_in_file(file_path, old_text, new_text):
 	file_data = file_data.replace(old_text, new_text)
 	with open(file_path, 'w') as f:
 		f.write(file_data)
+
+def read_api_version_minor(file_path):
+	"""Return QNN_API_VERSION_MINOR from a QnnCommon.h, or None if absent."""
+	with open(file_path, 'r') as fh:
+		for line in fh:
+			m = re.match(r'\s*#define\s+QNN_API_VERSION_MINOR\s+(\d+)', line)
+			if m:
+				return int(m.group(1))
+	return None
+
+def validate_sdk_version(qnn_root):
+	"""Reject an unsupported SDK before anything is copied into VENDOR_DIR."""
+	sdk_common_h = os.path.join(qnn_root, 'include', SENTINEL_REL_PATH)
+	if not os.path.exists(sdk_common_h):
+		sys.exit(
+			f'{sdk_common_h} not found. '
+			f'Check that --qnn-sdk-root/$QNN_SDK_ROOT points at a QNN SDK root.'
+		)
+	found_minor = read_api_version_minor(sdk_common_h)
+	if found_minor is None:
+		sys.exit(f'{sdk_common_h} does not define QNN_API_VERSION_MINOR - unexpected SDK layout.')
+	if found_minor != EXPECTED_API_VERSION_MINOR:
+		sys.exit(
+			f'Unexpected QNN API version: expected MINOR={EXPECTED_API_VERSION_MINOR} '
+			f'({EXPECTED_SDK_VERSION_TEXT}), found MINOR={found_minor}. '
+			f'Update the expected version in this script if you intend to bump the SDK.'
+		)
 
 def remove_path(path):
 	if os.path.isdir(path):
@@ -81,6 +115,14 @@ if __name__ == '__main__':
 			'Qualcomm QNN SDK root (e.g. .../qairt/2.47.0.x)'
 		)
 
+	# ── 0. Validate the SDK BEFORE touching VENDOR_DIR ────────────────────
+	# Checking the version only after the copy left a poisoned vendor tree
+	# behind on every rejected SDK: the sentinel header was already in place,
+	# so the next meson configure skipped regeneration and built against
+	# headers this script had just refused.
+	validate_sdk_version(qnn_root)
+	vendor_sentinel = os.path.join(VENDOR_DIR, SENTINEL_REL_PATH)
+
 	# Copy directories
 	for target_name, src_rel in target_src_dirs.items():
 		src_path = os.path.join(qnn_root, src_rel)
@@ -103,26 +145,11 @@ if __name__ == '__main__':
 			os.makedirs(os.path.dirname(target_rel), exist_ok=True)
 			shutil.copyfile(src_path, target_rel)
 
-	# ── 1b. Pin QNN API version ───────────────────────────────────────────
-	_qnn_common_h = os.path.join(VENDOR_DIR, 'QNN/QnnCommon.h')
-	if not os.path.exists(_qnn_common_h):
-		sys.exit(f'Expected {_qnn_common_h} to exist after SDK copy — check SDK layout.')
-	_expected_minor = 36
-	_found_minor = None
-	with open(_qnn_common_h, 'r') as _fh:
-		for _line in _fh:
-			_m = re.match(r'\s*#define\s+QNN_API_VERSION_MINOR\s+(\d+)', _line)
-			if _m:
-				_found_minor = int(_m.group(1))
-				break
-	if _found_minor is None:
-		sys.exit(f'{_qnn_common_h} does not define QNN_API_VERSION_MINOR — unexpected SDK layout.')
-	if _found_minor != _expected_minor:
-		sys.exit(
-			f'Unexpected QNN API version: expected MINOR={_expected_minor} (QNN SDK 2.47.x), '
-			f'found MINOR={_found_minor}. '
-			f'Update the expected version in this script if you intend to bump the SDK.'
-		)
+	# Hold the sentinel back until the tree is complete, so an interrupted or
+	# otherwise failed run leaves something the next configure regenerates.
+	if not os.path.exists(vendor_sentinel):
+		sys.exit(f'Expected {vendor_sentinel} to exist after SDK copy - check SDK layout.')
+	remove_path(vendor_sentinel)
 
 	# ── 2. Remove unused files/directories ────────────────────────────────
 
@@ -172,5 +199,10 @@ if __name__ == '__main__':
 	dl_open_wrapper = os.path.join(VENDOR_DIR, 'qnn-api/qualla/detail/dlOpenWrapper.hpp')
 	find_replace_in_file(dl_open_wrapper, 'static const int s_anchor', 'static int s_anchor')
 	find_replace_in_file(dl_open_wrapper, 'reinterpret_cast<const void*>', 'reinterpret_cast<void*>')
+
+	# ── 4. Publish the sentinel last ──────────────────────────────────────
+	os.makedirs(os.path.dirname(vendor_sentinel), exist_ok=True)
+	shutil.copyfile(os.path.join(qnn_root, 'include', SENTINEL_REL_PATH),
+	                vendor_sentinel)
 
 	print('QNN vendor files updated successfully.')
