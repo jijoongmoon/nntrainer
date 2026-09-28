@@ -10,8 +10,11 @@
 #ifndef __GENERATE_QNN_UTILS_HPP__
 #define __GENERATE_QNN_UTILS_HPP__
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -138,6 +141,62 @@ void fill_attention_mask_with_prev_length(int rows, int columns, int length,
  */
 void fill_sliding_mask_with_prev_length(int rows, int columns, int past_len,
                                         int window, uint16_t *attention_mask);
+
+/**
+ * @brief Sign-extend a 4-bit value (0..15 -> -8..7).
+ */
+inline int s4(unsigned nib) {
+  return (nib & 0x8u) ? static_cast<int>(nib) - 16 : static_cast<int>(nib);
+}
+
+/**
+ * @brief PLE 4-bit packed -> uint16 (QNN consumer space) two-step requant.
+ *
+ * ufixed8 path: f = (q4bit + lut_offset) * lut_scale.
+ */
+inline void dequant_nibbles_requant_u16(const uint8_t *packed, size_t elems,
+                                        float lut_scale, int lut_offset,
+                                        float out_scale, int out_offset,
+                                        uint16_t *dst) {
+  const float inv_out = 1.0f / out_scale;
+  auto requant = [&](uint8_t nib) -> uint16_t {
+    const float f = (static_cast<float>(nib) + lut_offset) * lut_scale;
+    int q = static_cast<int>(std::lrintf(f * inv_out)) - out_offset;
+    return static_cast<uint16_t>(std::max(0, std::min(65535, q)));
+  };
+  const size_t whole = elems / 2;
+  for (size_t i = 0; i < whole; ++i) {
+    const uint8_t b = packed[i];
+    dst[2 * i] = requant(b & 0x0F);
+    dst[2 * i + 1] = requant((b >> 4) & 0x0F);
+  }
+  if (elems & 1)
+    dst[2 * whole] = requant(packed[whole] & 0x0F);
+}
+
+/**
+ * @brief PLE sfixed4 (per-row-per-layer) -> uint16 requant.
+ *
+ * f = s4(nib) * row_scale.
+ */
+inline void dequant_sfixed4_requant_u16(const uint8_t *packed, size_t elems,
+                                        float row_scale, float out_scale,
+                                        int out_offset, uint16_t *dst) {
+  const float inv_out = 1.0f / out_scale;
+  auto requant = [&](unsigned nib) -> uint16_t {
+    const float f = static_cast<float>(s4(nib)) * row_scale;
+    int q = static_cast<int>(std::lrintf(f * inv_out)) - out_offset;
+    return static_cast<uint16_t>(std::max(0, std::min(65535, q)));
+  };
+  const size_t whole = elems / 2;
+  for (size_t i = 0; i < whole; ++i) {
+    const uint8_t b = packed[i];
+    dst[2 * i] = requant(b & 0x0F);
+    dst[2 * i + 1] = requant((b >> 4) & 0x0F);
+  }
+  if (elems & 1)
+    dst[2 * whole] = requant(packed[whole] & 0x0F);
+}
 
 uint16_t *get_zero_memory(int size, int zero_point);
 

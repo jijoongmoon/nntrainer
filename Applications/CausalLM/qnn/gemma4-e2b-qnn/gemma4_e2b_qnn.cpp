@@ -95,52 +95,9 @@ std::vector<int> read_eos_token_ids(const json &generation_cfg,
   throw std::invalid_argument("eos_token_id must be an integer or array");
 }
 
-// PLE 4-bit packed → uint16 (QNN consumer space) two-step requant.
-// ufixed8 path: f = (q4bit + lut_offset) * lut_scale.
-inline void dequant_nibbles_requant_u16(const uint8_t *packed, size_t elems,
-                                        float lut_scale, int lut_offset,
-                                        float out_scale, int out_offset,
-                                        uint16_t *dst) {
-  const float inv_out = 1.0f / out_scale;
-  auto requant = [&](uint8_t nib) -> uint16_t {
-    const float f = (static_cast<float>(nib) + lut_offset) * lut_scale;
-    int q = static_cast<int>(std::lrintf(f * inv_out)) - out_offset;
-    return static_cast<uint16_t>(std::max(0, std::min(65535, q)));
-  };
-  const size_t whole = elems / 2;
-  for (size_t i = 0; i < whole; ++i) {
-    const uint8_t b = packed[i];
-    dst[2 * i] = requant(b & 0x0F);
-    dst[2 * i + 1] = requant((b >> 4) & 0x0F);
-  }
-  if (elems & 1)
-    dst[2 * whole] = requant(packed[whole] & 0x0F);
-}
-
-// Sign-extend a 4-bit value (0..15 → -8..7).
-inline int s4(unsigned nib) {
-  return (nib & 0x8u) ? static_cast<int>(nib) - 16 : static_cast<int>(nib);
-}
-
-// PLE sfixed4 (per-row-per-layer) → uint16 requant. f = s4(nib) * row_scale.
-inline void dequant_sfixed4_requant_u16(const uint8_t *packed, size_t elems,
-                                        float row_scale, float out_scale,
-                                        int out_offset, uint16_t *dst) {
-  const float inv_out = 1.0f / out_scale;
-  auto requant = [&](unsigned nib) -> uint16_t {
-    const float f = static_cast<float>(s4(nib)) * row_scale;
-    int q = static_cast<int>(std::lrintf(f * inv_out)) - out_offset;
-    return static_cast<uint16_t>(std::max(0, std::min(65535, q)));
-  };
-  const size_t whole = elems / 2;
-  for (size_t i = 0; i < whole; ++i) {
-    const uint8_t b = packed[i];
-    dst[2 * i] = requant(b & 0x0F);
-    dst[2 * i + 1] = requant((b >> 4) & 0x0F);
-  }
-  if (elems & 1)
-    dst[2 * whole] = requant(packed[whole] & 0x0F);
-}
+// s4(), dequant_nibbles_requant_u16() and dequant_sfixed4_requant_u16() live
+// in the shared generate_qnn_utils.h so every QNN model reads the PLE 4-bit
+// requant from one definition instead of keeping a private copy.
 
 } // namespace
 
