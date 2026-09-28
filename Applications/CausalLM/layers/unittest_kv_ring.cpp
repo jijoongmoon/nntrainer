@@ -889,6 +889,10 @@ TEST(KVRing, det_arm_per_layer_rule) {
  * (bundle requested, ring on) was measured bit-identical run to run on every
  * cell, so the ring is not refused there either -- refusing it only cost
  * memory. Pinned so neither arm silently loses the memory win.
+ *
+ * Both arms are OpenCL arms: a build without ENABLE_OPENCL has no ring-aware
+ * arm for the gpu engine, so there the ring is refused on either arm and the
+ * layer keeps the linear cache (kvRingCap returns 0).
  */
 TEST(KVRing, ring_survives_both_arms) {
   ScopedEnv ring("NNTR_KV_WINDOW_RING", "1");
@@ -901,17 +905,22 @@ TEST(KVRing, ring_survives_both_arms) {
   ScopedEnv ctl("NNTR_KV_IMG_RING", nullptr);
   ScopedEnv allow("NNTR_ALLOW_NONDETERMINISTIC", nullptr);
   causallm::packAllowsNondeterministic() = false;
+#if defined(ENABLE_OPENCL)
+  const bool ring_arm = true;
+#else
+  const bool ring_arm = false; // no OpenCL arm to serve the gpu engine
+#endif
   {
     ScopedEnv det("NNTR_DETERMINISTIC", nullptr); // the fast default
-    EXPECT_TRUE(causallm::kvRingArmAvailable());
+    EXPECT_EQ(causallm::kvRingArmAvailable(), ring_arm);
     // a windowed layer is ringed; a full-attention one never is, on any arm
-    EXPECT_GT(causallm::kvRingCap(512, 16896, 4096, true), 0u);
+    EXPECT_EQ(causallm::kvRingCap(512, 16896, 4096, true) > 0u, ring_arm);
     EXPECT_EQ(causallm::kvRingCap(UINT_MAX, 16896, 4096, true), 0u);
   }
   {
     ScopedEnv det("NNTR_DETERMINISTIC", "1"); // the reproducible arm
-    EXPECT_TRUE(causallm::kvRingArmAvailable());
-    EXPECT_GT(causallm::kvRingCap(512, 16896, 4096, true), 0u);
+    EXPECT_EQ(causallm::kvRingArmAvailable(), ring_arm);
+    EXPECT_EQ(causallm::kvRingCap(512, 16896, 4096, true) > 0u, ring_arm);
     EXPECT_EQ(causallm::kvRingCap(UINT_MAX, 16896, 4096, true), 0u);
   }
   { // the control arms still close the ring under the image bundle
