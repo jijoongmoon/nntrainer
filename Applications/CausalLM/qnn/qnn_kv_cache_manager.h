@@ -58,6 +58,22 @@ public:
   void appendPrefillOutputs(const std::vector<IO_TensorType> &step_outputs,
                             int target_position, int rows, int src_row_length,
                             const std::string &graph_name);
+
+  // Ring-convention sibling of appendPrefillOutputs() for the sliding-window
+  // KV ring path: chunk row r (absolute position base_position+r) is written
+  // at slot (base_position+r) % seq_cap[layer] with NO shift/memmove, so the
+  // sliding layers wrap exactly like the ring decode append and the verify
+  // masks expect (mask column p % W == storage slot). Keys are head-major
+  // [.,.,head_dim,seq] (one column gathered per head_dim from the prefill
+  // output [head_dim, src_row_length]); values are seq-major [.,.,seq,head_dim]
+  // (one row gathered from [src_row_length, head_dim]). UFIXED8 (1 byte/elem)
+  // target path only. Parity with appendAcceptedGenerationOutputsRing(), which
+  // does the same ring write for the accepted verify nodes. Does NOT change
+  // kv_len_ (the caller advances the length).
+  void appendPrefillOutputsRing(const std::vector<IO_TensorType> &step_outputs,
+                                int base_position, int rows, int src_row_length,
+                                const std::string &graph_name);
+
   void appendGenerationOutputs(const std::vector<IO_TensorType> &step_outputs,
                                int target_position, int rows,
                                int src_row_length,
