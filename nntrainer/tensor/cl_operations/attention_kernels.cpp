@@ -4898,7 +4898,8 @@ bool flash_attention_prefill_f16_cl(
           const uint16_t *qp = Q_host + m * HD_Q + h * d;
           double smax = -1e300;
           for (long n = lo; n <= mabs; ++n) {
-            const size_t pn = (size_t)n; // physical row of key n
+            const size_t pn =
+              ring_cap > 0 ? (size_t)n % ring_cap : (size_t)n; // physical row
             const uint16_t *kr = (k_stride > 0)
                                    ? K_host + hk * (size_t)k_stride * d + pn * d
                                    : K_host + pn * HD_KV + hk * d;
@@ -4914,7 +4915,8 @@ bool flash_attention_prefill_f16_cl(
           double l = 0;
           std::fill(o.begin(), o.end(), 0.0);
           for (long n = lo; n <= mabs; ++n) {
-            const size_t pn = (size_t)n; // physical row of key n
+            const size_t pn =
+              ring_cap > 0 ? (size_t)n % ring_cap : (size_t)n; // physical row
             const uint16_t *vr = V_host + pn * HD_KV + hk * d;
             const double w = std::exp(sc[n] - smax);
             l += w;
