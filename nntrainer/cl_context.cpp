@@ -484,10 +484,19 @@ void ClContext::initBlasClKernels() {
   registerClKernel(transpose_32bit_16bit_kernel, "kernel_transpose_32_16");
   registerClKernel(q4_0_ab_bi_8x4_kernel, "kernel_mul_mat_Ab_Bi_8x4");
 
-  // register INT4 computation kernels
-  registerClKernel(int4_gemv_kernel, "fully_connected_gpu_int4_gemv");
-  registerClKernel(int4_quantize_input_kernel, "quantize_input_int4");
-  registerClKernel(int4_quantize_input_kernel, "quantize_input_int4_pad");
+  // INT4 computation kernels. Their sources use Intel-only constructs (the
+  // gemv reads through Intel sub-group block-read helpers it does not define
+  // for other devices, and the quantizer subscripts a vector type), so other
+  // vendors' compilers reject them and every init logged three failed
+  // registrations. Prewarm them only on Intel; their callers register them
+  // on first use anyway, so another device that does reach them still gets
+  // the same answer, just not at init.
+  constexpr uint32_t intel_vendor_id = 0x8086;
+  if (caps().vendor_id == intel_vendor_id) {
+    registerClKernel(int4_gemv_kernel, "fully_connected_gpu_int4_gemv");
+    registerClKernel(int4_quantize_input_kernel, "quantize_input_int4");
+    registerClKernel(int4_quantize_input_kernel, "quantize_input_int4_pad");
+  }
 
 #ifdef ENABLE_FP16
   registerClKernel(hgemv_kernel, "sgemv_cl_fp16");
