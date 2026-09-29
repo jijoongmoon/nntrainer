@@ -1685,22 +1685,26 @@ void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
     return requested && ClContext::Global().caps().dpas;
   }();
   // One-shot warning (stderr + ml_logw): XMX was requested/defaulted but this
-  // device has no DPAS matrix engine, so the honest dp4a fallback runs
-  // instead (~1.8x slower than XMX, not a correctness issue).
+  // Intel device has no DPAS matrix engine, so the honest dp4a fallback runs
+  // instead (~1.8x slower than XMX, not a correctness issue). Intel only: XMX
+  // is an Intel engine, so on any other GPU its absence is expected and the
+  // warning would only mislead.
   static bool xmx_no_dpas_warned = false;
   if (!xmx_no_dpas_warned) {
     xmx_no_dpas_warned = true;
+    constexpr uint32_t intel_vendor_id = 0x8086;
     const char *e = getenv("NNTR_FC_XMX");
     const bool requested = e ? (atoi(e) != 0) : true;
     const char *force = getenv("NNTR_FC_XMX_FORCE");
     const bool forced = force && std::string(force) == "1";
-    if (requested && !forced && !ClContext::Global().caps().dpas) {
+    const DeviceCaps &dc = ClContext::Global().caps();
+    if (requested && !forced && dc.vendor_id == intel_vendor_id && !dc.dpas) {
       ml_logw("[XMX] Intel GPU \"%s\" lacks the XMX/DPAS matrix engine "
               "(no cl_intel_subgroup_matrix_multiply_accumulate) — using the "
               "dp4a GEMM fallback (~1.8x slower than XMX, not a correctness "
               "issue). If an NVIDIA GPU is present, backend=cuda will be "
               "faster. Set NNTR_FC_XMX_FORCE=1 to force XMX for debugging.",
-              ClContext::Global().caps().device_name.c_str());
+              dc.device_name.c_str());
     }
   }
   // One-shot diagnostic (stderr): why XMX/DPAS is or is not selected. On
