@@ -216,6 +216,16 @@ public:
   }
 
   /**
+   * @copydoc Context::caps
+   * @brief CUDA override: a snapshot of the device this context selected
+   *        (the NNTR_CUDA_DEVICE ordinal), taken on the first call from the
+   *        properties cuda::ContextManager read when it opened the device. It
+   *        never throws; without a usable device only the fields that need no
+   *        device (backend "cuda", image_v8c off) are set.
+   */
+  const DeviceCaps &caps() const override;
+
+  /**
    * @brief Set the Mem Allocator object
    */
   void setMemAllocator(std::shared_ptr<MemAllocator> mem) {
@@ -232,6 +242,12 @@ private:
 
   /// true once the CUDA device/context/stream were created
   bool cuda_initialized = false;
+
+  // Device capability snapshot behind caps(). Mutable because caps() is a
+  // const query whose fill is deferred to first use; the once_flag makes the
+  // fill (and its log line) happen once even with concurrent callers.
+  mutable DeviceCaps device_caps_;
+  mutable std::once_flag caps_probed_;
 
   FactoryMap<nntrainer::Layer> factory_map;
 

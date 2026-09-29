@@ -57,6 +57,80 @@ CudaContext &CudaContext::Global() {
   return *instance;
 }
 
+const DeviceCaps &CudaContext::caps() const {
+  std::call_once(caps_probed_, [this]() {
+    // Set the backend tag first: it is the one field that stays true even when
+    // no device can be opened, and resolveExecPlan() keys on it.
+    device_caps_.backend = "cuda";
+    // Not a probe either: CUDA has no image2d path, so the OpenCL
+    // image-vs-buffer split is answered "buffer" whatever the device.
+    device_caps_.image_v8c = false;
+
+    try {
+      // Every field below comes from the properties of the device this
+      // process selected, read once when cuda::ContextManager opened it. No
+      // field is keyed on a device name or an SM version list, so a new part
+      // is described by its own properties.
+      if (!context_inst_.isAvailable())
+        return;
+
+      device_caps_.device_name = context_inst_.GetDeviceName();
+      device_caps_.arch = context_inst_.GetSmArch();
+      device_caps_.compute_units =
+        static_cast<uint32_t>(context_inst_.GetMultiProcessorCount());
+
+      // prop.integrated: 1 when the GPU shares the host's physical memory
+      // (Jetson Orin / Thor), 0 for a card with its own memory (GeForce/RTX,
+      // H100, and also Grace Hopper, whose HBM is a separate pool even though
+      // the CPU can address it).
+      device_caps_.integrated = context_inst_.isIntegrated();
+
+      // A single pointer the host and the device may both use while kernels
+      // are in flight: managed memory is supported AND the driver allows
+      // concurrent host access to it. managedMemory alone is 1 almost
+      // everywhere, including Windows WDDM, where a host touch of a managed
+      // buffer during a kernel is an access violation, so on its own it
+      // would not tell those devices apart. A system with
+      // pageableMemoryAccess (HMM, or ATS on Grace Hopper) has full unified
+      // memory and reports concurrentManagedAccess too, so it is included.
+      // Expected values, from the CUDA programming guide rather than
+      // measured on each platform (only a Linux GeForce RTX was measured):
+      //   Linux GeForce/RTX, H100/DGX, Grace Hopper: 1
+      //   Windows WDDM RTX: 0
+      //   Jetson Orin / Thor: whatever the driver answers for
+      //   concurrentManagedAccess on that device and release.
+      device_caps_.unified_memory = context_inst_.managedMemory() &&
+                                    context_inst_.concurrentManagedAccess();
+
+      // CUDA has no per-allocation cap below the device's memory, so the
+      // largest possible single allocation is the whole of totalGlobalMem. On
+      // an integrated device that is the system memory shared with the host,
+      // an upper bound rather than what is free.
+      device_caps_.max_alloc_bytes =
+        static_cast<uint64_t>(context_inst_.GetTotalGlobalMem());
+
+      // vendor_id, subgroups and dpas are OpenCL-only and stay at their
+      // defaults.
+    } catch (const std::exception &e) {
+      ml_logw("[CudaContext] device capability snapshot failed (%s); every "
+              "field stays at its default",
+              e.what());
+    } catch (...) {
+      ml_logw("[CudaContext] device capability snapshot failed; every field "
+              "stays at its default");
+    }
+
+    // The ordinal is part of the line because a multi-GPU host picks one
+    // device with NNTR_CUDA_DEVICE and the name alone may not tell them apart.
+    ml_logi("[CudaContext] ordinal=%d %s", context_inst_.GetDeviceOrdinal(),
+            device_caps_.toString().c_str());
+    ml_logi("[CudaContext] resolved %s",
+            resolveExecPlan(device_caps_).toString().c_str());
+  });
+
+  return device_caps_;
+}
+
 void CudaContext::initialize() noexcept {
   try {
     // [r20 fresh-init tax] On a dual-backend build this runs at the FIRST
@@ -96,6 +170,10 @@ void CudaContext::initialize() noexcept {
         "Error: CudaContext::initialize() failed (no usable CUDA device)");
       return;
     }
+
+    // Take the capability snapshot now that the device is open, so it and its
+    // log line are in place before any kernel is compiled.
+    (void)caps();
 
     // Default-ON opt-out. nntr_env_on() cannot express this: it answers false
     // for an unset variable, which is the right default for a lever but the

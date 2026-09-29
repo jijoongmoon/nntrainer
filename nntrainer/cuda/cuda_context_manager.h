@@ -78,6 +78,33 @@ public:
   bool concurrentManagedAccess() const { return concurrent_managed_access_; }
 
   /**
+   * @brief true when the device supports managed (cudaMallocManaged) memory
+   *        at all (cudaDeviceProp::managedMemory). Says nothing about when the
+   *        host may touch it -- see concurrentManagedAccess().
+   */
+  bool managedMemory() const { return managed_memory_; }
+
+  /**
+   * @brief Number of streaming multiprocessors
+   *        (cudaDeviceProp::multiProcessorCount); 0 if the probe failed.
+   */
+  int GetMultiProcessorCount() const { return multiprocessor_count_; }
+
+  /**
+   * @brief Device memory size in bytes (cudaDeviceProp::totalGlobalMem); 0 if
+   *        the probe failed. On an integrated device this is the system memory
+   *        the GPU shares with the host, not a dedicated pool.
+   */
+  size_t GetTotalGlobalMem() const { return total_global_mem_; }
+
+  /**
+   * @brief SM version of this device as "sm_<major><minor>", e.g. "sm_87",
+   *        "sm_90", "sm_120". Built from the compute capability, so a new
+   *        architecture needs no table entry.
+   */
+  std::string GetSmArch() const;
+
+  /**
    * @brief Stable signature used to key the on-disk PTX cache so a module built
    *        for a different GPU / driver / arch is never loaded.
    * @return "<name>|drv<driver>|sm_<cc>"
@@ -132,6 +159,9 @@ private:
   int driver_version_{0};
   bool integrated_{false};
   bool concurrent_managed_access_{true};
+  bool managed_memory_{false};
+  int multiprocessor_count_{0};
+  size_t total_global_mem_{0};
   bool initialized_ok_{false};
 };
 

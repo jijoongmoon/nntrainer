@@ -67,15 +67,20 @@ class Tensor;
 struct DeviceCaps {
   std::string backend = "cpu";  /**< "cpu" / "gpu" (OpenCL) / "cuda" */
   std::string device_name = ""; /**< human-readable device name */
-  std::string arch = "";        /**< backend arch tag, e.g. "compute_120" */
+  std::string arch = "";        /**< backend arch tag; CUDA: SM version,
+                                     e.g. "sm_120" */
   uint32_t vendor_id = 0;       /**< OpenCL CL_DEVICE_VENDOR_ID; 0 = n/a */
   bool integrated = true;       /**< host+device share one physical pool
                                      (host-coherent); CPU = true */
-  bool unified_memory = false;  /**< single-pointer SVM/UVM available */
+  bool unified_memory = false;  /**< single-pointer SVM/UVM available
+                                     (OpenCL: coarse-grain SVM; CUDA: managed
+                                     memory with concurrent host access) */
   bool subgroups = false;       /**< OpenCL cl_intel_subgroups (XMX/DPAS) */
-  uint32_t compute_units = 0;   /**< OpenCL CL_DEVICE_MAX_COMPUTE_UNITS */
-  uint64_t max_alloc_bytes = 0; /**< per-alloc cap (CL MAX_MEM_ALLOC_SIZE);
-                                     0 = unknown/unbounded */
+  uint32_t compute_units = 0;   /**< OpenCL CL_DEVICE_MAX_COMPUTE_UNITS;
+                                     CUDA multiProcessorCount */
+  uint64_t max_alloc_bytes = 0; /**< per-alloc cap (CL MAX_MEM_ALLOC_SIZE;
+                                     CUDA totalGlobalMem, which has no lower
+                                     cap); 0 = unknown/unbounded */
   bool image_v8c = true;        /**< device uses the image2d v8c path (FC GEMM +
                                      KV attention) rather than the cl_mem buffer
                                      path. Both report CL_DEVICE_IMAGE_SUPPORT, so

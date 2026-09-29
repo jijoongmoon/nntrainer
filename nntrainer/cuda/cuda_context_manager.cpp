@@ -174,6 +174,11 @@ bool ContextManager::CreateDefaultGPUDevice() {
     cudaDeviceGetAttribute(&cma, cudaDevAttrConcurrentManagedAccess,
                            device_ordinal_);
     concurrent_managed_access_ = cma != 0;
+    // Kept for CudaContext::caps(), so the capability snapshot reads the
+    // selected device's properties from this one query.
+    managed_memory_ = prop.managedMemory != 0;
+    multiprocessor_count_ = prop.multiProcessorCount;
+    total_global_mem_ = prop.totalGlobalMem;
   }
   cudaDriverGetVersion(&driver_version_);
 
@@ -237,6 +242,10 @@ std::string ContextManager::GetDeviceSignature() const {
 
 std::string ContextManager::GetComputeArch() const {
   return "compute_" + std::to_string(cc_major_) + std::to_string(cc_minor_);
+}
+
+std::string ContextManager::GetSmArch() const {
+  return "sm_" + std::to_string(cc_major_) + std::to_string(cc_minor_);
 }
 
 ContextManager::~ContextManager() {
