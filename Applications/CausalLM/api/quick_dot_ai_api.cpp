@@ -41,6 +41,7 @@
 #include "model_callbacks.h"
 #include "model_config_internal.h"
 #include "model_descriptor.h"
+#include "model_registry.h"
 #include "multilingual_tinybert_16mb.h"
 #include "qwen2_causallm.h"
 #include "qwen3_cached_slim_moe_causallm.h"
@@ -373,72 +374,16 @@ extern "C" const char *getModelCatalogJson(void) {
   return g_catalog_json_cache.c_str();
 }
 
-// Helper to register models (similar to main.cpp) ensuring factory is
-// populated. Factory registration is singleton and persistent, but we do it
-// once here to be sure. Since mquiain.cpp is not linked, we must duplicate
-// registration or share it. Assuming this lib is used independently of
-// main.cpp.
+// Helper to register models, ensuring the factory is populated once. The core
+// list comes from causallm::registerAllModels(); see the note inside.
 static void register_models() {
   static std::once_flag flag;
   std::call_once(flag, []() {
-    causallm::Factory::Instance().registerModel(
-      "LlamaForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
-        return std::make_unique<causallm::CausalLM>(cfg, generation_cfg,
-                                                    nntr_cfg);
-      });
-    causallm::Factory::Instance().registerModel(
-      "Qwen2ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
-        return std::make_unique<causallm::Qwen2CausalLM>(cfg, generation_cfg,
-                                                         nntr_cfg);
-      });
-    causallm::Factory::Instance().registerModel(
-      "Qwen3ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
-        return std::make_unique<causallm::Qwen3CausalLM>(cfg, generation_cfg,
-                                                         nntr_cfg);
-      });
-    causallm::Factory::Instance().registerModel(
-      "Qwen3MoeForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
-        return std::make_unique<causallm::Qwen3MoECausalLM>(cfg, generation_cfg,
-                                                            nntr_cfg);
-      });
-    causallm::Factory::Instance().registerModel(
-      "Qwen3SlimMoeForCausalLM",
-      [](json cfg, json generation_cfg, json nntr_cfg) {
-        return std::make_unique<causallm::Qwen3SlimMoECausalLM>(
-          cfg, generation_cfg, nntr_cfg);
-      });
-    causallm::Factory::Instance().registerModel(
-      "Qwen3CachedSlimMoeForCausalLM",
-      [](json cfg, json generation_cfg, json nntr_cfg) {
-        return std::make_unique<causallm::Qwen3CachedSlimMoECausalLM>(
-          cfg, generation_cfg, nntr_cfg);
-      });
-    causallm::Factory::Instance().registerModel(
-      "GptOssForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
-        return std::make_unique<causallm::GptOssForCausalLM>(
-          cfg, generation_cfg, nntr_cfg);
-      });
-    causallm::Factory::Instance().registerModel(
-      "GptOssCachedSlimCausalLM",
-      [](json cfg, json generation_cfg, json nntr_cfg) {
-        return std::make_unique<causallm::GptOssCachedSlimCausalLM>(
-          cfg, generation_cfg, nntr_cfg);
-      });
-    causallm::Factory::Instance().registerModel(
-      "Gemma3ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
-        return std::make_unique<causallm::Gemma3CausalLM>(cfg, generation_cfg,
-                                                          nntr_cfg);
-      });
-    causallm::Factory::Instance().registerModel(
-      "Gemma4ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
-        return std::make_unique<causallm::Gemma4CausalLM>(cfg, generation_cfg,
-                                                          nntr_cfg);
-      });
-    causallm::Factory::Instance().registerModel(
-      "MultilingualTinyBert", [](json cfg, json generation_cfg, json nntr_cfg) {
-        return std::make_unique<causallm::MultilingualTinyBert>(
-          cfg, generation_cfg, nntr_cfg);
-      });
+    // The core model set is the shared causallm::registerAllModels()
+    // (models/model_registry.h), the same list main.cpp registers, so the two
+    // entry points cannot drift apart. Only the API-specific extras follow.
+    causallm::registerAllModels();
+
     // Ouro (Universal-Transformer) self-registers "OuroModel" from its own
     // TU (src/models/ouro/ouro_embedding.cpp) via __attribute__((constructor)),
     // same pattern as the QNN models below.
@@ -523,7 +468,8 @@ static std::string apply_chat_template(const std::string &architecture,
     // Qwen chat format
     // <|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n
     return "<|im_start|>user\n" + input + "<|im_end|>\n<|im_start|>assistant\n";
-  } else if (architecture == "Gemma3ForCausalLM") {
+  } else if (architecture == "Gemma2ForCausalLM" ||
+             architecture == "Gemma3ForCausalLM") {
     // Gemma chat format:
     // <start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n
     return "<start_of_turn>user\n" + input +
@@ -1630,6 +1576,12 @@ static ErrorCode metrics_on_handle(CausalLmModel &h,
     metrics->generation_duration_ms = im.generation_duration_ms;
     metrics->total_duration_ms = im.total_duration_ms;
     metrics->peak_memory_kb = im.peak_memory_kb;
+    /* [perf-split] the honest rows */
+    metrics->ttft_ms = im.ttft_ms;
+    metrics->first_token_ms = im.first_token_ms;
+    metrics->decode_steady_ms = im.decode_steady_ms;
+    metrics->decode_steady_tokens = im.decode_steady_tokens;
+    metrics->prefill_drain_ms = im.prefill_drain_ms;
 
     double total_init = 0.0;
     for (double d : h.initialization_duration_ms)
@@ -1744,7 +1696,8 @@ static std::string apply_chat_template_messages(
     if (add_generation_prompt) {
       result += "<|im_start|>assistant\n";
     }
-  } else if (architecture == "Gemma3ForCausalLM") {
+  } else if (architecture == "Gemma2ForCausalLM" ||
+             architecture == "Gemma3ForCausalLM") {
     for (const auto &msg : messages) {
       if (msg.role == "user") {
         result += "<start_of_turn>user\n" + msg.content + "<end_of_turn>\n";

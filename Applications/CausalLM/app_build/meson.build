@@ -78,6 +78,19 @@ if is_android
   libccapi     = cxx.find_library('ccapi-nntrainer', dirs: [_nntr_libdir])
 
   nntrainer_inc_args = ['-I' + _nntr_incdir]
+  # The same private-header dirs jni/Android.mk adds from the source tree:
+  # residency_policy.h (tensor), the raw OpenCL kernel wrappers a few layer
+  # TUs still include (tensor/cl_operations; see the note in jni/Android.mk)
+  # and the header-only layer profiler (layers/llm). They are deliberately not
+  # installed, so the prebuilt include dir alone cannot provide them.
+  foreach p : [
+    nntrainer_root / 'nntrainer' / 'utils',
+    nntrainer_root / 'nntrainer' / 'tensor',
+    nntrainer_root / 'nntrainer' / 'tensor' / 'cl_operations',
+    nntrainer_root / 'nntrainer' / 'layers' / 'llm',
+  ]
+    nntrainer_inc_args += ['-I' + p]
+  endforeach
 else
   _nntr_builddir = nntrainer_root / get_option('nntrainer_builddir')
 
@@ -95,11 +108,13 @@ else
     nntrainer_root / 'nntrainer',
     nntrainer_root / 'nntrainer' / 'layers',
     nntrainer_root / 'nntrainer' / 'layers' / 'loss',
+    nntrainer_root / 'nntrainer' / 'layers' / 'llm',
     nntrainer_root / 'nntrainer' / 'models',
     nntrainer_root / 'nntrainer' / 'graph',
     nntrainer_root / 'nntrainer' / 'compiler',
     nntrainer_root / 'nntrainer' / 'optimizers',
     nntrainer_root / 'nntrainer' / 'tensor',
+    nntrainer_root / 'nntrainer' / 'tensor' / 'cl_operations',
     nntrainer_root / 'nntrainer' / 'tensor' / 'cpu_backend',
     nntrainer_root / 'nntrainer' / 'tensor' / 'cpu_backend' / 'fallback',
     nntrainer_root / 'nntrainer' / 'tensor' / 'cpu_backend' / 'cblas_interface',
@@ -187,7 +202,9 @@ endif
 #
 # Keep this list explicit. The previous recursive find silently changed the
 # Android ABI whenever an unrelated .cpp file was added under layers/ or
-# models/. This is the canonical Android core source manifest.
+# models/. This is the canonical Android core source manifest. The shared
+# LLM layers (lm_head, qkv, scalar_multiply, logit_softcapping, swiglu,
+# tie_word_embedding) live in libnntrainer (nntrainer/layers/llm), not here.
 causallm_src = [
   causallm_root / 'chat_template.cpp',
   causallm_root / 'factory.cpp',
@@ -197,6 +214,8 @@ causallm_src = [
   causallm_root / 'models' / 'causal_lm.cpp',
   causallm_root / 'models' / 'transformer.cpp',
   causallm_root / 'models' / 'sentence_transformer.cpp',
+  causallm_root / 'models' / 'model_registry.cpp',
+  causallm_root / 'models' / 'gemma2' / 'gemma2_causallm.cpp',
   causallm_root / 'models' / 'qwen2' / 'qwen2_causallm.cpp',
   causallm_root / 'models' / 'qwen2' / 'qwen2_embedding.cpp',
   causallm_root / 'models' / 'qwen3' / 'qwen3_causallm.cpp',
@@ -225,18 +244,14 @@ causallm_src = [
   causallm_root / 'layers' / 'embedding_pooling_layer.cpp',
   causallm_root / 'layers' / 'embedding_normalize_layer.cpp',
   causallm_root / 'layers' / 'per_layer_slice.cpp',
-  causallm_root / 'layers' / 'scalar_multiply.cpp',
-  causallm_root / 'layers' / 'logit_softcapping.cpp',
+  causallm_root / 'layers' / 'per_layer_slice_gpu.cpp',
+  causallm_root / 'layers' / 'rms_norm_gpu.cpp',
   causallm_root / 'layers' / 'mha_core.cpp',
-  causallm_root / 'layers' / 'lm_head.cpp',
   causallm_root / 'layers' / 'reshaped_rms_norm.cpp',
   causallm_root / 'layers' / 'custom_multiply.cpp',
   causallm_root / 'layers' / 'causal_conv1d_layer.cpp',
   causallm_root / 'layers' / 'rms_norm.cpp',
   causallm_root / 'layers' / 'rms_reverse_norm.cpp',
-  causallm_root / 'layers' / 'swiglu.cpp',
-  causallm_root / 'layers' / 'tie_word_embedding.cpp',
-  causallm_root / 'layers' / 'qkv_layer.cpp',
   causallm_root / 'layers' / 'deberta_attention_layer.cpp',
   causallm_root / 'layers' / 'shared_fully_connected_layer.cpp',
   causallm_root / 'api' / 'streamer.cpp',
