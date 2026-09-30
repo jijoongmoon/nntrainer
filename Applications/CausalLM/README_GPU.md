@@ -20,10 +20,11 @@ input. FP16 activations are the precondition for full GPU residency (attention /
 RoPE / KV cache all on device).
 
 > The engine is chosen by `causallm_engine()` (`llm_util.hpp`): it defaults to
-> **gpu** (OpenCL), drops to host CPU when `NNTR_ENGINE=cpu`, and selects CUDA
-> when `NNTR_ENGINE=cuda`. There is **no** `engine` key in `nntr_config.json` —
-> the single neutral graph resolves to the right backend at finalize, then the
-> GPU path is gated by the env vars below.
+> **gpu** (OpenCL) in a build with OpenCL and to **cpu** in one without, drops to
+> host CPU when `NNTR_ENGINE=cpu`, and selects CUDA when `NNTR_ENGINE=cuda`.
+> There is **no** `engine` key in `nntr_config.json` — the single neutral graph
+> resolves to the right backend at finalize, then the GPU path is gated by the
+> env vars below.
 
 > Conventions: **prefill** = the M-row prompt GEMM (`M=1024` in the perf tables);
 > **decode** = the `M=1` per-token step. The two are structurally different
@@ -43,13 +44,13 @@ RoPE / KV cache all on device).
 ninja -C build_cl Applications/CausalLM/nntr_causallm
 # (first-time configure, if build_cl is absent:)
 #   meson setup build_cl . -Denable-opencl=true -Denable-fp16=true \
-#       -Dwerror=false --buildtype=release
+#       -Denable-transformer=true -Dwerror=false --buildtype=release
 
-# Run (canonical Intel env). NNTR_V8C_BUF is MANDATORY (NEO can't read_imageui);
-# NNTR_GPU_CLMEM_POOL is MANDATORY for coherence; NNTR_XE3_SYNC is MANDATORY on
-# Xe3 (Panther Lake). XMX is now auto-selected from device caps — no NNTR_FC_XMX.
-NNTR_GPU_SVM_POOL=1 NNTR_V8C_BUF=1 NNTR_MHA_GPU=1 NNTR_FC_INT8_GPU=1 \
-NNTR_GPU_CLMEM_POOL=1 NNTR_XE3_SYNC=1 \
+# Run (canonical Intel env). The int8 FC GEMM, the SVM KV cache and the cl_mem
+# activation pool are on by default; the buffer (non-image) v8c path, XMX and
+# the Xe3 coarse-grain-SVM drain are derived from device caps. Only GPU
+# attention is opt-in.
+NNTR_MHA_GPU=1 \
   ./build_cl/Applications/CausalLM/nntr_causallm <MODEL_DIR> ["prompt"]
 ```
 
@@ -63,12 +64,14 @@ ninja -C build_cuda Applications/CausalLM/nntr_causallm
 BD=build_cuda
 export LD_LIBRARY_PATH="$BD/Applications/CausalLM:$BD/Applications/CausalLM/layers:$BD/nntrainer:$BD/api/ccapi:/usr/local/cuda/lib64"
 
-# Discrete RTX (canonical set). block-Q attention incl. the head_dim=128 kernel
-# means qwen3 needs NO NNTR_CUDA_GEMM_ATTN. GEMM_ATTN now auto-enables on Orin.
-NNTR_ENGINE=cuda NNTR_CUDA_DEV_ACT=1 NNTR_RMSNORM_CUDA_OFF=all NNTR_CUDA_ROPE=1 \
-NNTR_CUDA_ATTN=1 NNTR_CUDA_QKNORM=1 NNTR_CUDA_GEGLU=1 NNTR_CUDA_ELTWISE=1 \
-NNTR_CUDA_KV_UVM=1 NNTR_CUDA_VCOPY_PREFILL=1 NNTR_CUDA_FLASH_DECODE=64 \
-NNTR_CUDA_BLOCKQ=1 NNTR_FC_CUDA_CUBLAS=1 NNTR_CUDA_PREWARM=1 \
+# CudaContext fills in the device profile itself (setenv without overwrite):
+# always GEGLU / FC_CUDA_CUBLAS / ATTN / FLASH_DECODE=64 / BLOCKQ; on a discrete
+# part also DEV_ACT / VCOPY_PREFILL / RMSNORM_CUDA_OFF=all / LAYERNORM_CUDA_OFF=all,
+# ASYNC following DEV_ACT, and the GRAPH + M2B decode-graph pair. PREWARM is on
+# unless =0. Each can be turned off with =0. The remaining decode ops
+# (ROPE / QKNORM / ELTWISE) and the UVM KV cache stay opt-in.
+NNTR_ENGINE=cuda NNTR_CUDA_ROPE=1 NNTR_CUDA_QKNORM=1 NNTR_CUDA_ELTWISE=1 \
+NNTR_CUDA_KV_UVM=1 \
   "$BD/Applications/CausalLM/nntr_causallm" <MODEL_DIR> ["prompt"]
 ```
 
@@ -76,59 +79,49 @@ NVRTC compiles kernels at runtime for the live device arch (sm_89 Ada, sm_120
 Blackwell, sm_87 Orin …) and caches the PTX on disk — no fatbin to ship. On Orin
 use `run_gemma4_fast.sh` (the host-coherent safe-set, see §7.3.3).
 
-### Adreno (Android, ndk-build)
+### Adreno (Android, `build_android.sh`)
 
 ```bash
-export ANDROID_NDK=/path/to/android-ndk        # e.g. ~/Android/Sdk/ndk/27.2.12479018
+export ANDROID_NDK=/path/to/android-ndk
 
-# (a) Build libnntrainer + libccapi (meson). package_android.sh leaves OpenCL OFF
-#     by default, so force it on the first time, then ninja install:
-./tools/package_android.sh
-meson configure builddir -Denable-opencl=true -Dwerror=false
-ninja -C builddir install
-#     ⚠️ ndk-build does NOT run meson's .cl->.cpp codegen. If you edited a kernel,
-#     re-run the meson build (or `build_lib.sh`) first, or you get silent
-#     stale-kernel garbage. See §11.
+# (a) Build libnntrainer (with OpenCL) and the CausalLM app with Meson; -D options
+#     are forwarded to the engine build (tools/package_android.sh):
+cd Applications/CausalLM
+./build_android.sh -Denable-opencl=true
 
-# (b) Build the app (ndk-build):
-cd Applications/CausalLM/jni
-ndk-build NDK_PROJECT_PATH=. NDK_LIBS_OUT=./libs NDK_OUT=./obj \
-  APP_BUILD_SCRIPT=./Android.mk NDK_APPLICATION_MK=./Application.mk \
-  causallm_core nntrainer_causallm -j$(nproc)
+# (b) Deploy (see §9): --install pushes nntr_causallm, libcausallm.so,
+#     libccapi-nntrainer.so, libnntrainer.so and libc++_shared.so into the
+#     device directory it prints at the end.
+ANDROID_SERIAL=<SERIAL> ./build_android.sh -Denable-opencl=true --install
 
-# (c) Deploy ALL SIX artifacts to /data/local/tmp/nntrainer/causallm (see §9):
-#     nntrainer_causallm, libcausallm_core.so, libccapi-nntrainer.so,
-#     libnntrainer.so, libOpenCL.so, libc++_shared.so
-
-# (d) Run (canonical Adreno env). NNTR_KV_IMG_ATTN selects image2d KV;
-#     NNTR_GPU_CLMEM_POOL is MANDATORY for coherence.
-adb -s <SERIAL> shell 'cd /data/local/tmp/nntrainer/causallm && \
-  LD_LIBRARY_PATH=$PWD NNTR_FC_INT8_GPU=1 NNTR_MHA_GPU=1 NNTR_GPU_SVM_POOL=1 \
-  NNTR_KV_IMG_ATTN=1 NNTR_GPU_CLMEM_POOL=1 \
-  ./nntrainer_causallm models/<MODEL_DIR> ["prompt"]'
+# (c) Run (canonical Adreno env). NNTR_KV_IMG_ATTN selects image2d KV.
+adb -s <SERIAL> shell 'cd <DEVICE_DIR> && \
+  LD_LIBRARY_PATH=$PWD NNTR_MHA_GPU=1 NNTR_KV_IMG_ATTN=1 \
+  ./nntr_causallm models/<MODEL_DIR> ["prompt"]'
 ```
 
 ## 2. Canonical environment sets
 
 The minimal, verified-coherent env sets. Everything else (§8) is tuning /
-diagnostics. **Both pools are mandatory together** — `NNTR_GPU_SVM_POOL` orders
-the producer before the consumer (in-order queue) and `NNTR_GPU_CLMEM_POOL`
-gives them a shared device buffer; drop either and output collapses.
+diagnostics. Most of the OpenCL set is now a default (on, or derived from
+`DeviceCaps`); the table gives the effective value, and a variable only needs
+setting to override it (e.g. `=0` for an A/B run).
 
 | | Adreno | Intel (Xe / Meteor) | CUDA (RTX / Orin) |
 |---|---|---|---|
 | `NNTR_ENGINE` | — (gpu default) | — (gpu default) | `cuda` |
-| `NNTR_FC_INT8_GPU` | `1` | `1` | — (FC is `cuda_fc`) |
-| `NNTR_MHA_GPU` | `1` | `1` | `NNTR_CUDA_ATTN=1` |
-| `NNTR_GPU_SVM_POOL` | `1` | `1` | — (UVM) |
-| `NNTR_GPU_CLMEM_POOL` | `1` (coherence) | `1` (coherence) | `NNTR_CUDA_DEV_ACT=1` |
-| `NNTR_V8C_BUF` | — (image2d) | `1` (buffer/dp4a — mandatory on NEO) | — |
+| `NNTR_FC_INT8_GPU` | default on | default on | — (FC is `cuda_fc`) |
+| `NNTR_MHA_GPU` | `1` | `1` | `NNTR_CUDA_ATTN` (auto) |
+| `NNTR_GPU_SVM_POOL` | default on (SVM KV cache) | default on (SVM KV cache) | — (UVM) |
+| `NNTR_GPU_CLMEM_POOL` | default on | default on | `NNTR_CUDA_DEV_ACT` (auto on discrete) |
+| `NNTR_V8C_BUF` | caps → image2d | caps → buffer/dp4a | — |
 | `NNTR_KV_IMG_ATTN` | `1` (image2d KV) | — | — |
-| `NNTR_XE3_SYNC` | — | `1` **mandatory on Xe3** | — |
+| `NNTR_XE3_SYNC` | caps (fine-grain SVM ⇒ off) | caps (coarse-grain SVM, e.g. Xe3 ⇒ drain) | — |
 | GEMM family | dp4a (image) | **XMX auto** (caps) → dp4a | cuBLAS IMMA + block-Q |
 
-**Long context.** The sliding-window KV ring and chunked prefill are opt-in and
-off by default; add `NNTR_KV_WINDOW_RING=1` (which also turns chunked prefill on
+**Long context.** The sliding-window KV ring and chunked prefill are off by
+default (with the variable unset, a model's `kvRingByDefault()` decides, and no
+in-tree model turns it on); add `NNTR_KV_WINDOW_RING=1` (which also turns chunked prefill on
 at 4096 rows) on top of a canonical set, and `NNTR_CUDA_SPLITKV_PREFILL=1` on
 CUDA. Turning the ring on changes what `init_seq_len` means: with chunking off
 it is the prompt ceiling and a longer prompt is truncated to it, while with
@@ -136,7 +129,7 @@ chunking on it is only the height of one chunk's activation plane — the prompt
 is then bounded by the KV budget (`max_timestep`), not by `init_seq_len`, and
 the truncation warning reports the KV budget instead.
 
-`NNTR_FC_GPU` appears in some wrapper scripts but is a **legacy no-op alias** —
+`NNTR_FC_GPU` is a **legacy no-op alias** (no code reads it) —
 the real FC gate is `NNTR_FC_INT8_GPU`. `NNTR_FC_XMX` and `NNTR_CUDA_GEMM_ATTN`
 are now **caps-derived defaults** (auto-on where the hardware supports them) and
 are only needed as explicit overrides (§12).
@@ -180,8 +173,11 @@ allocator + op-table + a handful of GPU layers + a kernel library, all behind
 ## 4. The additive backend architecture
 
 `engine.cpp` registers `"cpu"→AppContext`, `"gpu"→ClContext`,
-`"cuda"→CudaContext` (each under its own `#if`), and `dlopen`s
-`libqnn_context.so` for `"npu"`. A backend is exactly four things:
+`"cuda"→CudaContext` and `"htp"→HtpContext` (each under its own `#if`), and
+`dlopen`s `libqnn_context.so`, which registers as `"qnn"`. The OpenCL context is
+brought up when `NNTR_ENGINE` is unset or `gpu`, the CUDA context only when
+`NNTR_ENGINE=cuda` (`NNTR_CL_EAGER_CTX=1` / `NNTR_CUDA_EAGER_CTX=1` force the
+bring-up). A backend is exactly four things:
 
 1. **Context** — `ClContext` / `CudaContext` (`Singleton<Context>`): the
    per-engine layer-factory map + kernel/PTX cache. Registered at link time next
@@ -194,10 +190,12 @@ allocator + op-table + a handful of GPU layers + a kernel library, all behind
    the activation pool. The CPU base is host `aligned_alloc`. The calloc/SVM
    macros were removed from `MemoryPool` itself.
 3. **ComputeOps op-table** — routes tensor ops to the right kernels (§4.1).
-4. **GPU layer factories** — the `cl_layers` (`FullyConnectedLayerCl`,
-   `RMSNormLayerCl`, `SwiGLULayerCl`, the now-neutral `GeGLULayer`,
-   `AdditionLayerCL`, `Concat`/`Reshape`/`TransposeLayerCl`) and `cuda_layers`
-   (`CudaFcLayer`, …), each registered only if its kernels compile.
+4. **GPU layer factories** — the backend-neutral `FullyConnectedLayerCl`,
+   `SwiGLULayer`, `GeGLULayer`, `AdditionLayer`, `LayerNormalizationLayer` and
+   `ActivationLayer`, registered on both GPU contexts, plus the remaining
+   per-backend forks (`RMSNormLayerCl` / `CudaRMSNormLayer`,
+   `Concat`/`Reshape`/`TransposeLayerCl`); OpenCL registrations are gated on
+   their kernels compiling.
 
 ### 4.1 The op-table (`ComputeOps`) and per-context dispatch
 
@@ -238,9 +236,9 @@ Per-piece highlights (full detail in §6–§7, §12):
 - **Context** — link-time self-registration (`"gpu"` / `"cuda"`); kernel compile +
   cache (OpenCL `clBuildProgram` + disk KERNEL_CACHE; CUDA **NVRTC** + PTX disk
   cache + CUmodule cache); a once-probed `DeviceCaps`; the `ExecPlan` resolver
-  (`DP4A` / **`XMX`** if `caps.subgroups` / `CUBLAS`) and the `ModelFeatures ×
-  DeviceCaps` matcher; in-order SVM queue (+ `NNTR_XE3_SYNC` on Xe3) vs CUDA-graph
-  capture/replay.
+  (`DP4A` / **`XMX`** if `caps.dpas` / `CUBLAS`) and the `ModelFeatures ×
+  DeviceCaps` matcher (both a logged shadow); in-order queue (+ a coarse-grain
+  SVM drain derived from the device's SVM caps) vs CUDA-graph capture/replay.
 - **MemAllocator** — OpenCL `clSVMAlloc` (one host+device pointer) vs CUDA
   `cudaMallocManaged` (UVM) + a `device_only cudaMalloc` activation pool; the
   capability predicates (`isHostAddressable`/`isDeviceVisible`/`isSVM`/
@@ -260,7 +258,7 @@ dispatches to per device class:
 
 | op-table op | Adreno | Intel (non-XMX) | Intel-XMX | CUDA |
 |---|---|---|---|---|
-| `fc` prefill GEMM | image2d v8c (`read_imageui`) | buffer v8c (dp4a) | `gemm_xmx_i4` systolic DPAS | `cuda_fc_qint4` dp4a / cuBLAS int8 IMMA |
+| `fc` prefill GEMM | image2d v8c (`read_imageui`) | buffer v8c (dp4a) | `gemm_xmx_i4` systolic DPAS | `cuda_fc_qs4cx` dp4a / cuBLAS int8 IMMA |
 | `fc` decode GEMV | 64-wide coop split-K | 64-wide coop split-K | dp4a (XMX is prefill-only) | dp4a GEMV |
 | attention (`mha_core`) | image2d KV mirror (`two_conv_attention`) | SVM flash + split-KV flash-decode | SVM flash + split-KV | block-Q (d128/256/512) + flash-decode + cuBLAS GEMM-attn |
 | `geglu` / `swiglu` | `geglu_cl_op` / `swiglu_cl_op` (SVM/cl_mem) | same | same | device fp16 kernel / host-on-UVM |
@@ -275,8 +273,8 @@ Adreno and both Intel variants, and only split host-vs-device on CUDA.
 
 ## 5. Engine selection
 
-`causallm_engine()` returns `"gpu"` by default, `"cpu"` under `NNTR_ENGINE=cpu`,
-`"cuda"` under `NNTR_ENGINE=cuda`. Every built layer carries
+`causallm_engine()` returns `"gpu"` by default (`"cpu"` in a build without
+OpenCL), `"cpu"` under `NNTR_ENGINE=cpu`, `"cuda"` under `NNTR_ENGINE=cuda`. Every built layer carries
 `engine=causallm_engine()`; there is **no** engine key in the config. One model
 definition runs on host or any GPU backend purely by env, with no per-model
 config edit and no graph fork.
@@ -378,8 +376,9 @@ dispatch time and shares kernels in `attention_kernels.cpp`:
   are created with `engine=gpu`, so their output stays GPU-resident instead of
   bouncing to host (qwen3 was slow purely because q/k-norm was on the host). The
   gamma-free case uses an FP32 sum-of-squares (overflow-safe).
-- **Decode-step gates** (`GpuDecodeRope` / `GpuDecodeAttn`, default-on for
-  gemma2/gemma4) move RoPE and attention onto the GPU at `M=1` too, so the
+- **Decode-step gates** (`GpuDecodeAttn`, default-on for gemma2/gemma4;
+  `GpuDecodeRope`, default-on for gemma4 only — gemma2 keeps host decode RoPE)
+  move attention and RoPE onto the GPU at `M=1` too, so the
   blocking `lower_q`/`lower_kv` host drains (~65 ms/token over 35 layers) become
   no-ops. Env `NNTR_MHA_GPU_DECODE` is the global override.
 
@@ -387,7 +386,7 @@ dispatch time and shares kernels in `attention_kernels.cpp`:
 
 GeGLU (`gelu_tanh(gate)·up`) is the template for the add-only refactor (§12). The
 former `GeGLULayerCl` (OpenCL) and `CudaGeGLULayer` (CUDA) forks are collapsed
-into **one** backend-neutral `GeGLULayer` (`nntrainer/layers/geglu_layer.h`) that
+into **one** backend-neutral `GeGLULayer` (`nntrainer/layers/llm/geglu_layer.h`) that
 owns structure/orchestration and dispatches the kernel via
 `in1.getOps()->geglu(...)` — a whole-op `ComputeOps` virtual. It lands on
 `ClComputeOps::geglu` (`geglu_cl_op`, cl_mem/SVM residency), `CudaComputeOps::geglu`
@@ -401,13 +400,12 @@ Adreno + Intel + CUDA.
 Residency is layered: the `MemAllocator` decides the memory *kind*, and a static
 `ResidencyClass` (`HOST` / `SVM` / `GPU_CLMEM`), derived once at
 `TensorPool::allocate()` from the producer engine + all consumers + dtype,
-decides how layers *bind* it. Two opt-in pools turn the host round-trips off:
+decides how layers *bind* it. Two pools, both on by default, turn the host
+round-trips off. The OpenCL command queue is always **in-order**, which is what
+orders a producer kernel's write *before* the consuming FC's device-direct read.
 
-- **`NNTR_GPU_SVM_POOL`** switches the OpenCL command queue to **in-order** with
-  SVM-resident buffers. This in-order property is what orders a producer kernel's
-  write *before* the consuming FC's device-direct read (out-of-order would race
-  to garbage). It also lets per-op SVM map/unmap (and the `clFinish` drain they
-  imply) be skipped — consecutive GPU kernels are already device-coherent.
+- **`NNTR_GPU_SVM_POOL`** places the KV cache in SVM (`kv_cache_manager.cpp`)
+  on the OpenCL engine; `=0` reverts to a host KV cache.
 - **`NNTR_GPU_CLMEM_POOL`** allocates the planned activation plane as plain device
   `cl_mem` (`ClBufferPool`) — one handle per distinct planner offset (binding the
   *same* handle for tensors reused at one offset, required for Adreno per-handle
@@ -415,9 +413,9 @@ decides how layers *bind* it. Two opt-in pools turn the host round-trips off:
   producer's exact device buffer with no SVM map. Oversized host-resident
   quantized planes (e.g. a Gemma4 Q6_K embedding > the device alloc cap) stay on
   SVM; the pool **hard-fails** rather than silently degrading to a corrupting
-  hybrid.
+  hybrid. `=0` falls back to the plain SVM pool (A/B only).
 
-Both are mandatory together for coherence. Carve-outs keep correctness while
+Carve-outs keep correctness while
 maximizing residency: the KV cache stays SVM; input-boundary RAISE and
 output-boundary LOWER let a host-produced/consumed tensor still be `GPU_CLMEM`
 because the producing/consuming layer explicitly uploads/reads it.
@@ -447,10 +445,11 @@ its buffer path.
   and shows it is **fetch/unpack-bound** on the texture path (compute hidden
   under fetch), at ~87% of peak. LDS staging / weight prefetch / M-fast dispatch
   were all measured **negative** on Adreno — documented dead ends.
-- **ARM build delicacy.** `ndk-build` does not run meson's `.cl→.cpp` codegen, so
-  a stale embedded kernel string silently produces garbage; `build_lib.sh`
-  regenerates any `.cl` newer than its `.cpp` first. Six artifacts must be
-  co-located on device (§9), `libccapi-nntrainer.so` being the most-forgotten.
+- **ARM build delicacy.** The production Android build is Meson
+  (`build_android.sh`), which regenerates the embedded kernel sources; the
+  `jni/Android.mk` ndk-build file is only a test harness. The runtime artifacts
+  must be co-located on device (§9), `libccapi-nntrainer.so` being the
+  most-forgotten.
 
 ### 7.2 Intel (Xe / Meteor Lake) — DPAS, NEO buffer path, Xe3 sync
 
@@ -465,25 +464,28 @@ Intel selects one of two GEMM families by capability and always uses the buffer
   Prefill-only — decode (`M=1`) is a bandwidth-bound GEMV that a
   compute-throughput engine can't speed up, so the `M>4` gate keeps it out.
   **Now caps-derived**: enabled by default when the device advertises
-  `cl_intel_subgroups` (`caps().subgroups`), retiring `NNTR_FC_XMX` as an opt-in;
-  a device without the matrix-MAD fails kernel registration and falls through to
-  dp4a (so it is safe on non-XMX Intel too).
+  `cl_intel_subgroup_matrix_multiply_accumulate` (`caps().dpas`), retiring
+  `NNTR_FC_XMX` as an opt-in (`NNTR_FC_XMX=0` disables it, `NNTR_FC_XMX_FORCE=1`
+  skips the capability check for benchmarking); a device without the matrix
+  engine falls through to dp4a (so it is safe on non-XMX Intel too).
 - **7.2.2 non-XMX (Meteor Lake / older NEO) buffer path.** Intel NEO's SPIR-V
   backend **cannot compile** integer-coordinate `read_imageui` (it fails the
   whole program build), so the image kernel bodies are `#ifndef V8C_BUFFER_ONLY`
   and Intel compiles `-DV8C_BUFFER_ONLY -cl-std=CL3.0` (CL3.0 is needed to expose
   the `dot_4x8packed_*` builtins NEO doesn't declare under CL1.2). The
-  buffer-load sibling kernels read the identical v8c bytes as `uint4[]`. This is
-  the `NNTR_V8C_BUF` switch — **mandatory on every Intel device**, XMX or not (the
-  XMX path's `buf_kernel` prerequisite rides the same flag). Decode uses the same
+  buffer-load sibling kernels read the identical v8c bytes as `uint4[]`. The
+  choice comes from `DeviceCaps::image_v8c` (set from the vendor id, so every
+  Intel device, XMX or not, takes the buffer path); `NNTR_V8C_BUF` only
+  overrides it. Decode uses the same
   64-wide cooperative GEMV (§6.2).
 - **7.2.3 Xe3 (Panther Lake) coherence.** Xe3 (NEO 26.22) does **not** honor
   in-order kernel→kernel memory consistency for the coarse-grained-SVM hand-offs
   the residency model relies on (Meteor Lake's fine-grained SVM did — this is a
-  new-ISA regression). **`NNTR_XE3_SYNC` is mandatory** on Xe3: it inserts a
-  `clFinish` at the producer→consumer boundary. Without it the consumer reads
-  stale output and the model emits garbage. It deliberately has no caps probe
-  (wrong ⇒ garbage), so it stays an explicit override.
+  new-ISA regression). The fix is a `clFinish` at the producer→consumer
+  boundary; without it the consumer reads stale output and the model emits
+  garbage. It is on by default for any device without fine-grain SVM
+  (`needsCoarseSVMDrain()` in `opencl_command_queue_manager.cpp`), and
+  `NNTR_XE3_SYNC` overrides that derivation either way.
 
 ### 7.3 NVIDIA CUDA — RTX (discrete) and Orin (integrated)
 
@@ -494,7 +496,7 @@ compile + PTX disk cache, `CudaMemAllocator` = `cudaMallocManaged` (UVM) + a
 NVRTC kernels.
 
 **Shared CUDA techniques:**
-- **QINT4 fused dequant-GEMM FC** (`cuda_fc_qint4`): decodes KAI Section-A int4
+- **QINT4 fused dequant-GEMM FC** (`cuda_fc_qs4cx`): decodes KAI Section-A int4
   on-device and runs w4a8 `__dp4a` with three shapes — `dp4a_gemv` (M=1 decode),
   `dp4a_gemm_reg` (M≥8, 64×64 register-blocked), `dp4a_gemm` (small M). Default
   ON (the host QINT4 dot is ARM/KAI-only).
@@ -531,12 +533,13 @@ discrete-VRAM assumption so one binary stays correct and fast on both:
 | activation pool | `device_only` `cudaMalloc` | forced managed (UVM, shared physical pool) |
 | cuBLAS int8 | single full-K call | **K-chunked at 2048** (sm_87 large-K algo bug) |
 | KV cache | device-mirror | pass-through (shared pool; avoids stale-KV snapshot) |
-| attention default | block-Q | **GEMM attention** (block-Q is ~0.2 TFLOP/s on sm_87) |
+| attention default | block-Q (GEMM attention for full-attention layers from 4096 keys) | **GEMM attention** (block-Q is ~0.2 TFLOP/s on sm_87) |
 | sync | honors `NNTR_CUDA_ASYNC` | forced sync (no UVM page-fault ordering) |
 | prefill graph | off (not sync-bound) | **on** (the per-op sync floor dominates) |
 
-`NNTR_CUDA_GEMM_ATTN` is now caps-derived (auto-on when `isIntegrated()`), and on
-Orin the host-coherent **safe-set** (`run_gemma4_fast.sh`) keeps decode ops on
+`NNTR_CUDA_GEMM_ATTN` is now caps-/shape-derived (auto-on when `isIntegrated()`,
+and on discrete parts for full-attention layers with `N_kv ≥ 4096`; `=0` off,
+`=1` force, `=N` sets the threshold), and on Orin the host-coherent **safe-set** (`run_gemma4_fast.sh`) keeps decode ops on
 GPU without the discrete-VRAM tricks. A host-resident FC input/weight is staged
 into device buffers rather than dereferenced on Orin (no `i8mm` → would `SIGILL`).
 
@@ -552,46 +555,46 @@ The full list is in the source (`grep -rn std::getenv`).
 | Var | Effect | Platform |
 |-----|--------|----------|
 | `NNTR_ENGINE` | `=cpu` host layers, `=cuda` CUDA; unset ⇒ OpenCL GPU. | all |
-| `NNTR_FC_INT8_GPU` | Master gate for the v8c int4/int8 quantized FC GEMM. | OpenCL |
-| `NNTR_V8C_BUF` | Buffer-path v8c (cl_mem uint4) vs image2d — the Adreno⇄Intel switch; mandatory on Intel NEO. | Intel |
+| `NNTR_FC_INT8_GPU` | Master gate for the v8c int4/int8 quantized FC GEMM (default on; `=0` disables). | OpenCL |
+| `NNTR_V8C_BUF` | Override the buffer-path v8c (cl_mem uint4) vs image2d choice — the Adreno⇄Intel switch, otherwise derived from `DeviceCaps::image_v8c`. | Intel |
 | `NNTR_KV_IMG_ATTN` | image2d KV mirrors + image KV attention (texture cache). | Adreno |
 | `NNTR_MHA_GPU` / `NNTR_MHA_GPU_DECODE` | GPU attention; the `_DECODE` form extends it (and GPU-RoPE + flash-decode) to the `M=1` step. | OpenCL |
-| `NNTR_GPU_SVM_POOL` | In-order SVM-resident queue; skips per-layer `clFinish`. | OpenCL |
-| `NNTR_GPU_CLMEM_POOL` | Device `cl_mem` activation pool (FC consumes producer's output directly). Mandatory for coherence. | OpenCL |
-| `NNTR_XE3_SYNC` | `clFinish` at producer→consumer; **mandatory on Xe3** (coherence regression). | Intel-Xe3 |
-| `NNTR_FC_XMX` | Override the caps-derived XMX default (force on/off). | Intel-XMX |
+| `NNTR_GPU_SVM_POOL` | SVM-resident KV cache on the OpenCL engine (default on; `=0` ⇒ host KV cache). | OpenCL |
+| `NNTR_GPU_CLMEM_POOL` | Device `cl_mem` activation pool (FC consumes producer's output directly). Default on; `=0` ⇒ plain SVM pool. | OpenCL |
+| `NNTR_XE3_SYNC` | Override the producer→consumer `clFinish`, which defaults on for devices without fine-grain SVM (e.g. Xe3). | OpenCL |
+| `NNTR_FC_XMX` / `NNTR_FC_XMX_FORCE` | `NNTR_FC_XMX=0` disables the caps-derived (`caps().dpas`) XMX default; `NNTR_FC_XMX_FORCE=1` skips the capability check. | Intel-XMX |
 | `NNTR_GEMV_COOP` | 64-wide K-split cooperative decode GEMV (default on). | OpenCL |
-| `NNTR_ROPE_LUT_CAP` / `NNTR_NO_GPU_ROPE` | Override / disable the GPU-RoPE LUT cap. | OpenCL |
-| `NNTR_VNORM_HOST` | Kill-switch: q/k/v-norm back to the host. | OpenCL |
+| `NNTR_ROPE_LUT_CAP` / `NNTR_NO_GPU_ROPE` | Override the GPU-RoPE LUT cap / disable GPU RoPE entirely. | OpenCL |
+| `NNTR_VNORM_HOST` | Kill-switch: the gamma-free norm (e.g. v_norm) back to the host. | OpenCL |
 | `NNTR_KV_INT8` | int8 (quantized) KV cache instead of FP16. | OpenCL |
-| `NNTR_CUDA_DEV_ACT` | Device-only activation pool (discrete); ignored on integrated. | CUDA |
+| `NNTR_CUDA_DEV_ACT` | Device-only activation pool (auto on discrete; `=0` opts out); ignored on integrated. | CUDA |
 | `NNTR_CUDA_ATTN` / `NNTR_CUDA_ROPE` / `NNTR_CUDA_QKNORM` / `NNTR_CUDA_GEGLU` / `NNTR_CUDA_ELTWISE` | Move the matching decode op onto the GPU. | CUDA |
-| `NNTR_CUDA_BLOCKQ` / `NNTR_CUDA_FLASH_DECODE` / `NNTR_FC_CUDA_CUBLAS` | block-Q attention / split-KV decode / cuBLAS IMMA prefill FC. | CUDA |
-| `NNTR_CUDA_GEMM_ATTN` | Override the caps-derived GEMM-attention default (auto-on for Orin). | CUDA |
-| `NNTR_CUDA_GRAPH` / `NNTR_CUDA_M2B` | CUDA-graph decode capture / single-capture replay. | CUDA |
-| `NNTR_CUDA_PREWARM` / `NNTR_CUDA_KV_UVM` / `NNTR_CUDA_VCOPY_PREFILL` | Load-time repack+scratch prewarm / KV residency / V-copy into the live KV slot. | CUDA |
-| `NNTR_OPENCL_PROFILING` / `NNTR_LAYER_PROFILE` / `NNTR_V8C_KCLOCK` | clprof / per-layer latency / in-kernel clock profiling. | diag |
-| `NNTR_KV_WINDOW_RING` | **Long context, opt-in (default off).** `=1` stores a sliding-window layer's KV cache as a ring of `Wcap` physical rows instead of the full context window, and turns chunked prefill on. The request is granted only where a ring-aware attention arm resolves (`NNTR_KV_OHWI=1` + `NNTR_MHA_GPU=1` on OpenCL, `NNTR_CUDA_ATTN=1` on `NNTR_ENGINE=cuda`, and neither `NNTR_KV_IMG_ATTN` nor `NNTR_MHA_GPU_IMG`); otherwise the linear full-height cache is kept and the reason is printed once. | OpenCL, CUDA |
+| `NNTR_CUDA_BLOCKQ` / `NNTR_CUDA_FLASH_DECODE` / `NNTR_FC_CUDA_CUBLAS` | block-Q attention / split-KV decode / cuBLAS IMMA prefill FC (auto-set by `CudaContext`; `=0` opts out). | CUDA |
+| `NNTR_CUDA_GEMM_ATTN` | Override the caps-/shape-derived GEMM-attention default (integrated: every layer; discrete: full-attention layers from 4096 keys). `=0` off, `=1` force, `=N` threshold. | CUDA |
+| `NNTR_CUDA_GRAPH` / `NNTR_CUDA_M2B` | CUDA-graph decode capture / single-capture replay (auto-set on discrete; effective only for a model that declares its replay feed nodes). | CUDA |
+| `NNTR_CUDA_PREWARM` / `NNTR_CUDA_KV_UVM` / `NNTR_CUDA_VCOPY_PREFILL` | Load-time repack+scratch prewarm (on unless `=0`) / KV residency / V-copy into the live KV slot (auto on discrete). | CUDA |
+| `NNTR_CL_LAUNCH_STAT` / `NNTR_LAYER_PROFILE` / `NNTR_V8C_KCLOCK` | OpenCL launch statistics (`>=2` also enables queue event profiling) / per-layer latency / in-kernel clock profiling. | diag |
+| `NNTR_KV_WINDOW_RING` | **Long context, off by default** (unset follows the model's `kvRingByDefault()`, false for every in-tree model). `=1` stores a sliding-window layer's KV cache as a ring of `Wcap` physical rows instead of the full context window, and turns chunked prefill on. The request is granted only where a ring-aware attention arm resolves (`NNTR_MHA_GPU=1` without `NNTR_KV_OHWI` or `NNTR_MHA_GPU_IMG` on OpenCL — under `NNTR_KV_IMG_ATTN` the ring is served through a sliding mirror unless `NNTR_KV_STAGE` or `NNTR_KV_IMG_RING=0` — and `NNTR_CUDA_ATTN=1` on `NNTR_ENGINE=cuda`); otherwise the linear full-height cache is kept and the reason is printed once. | OpenCL, CUDA |
 | `NNTR_PREFILL_CHUNK` | Query rows per prefill forward (`0`/unset ⇒ one block, unless the ring is on, which requests 4096). Clamped to `init_seq_len`, the activation-plane height. A non-positive or unparseable value is rejected with a message. | all |
 | `NNTR_CUDA_SPLITKV_PREFILL` | **Opt-in (default off).** Inside `NNTR_CUDA_BLOCKQ`, splits the key axis of a full-attention prefill (`=1` ⇒ 4096-key split, `=N>1` ⇒ custom, `=0` ⇒ off). Engages only above the split length, so shorter contexts are bit-unchanged. | CUDA |
 | `NNTR_CUDA_SPLITKV_PREFILL_MB` | Scratch budget in MiB for the split-KV partial buffers. | CUDA |
 
 ## 9. Build artifacts & deploy (Adreno)
 
-A working device run needs **all six** co-located in
-`/data/local/tmp/nntrainer/causallm` (with `LD_LIBRARY_PATH` pointing there):
+A working device run needs these co-located in one directory (with
+`LD_LIBRARY_PATH` pointing there); `build_android.sh --install` pushes them and
+prints the device directory at the end:
 
-1. `nntrainer_causallm` — the executable (`chmod 755` on device)
-2. `libcausallm_core.so` — CausalLM model/layer core
+1. `nntr_causallm` — the executable (`chmod 755` on device)
+2. `libcausallm.so` — CausalLM model/layer core
 3. **`libccapi-nntrainer.so`** — the nntrainer C++/CC-API; **holds the Tensor-API
    graph-compile (KV-placeholder dtype) logic**. ⚠️ **The #1 forgotten artifact**
    — a stale copy aborts with `cache placeholder dtype mismatch` at layer 0.
 4. `libnntrainer.so` — nntrainer core + OpenCL GPU symbols (needs `enable-opencl=true`)
-5. `libOpenCL.so` — the Adreno OpenCL ICD (from `builddir/opencl/lib/arm64-v8a`)
-6. `libc++_shared.so` — NDK C++ runtime
+5. `libc++_shared.so` — NDK C++ runtime
 
-ndk-build links into `obj/local/arm64-v8a/`; the `libs/arm64-v8a/` copy can lag —
-prefer pushing from `obj/local/arm64-v8a/` and check timestamps. When the
+The Adreno OpenCL ICD (`libOpenCL.so`) is loaded from the device's vendor library
+directory at run time and is not pushed. When the
 `ComputeOps` vtable is unchanged in existing slots (e.g. virtuals appended at the
 tail), a new `libnntrainer.so` is ABI-compatible with an older app/ccapi, so only
 that one `.so` needs pushing.
@@ -600,7 +603,7 @@ that one `.so` needs pushing.
 
 | Key | Meaning |
 |-----|---------|
-| `model_type` | **Must be `"CausalLM"`** or the runtime throws a model_type mismatch and aborts. |
+| `model_type` | Optional. `"embedding"` reroutes the architecture to its embedding model; other values keep the architecture from `config.json`. |
 | `model_tensor_type` | `WEIGHT-ACTIVATION` pair, e.g. `"QINT4-FP16"`. The activation half sets compute precision; **FP16 is required for full GPU residency**. |
 | `fc_layer_dtype` | Weight dtype for Q/K/V/O + FFN FC (e.g. `QINT4`, `Q4_0`). The v8c/CUDA GPU GEMM expects QINT4/Q4_0. |
 | `embedding_dtype` | Token-embedding weight dtype (e.g. `Q6_K`). Default for `lmhead_dtype`. |
@@ -617,18 +620,17 @@ that one `.so` needs pushing.
 | Symptom | Cause / Fix |
 |---------|-------------|
 | `allocateAndBindKVCache: cache placeholder dtype mismatch` (abort at layer 0) | **Stale `libccapi-nntrainer.so` on the device.** The KV-placeholder dtype is decided by the Tensor-API graph compile in libccapi; an old copy gives `kp=FP32 ≠ kc=FP16`. Push the fresh libccapi (verify with `md5sum`). |
-| Output collapses to a single repeated token | Missing `NNTR_GPU_CLMEM_POOL=1` (mandatory for coherence on both OpenCL backends). |
-| Garbage on **Xe3** specifically | Missing `NNTR_XE3_SYNC=1` (Panther Lake SVM coherence regression). |
-| `model_type mismatch` crash at load | `nntr_config.json` lacks `"model_type":"CausalLM"`. |
+| Output collapses to a single repeated token | `NNTR_GPU_CLMEM_POOL=0` is set (the pool is on by default and needed for coherence on both OpenCL backends). |
+| Garbage on **Xe3** specifically | `NNTR_XE3_SYNC=0` is set, or the drain resolved off (a "No device info" warning); set `NNTR_XE3_SYNC=1` (Panther Lake SVM coherence regression). |
 | `Failed to open file` (tokenizer) | `tokenizer_file` points at a device path; set the local absolute path. |
-| Silent garbage after editing a `.cl` kernel (Android) | ndk-build does not re-run meson's `.cl`→`.cpp` codegen. Re-run the meson build (or `build_lib.sh`) before rebuilding. |
+| Silent garbage after editing a `.cl` kernel (Android) | A stale embedded kernel string. Rebuild with `build_android.sh` (Meson regenerates the kernel sources) rather than the test-only `jni/Android.mk` ndk-build harness. |
 | `dlopen`/undefined-symbol for `clSVM*` on Android | `libnntrainer.so` was built without OpenCL. Reconfigure `builddir` with `-Denable-opencl=true` and `ninja install`. |
 | Orin: `SIGILL` / host-pointer fault in an FC | A host-resident input/weight reached a device kernel; ensure the safe-set (`run_gemma4_fast.sh`) so inputs are staged to device buffers. |
 
 ## 12. The multi-HW refactor (add-only architecture)
 
 The knobs above and the residual `#if` leakage are being folded into a
-principled **add-only** model (`nntrainer/docs/ARCHITECTURE_REFACTOR.md`):
+principled **add-only** model (`docs/backend_guide/ARCHITECTURE_REFACTOR.md`):
 express backend differences solely as op-table virtuals + `Context`
 capability/sync + `MemAllocator` capability predicates, so a new device becomes
 "register a `Context`, report its caps, provide an op-table subset" with **zero**
@@ -637,7 +639,8 @@ edits to models or core. Status:
 - **Phase 0 — landed.**
   - *T1 DeviceCaps probe.* A read-only `DeviceCaps` (`Context::caps()`) snapshot,
     probed once per backend from real device queries (vendor, arch, integrated,
-    unified_memory, `subgroups`=XMX, compute_units, max_alloc) — describes
+    unified_memory, subgroups, `dpas`=XMX, image_v8c, compute_units,
+    max_alloc) — describes
     attributes, never identity.
   - *T2 MemAllocator predicates.* `isHostAddressable` / `isDeviceVisible` /
     `isSVM` / `needsRegister` / `supportsDevicePool` (+ `makePool`) replace the
@@ -647,26 +650,28 @@ edits to models or core. Status:
     facade lets a vendor self-register a context (e.g. `"npu"`) without
     downcasting to a concrete `*Context`.
 - **Phase 1 — ExecPlan resolver, shadow → authoritative.** `resolveExecPlan(caps)`
-  is a pure function (`cuda→CUBLAS`, `gpu→subgroups?XMX:DP4A`, else CPU). Landed as
-  a logged shadow (T4), then **two cells flipped authoritative (T8)**: the v8c FC
-  **XMX gemm_path now defaults to `caps().subgroups`** (retiring `NNTR_FC_XMX` as
-  an opt-in) and **CUDA GEMM-attention now defaults to `isIntegrated()`**
+  is a pure function (`cuda→CUBLAS`, `gpu→dpas?XMX:DP4A`, else CPU). It is still
+  a logged shadow (T4): no decision site reads the `ExecPlan`. Two defaults did
+  move off env flags by reading device attributes directly at the dispatch
+  site: the v8c FC **XMX path now defaults to `caps().dpas`** (retiring
+  `NNTR_FC_XMX` as an opt-in) and **CUDA GEMM-attention now defaults on for
+  integrated parts, and for long full-attention layers on discrete ones**
   (retiring `NNTR_CUDA_GEMM_ATTN`). Both keep the env var as an explicit override.
-  This is the first concrete payoff of the probe→shadow→authoritative arc.
 - **Phase 2 — collapsing the layer forks.**
-  - *T6.* `CudaComputeOps : public CpuComputeOps` (extracted to a header so it is
-    inheritable); `CudaContext` binds `get_cuda_ops()`.
+  - *T6.* `CudaComputeOps : public CpuComputeOps` (`CpuComputeOps` is declared in
+    `cpu_ops_table.h` so it is inheritable); `CudaContext` binds `get_cuda_ops()`.
   - *T7.* The **first layer-fork collapse**: GeGLU is now one backend-neutral
     `GeGLULayer` dispatching `in1.getOps()->geglu(...)` (§6.6) — the
     `GeGLULayerCl` + `CudaGeGLULayer` forks are deleted, token-identical on all 3
-    HW. This is the template for the remaining `*_cl` / `*_cuda` layers (FC,
-    attention, rmsnorm, …).
+    HW. FC, SwiGLU, Addition, LayerNorm and Activation have since followed the
+    same template; the remaining forks are rmsnorm, concat/reshape/transpose and
+    the application-side attention.
 
 **Env-knob status.** *Retired to caps-default* (env now an override): `NNTR_FC_XMX`,
-`NNTR_CUDA_GEMM_ATTN`. *Never an env flag* (structural): q/k/v-norm residency
+`NNTR_CUDA_GEMM_ATTN`, `NNTR_V8C_BUF` (from `DeviceCaps::image_v8c`, set by
+vendor id), `NNTR_XE3_SYNC` (from the device's fine-grain-SVM capability).
+*Default on* (env only for an `=0` A/B): `NNTR_FC_INT8_GPU`, `NNTR_GPU_SVM_POOL`,
+`NNTR_GPU_CLMEM_POOL`. *Never an env flag* (structural): q/k/v-norm residency
 (`engine=` property). *No-op alias*: `NNTR_FC_GPU` (real gate `NNTR_FC_INT8_GPU`).
-*Still required* (not a pure function of caps; wrong ⇒ garbage, deliberately not
-resolved): `NNTR_V8C_BUF` & `NNTR_KV_IMG_ATTN` (the NEO `read_imageui`-compile
-quirk, both devices advertise image2d), `NNTR_XE3_SYNC` (new-ISA coherence), plus
-`NNTR_FC_INT8_GPU` / `NNTR_MHA_GPU` / `NNTR_GPU_SVM_POOL` / `NNTR_GPU_CLMEM_POOL`
-as the canonical run set.
+*Still required*: `NNTR_KV_IMG_ATTN` (the NEO `read_imageui`-compile quirk, both
+devices advertise image2d) and `NNTR_MHA_GPU` as the canonical run set.

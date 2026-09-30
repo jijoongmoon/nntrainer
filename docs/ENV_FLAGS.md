@@ -2,9 +2,12 @@
 
 Environment variables read by nntrainer at run time, and by its test harnesses.
 
-**This file lists only variables that are read by code in this tree.** Every entry below names
-the symbol that reads it, and every one was checked with a `getenv` grep over `nntrainer/`,
-`Applications/`, `api/` and `test/`. Nothing here is aspirational.
+**This file lists only variables that are read by code in this tree, but it is not a complete
+list.** Every entry below names the symbol that reads it, and every one was checked with a
+`getenv` grep over `nntrainer/`, `Applications/`, `api/` and `test/`. Nothing here is
+aspirational. The many GPU-backend tuning and diagnostic variables are not listed here; the
+GPU ones that matter for running CausalLM are documented in
+[`Applications/CausalLM/README_GPU.md`](../Applications/CausalLM/README_GPU.md).
 
 ## Maintenance rule
 
@@ -18,7 +21,8 @@ git grep -hoE '(std::)?getenv\("[A-Za-z_][A-Za-z_0-9]*"\)' -- nntrainer Applicat
   | grep -oE '"[^"]+"' | tr -d '"' | sort -u
 ```
 
-Every name that command prints should appear below, and vice versa.
+Every name listed below must appear in that command's output. The reverse does not hold yet: the
+command also prints the unlisted backend variables mentioned above.
 
 **Environment variables are a stopgap, not an interface.** A per-hardware or per-model behaviour
 selected by an environment variable is a decision the code has not yet learned to derive. The
@@ -61,9 +65,11 @@ are unset the affected tests skip rather than fail.
 
 ## Notes
 
-- There is no environment variable that selects the compute backend. The backend is chosen with
-  the `engine=` model/layer property, validated in `nntrainer/engine.cpp:
-  Engine::parseComputeEngine` against the values in `nntrainer/utils/base_properties.h:
-  ComputeEngineTypeInfo::EnumStr`.
+- The backend of a layer is chosen with the `engine=` model/layer property, validated in
+  `nntrainer/engine.cpp: Engine::parseComputeEngine` against the registered contexts. Which
+  contexts are brought up at all is selected by the `NNTR_ENGINE` environment variable (read
+  through `nntr_engine_env()` in `nntrainer/utils/env_compat.h`), and the CausalLM application
+  derives its default `engine=` from it (`causallm_engine()` in
+  `Applications/CausalLM/llm_util.hpp`).
 - Build-time options (`-Denable-opencl`, `-Denable-htp`, and the rest) gate *availability*, not
   selection; see `meson_options.txt`.

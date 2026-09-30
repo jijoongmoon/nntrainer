@@ -5,7 +5,7 @@
 > progress report: it deliberately carries no task list, no phase plan and no per-item
 > "landed / not landed" tracking, so that it stays citable as it is implemented.
 >
-> **Scope.** Inference and training dispatch across CPU, OpenCL (Intel Xe, Adreno), and NPU
+> **Scope.** Inference and training dispatch across CPU, OpenCL (Intel Xe, Adreno), CUDA, and NPU
 > (QNN/HTP), plus the shape any further backend has to take.
 >
 > **Companion document.** [`ARCHITECTURE.md`](ARCHITECTURE.md) in this directory describes the
@@ -95,23 +95,28 @@ class ContextData {
 }
 class AppContext { <<current>> }
 class ClContext { <<current>> }
+class CudaContext { <<current>> }
 class HtpContext { <<current>> }
 class QNNContext { <<current>> }
 
 class DeviceCaps {
-  <<target>>
-  +isIntegrated bool
-  +supportsImage2D bool
-  +inorderSvmCoherent bool
-  +hasSubgroupMatmul bool
-  +graphCapture bool
-  +wholeGraphOffload bool
-  +maxAllocBytes
+  <<current>>
+  +backend string
+  +device_name string
+  +arch string
+  +vendor_id
+  +integrated bool
+  +unified_memory bool
+  +subgroups bool
+  +compute_units
+  +max_alloc_bytes
+  +image_v8c bool
+  +dpas bool
 }
 class ContextCapsExt {
-  <<target>>
+  <<current>>
   +caps() DeviceCaps
-  +runDecode(from,to,walk,emb)
+  +runDecode(nn,from,to,input,label)
 }
 
 class ComputeOps {
@@ -121,13 +126,14 @@ class ComputeOps {
   +tanh_gelu_mul_fp32()
   +gemm_q4_0_fp32()
   +supports_gemm_q4_0_accel_fp32()
+  +fc()
 }
 class CpuComputeOps { <<current>> }
 class ClComputeOps { <<current>> }
+class CudaComputeOps { <<current>> }
 class HtpComputeOps { <<current>> }
 class ComputeOpsExt {
   <<target>>
-  +fc_quantized()
   +rmsnorm()
   +rope()
   +attention()
@@ -144,35 +150,42 @@ class MemAllocator {
   +getName()
 }
 class ClSVMAllocator { <<current>> }
+class CudaMemAllocator { <<current>> }
 class QNNRpcManager { <<current>> }
 class MemAllocatorCapsExt {
-  <<target>>
+  <<current>>
   +isHostAddressable bool
   +isDeviceVisible bool
   +isSVM bool
   +needsRegister bool
-  +allocAlignment
+  +supportsDevicePool bool
   +makePool()
 }
 
 class ExecPlanResolver {
-  <<target>>
-  +resolve(DeviceCaps, ModelFeatures) ExecPlan
+  <<current>>
+  +resolveExecPlan(DeviceCaps, ModelFeatures) ExecPlan
 }
 class ModelFeatures {
-  <<target>>
-  +norm_style
+  <<current>>
+  +has_qk_norm bool
+  +has_v_norm bool
   +mlp_kind
-  +head_dim_policy
-  +sliding_window
+  +norm_style
+  +sliding_window bool
   +kv_share_skip_prefill bool
-  +per_layer_embedding bool
+  +dual_head_dim bool
+  +ple bool
   +attn_softcap bool
+  +final_softcap bool
   +lmhead_kind
+  +decode_gpu bool
+  +decode_rope_gpu bool
+  +head_dim
 }
 class FusionRealizer {
-  <<target>>
-  +rewrite(graph)
+  <<current>>
+  +realize(graph)
 }
 class OffloadNode {
   <<target>>
@@ -195,12 +208,16 @@ class BackendLayerForks {
   <<current-collapse>>
   fc_layer_cl
   rmsnorm_layer_cl
-  swiglu_cl
+  cuda_rmsnorm_layer
+  concat_cl
+  reshape_cl
+  transpose_cl
 }
 
 Engine --> Context : resolves
 Context <|-- AppContext
 Context <|-- ClContext
+Context <|-- CudaContext
 Context <|-- HtpContext
 Context <|-- QNNContext
 Context --> ContextData
@@ -210,9 +227,11 @@ ContextData --> ComputeOps
 ContextData --> MemAllocator
 ComputeOps <|-- CpuComputeOps
 ComputeOps <|-- ClComputeOps
+CpuComputeOps <|-- CudaComputeOps
 CpuComputeOps <|-- HtpComputeOps
 ComputeOps ..> ComputeOpsExt : add whole-op + fused virtuals
 MemAllocator <|-- ClSVMAllocator
+MemAllocator <|-- CudaMemAllocator
 MemAllocator <|-- QNNRpcManager
 MemAllocator ..> MemAllocatorCapsExt : add predicates
 ExecPlanResolver --> DeviceCaps
@@ -227,7 +246,10 @@ NeutralLayer ..> ComputeOpsExt : dispatches
 
 `<<current>>` marks a type that exists in the tree; `<<target>>` marks one this document
 specifies. The stereotype is a structural statement — which side of the seam a type sits on —
-not a progress tracker.
+not a progress tracker. `ContextCapsExt` and `MemAllocatorCapsExt` name virtuals that now sit on
+the `Context` and `MemAllocator` bases themselves, and `ExecPlanResolver` is the free function
+`resolveExecPlan` (`nntrainer/context.h`); its plan is still a logged shadow that no decision site
+reads.
 
 **Residency is owned by the allocator, not by the `Context`.** A `Context::residencyFor(role)`
 method is deliberately **not** part of the target: the `MemAllocator` capability predicates
@@ -247,11 +269,11 @@ guards the accelerated `gemm_q4_0` / `gemv_int4` paths. Consequences, both norma
    managed-memory scheme) **must report `isSVM() == false`**, or a unified build silently routes
    its tensors into OpenCL fast paths.
 2. Residency must be **derived from allocator capability predicates, not from the allocator's
-   name**. Today `MemoryPool::getMemory` (`nntrainer/tensor/memory_pool.cpp`) stamps the flag with
-   `setSVM(allocator_->getName() == "gpu-svm")` — a string comparison that mis-tags every
-   allocator that is host-addressable without being an OpenCL SVM allocator. Replacing that
-   comparison with a predicate is the first step of the residency work, and no new code may add
-   another `getName()` comparison in its place.
+   name**. `MemoryPool::getMemory` (`nntrainer/tensor/memory_pool.cpp`) stamps the flag from
+   `allocator_->isSVM()`, which replaced the former `getName() == "gpu-svm"` string comparison.
+   Name comparisons remain elsewhere — the `"qnn"` check in `nntrainer/tensor/memory_pool.cpp`
+   and the `"gpu-svm"` check in `Applications/CausalLM/kv_cache_manager.cpp` — and no new code
+   may add another.
 
 ---
 
@@ -259,7 +281,9 @@ guards the accelerated `gemm_q4_0` / `gemv_int4` paths. Consequences, both norma
 
 `Applications/CausalLM/layers/` carries the LLM layer set. Core `nntrainer/layers/` has
 `attention_layer`, `multi_head_attention_layer`, `mol_attention_layer`, `embedding` and
-`layer_normalization`, but no RMSNorm, SwiGLU, LLM-MHA or RoPE.
+`layer_normalization`, and `nntrainer/layers/llm/` holds the promoted `swiglu`, `geglu`,
+`lm_head`, `qkv_layer`, `logit_softcapping`, `scalar_multiply` and `tie_word_embedding`; there is
+still no backend-neutral core RMSNorm, LLM-MHA or RoPE.
 
 **The criterion.** Promote a layer into the core if its variability is expressible as
 **parameters** — that is, as `ModelFeatures` inputs. Keep it application-side if it encodes
@@ -288,7 +312,9 @@ single-model or model-tuned behaviour.
 **The collapse rule.** Every per-backend fork of a layer — anything under
 `nntrainer/layers/cl_layers/` that shadows a neutral layer, and any `*_gpu` variant of an
 application layer — **collapses** into one neutral layer that dispatches through a `ComputeOps`
-whole-op virtual. `fc_layer_cl`, `rmsnorm_layer_cl` and `swiglu_cl` are the standing instances.
+whole-op virtual. `rmsnorm_layer_cl` / `cuda_rmsnorm_layer` and `concat_cl` / `reshape_cl` /
+`transpose_cl` are the standing instances; `fc_layer_cl` already dispatches through
+`ComputeOps::fc` but is still a class separate from the core FC layer.
 A **KEEP** layer is not exempt from the collapse rule: it stays application-side, but it still
 dispatches through the op table rather than carrying its own backend fork.
 
@@ -301,8 +327,8 @@ virtual lands, new accelerator work on such an operation must:
 - keep the whole-op body in a single whole-`Tensor` helper called **once** from `forwarding()`,
 
 so that migrating to `ops->rmsnorm(...)` later is a mechanical swap rather than a rewrite.
-LayerNorm and GELU each need their own virtual (`layer_norm`, `gelu`); they are not
-parameterizations of `rmsnorm` — LayerNorm adds `beta` and a mean-subtraction pass. One virtual
+LayerNorm has its own virtual (`layer_norm`) and GELU is served by the `activation` virtual; neither
+is a parameterization of `rmsnorm` — LayerNorm adds `beta` and a mean-subtraction pass. One virtual
 per named kernel is the house style already set by `swiglu_fp32` and `tanh_gelu_mul_fp32`.
 
 ---
@@ -316,22 +342,22 @@ this procedure and is cited below wherever it exercised a step.
 
 1. **Decide whether you need your own residency plane.** If you do, the closed enum must be
    extended, and this is the single unavoidable shared edit:
-   - `api/ccapi/include/common.h: LayerComputeEngine` — currently `{CPU, GPU, QNN, HTP}`.
+   - `api/ccapi/include/common.h: LayerComputeEngine` — currently `{CPU, GPU, QNN, HTP, CUDA}`.
    - `nntrainer/utils/base_properties.h: ComputeEngineTypeInfo::EnumStr` — currently
-     `{"cpu", "gpu", "qnn", "htp"}`.
+     `{"cpu", "gpu", "qnn", "htp", "cuda"}`.
 
-   Both `Engine::parseComputeEngine` (`nntrainer/engine.cpp`) and the layer-level
-   `getComputeEngine` (`nntrainer/layers/layer_node.cpp`) resolve `engine=` by looping that
-   enum/string pair, so a backend that declares its own plane is visible only after both are
-   extended. **Opening this lookup to the live registered-context name set is the change that
-   retires the exception** — after it, a new backend touches neither file. A backend that reuses
-   an existing plane needs no edit here.
+   Resolving `engine=` no longer needs either edit: `Engine::parseComputeEngine`
+   (`nntrainer/engine.cpp`) validates against the live registered-context name set (an unknown
+   name falls back to `"cpu"`), and `nntrainer/layers/layer_node.cpp: toLayerComputeEngine` maps
+   a registered name onto its residency plane through `Context::residencyEngine()`, using the
+   enum/string pair only for a name that is not registered. The enum value is needed only for a
+   genuinely new residency plane. A backend that reuses an existing plane needs no edit here.
 
 2. **Add the `Context` [new files].** Subclass `Context`; return your name from `getName()`;
    self-register at link time (the OpenCL pattern) or via `dlopen` (the QNN pattern, for a closed
    vendor SDK). Add the `caps()` override returning your `DeviceCaps`.
-   *`HtpContext` is the worked instance of the registration half; it does not override `caps()`,
-   so that half has no in-tree precedent yet.*
+   *`HtpContext` is the worked instance of the registration half; it does not override `caps()`.
+   `ClContext::caps()` and `CudaContext::caps()` are the in-tree instances of the `caps()` half.*
 
 3. **Choose an offload mode.**
    - **Whole-graph offload.** The graph is claimed into a single node whose `forwarding()` runs a
@@ -344,10 +370,12 @@ this procedure and is cited below wherever it exercised a step.
      entry points is exactly this shape, and is the proven path.
 
 4. **Add the `MemAllocator` [new files].** Subclass `MemAllocator` and implement the capability
-   predicates (`needsRegister` for ION/RPC-style memory, `isHostAddressable`, `allocAlignment`,
-   `makePool()`). Add a new residency tag only if a genuinely new memory kind is needed.
-   *The HTP backend added the allocator but not the predicates; the predicate half has no in-tree
-   precedent yet.*
+   predicates (`needsRegister` for ION/RPC-style memory, `isHostAddressable`, `isDeviceVisible`,
+   `supportsDevicePool`, `makePool()`). Add a new residency tag only if a genuinely new memory
+   kind is needed.
+   *`ClSVMAllocator` and `CudaMemAllocator` are the in-tree instances of the predicate half. The
+   HTP backend keeps the default CPU allocator for model tensors, and `QNNRpcManager` does not
+   override the predicates yet.*
 
 5. **Override the decode hook, only if it buys something.** The default is to walk the graph; a
    backend with a record/replay or graph-capture queue overrides it. The HTP backend took the
@@ -464,15 +492,15 @@ The axes, from the models in the tree:
 | Axis | What varies |
 |---|---|
 | `has_qk_norm` / `has_v_norm` | per-head q/k (and sometimes v) normalization, present or absent |
-| `head_dim_policy` | one head dimension for all layers, or distinct dimensions for sliding and global layers |
+| `dual_head_dim` / `head_dim` | one head dimension for all layers, or distinct dimensions for sliding and global layers |
 | `mlp_kind` | SwiGLU (SiLU gate) or GeGLU (tanh-approximated GELU gate) |
 | `norm_style` | pre-norm, or sandwich norm (a second normalization after the residual branch) |
 | `sliding_window` | absent, uniform, dual, or alternating by layer index |
 | `kv_share_skip_prefill` | last N layers reuse an earlier layer's KV and skip prefill |
-| `per_layer_embedding` | a per-layer embedding stream merged into each block |
+| `ple` | a per-layer embedding stream merged into each block |
 | `attn_softcap` / `final_softcap` | logit soft-capping inside attention, and/or on the final logits |
 | `lmhead_kind` | tied to the embedding, or an untied and separately quantized weight |
-| `decode_accel` | whether the decode-step attention and RoPE are worth putting on the accelerator |
+| `decode_gpu` / `decode_rope_gpu` | whether the decode-step attention and RoPE are worth putting on the accelerator |
 
 The resolver consumes these together with `DeviceCaps`. Neither vocabulary may name a backend,
 and neither may name a model.
@@ -487,16 +515,17 @@ capture-replay and whole-graph offload are accelerator-only; fusion is not.
 
 **Three-way split, and each part has one owner:**
 
-- *transformation* — a backend-neutral realizer, a sibling of
-  `nntrainer/compiler/bn_realizer.h` and `nntrainer/compiler/activation_realizer.h`, both already
-  in the realizer chain (`nntrainer/models/neuralnet.cpp: NeuralNetwork::compile`);
+- *transformation* — a backend-neutral realizer, `nntrainer/compiler/fusion_realizer.h:
+  FusionRealizer`, which runs in the inference realizer chain just before `ActivationRealizer`
+  (`nntrainer/models/neuralnet.cpp: NeuralNetwork::compile`; `nntrainer/compiler/bn_realizer.h`
+  exists but is not in that chain);
 - *profitability* — caps-gated: fuse only where it avoids a slow-memory round trip;
 - *kernel* — a fused `ComputeOps` virtual, gated by its own `supports_fused_*()` predicate, with
   the unfused path as the fallback.
 
 | Category | Examples | Applies to | Existing seam |
 |---|---|---|---|
-| **Activation / epilogue** | `conv+act`, `conv+bn+act`, `fc+act`, `matmul+bias+act` | CNN **and** LLM, training **and** inference, all backends — the broadest reach | `ActivationRealizer`, `BnRealizer` |
+| **Activation / epilogue** | `conv+act`, `conv+bn+act`, `fc+act`, `matmul+bias+act` | CNN **and** LLM, training **and** inference, all backends — the broadest reach | `FusionRealizer`, `ActivationRealizer` |
 | Gated MLP | gate-and-multiply MLPs, optionally folding the output quantization | LLM | `swiglu_fp32`, `tanh_gelu_mul_fp32` |
 | Norm | normalization folded with the residual add | LLM, CNN | — |
 | Projection | QKV projection folded with RoPE | LLM | — |
@@ -562,21 +591,20 @@ are gaps in the code relative to the rules above; they are not a schedule.
 - **No whole-op virtual for `rmsnorm`, `rope` or `attention`.** They are absent from
   `nntrainer/tensor/cpu_backend/compute_ops.h`, so §4's collapse is blocked for those operations
   and §4's interim rule applies instead.
-- **Residency is decided by an allocator-name string comparison** in
-  `nntrainer/tensor/memory_pool.cpp` — see §3.
-- **`engine=` resolves against a closed enum** in `nntrainer/engine.cpp` and
-  `nntrainer/layers/layer_node.cpp` — see §5 step 1 and decision 7.
+- **Allocator-name string comparisons remain** in `nntrainer/tensor/memory_pool.cpp` (`"qnn"`)
+  and `Applications/CausalLM/kv_cache_manager.cpp` (`"gpu-svm"`) — see §3.
 - **There is no public layer-author API.** `ml::train::Layer`
   (`api/ccapi/include/layer.h`) is a consumer facade: it exposes weights and properties but not
   `finalize` / `forwarding` / `calcDerivative` / `exportTo`. Every application layer therefore
-  inherits the internal base, and registration goes through a concrete-context downcast —
-  `static_cast<nntrainer::AppContext *>(engine.getRegisteredContext("cpu"))->registerFactory(...)`
-  in `Applications/CausalLM/models/causal_lm.cpp: CausalLM::registerCustomLayers`, because
-  `registerFactory` is declared on `AppContext` (`nntrainer/app_context.h`) and not on the
-  `Context` base. **A public registration facade — a `Context` base virtual plus a free function
-  that hides both the `Engine` singleton and the concrete context type — is the fix, and no new
-  code should add another downcast.**
-- **No device-capability struct and no plan resolver.** Until they exist, per-hardware behaviour
-  is selected by environment variables; see [`../ENV_FLAGS.md`](../ENV_FLAGS.md). Each such
-  variable is a resolver cell that has not been written yet, and the direction of travel is from
-  the variable to a derived capability, never the reverse.
+  inherits the internal base. Registration has a facade — the `Context::registerLayerFactory`
+  virtual behind `Engine::registerLayerFactory` (`nntrainer/engine.h`), which
+  `CausalLM::registerCustomLayers` uses — but one concrete-context downcast remains,
+  `static_cast<nntrainer::AppContext *>(...)` in
+  `Applications/CausalLM/models/lfm2/lfm2_causallm.cpp: Lfm2Transformer::registerCustomLayers`.
+  **No new code should add another downcast.**
+- **The plan resolver is not authoritative.** `DeviceCaps` and `resolveExecPlan` exist, but the
+  `ExecPlan` is only logged; a few sites read `caps()` directly (the v8c buffer path and the XMX
+  gate in `nntrainer/tensor/cl_operations/blas_kernels.cpp`) and the rest of the per-hardware
+  behaviour is selected by environment variables; see [`../ENV_FLAGS.md`](../ENV_FLAGS.md). Each
+  such variable is a resolver cell that has not been written yet, and the direction of travel is
+  from the variable to a derived capability, never the reverse.

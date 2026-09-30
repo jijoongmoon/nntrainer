@@ -69,9 +69,11 @@ qnn-2.x.x.x/
 └── share/
 ```
 
-nntrainer's build only consumes headers under `include/`; the runtime
-shared libraries (`libQnnHtp.so`, `libQnnCpu.so`, ...) are dlopen'd at
-runtime — see §5.
+nntrainer's build consumes headers under `include/` plus the SDK sample
+utility sources (logging, PAL, `IOTensor`/`DataUtil`, wrapper utils,
+`qnn-api`) that are copied into `nntrainer/qnn/jni/vendor/` and compiled
+into the plugin; the runtime shared libraries (`libQnnHtp.so`,
+`libQnnCpu.so`, ...) are dlopen'd at runtime — see §5.
 
 ## 3. Configure the build
 
@@ -102,15 +104,17 @@ SDK headers and apply compatibility patches into
 do not need to run the script by hand unless you later update the SDK
 and want to refresh `vendor/` without reconfiguring from scratch.
 
-The configure step validates the SDK root early and produces a clear
-error if neither `-Dqnn-sdk-root` nor `QNN_SDK_ROOT` is set, or if the
-path does not point at a valid SDK:
+The configure step validates the SDK root early: if `vendor/` has not
+been generated yet and neither `-Dqnn-sdk-root` nor `QNN_SDK_ROOT`
+points at a valid SDK, `update_qnn_version.py` fails and configure stops
+with its output:
 
 ```
-nntrainer/qnn/meson.build:9:0: ERROR: enable-npu=true requires
--Dqnn-sdk-root=<path-to-qcom-qnn-sdk> or QNN_SDK_ROOT env var.
-Obtain the QNN SDK from https://qpm.qualcomm.com/ and pass its root
-directory. See docs/backend_guide/QNN_BUILD.md.
+ERROR: QNN vendor tree generation failed.
+stdout: ...
+stderr: ...
+Set -Dqnn-sdk-root=<path> or export QNN_SDK_ROOT=<path> to your Qualcomm
+QNN SDK root (...).
 ```
 
 When `enable-npu=false` (the default) the `qnn-sdk-root` option and
@@ -120,11 +124,15 @@ Qualcomm and are unaffected by all of this.
 ## 4. What gets built
 
 With `enable-npu=true`, the QNN integration is compiled into a
-**separate plugin shared library** (`libqnn_context.so`). The main
-`libnntrainer.so` is unchanged. The plugin is loaded dynamically by
-`Engine::registerContext` only when the user actually requests the
-`"qnn"` backend; this keeps the QNN runtime dependency from leaking
-into binaries that do not need it.
+**separate plugin shared library** (`libqnn_context.so`), built by the
+`qnn_context` module of the generated `jni/Android.mk` (from
+`jni/Android.mk.in`); `nntrainer/qnn/meson.build` only collects its
+sources and include directories. The main `libnntrainer.so` does not
+link the QNN runtime. In an `ENABLE_NPU` build,
+`Engine::add_default_object` `dlopen`s the plugin at engine start-up via
+`registerContext("libqnn_context.so", ...)` and registers it as `"qnn"`;
+if the plugin cannot be loaded it logs a warning and continues. This
+keeps the QNN runtime dependency out of `libnntrainer.so` itself.
 
 The plugin contains:
 
@@ -135,11 +143,13 @@ The plugin contains:
 - `nntrainer/qnn/jni/iotensor_wrapper.hpp` — adapter around the QNN
   sample-app `IOTensor` / `DataUtil` utilities (these utilities live
   inside the SDK, *not* in this repo).
-- `nntrainer/qnn/jni/qnn/op/QNN{Linear,Graph}.{h,cpp}` — Layer-level
-  ops that capture into a QNN graph (see ARCHITECTURE.md §5 for why
-  QNN integrates at Layer granularity rather than at ComputeOps op
+- `nntrainer/qnn/jni/rpc_mem.{h,cpp}` — the RPC memory allocation
+  helpers used by the RPC manager.
+- `nntrainer/qnn/jni/QNNGraph.{h,cpp}` — the Layer-level op that
+  captures into a QNN graph (see ARCHITECTURE.md §5 for why QNN
+  integrates at Layer granularity rather than at ComputeOps op
   granularity).
-- `nntrainer/qnn/jni/qnn/qnn_properties.{h,cpp}` — string ⇄ struct
+- `nntrainer/qnn/jni/qnn_properties.{h,cpp}` — string ⇄ struct
   converters for QNN-specific layer properties (quantization params,
   tensor shapes, ...).
 
@@ -158,7 +168,7 @@ At run time the QNN runtime libraries (`libQnnHtp.so`,
 
 ```bash
 export LD_LIBRARY_PATH=/opt/qcom/aistack/qnn-2.47.0/lib/x86_64-linux-clang:$LD_LIBRARY_PATH
-./build/test/unittest/unittest_nntrainer_qnn   # or any binary using the qnn ctx
+<any binary that uses the qnn context>
 ```
 
 On Android / device builds, place the matching `aarch64-android/`
@@ -173,12 +183,10 @@ the same layout.
 ## 6. Verifying the build
 
 Quick sanity check that the QNN context registers without exercising
-the NPU itself:
-
-```bash
-ninja -C build test
-build/test/unittest/unittest_nntrainer_engine --gtest_filter='*QNN*'
-```
+the NPU itself: start any binary built with `enable-npu=true` and check
+that the log does not contain the warning
+`QNN context plugin not available: ...`, which `Engine` emits when
+`libqnn_context.so` cannot be loaded.
 
 Tests that exercise the actual HTP runtime are gated behind the
 presence of the SDK shared libraries and a Snapdragon device with HTP

@@ -20,7 +20,7 @@ for the parts of the design that are non-obvious.
 
 ```
 Engine                            (process-wide singleton)
-  └─ Context                      (one per vendor: cpu / gpu / qnn)
+  └─ Context                      (one per vendor: cpu / gpu / cuda / htp / qnn)
        └─ ContextData             (per-vendor metadata blob)
             └─ ComputeOps*        (virtual interface, vendor subclass)
                  └─ kernels       (sgemm, ele_mul, gemm_q4_0, ...)
@@ -29,7 +29,7 @@ Engine                            (process-wide singleton)
 Reading top-to-bottom:
 
 * **Engine** holds a registry of `Context` objects, keyed by name
-  (`"cpu"`, `"gpu"`, `"qnn"`). At process startup it calls
+  (`"cpu"`, `"gpu"`, `"cuda"`, `"htp"`, `"qnn"`). At process startup it calls
   `ensureComputeOps()` once to bind the global CPU `g_compute_ops`,
   then registers each available `Context`.
 
@@ -115,11 +115,11 @@ through to global `g_compute_ops`. This preserves backward
 compatibility for every test and call site that never touches
 ContextData.
 
-`Tensor::to(target_ct)` is the migration entry point. In the
-current host-shared-memory regime, it deep-copies and re-tags. When
-true device-only memory backends land (CUDA, NPU with DMA-only
-buffers), this is the one place that grows host↔device or
-device↔device transfer logic.
+`Tensor::to(target_ct)` is the migration entry point. It still
+deep-copies and re-tags. A device-only memory kind has landed (the
+CUDA device-only activation pool, `Manager::activationAllocator`),
+but `to()` has not grown a transfer path for it yet; this is the one
+place that should grow host↔device or device↔device transfer logic.
 
 ---
 
@@ -134,7 +134,7 @@ pointer without leaking into thread-local globals — which defeats
 the whole "Context owns its own ops" design.
 
 The current design makes `ComputeOps` an abstract C++ class with
-~80 virtual methods. Concrete subclasses can hold backend state as
+~100 virtual methods. Concrete subclasses can hold backend state as
 plain member variables and reach it from inside the override
 without any indirection. The virtual call overhead (~1–3 ns) is
 dwarfed by kernel cost (sgemm ≥ 100 µs); no measurable impact on
@@ -142,9 +142,9 @@ any layer-level test.
 
 ### "Pure virtual or default-throw?"
 
-Default-throw. The 80 ops in `ComputeOps` have a long tail (~60 of
-them are quantized variants, FP16 paths, accelerator-only batch
-GEMMs). Forcing every backend to implement all of them with
+Default-throw. The ~100 virtuals in `ComputeOps` have a long tail
+(most of them are quantized variants, FP16 paths, accelerator-only
+batch GEMMs). Forcing every backend to implement all of them with
 `= 0` would mean OpenCL/QNN backends ship a wall of NYI stubs
 that adds no value. Default-throw lets each backend override only
 what it has, with the throw bubbling up immediately and tagged
@@ -208,10 +208,10 @@ the ComputeOps level:
 * Those layers' `forwarding()` methods are stubs by design — the
   real execution happens once `QNNGraph::compile()` flushes the
   captured subgraph.
-* QNNContext's `ContextData` still binds the CPU fallback
-  ComputeOps so any tensor operation that escapes the QNN graph
-  (e.g. user code holding a tensor across `forwarding()` calls)
-  runs on CPU instead of throwing.
+* QNNContext binds no ComputeOps of its own; a tensor operation
+  that escapes the QNN graph (e.g. user code holding a tensor
+  across `forwarding()` calls) falls back to the global CPU ops
+  through `TensorBase::getOps()` instead of throwing.
 
 The single `ComputeOps` interface is therefore not a one-size-
 fits-all replacement for all vendor integrations — it is the
@@ -245,11 +245,12 @@ into `ensureComputeOps()` → `call_once` → the read after returning
 is synchronised through the once_flag, so the final return picks
 up the latest value.
 
-`AppContext::initialize`, `Engine::add_default_object`,
-`ClContext::initialize`, `QNNContext::initialize`, and
-`HtpContext::initialize` all route through `ensureComputeOps()`
-rather than calling `init_backend()` directly, so the call_once
-funnel cannot be bypassed.
+`AppContext::initialize`, `Engine::add_default_object` and
+`HtpContext::initialize` route through `ensureComputeOps()` rather
+than calling `init_backend()` directly, so the call_once funnel
+cannot be bypassed. `ClContext` and `CudaContext` install their own
+table (`setComputeOps(get_cl_ops())` / `get_cuda_ops()`) and never
+call `init_backend()`; `QNNContext` installs none.
 
 ---
 
