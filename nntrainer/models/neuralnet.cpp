@@ -47,6 +47,8 @@
 
 #if !defined(_WIN32)
 #include <fcntl.h> // posix_fadvise: drop the weight file's page cache after the load
+#include <sys/stat.h>
+#include <unistd.h>
 #endif
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
 #include <cuda_context_manager.h> // cuda::drain_if_async
@@ -908,6 +910,109 @@ void NeuralNetwork::backwarding(int iteration,
 }
 
 namespace {
+
+#if !defined(_WIN32) && defined(POSIX_FADV_WILLNEED)
+/**
+ * @brief Read the weight file ahead of the mapped load workers.
+ *
+ * The mapped loader copies every weight out of a file mapping, so on a cold
+ * page cache each worker pulls the file in through page faults: one readahead
+ * window per fault, one outstanding request per worker. A stream read of the
+ * same file hands the kernel one large request per tensor instead, and on a
+ * flash-backed handset that difference is most of the mapped load's time:
+ * measured on a 3.4 GB weight file, 20-30 K major faults per load against
+ * 0.1-6 K for the stream read of the same bytes.
+ *
+ * One helper thread therefore walks the file front to back -- the order the
+ * workers consume it in -- and asks the kernel to start reading each step
+ * with posix_fadvise(POSIX_FADV_WILLNEED). The call only queues reads into the
+ * page cache: it maps nothing into this process (no RSS), never changes a byte
+ * that is read, and the workers' faults on those pages become minor ones.
+ *
+ * The step is small on purpose. The kernel serves one WILLNEED call with at
+ * most one readahead window (max(ra_pages, io_pages)) and silently drops the
+ * rest of the range: measured on the same file, 32 MiB steps left the load
+ * exactly as slow as no read-ahead, and 512 KiB steps recovered only part of
+ * it. 128 KiB is the common default window; a step no larger than the window
+ * covers every byte, and the call does not wait for the read, so many small
+ * calls keep the device queue deep.
+ *
+ * The walk is bounded to half of the memory the system reports as available
+ * when the load starts, so a file larger than the page cache can hold is not
+ * read ahead only to be evicted again before its reader gets there; past the
+ * bound the workers fall back to plain fault-driven readahead. It stops as
+ * soon as the load's workers are done. NNTR_LOAD_PREFETCH=0 turns it off.
+ */
+class WeightFileReadAhead {
+public:
+  explicit WeightFileReadAhead(int fd) {
+    static const bool enabled = []() {
+      const char *e = std::getenv("NNTR_LOAD_PREFETCH");
+      return !(e != nullptr && e[0] == '0');
+    }();
+    if (!enabled || fd < 0)
+      return;
+    struct stat st {};
+    if (::fstat(fd, &st) != 0 || st.st_size <= 0)
+      return;
+    const uint64_t limit =
+      std::min<uint64_t>(static_cast<uint64_t>(st.st_size), budgetBytes());
+    if (limit == 0)
+      return;
+    worker_ = std::thread([this, fd, limit]() {
+      constexpr uint64_t step = 128ull << 10;
+      const auto t0 = std::chrono::steady_clock::now();
+      uint64_t off = 0;
+      for (; off < limit && !stop_.load(std::memory_order_relaxed); off += step)
+        (void)::posix_fadvise(fd, static_cast<off_t>(off),
+                              static_cast<off_t>(std::min(step, limit - off)),
+                              POSIX_FADV_WILLNEED);
+      ml_logi("load read-ahead: %llu of %llu MiB queued in %.1f ms",
+              static_cast<unsigned long long>(std::min(off, limit) >> 20),
+              static_cast<unsigned long long>(limit >> 20),
+              std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0)
+                .count());
+    });
+  }
+
+  ~WeightFileReadAhead() {
+    stop_.store(true, std::memory_order_relaxed);
+    if (worker_.joinable())
+      worker_.join();
+  }
+
+  WeightFileReadAhead(const WeightFileReadAhead &) = delete;
+  WeightFileReadAhead &operator=(const WeightFileReadAhead &) = delete;
+
+private:
+  /** @brief half of MemAvailable, else a quarter of physical memory */
+  static uint64_t budgetBytes() {
+    std::ifstream meminfo("/proc/meminfo");
+    std::string key;
+    uint64_t kib = 0;
+    while (meminfo >> key >> kib) {
+      if (key == "MemAvailable:")
+        return (kib << 10) / 2;
+      meminfo.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+    }
+    const long pages = ::sysconf(_SC_PHYS_PAGES);
+    const long page_size = ::sysconf(_SC_PAGESIZE);
+    if (pages <= 0 || page_size <= 0)
+      return 0;
+    return static_cast<uint64_t>(pages) * static_cast<uint64_t>(page_size) / 4;
+  }
+
+  std::atomic<bool> stop_{false};
+  std::thread worker_;
+};
+#else
+/** @brief no read-ahead where posix_fadvise is not available */
+class WeightFileReadAhead {
+public:
+  explicit WeightFileReadAhead(int) {}
+};
+#endif
 
 /**
  * @brief Resolve the data type a weight will actually be stored as.
@@ -1807,6 +1912,12 @@ void NeuralNetwork::load(const std::string &file_path,
           }
         });
 #endif
+      // The mapped arm reads the file through page faults; start the kernel
+      // reading it ahead of the workers (see WeightFileReadAhead). FSU keeps
+      // the file as its weight store and reads only what it needs.
+      std::optional<WeightFileReadAhead> read_ahead;
+      if (MMAP_READ && !fsu_mode)
+        read_ahead.emplace(model_file_fd);
       const auto _lt_fanout_t0 = std::chrono::steady_clock::now();
       for (size_t t = 0; t < num_load_threads; ++t) {
         threads.emplace_back(load_worker);
@@ -1815,6 +1926,7 @@ void NeuralNetwork::load(const std::string &file_path,
         if (t.joinable())
           t.join();
       }
+      read_ahead.reset();
       nntrainer::load_trace::add(
         nntrainer::load_trace::WALL,
         (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
