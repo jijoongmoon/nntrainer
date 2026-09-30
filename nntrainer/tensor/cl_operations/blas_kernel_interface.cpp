@@ -2095,30 +2095,30 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
     gemm_int8_v8c_cl(gemm_act_arg, gemm_wgt_arg, act_scale_arg,
                      w->scale_buf.get(), act_rs_arg, act_zp_arg,
                      w->row_sum_w_int4.get(), gemm_y_arg, M_pad, N, K, M);
-    // NNTR_XE3_FC_SYNC: narrowed coarse-grain-SVM coherence fix. The in-order
-    // queue does not give kernel->kernel coarse-grained-SVM coherence on some
-    // Intel drivers. A clFinish after the FC GEMM (the dominant SVM-producing
-    // op) covers that handoff. It does NOT replace the global drain: on a
-    // coarse-grain-only device needsCoarseSVMDrain() still drains after every
-    // SVM dispatch, so on such Intel parts both run. Value-parsed so
-    // NNTR_XE3_FC_SYNC=0 disables.
+    // NNTR_XE3_FC_SYNC=1: clFinish after the FC GEMM. Off by default on
+    // every platform; =0 or leaving it unset keeps it off.
+    //
+    // It was added as a narrower form of the global drain for the
+    // coarse-grained-SVM handoff on Intel, on the view that the FC GEMM was
+    // the dominant op writing shared memory. The GEMM itself binds only device
+    // buffers (the int8 activation scratch, the weights, and y_fp16 or the
+    // planner sub-buffer), and on the in-order queue a device-buffer handoff
+    // needs no drain. Where the FC does touch shared memory -- an SVM input
+    // staged by v8c_copy_svm_to_clmem, an SVM output written by
+    // v8c_write_output_resident -- those copy kernels bind SVM arguments, so
+    // the capability-derived drain in CommandQueueManager (needsCoarseSVMDrain)
+    // already finishes the queue after them on a coarse-grain device.
+    //
+    // Measured on an Intel Xe3 iGPU with that drain in place: skipping this
+    // sync left the generated token sequence unchanged on three models (a
+    // dense 1.5B model on the XMX and dp4a lanes, a 2B-class model with
+    // per-layer embeddings, and Gemma-4), 1K-token summarization prompts,
+    // 30 runs per model against the synced reference. It cost one
+    // clFinish per FC (169 of 461 per decoded token on the 1.5B model) and
+    // 7-9% of decode throughput. Windows had it off already.
     static const bool xe3_fc_sync = []() {
       const char *e = std::getenv("NNTR_XE3_FC_SYNC");
-      if (e)
-        return std::atoi(e) != 0;
-#ifdef _WIN32
-      // Windows/WDDM default-OFF: a battery of cold-boot goldens, token-class
-      // A/B runs and long-context summarizations with the drain skipped found
-      // no coherence failure attributable to it there, and it costs 15-25% of
-      // decode on that stack. The env still turns it on explicitly.
-      return false;
-#else
-      // The stale read reproduces on Intel; every other vendor observed is
-      // coherent across the handoff already. vendor_id is a queryable,
-      // vendor-wide attribute -- not a device-name match.
-      constexpr uint32_t INTEL_VENDOR_ID = 0x8086;
-      return ClContext::Global().caps().vendor_id == INTEL_VENDOR_ID;
-#endif
+      return e != nullptr && std::atoi(e) != 0;
     }();
     if (xe3_fc_sync)
       opencl::clFinish(q);

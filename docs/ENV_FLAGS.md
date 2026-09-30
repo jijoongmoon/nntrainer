@@ -38,6 +38,7 @@ give it a working default so that a bare run needs no environment at all.
 | Variable | Meaning | Default | Read by |
 |---|---|---|---|
 | `NNTR_NUM_THREADS` | Number of CPU compute worker threads. Takes priority over the `NNTR_NUM_THREADS` compile flag. | `hardware_concurrency() / 2` (minimum 1) | `nntrainer/utils/thread_manager.h: ThreadManagerConfig::defaultComputeThreads` |
+| `NNTR_XE3_FC_SYNC` | `1`: `clFinish` after every quantised FC GEMM/GEMV on the OpenCL v8c path. The coarse-grained SVM drain in the command queue already covers the copy kernels that touch shared memory, so this is a diagnostic only. | unset = off | `nntrainer/tensor/cl_operations/blas_kernel_interface.cpp: dotCl_v8c` |
 | `NNTRAINER_PATH` | A **single** directory searched for dynamically loadable layer and optimizer plugins, in addition to the build-time configured plugin path. Ignored with a warning if the path does not exist. | unset | `nntrainer/app_context.cpp: getPluginPaths` |
 
 ## QNN backend
