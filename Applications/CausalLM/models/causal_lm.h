@@ -171,6 +171,62 @@ public:
   WIN_EXPORT virtual void load_kvcache(std::string path, int to);
 
   /**
+   * @brief Restore a saved KV cache AND position the session on it, so the
+   *        next run() continues the cached conversation instead of prefilling
+   *        it again.
+   * @param path file written by save_kvcache()
+   * @param token_len absolute token position to resume at, or 0 to take the
+   *        position the file records (only a file with a header has one)
+   * @return the absolute token position the session now holds
+   * @throw std::runtime_error naming the field that disagreed when the file
+   *        does not belong to this model
+   * @details The difference from setPrecomputedKVCache(path, len), which arms a
+   *          reload for the next run(): this one loads NOW, so a bad file is a
+   *          failure of the call that named it rather than of the next
+   *          generation, and getKvLen() answers correctly straight away.
+   *          Positioning goes through the session token position (not
+   *          SYS_PROMP_LEN), which is the one counter run() accumulates -- so a
+   *          run AFTER the resumed one continues from the true position instead
+   *          of rewinding onto the restored prefix.
+   */
+  WIN_EXPORT unsigned int resumeFromKVCacheFile(const std::string &path,
+                                                unsigned int token_len);
+
+  /**
+   * @brief Continue the next run() at absolute token position @p pos in the KV
+   *        cache this model already holds, without reloading anything.
+   * @param pos absolute token position; 0 is "start a fresh conversation"
+   * @details This is the in-memory half of resume: the `prev_idx` an SDK
+   *          consumer passes back after a pause, or the position a multi-turn
+   *          caller continues from. It only moves the bookkeeping -- the caller
+   *          asserts the cache really holds a valid prefix of that length,
+   *          which getKvLen() is how it knows.
+   * @note Also disarms any armed precomputed-KV reload, so the two ways of
+   *       saying "resume" cannot both apply to one run, and retires a captured
+   *       decode graph (see the definition for why that is not optional).
+   */
+  WIN_EXPORT void setSessionTokenPosition(unsigned int pos);
+
+  /**
+   * @brief Absolute token position the next run() would continue from.
+   * @note Equal to getKvLen() after a completed run; the two differ only while
+   *       a resume has been armed but not yet consumed.
+   */
+  unsigned int getSessionTokenPosition() const {
+    return SYS_PROMP_LEN + global_token_len;
+  }
+
+  /**
+   * @brief Opaque identity written into a saved KV cache and checked when one
+   * is loaded: everything about this model that decides how to read a KV plane.
+   * @details Geometry alone is not enough. Two of this tree's models -- one
+   * with 1 KV head x 256, one with 2 x 128 -- have the SAME per-layer KV width
+   * and the same layer count, so a length check passes between them and the
+   * loaded bytes are simply another model's attention state.
+   */
+  WIN_EXPORT std::string kvCacheModelTag() const;
+
+  /**
    * @brief Arm (or disarm) resume-from-saved-KV for the next run() call.
    * @param path Saved KV-cache file produced by save_kvcache(); an empty
    *             string disarms and restores plain-prefill behavior.
@@ -180,14 +236,11 @@ public:
    * @note  Drives the same USE_KVCACHE flow that nntr_config.json's
    *        system_prompt.kvcache block configures, without needing the
    *        config entry.
+   * @note  Also moves the session to 0, so it retires a captured decode graph
+   *        for the same reason setSessionTokenPosition() does.
    */
-  void setPrecomputedKVCache(const std::string &path,
-                             unsigned int sys_prompt_token_len) {
-    USE_KVCACHE = !path.empty();
-    PRE_COMPUTED_CACHE_PATH = path;
-    SYS_PROMP_LEN = USE_KVCACHE ? sys_prompt_token_len : 0;
-    global_token_len = 0;
-  }
+  WIN_EXPORT void setPrecomputedKVCache(const std::string &path,
+                                        unsigned int sys_prompt_token_len);
 
   /**
    * @brief The sampling knobs applyTKP() consumes, as a settable group.

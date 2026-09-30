@@ -244,6 +244,20 @@ bool kv_regime_holds(int kv_len);
  */
 int kv_regime_size();
 
+/**
+ * @brief Declare the recorded table stale: kv_regime_holds() answers false at
+ *        every key count until the next capture records a new one.
+ *
+ * Every question in the table has the form "is the key count still on this side
+ * of that bound", which is the right question while a sequence grows one token
+ * at a time. It is the wrong question when the sequence is REPLACED -- a
+ * restored KV cache, or a session repositioned to an earlier token -- because
+ * the captured graph then describes a prefix that is no longer there while the
+ * deltas happily certify it. The host lever that puts a cache back is what
+ * calls this (causallm::CausalLM::load_kvcache / resumeFromKVCacheFile).
+ */
+void kv_regime_invalidate();
+
 } // namespace nntrainer::cuda
 
 #endif // __CUDA_STREAM_MANAGER_H__

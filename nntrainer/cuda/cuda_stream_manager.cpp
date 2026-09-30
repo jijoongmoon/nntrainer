@@ -53,6 +53,7 @@ struct SharedCudaState {
   int regime_n = 0;
   int regime_overflow = 0;
   int regime_exact = 0;
+  int regime_stale = 0; // the sequence under the capture was replaced
   int regime_delta[kKvRegimeMax] = {0};
 };
 
@@ -400,14 +401,22 @@ void kv_regime_begin(int kv_len) {
   sh->regime_n = 0;
   sh->regime_overflow = 0;
   sh->regime_exact = 0;
+  sh->regime_stale = 0;
   sh->regime_base_kv = kv_len;
   sh->regime_recording = 1;
 }
 
 void kv_regime_seal() { shared_cuda_state()->regime_recording = 0; }
 
+void kv_regime_invalidate() { shared_cuda_state()->regime_stale = 1; }
+
 bool kv_regime_holds(int kv_len) {
   auto *sh = shared_cuda_state();
+  /** The sequence under the capture was replaced (a KV cache was restored, or
+   *  the session was repositioned). No key count can make that capture current
+   *  again -- only a new one can. */
+  if (sh->regime_stale != 0)
+    return false;
   const int delta = kv_len - sh->regime_base_kv;
   if (sh->regime_exact != 0)
     return delta == 0;

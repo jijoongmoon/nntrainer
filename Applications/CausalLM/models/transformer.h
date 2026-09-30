@@ -338,6 +338,16 @@ public:
   virtual int getKvLen() const { return 0; }
 
   /**
+   * @brief Context window in tokens: the KV-cache capacity this model was built
+   *        with (nntr_config.json `max_seq_len`, or NNTR_MAX_SEQ_LEN when the
+   *        host overrode it at construction).
+   * @details Exposed because it is the bound a host API has to check a resume
+   *          position against before handing it down, and the number a caller
+   *          would otherwise have to re-read the package's config to learn.
+   */
+  unsigned int getMaxSeqLen() const { return MAX_SEQ_LEN; }
+
+  /**
    * @brief Per-layer KV-cache width (num_kv_heads * head_dim) for the layer.
    * @details The single per-model degree of freedom the generic
    * allocateAndBindKVCache needs: uniform-geometry models use this default,
