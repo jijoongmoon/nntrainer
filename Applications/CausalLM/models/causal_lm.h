@@ -248,7 +248,8 @@ public:
   /**
    * @brief The sampling knobs applyTKP() consumes, as a settable group.
    * @details Same three values generation_config.json seeds at construction
-   *          (temperature 0.7 / top_k 20 / top_p 0.95 by default). Held here
+   *          (Hugging Face's temperature 1.0 / top_k 50 / top_p 1.0 when a key
+   *          is missing). Held here
    *          rather than passed down through run() so that a host API can
    *          express "this request is creative, the next one is not" without
    *          every model's run() signature growing a parameter.
@@ -283,15 +284,32 @@ public:
   }
 
   /**
-   * @brief Re-seed the sampling RNG.
-   * @details The RNG is a per-model member that is default-constructed once and
-   *          then advances across run() calls, so sampled output is
-   *          reproducible only for the first run of a fresh process. Seeding
-   *          immediately before a run makes that run reproducible on its own:
-   *          same prompt + same params + same seed => same tokens, on any run
-   *          number. Inert for greedy decoding.
+   * @brief Whether the model config asks for sampling.
+   * @details generation_config.json "do_sample"; false when the key is
+   *          missing (the Hugging Face default). Hosts that do not choose a
+   *          decoding mode themselves pass this to run().
    */
-  void setSamplingSeed(uint64_t seed) { rng.seed(seed); }
+  bool getDoSample() const { return DO_SAMPLE; }
+
+  /**
+   * @brief The seed every run() starts from unless setSamplingSeed() was
+   *        called for that run: generation_config.json "seed", else
+   *        nntr_config.json "seed", else causallm::kDefaultSamplingSeed.
+   */
+  uint64_t getSamplingSeed() const { return SAMPLING_SEED; }
+
+  /**
+   * @brief Seed the sampling RNG for the next run() only.
+   * @details Every run() re-seeds the RNG with getSamplingSeed() before it
+   *          decodes, so the same prompt + params give the same tokens on any
+   *          run number and in any process. Calling this before a run
+   *          replaces that seed for that one run; the run after it goes back
+   *          to getSamplingSeed(). Inert for greedy decoding.
+   */
+  void setSamplingSeed(uint64_t seed) {
+    rng.seed(seed);
+    sampling_seed_pending_ = true;
+  }
 
 protected:
   /**
@@ -384,9 +402,11 @@ protected:
   // members (the diamond joins only at <Model>CausalLM).
   std::vector<unsigned int> EOS_TOKEN_ID;
   unsigned int BOS_TOKEN_ID;
+  bool DO_SAMPLE = false; /**< generation_config.json "do_sample" */
   float TEMPERATURE;
   unsigned int TOP_K;
   float TOP_P;
+  uint64_t SAMPLING_SEED = causallm::kDefaultSamplingSeed; /**< per-run seed */
 
   std::vector<unsigned int> BAD_WORD_IDS; /**< List of bad word IDs */
   unsigned int NUM_BADWORDS;              /**< Number of bad words */
@@ -413,6 +433,17 @@ protected:
   unsigned int global_token_len;
 
   causallm::SamplingRng rng{causallm::kDefaultSamplingSeed}; /**< sampler RNG */
+  bool sampling_seed_pending_ = false; /**< setSamplingSeed() for next run */
+
+  /**
+   * @brief Re-seed the sampling RNG at the start of a run, unless the caller
+   *        seeded it for this run with setSamplingSeed().
+   */
+  void beginSamplingRun() {
+    if (!sampling_seed_pending_)
+      rng.seed(SAMPLING_SEED);
+    sampling_seed_pending_ = false;
+  }
 
   LogitsProcessor *logits_processor = nullptr; /**< Non-owning processor */
 

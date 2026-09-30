@@ -489,6 +489,9 @@ void Lfm2CausalLM::run_with_embeddings(const void *inputs_embeds,
       "MAX_SEQ_LEN must be greater than or equal to INIT_SEQ_LEN");
   }
 
+  // Same per-run seed rule as CausalLM::run().
+  beginSamplingRun();
+
   // Allocate the host-owned KV cache and bind it to mha_core's external cache
   // input slots. Idempotent: only the first call does work.
   allocateAndBindKVCache();

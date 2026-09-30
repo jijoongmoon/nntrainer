@@ -354,15 +354,32 @@ void CausalLM::setupParameters(json &cfg, json &generation_cfg,
   BOS_TOKEN_ID = generation_cfg["bos_token_id"].empty()
                    ? cfg["bos_token_id"].get<unsigned int>()
                    : generation_cfg["bos_token_id"].get<unsigned int>();
+  // Decoding follows generation_config.json. A missing key takes the Hugging
+  // Face default: do_sample false (greedy), and -- consulted only when
+  // do_sample is true -- temperature 1.0, top_k 50, top_p 1.0.
+  DO_SAMPLE = false;
+  if (generation_cfg.contains("do_sample") &&
+      generation_cfg["do_sample"].is_boolean())
+    DO_SAMPLE = generation_cfg["do_sample"].get<bool>();
   TOP_K = generation_cfg.contains("top_k")
             ? generation_cfg["top_k"].get<unsigned int>()
-            : 20;
+            : 50;
   TOP_P = generation_cfg.contains("top_p")
             ? generation_cfg["top_p"].get<float>()
-            : 0.95;
+            : 1.0f;
   TEMPERATURE = generation_cfg.contains("temperature")
                   ? generation_cfg["temperature"].get<float>()
-                  : 0.7;
+                  : 1.0f;
+  // One fixed seed everywhere unless the pack names one; every run() re-seeds
+  // with it (beginSamplingRun), so sampled output is a function of the prompt.
+  if (generation_cfg.contains("seed") &&
+      generation_cfg["seed"].is_number_unsigned())
+    SAMPLING_SEED = generation_cfg["seed"].get<uint64_t>();
+  else if (nntr_cfg.contains("seed") && nntr_cfg["seed"].is_number_unsigned())
+    SAMPLING_SEED = nntr_cfg["seed"].get<uint64_t>();
+  else
+    SAMPLING_SEED = causallm::kDefaultSamplingSeed;
+  rng.seed(SAMPLING_SEED);
   global_token_len = 0;
 }
 
@@ -1247,6 +1264,9 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   // reuses the buffers exactly as before.
   has_run_ = false;
   prepareStopRequestForRun();
+  // Same seed at the top of every run, so run N samples exactly what run 1
+  // (or a fresh process) would. A caller seed from setSamplingSeed() wins.
+  beginSamplingRun();
 
   output_list.clear();
   for (unsigned int b = 0; b < BATCH_SIZE; ++b) {

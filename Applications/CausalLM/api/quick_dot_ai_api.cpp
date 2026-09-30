@@ -182,6 +182,17 @@ static causallm::Quick_Dot_AI_QNN *as_qnn_model(causallm::Transformer *model) {
 }
 #endif
 
+/**
+ * @brief Decoding mode for a request that does not choose one itself: the
+ *        model's generation_config.json "do_sample" (false when the key is
+ *        missing, and for models that are not a CausalLM).
+ */
+static bool model_do_sample(causallm::Transformer *model) {
+  if (auto *causal_model = as_causal_lm(model))
+    return causal_model->getDoSample();
+  return false;
+}
+
 static bool model_supports_text_output(causallm::Transformer *model) {
   if (as_causal_lm(model) != nullptr)
     return true;
@@ -1532,10 +1543,10 @@ run_on_handle(CausalLmModel &h, const char *inputTextPrompt,
 
 // We assume single batch request for this API
 #if defined(_WIN32)
-    model->run(std::wstring(input.begin(), input.end()), false, L"", L"",
-               g_verbose);
+    model->run(std::wstring(input.begin(), input.end()), model_do_sample(model),
+               L"", L"", g_verbose);
 #else
-    model->run(input, false, "", "", g_verbose);
+    model->run(input, model_do_sample(model), "", "", g_verbose);
 #endif
 
     if (!get_model_output(model, h.last_output))
@@ -2175,10 +2186,10 @@ static ErrorCode run_model_streaming_on_handle(CausalLmModel &h,
     }
 
 #if defined(_WIN32)
-    m->run(std::wstring(input.begin(), input.end()), false, L"", L"",
-           g_verbose);
+    m->run(std::wstring(input.begin(), input.end()), model_do_sample(m), L"",
+           L"", g_verbose);
 #else
-    m->run(input, false, "", "", true);
+    m->run(input, model_do_sample(m), "", "", true);
 #endif
 
     if (!get_model_output(m, h.last_output))
@@ -2500,7 +2511,7 @@ static ErrorCode execute_multimodal(CausalLmModel &h,
 
   try {
     llm->run_with_embeddings(combined.data(), n_total, text_ids,
-                             /*do_sample=*/false, /*log_output=*/g_verbose);
+                             model_do_sample(llm), /*log_output=*/g_verbose);
     h.kv_len = llm->getKvLen();
   } catch (const std::exception &e) {
     LOGE("[MM] llm threw: %s", e.what());
