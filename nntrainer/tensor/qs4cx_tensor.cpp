@@ -526,4 +526,22 @@ bool qs4cxHeapBypassOn() {
   return on;
 }
 
+bool qs4cxDropPlainOn() {
+  static const bool on = []() {
+    const char *e = std::getenv("NNTR_V8C_DROP_PLAIN");
+    if (e != nullptr)
+      return e[0] == '1';
+#if defined(__ANDROID__)
+    return qs4cxHeapBypassOn();
+#else
+    // Opt-in off Android. DiscardVirtualMemory does work on the WDDM SVM
+    // host shadow (verified on every weight, goldens byte-identical); the
+    // bundles that ship it set the variable, and a bare run keeps the
+    // long-measured residency it always had.
+    return false;
+#endif
+  }();
+  return on;
+}
+
 } // namespace nntrainer

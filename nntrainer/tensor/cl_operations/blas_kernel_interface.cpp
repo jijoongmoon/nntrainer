@@ -1030,29 +1030,16 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
   // madvise (EINVAL) and on a kgsl SVM arena "succeeds" without giving
   // anything back, so a slice is never recorded as unreadable.
   //
-  // Default: the env value when set; otherwise ON on Android when the heap
-  // bypass is on (the only shape whose release is real there -- and where
-  // the measured cost of NOT dropping is a second copy of every FC weight,
-  // 569 MiB of a 1 338 MiB GPU footprint on a 1.5B model), OFF elsewhere.
-  // Off Android the SDK bundles that were measured with the drop set the
-  // variable themselves.
+  // Default: qs4cxDropPlainOn() -- the env value when set; otherwise ON on
+  // Android when the heap bypass is on (the only shape whose release is real
+  // there -- and where the measured cost of NOT dropping is a second copy of
+  // every FC weight, 569 MiB of a 1 338 MiB GPU footprint on a 1.5B model),
+  // OFF elsewhere. The zero-copy load in FullyConnectedLayerCl::read() takes
+  // its default from the same function.
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) ||             \
   defined(_M_IX86) || defined(__aarch64__) || defined(_M_ARM64)
   {
-    static const bool drop_plain = []() {
-      const char *v = std::getenv("NNTR_V8C_DROP_PLAIN");
-      if (v != nullptr)
-        return v[0] == '1';
-#if defined(__ANDROID__)
-      return qs4cxHeapBypassOn();
-#else
-      // Opt-in off Android. DiscardVirtualMemory does work on the WDDM SVM
-      // host shadow (verified on every weight, goldens byte-identical); the
-      // bundles that ship it set the variable, and a bare run keeps the
-      // long-measured residency it always had.
-      return false;
-#endif
-    }();
+    static const bool drop_plain = qs4cxDropPlainOn();
     // Announce the resolved decision once. The drop is otherwise invisible in
     // a run log -- same outputs, same caches, only the residency differs --
     // which makes "was it actually on?" unanswerable after the fact. The

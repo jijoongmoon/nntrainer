@@ -21,6 +21,7 @@
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 #include <node_exporter.h>
+#include <qs4cx_tensor.h>
 #include <tensor.h>
 #include <util_func.h>
 
@@ -265,20 +266,19 @@ void FullyConnectedLayerCl::read(ReadSource src, RunLayerContext &run_context,
   //
   // The mapping is alive for exactly this call (the loader unmaps it when the
   // node is done), which is why the build has to happen here and not later.
-  // The default follows the NNTR_V8C_DROP_PLAIN environment variable rather
-  // than being ON everywhere, because it rests on exactly the same fact: that
-  // on this lane every QS4CX FC is dispatched by the v8c path, so the host FC
+  // The default is the resolved drop decision, qs4cxDropPlainOn(), rather
+  // than ON everywhere, because it rests on exactly the same fact: that on
+  // this lane every QS4CX FC is dispatched by the v8c path, so the host FC
   // fallback -- the one reader of the payload -- is unreachable in a healthy
-  // run. Only an explicit NNTR_V8C_DROP_PLAIN=1 turns it on: nothing in the
-  // tree sets that variable, and the built-in Android DROP_PLAIN default does
-  // not enable zero-copy. Otherwise the copy stays.
+  // run. Where the drop is on (the variable, or its Android default with the
+  // heap bypass) skipping the copy is strictly better than making it and then
+  // madvising it away. Where it is off, the copy stays.
   // NNTR_LOAD_ZEROCOPY=1/0 overrides either way.
   static const bool zerocopy_on = []() {
     const char *e = std::getenv("NNTR_LOAD_ZEROCOPY");
     if (e != nullptr)
       return e[0] != '0';
-    const char *d = std::getenv("NNTR_V8C_DROP_PLAIN");
-    return d != nullptr && d[0] == '1';
+    return qs4cxDropPlainOn();
   }();
   const char *const *mapping = std::get_if<const char *>(&src);
   Tensor *zc_w = nullptr;

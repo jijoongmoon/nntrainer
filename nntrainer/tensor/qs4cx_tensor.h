@@ -407,6 +407,22 @@ void refuseIfQs4cxPayloadDropped(const void *payload, const char *who);
  */
 bool qs4cxHeapBypassOn();
 
+/**
+ * @brief Resolved NNTR_V8C_DROP_PLAIN: is the plain QS4CX payload dead once
+ *        the device repack has been built from it -- released after the
+ *        build, or, on the zero-copy load, never filled at all?
+ *
+ * Set in the environment, the value wins (=1 on, anything else off). Unset,
+ * it follows qs4cxHeapBypassOn() on Android -- a heap payload is the only
+ * shape whose release is real there -- and is OFF elsewhere, where the SDK
+ * bundles that were measured with it set the variable themselves.
+ *
+ * The drop after the v8c build and the default of the zero-copy load
+ * (NNTR_LOAD_ZEROCOPY) both ask this one function, so the two cannot
+ * disagree. Read once; the first call latches the answer for the process.
+ */
+bool qs4cxDropPlainOn();
+
 } // namespace nntrainer
 
 #endif /* __cplusplus */
