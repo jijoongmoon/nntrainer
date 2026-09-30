@@ -93,7 +93,6 @@ QNNGraph::~QNNGraph() {
   }
 }
 
-
 void QNNGraph::finalize(InitLayerContext &context) {
   bin_path = std::get<props::FilePath>(graph_props).get();
 
