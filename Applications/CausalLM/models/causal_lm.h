@@ -41,6 +41,7 @@
 #endif
 
 #include <kv_cache_manager.h>
+#include <token_sampler.h>
 #include <transformer.h>
 
 #include <atomic>
@@ -290,7 +291,7 @@ public:
    *          same prompt + same params + same seed => same tokens, on any run
    *          number. Inert for greedy decoding.
    */
-  void setSamplingSeed(uint32_t seed) { rng.seed(seed); }
+  void setSamplingSeed(uint64_t seed) { rng.seed(seed); }
 
 protected:
   /**
@@ -411,7 +412,7 @@ protected:
   unsigned int REPETITION_WINDOW;
   unsigned int global_token_len;
 
-  std::mt19937 rng; /**< Random Number Gen */
+  causallm::SamplingRng rng{causallm::kDefaultSamplingSeed}; /**< sampler RNG */
 
   LogitsProcessor *logits_processor = nullptr; /**< Non-owning processor */
 

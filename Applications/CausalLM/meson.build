@@ -450,6 +450,23 @@ if get_option('enable-test')
     suite: 'unittests'
   )
 
+  # Portable token sampler (token_sampler.h): host-only, header-only. Pins the
+  # RNG stream, same-seed reproducibility and the top-k / top-p tie rules.
+  unittest_sampling = executable(
+    'unittest_sampling',
+    meson.current_source_dir() / 'unittest_sampling.cpp',
+    dependencies: [gtest_main_dep],
+    include_directories: causallm_inc,
+    build_by_default: true,
+    install: false,
+  )
+
+  test('unittest_sampling', unittest_sampling,
+    args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_sampling'),
+    timeout: 60,
+    suite: 'unittests'
+  )
+
   unittest_kv_cache_manager = executable(
     'unittest_kv_cache_manager',
     meson.source_root() / 'test' / 'unittest' / 'layers' / 'unittest_kv_cache_manager.cpp',

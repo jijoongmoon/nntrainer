@@ -22,6 +22,7 @@
 #include <env_compat.h>
 #include <layer.h>
 #include <model.h>
+#include <token_sampler.h>
 /***************** ALAIS *******************/
 using LayerHandle = std::shared_ptr<ml::train::Layer>;
 using ModelHandle = std::unique_ptr<ml::train::Model>;
@@ -146,9 +147,12 @@ void applyBadWordsPenalty(float *logits, unsigned int *bad_words_ids,
 
 /**
  * @brief do sampling to logits with temperature, top-k, top-p
+ * @details Thin wrapper over causallm::sampleToken() in token_sampler.h,
+ *          which documents the tie and boundary rules.
  * @return Sampled token index
  */
 unsigned int applyTKP(const float *logits, int len, float temperature,
-                      unsigned int top_k, float top_p, std::mt19937 &rng);
+                      unsigned int top_k, float top_p,
+                      causallm::SamplingRng &rng);
 
 #endif // __LLM_UTIL_HPP__
