@@ -2613,6 +2613,67 @@ void MHACoreLayer::one_batch_incremental_forwarding(
       // is the whole point of the layer.
       const bool skip_q_rope = skip_prefill && (to - from) > 1;
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+      // [m2b] Publish THIS step's absolute position before anything below reads
+      // it. Under the decode-graph pair the K and V writes further down compute
+      // their destination row on the DEVICE from d_pos[0]
+      // (cuda_rope_fp16_dpos / cuda_scalar_mul_fp16_slot with out_slot_dpos),
+      // so a step that does not publish scatters its keys at whatever row the
+      // PREVIOUS step left there.
+      //
+      // Several paths reached those writes without publishing, because the only
+      // publish was inside the query-RoPE arm below:
+      //   - a skip-prefill model's prefill (skip_q_rope) leaves that arm before
+      //     the publish;
+      //   - so does a prefill whose query is not device-resident, or whose trig
+      //     table is shorter than cache_index + nrows;
+      //   - NNTR_CUDA_ROPE off skips the arm entirely.
+      // The first is the one that bites. A process's FIRST prefill starts at 0
+      // and inherits an accidentally-correct 0 from fresh device memory; a
+      // SECOND generation prefills at from > 0 and inherits the previous run's
+      // last decode position instead.
+      //
+      // Measured, Gemma-4 on a discrete part (skip_prefill = true), 1K prompt
+      // cut at 400 tokens, 64 asked for: continuing in the same process
+      // produced 5 tokens of unrelated text where the uninterrupted run
+      // produced 64, and with NNTR_CUDA_DECODE_GRAPH=0 -- which turns the slot
+      // writes off -- the two agreed. Plain multi-turn shows it with no KV
+      // resume involved, so this is not about resume: it is about any second
+      // prefill.
+      //
+      // Publishing here is an 8-byte pinned H2D on the backend stream,
+      // idempotent, and the value is the one the arm below used to set. Not
+      // while capturing: under capture CudaContext::runDecode publishes once
+      // per token before the replay, and a write inside the capture would
+      // bake it.
+      {
+        static const bool m2b_pos = nntrainer::cuda::decodeGraphEnabled();
+        if (m2b_pos && !nntrainer::cuda::StreamManager::Global().isCapturing())
+          nntrainer::cuda::cuda_set_pos((int)cache_index, (int)cache_index + 1);
+      }
+      // [m2b] ...and the device-slot writes themselves belong to a step that
+      // can be REPLAYED, which is a single-token decode step and nothing else.
+      // The decode graph is only ever captured for (to - from) == 1 (the
+      // prefill capture is a separate lever and only at from == 0, where it
+      // records the direct writes), so on a multi-token step the slot form buys
+      // nothing and costs the guarantee that the destination is known on the
+      // host.
+      //
+      // It cost exactly that. A resumed prefill (from > 0, many rows) went
+      // through the slot kernels, whose destination row is d_pos[0] + row/width
+      // read on the DEVICE, and landed its keys outside the range the run then
+      // attended: dumping the cache after a 400 -> 842 resumed prefill showed
+      // the planes from layer 3 onward still ZERO at rows 400..841 (17.6 MB of
+      // 36 MB differing from the same resume done in a fresh process, and all
+      // of it zero on the failing side). The answer stayed fluent for five
+      // tokens and then stopped. With NNTR_CUDA_DECODE_GRAPH=0 -- i.e. with the
+      // direct writes -- the cache came out byte-identical to the uninterrupted
+      // run.
+      //
+      // A process's FIRST prefill hid this: it starts at row 0, and the direct
+      // and slot forms then agree for as long as d_pos still holds the 0 it was
+      // allocated with. Only a second prefill in the same process (multi-turn,
+      // or a resume) starts anywhere else.
+      const bool m2b_replayable_step = (to - from) == 1;
       // GPU RoPE (decode, device-resident query): split-half rotation on the
       // device matching apply_rotary_emb_tensor_v2, keeping the query off the
       // host. Opt-in (NNTR_CUDA_ROPE) until the whole decode chain is on-GPU.
@@ -2657,15 +2718,11 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                 q_rope_gpu = true;
               } else if (cosd && sind) {
                 // M2-B: read the RoPE position from the device d_pos buffer so
-                // a captured decode graph stays valid across tokens. Set d_pos
-                // here only when NOT capturing (non-graph decode); under
-                // capture CudaContext::runDecode sets it once per token before
-                // the replay (and once inside the capture).
+                // a captured decode graph stays valid across tokens. The
+                // publish moved up to the top of this block, where every path
+                // that reaches the K/V slot writes passes through it.
                 static const bool m2b = nntrainer::cuda::decodeGraphEnabled();
-                if (m2b) {
-                  if (!nntrainer::cuda::StreamManager::Global().isCapturing())
-                    nntrainer::cuda::cuda_set_pos((int)cache_index,
-                                                  (int)cache_index + 1);
+                if (m2b && m2b_replayable_step) {
                   q_rope_gpu = nntrainer::cuda::cuda_rope_fp16_dpos(
                     q, q, cosd, sind, query_step.width() / head_dim, head_dim,
                     (int)nrows, /*out_slot_dpos=*/0);
@@ -2739,7 +2796,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
               const unsigned short *sind =
                 rope_lut_device(cached_freqs_sin_fp16, half);
               static const bool m2b_k = nntrainer::cuda::decodeGraphEnabled();
-              if (cosd && sind && m2b_k) {
+              if (cosd && sind && m2b_k && m2b_replayable_step) {
                 // M2-B: write RoPE'd K into the cache at the live slot computed
                 // on-device from d_pos[0] (kbase = cache BASE for this batch,
                 // not the host pre-offset b_cache_key_step) -> correct slot on
@@ -2816,7 +2873,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
           static const bool m2b_v = nntrainer::cuda::decodeGraphEnabled();
           if (cuda_elt && dev &&
               (value_step.height() == 1 || vcopy_prefill || v_dev_only)) {
-            if (m2b_v) {
+            if (m2b_v && m2b_replayable_step) {
               // M2-B: write V into the cache at the live slot d_pos[0] computed
               // on-device (vbase = cache BASE for this batch) -> correct on
               // replay.
