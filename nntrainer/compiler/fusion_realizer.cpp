@@ -27,7 +27,7 @@ FusionRealizer::realize(const GraphRepresentation &reference) {
   /// in-place onto the fusible compute nodes).
   GraphRepresentation processed(reference.begin(), reference.end());
 
-  /// opt-in by default; NNTR_FUSE_ACT=0 disables the fusion (falls back to the
+  /// on by default; NNTR_FUSE_ACT=0 disables the fusion (falls back to the
   /// standalone ActivationLayer that ActivationRealizer would split out).
   const char *gate = std::getenv("NNTR_FUSE_ACT");
   const bool enabled = (gate == nullptr) || (gate[0] != '0');

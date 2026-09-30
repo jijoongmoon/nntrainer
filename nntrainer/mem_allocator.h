@@ -27,7 +27,7 @@ class MemoryPool;
  * @brief MemAllocator, Memory allocator class
  *
  * Backend-pluggable allocator for MemoryPool. The default implementation
- * uses std::aligned_alloc (zero-initialized), so MemoryPool no longer
+ * uses std::aligned_alloc (not zero-initialized), so MemoryPool no longer
  * embeds calloc/SVM/rpcmem dispatch via macros. Per-vendor Contexts
  * (ClContext, QNNContext) install their own subclass through
  * ContextData::setMemAllocator(). MemoryPool then takes the allocator
@@ -47,7 +47,8 @@ public:
    *                       caller passes the page size or a smaller value
    *                       depending on the use case
    *
-   * The default implementation uses std::aligned_alloc and zero-fills.
+   * The default implementation uses std::aligned_alloc (_aligned_malloc on
+   * Windows) and does not zero-fill the memory.
    * Subclasses (ClSVMAllocator, QNNRpcManager) override to plumb the
    * vendor allocator instead.
    */

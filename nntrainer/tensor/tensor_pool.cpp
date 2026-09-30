@@ -442,7 +442,7 @@ void TensorPool::expandLifespan(RequestSpec &spec,
     << spec.tensor->getName();
 
   if (details.lifespan != TensorLifespan::UNMANAGED) {
-    /// update only if lifespan is unmanaged
+    /// update only if lifespan is not unmanaged
     details.lifespan =
       enum_class_or<TensorLifespan>(details.lifespan, lifespan);
   }

@@ -164,8 +164,8 @@ void MemoryPool::allocate() {
 
   // Single contiguous buffer routed through the per-vendor allocator.
   // For ClSVMAllocator this returns SVM memory directly addressable
-  // by both host and device; the base allocator returns page-aligned,
-  // zero-initialised host memory.
+  // by both host and device; the base allocator returns page-aligned
+  // host memory that is not zero-initialised.
   allocator_->alloc(&mem_pool, pool_size, system_page_size());
   owned_buffers_.push_back(mem_pool);
 
@@ -280,7 +280,8 @@ std::shared_ptr<MemoryData> MemoryPool::getMemory(unsigned int idx) {
   // answers something else, silently. The flags belong to the TOKEN, not to
   // the allocator: no memory, no planes.
   mem_data->setSVM(shared != nullptr && allocator_->isSVM());
-  // Same rule for host addressability: a device-only plane (cudaMalloc) must be
+  // Host addressability is taken from the allocator alone (a null-slice token
+  // is not special-cased here): a device-only plane (cudaMalloc) must be
   // staged, never dereferenced, and the allocator is the only thing that knows.
   mem_data->setHostAddressable(allocator_->isHostAddressable());
   return mem_data;

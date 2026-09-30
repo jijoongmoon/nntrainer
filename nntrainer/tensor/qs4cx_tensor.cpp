@@ -69,11 +69,15 @@ void readLegacyQint4ToQs4cx(
  * @brief Is this process's QS4CX payload allocation load-destined, i.e. may
  *   allocate() hand back UNINITIALIZED memory?
  *
- * NNTR_QS4CX_HEAP_BYPASS is exactly the "self-owned weight payload about to be
- * filled from the model file" signal: Manager::requestWeights only takes the
- * bypass branch (weight_pool.request(UNMANAGED) + var->allocate()) under it,
- * and every QS4CX tensor reached that way is a weight (the only other producer
- * is the offline quantize tool, which never sets this env). Both zero passes
+ * The resolved heap-bypass decision (qs4cxHeapBypassOn():
+ * NNTR_QS4CX_HEAP_BYPASS if set, else ON on Android and OFF elsewhere) is the
+ * "self-owned weight payload about to be filled from the model file" signal:
+ * Manager::requestWeights only takes the bypass branch
+ * (weight_pool.request(UNMANAGED) + var->allocate()) under it, and every QS4CX
+ * tensor reached that way is a weight. Any other producer that allocates a
+ * QS4CX_Tensor while the decision resolves ON (for example the offline
+ * quantize tool run on Android) also gets uninitialized memory and must write
+ * all size() bytes itself. Both zero passes
  * allocate() used to do -- `new uint8_t[size()]{}` and initialize()->setZero()
  * -- are dead stores there: the payload is subsequently overwritten IN FULL,
  * either by TensorBase::read (bytes() == size() for QS4CX) or by copy_qs4cx.
@@ -318,8 +322,9 @@ size_t QS4CX_Tensor::size() const {
    * per tensor with setQs4cxRecordPadded(); getScale() and pack() then index
    * the scales at whichever stride was selected. NeuralNetwork::load() is
    * that caller: it lays the whole file out at the padded stride, then
-   * re-walks at the trimmed one once the file size shows the file fits only
-   * the trimmed total.
+   * re-walks at the trimmed one when the file size fits only the trimmed
+   * total, or when the size also fits the padded total and the first QS4CX
+   * record's own bytes read as trimmed (qs4cxRecordStride()).
    */
   return recordBytes(height(), width(), isQs4cxRecordPadded());
 }

@@ -1177,7 +1177,9 @@ enum class Qs4cxRecordStride {
  *
  * The two strides differ only by the floor(N/2) pad bytes the padded layout
  * keeps between a record's nibbles and its scales. The writer never touches
- * that pad -- QS4CX_Tensor zero-fills the record and the quantiser writes
+ * that pad -- QS4CX_Tensor zero-fills the record while the heap bypass is
+ * resolved off (a writer running with it on, e.g. on Android, leaves the pad
+ * uninitialized and this probe can misread it) and the quantiser writes
  * strictly inside the N * ceil(K/2) nibbles -- so under the padded layout the
  * bytes right after the nibbles are zero, while under the trimmed layout they
  * are the first per-channel scale, which is a strictly positive finite
@@ -1230,8 +1232,10 @@ void NeuralNetwork::load(const std::string &file_path,
   // A QINT4 record's on-disk size depends on its container: the shared
   // plain container (qscheme PER_CHANNEL_AFFINE at the record head; the
   // PR#3978 form) carries fp32 scales plus KAI pad and is NOT the in-memory
-  // Section A size that getMemoryBytes() reports. Peek each QINT4 record's
-  // qscheme so the running offset matches the actual file layout.
+  // size that getMemoryBytes() reports. QINT4 is an on-disk format only
+  // (Tensor refuses to build a QINT4 tensor), so int4 records reach this walk
+  // as QS4CX weights and the legacy_int4_model branch below peeks each
+  // record's qscheme so the running offset matches the actual file layout.
   std::ifstream qint4_peek_stream;
   bool qint4_peek_tried = false;
   // A legacy QINT4 model (model_tensor_type "QINT4-*") now builds QS4CX
@@ -1308,13 +1312,15 @@ void NeuralNetwork::load(const std::string &file_path,
             tensor_data_type != TensorDim::DataType::QS4CX) {
           // for tensor with qparam
           size += sizeof(uint16_t);
-          // ... but only CharTensor, ShortTensor, Uint4QTensor and BCQTensor
-          // actually override save()/read() to write and consume that byte
-          // pair. Q4_K and the plain UINT8/16/32 tensors have no override, so
-          // their records carry no qparam header and are 2 bytes smaller on
-          // disk than accounted here. UINT4 is ambiguous: with qscheme Q4_Kx8
-          // it materialises as a Q4_K_Tensor and behaves like Q4_K. Track that
-          // so the size check below only speaks where it can be believed.
+          // ... but only CharTensor, ShortTensor, UIntTensor (UINT8/16/32),
+          // Uint4QTensor and BCQTensor actually override save()/read() to
+          // write and consume that byte pair. Q4_K has no override, so its
+          // records carry no qparam header and are 2 bytes smaller on disk
+          // than accounted here. UINT4 is ambiguous: with qscheme Q4_Kx8 it
+          // materialises as a Q4_K_Tensor and behaves like Q4_K. UINT8/16/32
+          // are excluded from the exact check as well, conservatively. Track
+          // that so the size check below only speaks where it can be
+          // believed.
           if (tensor_data_type == TensorDim::DataType::Q4_K ||
               tensor_data_type == TensorDim::DataType::UINT4 ||
               tensor_data_type == TensorDim::DataType::UINT8 ||
@@ -2042,8 +2048,9 @@ void NeuralNetwork::load(const std::string &file_path,
         weight->getVariableRef().setFileOffset(file_off);
 
         // Resolve the QS4CX record stride from the header, which is the one
-        // place a stride is written down: the .bin has to infer it from the
-        // whole file's size because a record names neither of the two, but a
+        // place a stride is written down: the .bin has to infer it (from the
+        // whole file's size, then from the first QS4CX record's bytes) because
+        // a record names neither of the two, but a
         // safetensors entry carries this tensor's own byte extent. So no
         // inference and no per-file assumption here -- ask the record that was
         // actually written. A weight whose extent matches neither stride is

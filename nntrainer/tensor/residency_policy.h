@@ -12,7 +12,7 @@
  *
  * @details The residency planner decides where a tensor lives from facts core
  * owns: the producing layer's compute engine, whether every consumer is on the
- * same engine, and the data type. Three facts it cannot derive belong to the
+ * same engine, and the data type. Four facts it cannot derive belong to the
  * model rather than to core, and an application declares them here once before
  * the graph allocates:
  *
@@ -43,9 +43,10 @@ namespace nntrainer {
  *
  * @details WRITE WINDOW, and the limits that follow from it. The policy is a
  * process-wide singleton the application fills in ONCE, before it builds any
- * model, and does not touch again. Two separate reads depend on that:
- * Manager::requestInputs() consults isEngineNeutral() while the graph is being
- * built, and TensorPool::allocate() reads the pattern lists at allocation. A
+ * model, and does not touch again. Two separate phases read it:
+ * Manager::requestInputs() and LayerNode::finalize() consult isEngineNeutral()
+ * while the graph is being built, and TensorPool::allocate() (the pattern
+ * lists) and ClBufferPool (skip_shared_slice) read it at allocation. A
  * write between those two points produces a graph planned against one policy
  * and allocated against another, and nothing diagnoses it -- the placements
  * simply disagree with the consumer votes that were recorded earlier.

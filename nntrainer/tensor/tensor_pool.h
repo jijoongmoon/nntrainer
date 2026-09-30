@@ -348,7 +348,7 @@ public:
   bool checkLoadComplete(unsigned int order);
 
   /**
-   * @brief load cache data by execution order
+   * @brief unload cache data by execution order (asynchronously)
    *
    * @param order execution order
    * @return async task id
@@ -357,7 +357,7 @@ public:
                           TaskExecutor::CompleteCallback complete_callback);
 
   /**
-   * @brief load cache data by execution order
+   * @brief cancel an asynchronous cache task
    *
    * @param id async task id
    */
@@ -518,7 +518,7 @@ private:
                      can recreate the pool with the same backend
                      without re-resolving from the engine. */
   std::shared_ptr<MemoryPool> mem_pool;      /**< memory pool for the tensors */
-  std::unique_ptr<CacheLoader> cache_loader; /**< memory pool for the tensors */
+  std::unique_ptr<CacheLoader> cache_loader; /**< async loader for cache pool */
 
   /**
    * @brief     Check if the lifespan leads to long term valitidy

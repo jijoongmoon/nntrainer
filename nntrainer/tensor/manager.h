@@ -137,14 +137,6 @@ public:
     exec_mode(ExecutionMode::TRAIN) {}
 
   /**
-   * @brief     Constructor of Manager
-   *
-   * @param allocator backend allocator from the engine's Context
-   *        (CPU / SVM / RPC). Forwarded into both the weight and the
-   *        tensor pools so all dynamically requested memory comes
-   *        from the same source. Default = host CPU memory.
-   */
-  /**
    * @brief Pick the activation-pool allocator. Default = the same allocator as
    *        the weight pool. On engine=cuda with NNTR_CUDA_DEV_ACT enabled,
    *        return a device-only (cudaMalloc) allocator so the activation
@@ -168,6 +160,15 @@ public:
     return allocator;
   }
 
+  /**
+   * @brief     Constructor of Manager
+   *
+   * @param allocator backend allocator from the engine's Context
+   *        (CPU / SVM / RPC). Forwarded to the weight pool as is, and to
+   *        the tensor pool through activationAllocator(), which may
+   *        substitute a device-only allocator (engine=cuda with
+   *        NNTR_CUDA_DEV_ACT). Default = host CPU memory.
+   */
   Manager(bool enable_fsu_, const std::string &fsu_path = "",
           unsigned int lookahead = 0, const std::string tensor_format_ = "NCHW",
           const std::string tensor_dtype_ = "FP32-FP32",
@@ -250,10 +251,15 @@ public:
     bool trainable, const std::vector<std::string> &shared_names = {});
 
   /**
-   * @brief     Create tensors with the given spec
+   * @brief     Create the optimizer variables of a weight
    *
-   * @param node Graph node to extract node identifiers/info
-   * @param tensors_spec Specification for the tensors
+   * @param dims dimensions of the optimizer variables
+   * @param name name of the weight they belong to
+   * @param suffix suffix appended to @a name for each variable
+   * @param lifespan lifespan of the variables
+   * @param is_grad_clip whether the weight is gradient-clipped
+   * @param is_mixed_type whether the weight is trained in mixed precision
+   * @param initializer initializer of the variables
    *
    * @return created tensors list
    */
@@ -511,9 +517,8 @@ public:
    * @brief flush cache data except the order
    *
    * @param order except execution order
-   * @param lookahead preloading size
    * @note preloading loads execution order data asynchronously,
-   *       for lookahead size. If new flush request arrives,
+   *       for the manager's lookahead size. If new flush request arrives,
    *       it waits previous preloading is completed and invokes new one.
    */
   void flushCacheExcept(unsigned int order);

@@ -36,7 +36,7 @@ namespace nntrainer {
  * Allocation and deallocation are routed through an injected
  * MemAllocator so per-vendor backends (CPU, GPU-SVM, NPU-RPC) plug in
  * without #ifdef branches inside the pool. The default ctor uses the
- * base MemAllocator (page-aligned host memory, zero-initialised); CL
+ * base MemAllocator (page-aligned host memory, not zero-initialised); CL
  * and QNN install ClSVMAllocator / QNNRpcManager via their Context.
  */
 class MemoryPool {
@@ -121,7 +121,7 @@ public:
   /**
    * @brief Get the allocated memory
    *
-   * @param token The token received from the requestMemory
+   * @param idx The token received from the requestMemory
    *
    * @return The pointer of the memory
    *

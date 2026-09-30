@@ -6,7 +6,8 @@
  * @date   06 September 2026
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @bug    No known bugs except for NYI items
- * @brief  Env-gated stopwatch for the phases inside the weight load.
+ * @brief  Env-gated stopwatch for the phases inside the weight load, plus
+ *         the init phases around it (context, kernels, graph).
  *
  * `model->load_weight()` is 78% of a warm init on a handset, and until now it
  * was one number. This splits it into the file map, the byte read, the GPU
@@ -14,9 +15,9 @@
  * and the page reaper, accumulating nanoseconds per slot across every loader
  * worker so a serial pole shows up as busy-time close to wall-time.
  *
- * Everything here is inert unless NNTR_LOAD_TRACE is set: `on()` is one
- * function-local static bool and every Scope's constructor returns
- * immediately when it is false.
+ * Everything here is inert unless NNTR_LOAD_TRACE or NNTR_INIT_TRACE is set:
+ * `on()` is one function-local static bool and every Scope's constructor
+ * returns immediately when it is false.
  */
 #ifndef __LOAD_TRACE_H__
 #define __LOAD_TRACE_H__

@@ -7,12 +7,15 @@
  * @see     https://github.com/nntrainer/nntrainer
  * @author  Jijoong Moon <jijoong.moon@samsung.com>
  * @bug     No known bugs except for NYI items
- * @brief   POSIX setenv() shim for MSVC. The GPU contexts apply their
- *          HW-optimal env defaults with setenv(name, value, overwrite=0)
- *          ("explicit env always wins"); MSVC only has _putenv_s, which
- *          unconditionally overwrites, so the overwrite=0 semantics are
- *          reproduced with a getenv() check. Include this in any TU that
- *          calls setenv() and must also build on Windows. No-op elsewhere.
+ * @brief   Env helpers shared by every platform -- nntr_engine_env()
+ *          (NNTR_ENGINE lowercased) and nntr_env_on() (value-checked
+ *          on/off) -- plus a POSIX setenv() shim for MSVC. The GPU contexts
+ *          apply their HW-optimal env defaults with setenv(name, value,
+ *          overwrite=0) ("explicit env always wins"); MSVC only has
+ *          _putenv_s, which unconditionally overwrites, so the overwrite=0
+ *          semantics are reproduced with a getenv() check. Include this in
+ *          any TU that calls setenv() and must also build on Windows; the
+ *          shim is compiled only on _WIN32.
  */
 
 #ifndef __NNTR_ENV_COMPAT_H__
