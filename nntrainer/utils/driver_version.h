@@ -37,6 +37,9 @@ namespace nntrainer {
  *        String versions are whatever the vendor reported, verbatim.
  */
 struct DriverVersionInfo {
+  bool cuda_probed = false;     /**< probeCuda() ran (see the engine-scoped
+                                     queryDriverVersions overload) */
+  bool opencl_probed = false;   /**< probeOpenCl() ran */
   bool cuda_present = false;    /**< CUDA driver library loadable */
   int cuda_driver_version = 0;  /**< cuDriverGetVersion() */
   int cuda_runtime_version = 0; /**< cudaRuntimeGetVersion(), 0 if no cudart */
@@ -102,6 +105,29 @@ const std::vector<DriverRequirement> &driverRequirements();
  *        inside a process); pass force=true to re-probe.
  */
 const DriverVersionInfo &queryDriverVersions(bool force = false);
+
+/**
+ * @brief Probe only what @p engine needs ("cuda", "gpu" (OpenCL), "cpu"), so a
+ *        caller that already knows its backend does not pay for the other
+ *        vendor's runtime load + device enumeration.
+ * @details An empty @p engine means "probe everything", i.e. the overload
+ *          above. Results accumulate in one process-wide record: a later call
+ *          naming the other engine fills in the half that was skipped, and
+ *          formatDriverVersions() says "not probed" for a half nobody asked
+ *          for rather than claiming it is absent. NNTR_DRIVER_PROBE_ALL=1
+ *          restores the unconditional both-backend probe.
+ */
+const DriverVersionInfo &queryDriverVersions(const std::string &engine,
+                                             bool force = false);
+
+/**
+ * @brief Deleted: a `const char *` engine would otherwise convert to the
+ *        `bool force` overload above by a standard pointer-to-bool conversion
+ *        and win overload resolution, silently probing everything. Callers pass
+ *        a std::string.
+ */
+const DriverVersionInfo &queryDriverVersions(const char *engine,
+                                             bool force = false) = delete;
 
 /**
  * @brief One-line-per-item human report of @p info, for logs and for

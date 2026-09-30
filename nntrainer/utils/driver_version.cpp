@@ -410,27 +410,76 @@ const std::vector<DriverRequirement> &driverRequirements() {
   return rows;
 }
 
+/**
+ * NNTR_DRIVER_PROBE_ALL=1 restores the unconditional both-backend probe.
+ * Default off: a caller that names one engine gets that engine probed only.
+ */
+static bool probeAllForced() {
+  static const bool v = []() {
+    const char *e = std::getenv("NNTR_DRIVER_PROBE_ALL");
+    return e != nullptr && e[0] != '0';
+  }();
+  return v;
+}
+
 const DriverVersionInfo &queryDriverVersions(bool force) {
+  return queryDriverVersions(std::string(), force);
+}
+
+const DriverVersionInfo &queryDriverVersions(const std::string &engine,
+                                             bool force) {
   static std::mutex mutex;
   static DriverVersionInfo info;
-  static bool probed = false;
+  static bool did_cuda = false;
+  static bool did_opencl = false;
+  static bool did_wddm = false;
   std::lock_guard<std::mutex> lock(mutex);
 
-  if (probed && !force)
-    return info;
+  if (force) {
+    info = DriverVersionInfo();
+    did_cuda = did_opencl = did_wddm = false;
+  }
 
-  info = DriverVersionInfo();
-  probeCuda(info);
-  probeOpenCl(info);
-  probeWddm(info);
-  probed = true;
+  /** Each probe dlopen()s a vendor runtime and enumerates its devices, and on
+   *  this class of machine the irrelevant half is the expensive one: probeCuda
+   *  calls cuInit(0), which wakes a suspended discrete GPU, and probeOpenCl
+   *  loads every installed ICD, the NVIDIA one included. A caller that names an
+   *  engine therefore pays for a verdict it will not read -- measured 215 ms of
+   *  a 572 ms warm OpenCL LOAD and 146 ms of a 471 ms warm CUDA one on an
+   *  Intel-Xe + RTX-5060 host. An empty engine keeps the old meaning ("tell me
+   *  about this machine") and probes everything, so getDriverVersions() and the
+   *  NPU verdict path are unchanged. */
+  const bool all = engine.empty() || probeAllForced();
+  const bool want_cuda = all || engine == "cuda";
+  const bool want_opencl = all || engine == "gpu";
+
+  if (want_cuda && !did_cuda) {
+    probeCuda(info);
+    did_cuda = true;
+  }
+  if (want_opencl && !did_opencl) {
+    probeOpenCl(info);
+    did_opencl = true;
+  }
+  /** WDDM reads a driver string; it neither loads a runtime nor wakes a device,
+   *  so it is not worth deferring. */
+  if (!did_wddm) {
+    probeWddm(info);
+    did_wddm = true;
+  }
+  info.cuda_probed = did_cuda;
+  info.opencl_probed = did_opencl;
   return info;
 }
 
 std::string formatDriverVersions(const DriverVersionInfo &info) {
   std::ostringstream os;
 
-  if (info.cuda_present) {
+  if (!info.cuda_probed) {
+    /** Not "absent": nobody asked. Saying absent here would turn a deferred
+     *  probe into a false machine report. */
+    os << "cuda driver not probed";
+  } else if (info.cuda_present) {
     os << "cuda driver " << (info.cuda_driver_version / 1000) << "."
        << ((info.cuda_driver_version % 1000) / 10);
     if (info.cuda_runtime_version > 0)
@@ -442,7 +491,9 @@ std::string formatDriverVersions(const DriverVersionInfo &info) {
   }
 
   os << " | ";
-  if (info.opencl_present) {
+  if (!info.opencl_probed) {
+    os << "opencl not probed";
+  } else if (info.opencl_present) {
     os << "opencl " << info.opencl_platform_version << " ["
        << info.opencl_platform_name << "] device '" << info.opencl_device_name
        << "' driver " << info.opencl_driver_version;
