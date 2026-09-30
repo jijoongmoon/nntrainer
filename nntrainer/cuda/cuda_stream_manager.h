@@ -61,12 +61,14 @@ public:
   void finish();
 
   /**
-   * @brief Conditional drain: finish() unless NNTR_CUDA_ASYNC=1. Per-op
+   * @brief Conditional drain: finish() unless async mode is on. Per-op
    *        cudaStreamSynchronize is ~90% of decode wall time (it serializes
-   *        CPU/GPU); once every decode op is on-GPU (no host op reads UVM
-   *        mid-chain), NNTR_CUDA_ASYNC=1 turns these into no-ops so the GPU
-   *        pipeline fills and only the final host read (sampling) drains once
-   *        per token. Until then, default (sync) keeps coherence.
+   *        CPU/GPU); with every decode op on-GPU (no host op reads UVM
+   *        mid-chain), NNTR_CUDA_ASYNC=1 on a non-integrated part turns these
+   *        into no-ops so the GPU pipeline fills and only the final host read
+   *        (sampling) drains once per token. CudaContext defaults it on
+   *        together with the device-only activation pool (NNTR_CUDA_DEV_ACT);
+   *        without that pool it stays off and the drains keep coherence.
    */
   void maybeFinish();
 
@@ -88,11 +90,12 @@ public:
    *        (an in-capture cudaStreamSynchronize is illegal -- drains are
    * deferred to after the graph replay). Returns false if the stream is missing
    * / begin fails.
-   * @note  Decode CUDA-graph (NNTR_CUDA_GRAPH) foundation. Capturing the whole
-   *        per-token forward additionally needs the embedding host-staging
-   *        buffers (embedding_layer.cpp / tie_word_embedding.cpp `emb_stage`)
-   * to be PERSISTENT + PINNED (a local std::vector is freed before the graph
-   *        replays, and a pageable cudaMemcpyAsync is not capturable). TODO.
+   * @note  Decode CUDA-graph (NNTR_CUDA_GRAPH) foundation; the whole
+   *        per-token forward is captured by CudaContext::runDecode. That
+   *        relies on the embedding host-staging buffers (embedding_layer.cpp
+   *        / tie_word_embedding.cpp `emb_stage`) being PERSISTENT + PINNED
+   *        (cudaHostAlloc): a local std::vector would be freed before the
+   *        graph replays, and a pageable cudaMemcpyAsync is not capturable.
    */
   bool beginCapture();
 
@@ -169,9 +172,11 @@ private:
 int *cuda_pos_buffer();
 
 /**
- * @brief Update the per-token decode position (8-byte H2D on the backend
- * stream, issued OUTSIDE graph capture, ordered before the cudaGraphLaunch that
- *        reads it). pos == cache_index for the token; n_kv == pos+1.
+ * @brief Update the per-token decode position (8-byte H2D from a pinned host
+ *        slot on the backend stream). CudaContext::runDecode calls it before
+ *        each replay (outside capture, ordered before the cudaGraphLaunch that
+ *        reads it) and once inside the capture, where the copy is recorded
+ *        as a graph node. pos == cache_index for the token; n_kv == pos+1.
  */
 void cuda_set_pos(int pos, int n_kv);
 

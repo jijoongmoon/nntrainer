@@ -72,8 +72,9 @@ public:
    *        memory while kernels are in flight
    * (cudaDevAttrConcurrentManagedAccess). Linux discrete GPUs: 1. Windows WDDM:
    * 0 -- there, host access to ANY managed allocation is only legal while the
-   * device is idle (pre-Pascal model), so async submission and the discrete env
-   *        add-ons tuned around cMA=1 must be gated off.
+   * device is idle (pre-Pascal model), so such a part must not touch managed
+   *        memory mid-kernel: CudaContext gives it pinned host-mapped and
+   *        device-only pools instead (its WDDM profile), not async-off.
    */
   bool concurrentManagedAccess() const { return concurrent_managed_access_; }
 
@@ -169,8 +170,8 @@ private:
  * @brief True iff this run selected the CUDA engine (NNTR_ENGINE=cuda, any
  *        case -- the same lowercased read the Engine and CudaContext use,
  *        static-cached). The residency probes below and every shared-layer
- *        CUDA touch must short-circuit on this: cudart is statically linked,
- *        so on a non-cuda run of the unified binary the first cudart call
+ *        CUDA touch must short-circuit on this: on a non-cuda run of a
+ *        binary that links cudart, the first cudart call
  *        boots the runtime (LoadLibrary nvcuda + driver init) wherever it
  *        lands — with the engine-gated context bring-up (engine.cpp) no longer
  *        hiding it at startup, that was the first forward = inside the timed
@@ -189,8 +190,9 @@ void drain_if_async();
 
 /**
  * @brief  Is pointer @p p reachable by a CUDA kernel? Accepts Managed/Device
- *         always; on an INTEGRATED GPU (Tegra/Orin) also accepts Host, because
- *         there cudaMallocManaged memory can report as cudaMemoryTypeHost yet
+ *         always, and pinned host-mapped memory (Host with a device pointer)
+ *         on any GPU. On an INTEGRATED GPU (Tegra/Orin) it also accepts Host,
+ * because there cudaMallocManaged memory can report as cudaMemoryTypeHost yet
  * is GPU-accessible (one shared physical pool). Without this every dev() gate
  * rejects the (managed) activation pool on Orin and the GPU ops silently fall
  * to the host => correct-but-slow (2 TPS). Single source of truth for the

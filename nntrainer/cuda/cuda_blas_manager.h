@@ -9,7 +9,8 @@
  * @bug     No known bugs except for NYI items
  * @brief   Owns the process-lifetime cuBLAS handle, bound to the CUDA backend
  *          stream. Kept separate from StreamManager so cublas_v2.h stays out of
- *          the core runtime headers. Used by CudaFcLayer (and later GEMM ops).
+ *          the core runtime headers. Used by CudaComputeOps::fc, the QS4CX int8
+ *          GEMM and the GEMM attention path.
  */
 
 #ifndef __CUDA_BLAS_MANAGER_H__

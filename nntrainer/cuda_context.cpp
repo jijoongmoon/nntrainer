@@ -49,9 +49,9 @@ std::mutex cuda_factory_mutex;
 
 CudaContext &CudaContext::Global() {
   // Out-of-line + intentionally leaked (see header note): matches the
-  // never-destroy convention adopted for the whole GPU-context singleton
-  // family (ClContext::Global(), cuda::ContextManager/StreamManager/
-  // BlasManager::Global()) after the 2026-07-20 shared+cuda exit crash.
+  // never-destroy convention of the CUDA singleton family
+  // (cuda::ContextManager/StreamManager/BlasManager::Global()) adopted after
+  // a shared+cuda exit crash. ClContext::Global() does not follow it.
   static CudaContext *instance = new CudaContext();
   instance->initializeOnce();
   return *instance;
@@ -133,16 +133,16 @@ const DeviceCaps &CudaContext::caps() const {
 
 void CudaContext::initialize() noexcept {
   try {
-    // [r20 fresh-init tax] On a dual-backend build this runs at the FIRST
-    // Engine::Global() touch of ANY run — including engine=cpu/gpu — and
-    // cudaInit()'s cuInit wakes a runtime-PM-suspended dGPU over PCIe
+    // [r20 fresh-init tax] Engine only constructs this context when
+    // NNTR_ENGINE=cuda (or NNTR_CUDA_EAGER_CTX); this gate repeats that test
+    // for any other caller of Global(), because a bring-up here runs
+    // cudaInit(), whose cuInit wakes a runtime-PM-suspended dGPU over PCIe
     // (measured: nvidia-smi-alone D3cold wake 2.27s on RTX 5060 = the whole
     // "fresh intel init +2.4s" constant; waking the card first drops a fresh
     // intel init from 3451 to 1133 ms). Defer the bring-up when CUDA is not
-    // the active engine: explicit NNTR_ENGINE != cuda, or NNTR_ENGINE unset
-    // on an OpenCL-enabled build (where the engine default is "gpu",
-    // mirroring causallm_engine()). Non-cuda runs never legitimately touch
-    // this context (prewarm/StreamManager gate on the engine string).
+    // the active engine: NNTR_ENGINE (any case) other than cuda, or unset, on
+    // every build. Non-cuda runs never legitimately touch this context
+    // (prewarm/StreamManager gate on the engine string).
     //
     // This test MUST match Engine::add_default_object()'s gate for "cuda"
     // exactly: same environment variable, same escape hatch, same default.
@@ -212,8 +212,9 @@ void CudaContext::initialize() noexcept {
       // every op. This is only legal when the driver reports concurrent
       // managed access -- without it (notably the Windows WDDM model) a host
       // touch of managed memory with kernels in flight is an access violation
-      // rather than a race, so an integrated or WDDM device keeps the
-      // conservative profile.
+      // rather than a race, so an integrated device keeps the conservative
+      // profile; a discrete part without it (WDDM) gets the equivalent
+      // profile in the branch below.
       // Async submission (no per-op drain) is worth roughly +75 % prefill and
       // +100 % decode on a 1K cell, but it is only COHERENT when no host op
       // sits in the middle of the device chain: dropping the drains means a
@@ -247,7 +248,7 @@ void CudaContext::initialize() noexcept {
       // NNTR_CUDA_DEV_ACT=0 restores the managed activation pool and with it
       // drained submission (async is only auto-enabled alongside the pool),
       // NNTR_CUDA_VCOPY_PREFILL=0 puts the prefill V-copy back on the host,
-      // and NNTR_DETERMINISTIC=1 keeps drained submission with the pool on.
+      // and NNTR_CUDA_ASYNC=0 keeps drained submission with the pool on.
       setenv("NNTR_CUDA_DEV_ACT", "1", 0);
       setenv("NNTR_CUDA_VCOPY_PREFILL", "1", 0);
       // Async submission is auto-enabled alongside the device-only pool; the
@@ -327,7 +328,8 @@ void CudaContext::initialize() noexcept {
     //
     // The rule itself is unchanged: async is coherent only with the pool (a
     // host op in the middle of an undrained chain reads bytes a kernel is still
-    // writing), and NNTR_DETERMINISTIC=1 keeps the drains. The runtime gate in
+    // writing), and an explicit NNTR_CUDA_ASYNC=0 keeps the drains
+    // (NNTR_DETERMINISTIC no longer does, see below). The runtime gate in
     // cuda_stream_manager additionally requires a non-integrated part.
     {
       const char *dev_act = getenv("NNTR_CUDA_DEV_ACT");
@@ -373,9 +375,9 @@ void CudaContext::initialize() noexcept {
     // What still gates the path is the model's own declaration of the nodes a
     // replay must re-run on the host (NeuralNetwork::getGraphReplayFeedNodes):
     // a model that declares none never reaches the capture at all, so this
-    // default cannot reach an unverified model. In this tree nothing declares
-    // them yet -- the declaration is written by the model, so the default is
-    // inert here and becomes effective when a model opts in.
+    // default cannot reach an unverified model. The declaration is written by
+    // the model (the CausalLM Gemma-4 model declares its embedding nodes), so
+    // for every model that does not opt in the default is inert.
     //
     // Why it is worth defaulting: the replay's saving is per-launch submission
     // cost, which is ~nothing on a Linux discrete part (measured 133 vs 133
@@ -411,9 +413,11 @@ void CudaContext::initialize() noexcept {
     add_default_object();
 
     // Unified-Memory allocator: MemoryPool buffers for engine=cuda tensors are
-    // cudaMallocManaged -> host-addressable AND device-accessible (the SVM
-    // analogue), so a tensor on this context is device-resident with no
-    // separate copy step. Falls back to host memory if UVM is unavailable.
+    // cudaMallocManaged (pinned host-mapped on a cMA=0 part) ->
+    // host-addressable AND device-accessible (the SVM analogue), so a tensor on
+    // this context is device-resident with no separate copy step. Falls back to
+    // host memory if UVM is unavailable. With NNTR_CUDA_DEV_ACT the activation
+    // pool is device-only cudaMalloc instead (Manager::activationAllocator).
     setMemAllocator(std::make_shared<CudaMemAllocator>());
 
     // ComputeOps = the CUDA op table. CudaComputeOps derives from CpuComputeOps
@@ -564,7 +568,8 @@ CudaContext::registerCudaKernel(const std::string &kernel_source,
     return it->second;
 
   // owning module cache: kernels sharing one (source, options) reuse the
-  // compiled+loaded CUmodule (and its on-disk PTX cache, see cuda_module.cpp).
+  // compiled+loaded CUmodule (and its on-disk cubin/PTX cache, see
+  // cuda_module.cpp).
   const std::string mkey =
     std::to_string(cuda::Module::GetKernelHash(kernel_source, compile_options));
   std::shared_ptr<cuda::Module> module;
@@ -627,15 +632,15 @@ void cuda_reset_decode_graph_cache() {
 // the GPU sits idle for most of the step. Capturing the step into a CUDA graph
 // once and replaying it collapses that launch cost.
 //
-// Two capture points, both off unless asked for:
+// Two capture points, each with a hardware-derived default:
 //
 //  * the DECODE graph, captured on the first single-token step and replayed for
-//    every later one. Between replays only the nodes the model declared as feed
-//    nodes re-run on the host (to refresh what the graph reads through fixed
-//    device pointers) and the token position is updated in device memory. A
-//    model that declares no feed nodes does not get this path at all, because
-//    replaying without the refresh would silently reuse the previous step's
-//    embedding.
+//    every later one. Default on for a discrete GPU (see initialize()). Between
+//    replays only the nodes the model declared as feed nodes re-run on the host
+//    (to refresh what the graph reads through fixed device pointers) and the
+//    token position is updated in device memory. A model that declares no feed
+//    nodes does not get this path at all, because replaying without the refresh
+//    would silently reuse the previous step's embedding.
 //  * the PREFILL graph, which is the same machinery applied to the multi-token
 //    step. Default on for an integrated GPU, where the per-op drain the eager
 //    path needs is expensive; a discrete GPU keeps the eager path.
@@ -761,7 +766,9 @@ sharedConstTensors CudaContext::runDecode(NeuralNetwork &nn, unsigned int from,
     cached_exec = nullptr;
     cached_out = {};
     // The gather nodes captured in that graph are gone with it: the per-token
-    // feed must dispatch (or host-decode) eagerly until the next capture.
+    // feed must dispatch (or host-decode) eagerly. Nothing on this tree sets
+    // the flag back to true after a capture, so the feed re-dispatches every
+    // token either way.
     nntrainer::cuda::emb_gather_set_graph_live(false);
   }
 

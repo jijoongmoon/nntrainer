@@ -7,12 +7,11 @@
  * @see    https://github.com/nntrainer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @bug    No known bugs except for NYI items
- * @brief  CUDA ComputeOps subclass (mirror of ClComputeOps). P1 provides only
- *         the host-side copy ops so Tensor::copy() works on engine=cuda tensors
- *         (their memory is Unified/managed, hence host-addressable). The
- *         accelerator quantized GEMM/GEMV predicates are left at the base
- *         default (false), so float_tensor.cpp falls back to the CPU path until
- *         the CUDA kernels land in P3 (cuda_operations/).
+ * @brief  CUDA ComputeOps subclass (mirror of ClComputeOps). Overrides the
+ *         copy ops and the whole-op entries that have a device kernel (GeGLU,
+ *         SwiGLU, SigmoidGLU, SigmoidAdd, LayerNorm, activation, FC); every
+ *         other op inherits the CpuComputeOps host implementation, which is
+ *         correct on host-addressable (Unified/managed) engine=cuda tensors.
  */
 
 #include <common_properties.h> // ActivationType (the act_type int encoding)
@@ -48,10 +47,10 @@ namespace nntrainer {
 
 // CudaComputeOps derives from CpuComputeOps (not the abstract ComputeOps base):
 // engine=cuda tensors are Unified Memory (host-coherent), so every standard op
-// runs correctly via the CPU implementations; this class only overrides the
-// host-side copy ops for now. Inheriting CpuComputeOps means get_cuda_ops() can
-// be installed without throwing on the un-accelerated ops (prereq for the CUDA
-// op kernels in a later phase).
+// runs correctly via the CPU implementations; this class overrides the copy
+// ops and the whole-op entries that have a device kernel. Inheriting
+// CpuComputeOps means get_cuda_ops() can be installed without throwing on the
+// un-accelerated ops.
 class CudaComputeOps : public CpuComputeOps {
 public:
   // Plain elementwise copy (Y = X). Tensor::copy() calls this unconditionally
@@ -157,10 +156,10 @@ public:
 #endif
 
   // ── Whole-op (Tensor-level) ───────────────────────────────────────────────
-  // GeGLU: out = gelu_tanh(gate) * up. Device-resident fp16 kernel (opt-in via
-  // NNTR_CUDA_GEGLU until the whole decode chain is on-GPU); otherwise the host
-  // gelu loop on the host-coherent UVM tensors (CpuComputeOps::geglu). Matches
-  // the former forked GeGLU layer's math byte-for-byte.
+  // GeGLU: out = gelu_tanh(gate) * up. Device-resident fp16 kernel (on by
+  // default: CudaContext sets NNTR_CUDA_GEGLU=1, =0 disables); otherwise the
+  // host gelu loop on the host-coherent UVM tensors (CpuComputeOps::geglu).
+  // Matches the former forked GeGLU layer's math byte-for-byte.
   void geglu(const Tensor &in1, const Tensor &in2, Tensor &out,
              unsigned int active_rows, unsigned int row_offset) override {
     const unsigned int dim2 = in1.width();
@@ -448,7 +447,8 @@ public:
     // QS4CX weight: fused dequant-GEMM on device, consuming the PLAIN nibble
     // payload in place -- the derived dp4a/cuBLAS device caches are keyed by
     // its pointer, so the payload is never copied. Default on; the host
-    // Tensor::dot fallback below has no x86 implementation for this dtype.
+    // Tensor::dot fallback below is a slow CPU reference for this dtype (and
+    // dereferences the activation, which a device-only pool forbids).
     if (wt == DT::QS4CX && (at == DT::FP32 || at == DT::FP16) && M > 0 &&
         N > 0 && K > 0) {
       static const bool qs4cx_enabled = []() {
@@ -625,8 +625,8 @@ public:
 
 #ifdef ENABLE_FP16
     // FP16 weight: cuBLAS fp16 GEMM, fp32 accumulate. A DENSE fp16 FC had no
-    // device arm here and fell to the host, which the comment below calls
-    // "correct for FP16" -- and it is, on a host-coherent UVM tensor. With the
+    // device arm here and fell to the host fallback below -- which is correct
+    // on a host-coherent UVM tensor. With the
     // device-only activation pool (NNTR_CUDA_DEV_ACT, the discrete default) it
     // is not correct at all: the host reference dereferences real device
     // pointers and segfaults. A package that stores some of its FC weights

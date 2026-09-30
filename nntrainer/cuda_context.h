@@ -75,9 +75,10 @@ public:
    *        Singleton<T>::Global(), intentionally-leaked heap instance --
    *        never destroyed). ~CudaContext is itself trivial, but its member
    *        singleton references (context_inst_/stream_inst_/cudabuffInstance)
-   *        are only initialized once here; leaking mirrors ClContext::Global()
-   *        (cl_context.h) so the whole GPU-context singleton family follows
-   *        one never-destroy convention (2026-07-20 field crash fix).
+   *        are only initialized once here; leaking keeps the CUDA singleton
+   *        family (context, ContextManager, StreamManager, BlasManager) on one
+   *        never-destroy convention (field crash fix). ClContext::Global() is
+   *        different: a function-local static destroyed at exit.
    */
   static CudaContext &Global();
 
@@ -104,8 +105,11 @@ public:
    * @copydoc Context::runDecode
    * @brief CUDA override of the decode/prefill step: capture the step into a
    *        CUDA graph once and replay it, instead of re-issuing every launch.
-   *        With the graph flags unset this is a plain eager walk == the base,
-   *        so engine=cuda without them is byte-identical.
+   *        The decode graph defaults on for a discrete part (initialize()
+   *        fills NNTR_CUDA_GRAPH / NNTR_CUDA_M2B) and is only taken for a
+   *        model that declares graph-replay feed nodes; the prefill graph
+   *        defaults on for an integrated part. With both off this is a plain
+   *        eager walk == the base.
    */
   std::vector<std::shared_ptr<const Tensor>>
   runDecode(NeuralNetwork &nn, unsigned int from, unsigned int to,

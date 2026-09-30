@@ -81,9 +81,11 @@ void emb_gather_set_token(int handle, int tok);
 /**
  * @brief Prefill-time page warm: batch-fault the GPU mappings for a chunk's
  *        token rows on the side stream (deduplicated by the same per-row
- *        bitmap the notify hook uses). The prompt vocabulary dominates the
- *        decode vocabulary, so warming it during prefill removes most of the
- *        decode-time HMM cold faults. The pages are the very ones the host
+ *        bitmap the notify hook uses). Opt-in
+ *        (NNTR_CUDA_EMB_GATHER_PREFILL_WARM=1): measured, the prompt vocabulary
+ *        was a poor predictor of the decode vocabulary, so the warm is off by
+ *        default and kept for workloads where it does track the prompt. The
+ *        pages are the very ones the host
  *        prefill dequant touches anyway, so residency does not change.
  *        Best-effort: skipped under capture or while a previous warm batch
  *        is still in flight.
@@ -112,7 +114,9 @@ bool emb_gather_dispatch_s4(int handle, float layer_scale, void *out,
  * @brief M2-B cached-graph lifecycle: true while a captured decode graph is
  *        live (its replay performs the gathers, so the per-token feed must
  *        NOT re-dispatch them eagerly); false drops it (and bumps the epoch
- *        below) when the cached exec is destroyed or capture fails.
+ *        below). CudaContext::runDecode only writes false (when it destroys
+ *        the cached exec before an eager multi-token step); nothing in this
+ *        tree writes true, so the feed currently always re-dispatches.
  */
 void emb_gather_set_graph_live(bool live);
 bool emb_gather_graph_live();

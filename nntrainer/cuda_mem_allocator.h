@@ -81,10 +81,10 @@ public:
   // set unconditionally, the layer output is NEVER WRITTEN, and the planner's
   // previous tenant leaks downstream (measured: layer0_gated_norm r0
   // bit-equal to layer0_wq -> whole-model deterministic garbage in every
-  // CUDA-on-Windows config). Linux never sees it: build_cl / build_cuda are
-  // SEPARATE binaries there -- only the Windows unified build compiles both
-  // engines in. To every consumer this flag means "OpenCL SVM", so CUDA
-  // memory must report false; CUDA-side device checks use
+  // CUDA-on-Windows config). It needs a build that compiles both engines in
+  // (the Windows unified build, or any build with -Denable-opencl=true and
+  // -Denable-cuda=true). To every consumer this flag means "OpenCL SVM", so
+  // CUDA memory must report false; CUDA-side device checks use
   // cuda::dev_accessible(), not this flag.
   bool isSVM() const override { return false; }
 

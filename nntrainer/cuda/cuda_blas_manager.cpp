@@ -227,8 +227,9 @@ BlasManager::~BlasManager() {
 
 BlasManager &BlasManager::Global() {
   // Out-of-line + intentionally leaked (see header note): never destroyed,
-  // so ~BlasManager (cublasDestroy) never runs at process exit (2026-07-20
-  // field crash fix, same convention as ClContext).
+  // so ~BlasManager (cublasDestroy) never runs at process exit (field crash
+  // fix; same convention as the other CUDA singletons, unlike
+  // ClContext::Global(), which is destroyed at exit).
   static BlasManager *instance = new BlasManager();
   instance->initializeOnce();
   return *instance;

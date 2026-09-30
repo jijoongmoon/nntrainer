@@ -1618,8 +1618,8 @@ bool attention_blockq_splitkv_prefill(
 } // namespace
 
 // Pre-grow the split-KV decode scratch (g_pm/g_pl/g_pacc) to the model's max
-// decode capacity at load. The M=1 split-KV path is only reached under graph
-// capture once NNTR_CUDA_GRAPH is on; a cudaMalloc/Free inside
+// decode capacity at load. The M=1 split-KV path also runs inside the decode
+// graph capture (NNTR_CUDA_GRAPH), and a cudaMalloc/Free inside
 // cudaStreamBeginCapture..EndCapture invalidates the capture. Warming here
 // (before any capture) makes every captured ensure_sk a pure cap-hit, so the
 // fast flash-decode path stays usable under the graph. Idempotent (cap check).
@@ -1694,7 +1694,7 @@ bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
     if (!e)
       return 0; // off
     int c = atoi(e);
-    return c > 0 ? c : 64; // =1 -> default chunk 64; or an explicit chunk size
+    return c > 0 ? c : 64; // value = chunk size; <=0 / non-numeric -> 64
   }();
   // [kv-regime] THE decode arm flip: this threshold (64 keys by default)
   // decides between the split-KV reduce below and the dense per-key kernel at
@@ -1713,8 +1713,8 @@ bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
   // GEMM prefill attention (cuBLAS fp16 QK^T -> softmax -> PV): materialises
   // scores instead of the per-key flash reduce, so it is far faster for prefill
   // and head_dim-agnostic -- the lever for head_dim=128 (qwen3/llama) where
-  // block-Q underperforms. Opt-in (NNTR_CUDA_GEMM_ATTN); falls through on any
-  // cuBLAS/registration failure.
+  // block-Q underperforms. Default-gated below (NNTR_CUDA_GEMM_ATTN overrides);
+  // falls through on any cuBLAS/registration failure.
   // head_dim 256/512 are faster on block-Q (warp-shuffle, K/V reuse); GEMM wins
   // for the smaller head dims (128 = qwen3/llama) where block-Q underutilises.
   // NNTR_CUDA_GEMM_ATTN: unset -> caps/shape-derived default (below); =0 ->
@@ -1763,8 +1763,9 @@ bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
   // head_dim 256/512 (gemma4 sliding/global) were historically excluded because
   // block-Q beat the cuBLAS path on RTX/Adreno. On Orin (sm_87) block-Q runs at
   // only ~0.2 TFLOP/s, so the cuBLAS int8/fp16 Tensor-Core QK/PV is worth
-  // trying here -- opt-in via NNTR_CUDA_GEMM_ATTN, so other arches keep
-  // block-Q. [kv-window-ring] attention_gemm_prefill_fp16 hands K/V straight to
+  // trying here -- the default above takes it on every layer of an integrated
+  // part, while a discrete part keeps block-Q for sliding and short-context
+  // layers. [kv-window-ring] attention_gemm_prefill_fp16 hands K/V straight to
   // cuBLAS as dense [N_kv, d] matrices, so it can only be used while the ring
   // has NOT wrapped (logical rows <= ring_cap). Past that the physical cache
   // holds only ring_cap rows and a linear walk both reads past the mirror and
@@ -1785,9 +1786,9 @@ bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
 
   // Block-Q multi-row prefill: one warp per (head, TM=4 row tile), warp-shuffle
   // d-dot, K/V reused across rows. 3-4x faster than the per-key LDS-reduce
-  // attn_core_il_fp16 below, fp16-identical. Opt-in (NNTR_CUDA_BLOCKQ) until
-  // folded; only the multi-row (prefill) path with head_dim in {256, 512}
-  // (gemma4 sliding/global) -- decode (N_q==1) keeps split-KV above.
+  // attn_core_il_fp16 below, fp16-identical. On by default (CudaContext sets
+  // NNTR_CUDA_BLOCKQ=1, =0 disables); only the multi-row (prefill) path with
+  // head_dim in {128, 256, 512} -- decode (N_q==1) keeps split-KV above.
   static const bool blockq_on = nntr_env_on("NNTR_CUDA_BLOCKQ");
   if (blockq_on && N_q > 1 &&
       (head_dim == 128 || head_dim == 256 || head_dim == 512)) {

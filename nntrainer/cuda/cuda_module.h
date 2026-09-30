@@ -9,8 +9,9 @@
  * @bug     No known bugs except for NYI items
  * @brief   CUDA wrapper for runtime kernel compilation (NVRTC) + module load.
  *          Peer of nntrainer::opencl::Program: compiles a .cu source STRING via
- *          NVRTC to PTX, caches the PTX on disk keyed by device signature + a
- *          hash of (source, options), then loads it via the Driver API.
+ *          NVRTC to a cubin for the device's SM (PTX with NNTR_CUDA_PTX),
+ *          caches the image on disk keyed by device signature + a hash of
+ *          (source, options), then loads it via the Driver API.
  */
 
 #ifndef __CUDA_MODULE_H__

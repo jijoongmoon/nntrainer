@@ -31,10 +31,11 @@ namespace {
  * @brief The CUDA state that must be ONE per process, not one per module.
  *
  * See StreamManager::initialize() for why "per module" is the default here and
- * what it breaks. Three fields, and each is shared for the same reason: the
- * M2-B capture records ONE stream, the capture flag decides whether a guard
- * fires, and the decode-position buffer is the fixed device address the
- * captured RoPE/attention/KV nodes were recorded against.
+ * what it breaks. Every field is shared for the same reason: the M2-B capture
+ * records ONE stream, the capture flag decides whether a guard fires, the
+ * decode-position buffer is the fixed device address the captured
+ * RoPE/attention/KV nodes were recorded against, and the kv-regime table
+ * records the host branches that capture froze.
  */
 /// Distinct KV-length bounds one captured decode step can compare against.
 /// Four layer kinds x (window, chunk, ring, gemm) with room to spare; a table
@@ -334,7 +335,8 @@ StreamManager::~StreamManager() {
 StreamManager &StreamManager::Global() {
   // Out-of-line + intentionally leaked (see header note): never destroyed,
   // so ~StreamManager (cudaStreamDestroy) never runs at process exit
-  // (2026-07-20 field crash fix, same convention as ClContext).
+  // (field crash fix; same convention as the other CUDA singletons, unlike
+  // ClContext::Global(), which is destroyed at exit).
   static StreamManager *instance = new StreamManager();
   instance->initializeOnce();
   return *instance;
@@ -424,8 +426,9 @@ bool kv_regime_holds(int kv_len) {
 int kv_regime_size() { return shared_cuda_state()->regime_n; }
 
 void cuda_set_pos(int pos, int n_kv) {
-  // Pinned host source so the H2D is a real async DMA (also keeps it capturable
-  // should it ever be issued inside a capture). The copy is on the backend
+  // Pinned host source so the H2D is a real async DMA (and capturable:
+  // CudaContext::runDecode issues it inside the decode capture). The copy is
+  // on the backend
   // stream, so it is ordered before a subsequent cudaGraphLaunch on the same
   // stream -- the replayed kernels read the fresh pos.
   static int *g_pos_host = []() -> int * {

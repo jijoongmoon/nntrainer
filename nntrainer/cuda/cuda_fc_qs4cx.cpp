@@ -167,14 +167,13 @@ bool cuda_fc_qs4cx_scales_to_uvm_fp32(const float *fp32_scales, unsigned int N,
 // point hook for the future selective-sync work (sync only before a HOST
 // consumer reads a UVM output, not after every FC).
 //
-// NNTR_CUDA_ASYNC=1 drops the drains -- EXPERIMENTAL/UNSAFE: it makes decode
-// ~40% faster but produces GARBAGE, because the host ops between FCs (RoPE,
-// attention, geglu) then read UVM the GPU is still writing -- the
-// concurrentManagedAccess page-fault does NOT order a host read against an
-// in-flight kernel write. The coherent path to that speedup is to move those
-// decode host ops onto the GPU too (GPU RoPE/geglu, the GPU attention exists)
-// so the whole decode step is one ordered GPU chain drained once per token.
-// Default (sync) is coherent.
+// NNTR_CUDA_ASYNC=1 drops the drains. On a MANAGED activation pool that is
+// unsafe: the host ops between FCs would read UVM the GPU is still writing --
+// the concurrentManagedAccess page-fault does NOT order a host read against an
+// in-flight kernel write. It is coherent only with the device-only activation
+// pool (NNTR_CUDA_DEV_ACT), where every op is on the device and a host
+// fallback faults instead of racing; CudaContext::initialize() enables it by
+// default exactly then, and an integrated part is always drained.
 static inline void maybe_finish(const void *out = nullptr) {
   // Device-only (cudaMalloc) destination: host code CANNOT read it directly
   // (it would AV) -- every legal host access goes through a stream-ordered

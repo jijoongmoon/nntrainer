@@ -35,7 +35,8 @@ namespace nntrainer::cuda {
 #ifdef _WIN32
 // [delay-load failure hook] Without this, a missing CUDA runtime DLL (the
 // binary /DELAYLOAD-imports cublas64_13.dll, cublasLt64_13.dll,
-// nvrtc64_130_0.dll and nvcuda.dll -- see meson.build cuda_delayload_args)
+// nvrtc64_130_0.dll and nvcuda.dll when linked with /DELAYLOAD, which this
+// tree's meson.build does not add)
 // makes the FIRST call through that import raise an MSVC delay-load SEH
 // exception
 // (0xC06D007E) instead of a normal error return. Unhandled, that looks like
@@ -97,8 +98,9 @@ extern "C" const PfnDliHook __pfnDliFailureHook2 = nntr_dli_failure_hook;
 void ContextManager::initialize() noexcept {
   initialized_ok_ = CreateDefaultGPUDevice();
 #ifdef _WIN32
-  // [W2 delay-load follow-up] The unified binary delay-loads cuBLAS/NVRTC
-  // (meson cuda_delayload_args) so XMX runs never map their DLL images. On
+  // [W2 delay-load follow-up] A unified binary linked with /DELAYLOAD for
+  // cuBLAS/NVRTC (not added by this tree's meson.build) never maps their DLL
+  // images on XMX runs. On
   // CUDA runs the deferred LoadLibrary then landed inside the first in-forward
   // call, i.e. mid-prefill: +67ms inside the timed 1K window (measured
   // 4210 -> 3300 TPS; clocks were flat P0/2805MHz, so the "sustained
@@ -168,10 +170,10 @@ bool ContextManager::CreateDefaultGPUDevice() {
     // activation pool, KV mirror copies, MemAdvise device-pin) so the same
     // binary stays coherent on both -- see isIntegrated().
     integrated_ = prop.integrated != 0;
-    // Windows WDDM reports 0 here (Linux discrete: 1). Everything that lets a
-    // host thread touch managed memory while kernels may be in flight -- async
-    // submission, and by extension the discrete "FAST" env add-ons tuned
-    // around it -- presumes 1, so the profile gates consult this bit.
+    // Windows WDDM reports 0 here (Linux discrete: 1). Anything that lets a
+    // host thread touch MANAGED memory while kernels may be in flight presumes
+    // 1, so the profile gates consult this bit: a cMA=0 discrete part gets its
+    // own profile built on pinned host-mapped and device-only memory.
     int cma = 0;
     cudaDeviceGetAttribute(&cma, cudaDevAttrConcurrentManagedAccess,
                            device_ordinal_);
@@ -260,7 +262,8 @@ ContextManager::~ContextManager() {
 ContextManager &ContextManager::Global() {
   // Out-of-line + intentionally leaked (see header note): never destroyed,
   // so ~ContextManager (cuDevicePrimaryCtxRelease) never runs at process
-  // exit (2026-07-20 field crash fix, same convention as ClContext).
+  // exit (field crash fix; the CUDA singletons share this convention, while
+  // ClContext::Global() is a function-local static destroyed at exit).
   static ContextManager *instance = new ContextManager();
   instance->initializeOnce();
   return *instance;
