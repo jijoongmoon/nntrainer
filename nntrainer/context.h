@@ -56,11 +56,12 @@ class Tensor;
  *        from real device queries (clGetDeviceInfo / cudaGetDeviceProperties
  *        via the per-backend ContextManagers) rather than from NNTR_* env
  *        flags. The probe is per-Context and runs on the first caps() call —
- *        ClContext::caps() is the one implemented today; the base Context
- *        answers with the CPU defaults below and probes nothing, which is the
- *        correct answer for a host backend. Currently LOG-ONLY — no decision
- *        site reads it yet; it is the input the ExecPlan resolver consumes
- *        (see docs/backend_guide/ARCHITECTURE_REFACTOR.md §6). Fields describe
+ *        ClContext::caps() and CudaContext::caps() implement it; the base
+ *        Context answers with the CPU defaults below and probes nothing, which
+ *        is the correct answer for a host backend. The OpenCL kernel-selection
+ *        sites read it directly (vendor_id, image_v8c, dpas), and it is the
+ *        input the ExecPlan resolver consumes (see
+ *        docs/backend_guide/ARCHITECTURE_REFACTOR.md §6). Fields describe
  *        attributes (what the device can do), never identity (who it is);
  *        a field the probe cannot answer stays at the default below.
  */
@@ -75,7 +76,8 @@ struct DeviceCaps {
   bool unified_memory = false;  /**< single-pointer SVM/UVM available
                                      (OpenCL: coarse-grain SVM; CUDA: managed
                                      memory with concurrent host access) */
-  bool subgroups = false;       /**< OpenCL cl_intel_subgroups (XMX/DPAS) */
+  bool subgroups = false;       /**< OpenCL cl_intel_subgroups (not a matrix
+                                     engine signal; see dpas) */
   uint32_t compute_units = 0;   /**< OpenCL CL_DEVICE_MAX_COMPUTE_UNITS;
                                      CUDA multiProcessorCount */
   uint64_t max_alloc_bytes = 0; /**< per-alloc cap (CL MAX_MEM_ALLOC_SIZE;
@@ -156,9 +158,9 @@ inline const char *toString(GemmPath p) {
  *        This is the output of the ExecPlan resolver — the single place where
  *        device attributes (and later ModelFeatures) decide which kernels run,
  *        replacing scattered NNTR_* env flags. Currently a SHADOW
- *        (docs/backend_guide/ARCHITECTURE_REFACTOR.md §6): resolved, logged
- *        and asserted equal to the current env-driven choice, but NOT yet
- *        authoritative — no decision site reads it, so it is byte-identical.
+ *        (docs/backend_guide/ARCHITECTURE_REFACTOR.md §6): resolved and
+ *        logged at context bring-up, but NOT yet authoritative — no decision
+ *        site reads it, so it is byte-identical.
  *
  *        Only cleanly caps-derivable cells are resolved here. Cells that are
  *        NOT a pure function of caps stay env overrides for now and are NOT
@@ -328,10 +330,10 @@ public:
   };
 
   /**
-   * @brief Create an Layer Object from the integer key
+   * @brief Create an Optimizer Object from the integer key
    *
    * @param int_key integer key
-   * @param props property
+   * @param properties property
    * @return PtrType<nntrainer::Optimizer> unique pointer to the object
    */
   virtual PtrType<nntrainer::Optimizer>
@@ -343,8 +345,8 @@ public:
   /**
    * @brief Create an LearningRateScheduler Object from the type (stirng)
    *
-   * @param type type of optimizer
-   * @param props property
+   * @param type type of learning rate scheduler
+   * @param propeties property
    * @return PtrType<ml::train::LearningRateScheduler> unique pointer to the
    * object
    */
@@ -358,7 +360,7 @@ public:
    * @brief Create an LearningRateScheduler Object from the integer key
    *
    * @param int_key integer key
-   * @param props property
+   * @param propeties property
    * @return PtrType<ml::train::LearningRateScheduler> unique pointer to the
    * object
    */
@@ -392,10 +394,11 @@ public:
    * @brief Read-only device capability snapshot for this backend, probed once
    *        on the first call. The base returns CPU caps (host-coherent, no
    *        accelerator) and probes nothing, which is the whole truth for a host
-   *        backend; ClContext overrides it with a real clGetDeviceInfo probe.
-   *        LOG-ONLY for now (see
-   *        docs/backend_guide/ARCHITECTURE_REFACTOR.md §6) — no decision site
-   *        reads it yet, so overriding it is byte-identical.
+   *        backend; ClContext and CudaContext override it with a real device
+   *        probe. The OpenCL kernel-selection sites read it (vendor_id,
+   *        image_v8c, dpas), so an override changes which kernels run; the
+   *        ExecPlan derived from it is still log-only (see
+   *        docs/backend_guide/ARCHITECTURE_REFACTOR.md §6).
    *
    * @return const DeviceCaps& capabilities of the device backing this context
    */
@@ -435,9 +438,10 @@ public:
    *        (toLayerComputeEngine, layer_node.cpp) — retiring the central
    *        name→enum string table (ComputeEngineTypeInfo::EnumStr) in favour of
    *        a per-context declaration. The base is CPU (host residency), which
-   *        is the right answer for AppContext; ClContext overrides it with GPU.
-   *        A backend that arrives later (CUDA, QNN) declares its own plane the
-   *        same way, with no central table to edit (add-only). See
+   *        is the right answer for AppContext; ClContext overrides it with GPU
+   *        and CudaContext with CUDA. A backend that arrives later (e.g. QNN)
+   *        declares its own plane the same way, with no central table to edit
+   *        (add-only). See
    *        docs/backend_guide/ARCHITECTURE_REFACTOR.md §5 step 1.
    * @note  NEW vtable tail: appended after every pre-existing slot so a rebuilt
    *        libnntrainer.so stays ABI-compatible with an app/ccapi built against
@@ -494,11 +498,11 @@ using CreateContextFunc = nntrainer::Context *(*)();
 using DestroyContextFunc = void (*)(nntrainer::Context *);
 
 /**
- * @brief  Context Pluggable struct that enables pluggable layer
+ * @brief  Context Pluggable struct that enables pluggable context
  *
  */
 typedef struct {
-  CreateContextFunc createfunc;   /**< create layer function */
+  CreateContextFunc createfunc;   /**< create context function */
   DestroyContextFunc destroyfunc; /**< destory function */
 } ContextPluggable;
 

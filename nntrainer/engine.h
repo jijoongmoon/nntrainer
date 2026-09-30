@@ -115,12 +115,12 @@ public:
 
   /**
    * @brief register a Context from a shared library
-   * plugin must have **extern "C" LayerPluggable *ml_train_context_pluggable**
+   * plugin must have **extern "C" ContextPluggable ml_train_context_pluggable**
    * defined else error
    *
    * @param library_path a file name of the library
    * @param base_path    base path to make a full path (optional)
-   * @throws std::invalid_parameter if library_path is invalid or library is
+   * @throws std::invalid_argument if library_path is invalid or library is
    * invalid
    */
   int registerContext(const std::string &library_path,
@@ -130,7 +130,7 @@ public:
    * @brief get registered a Context
    *
    * @param name Registered Context Name
-   * @throws std::invalid_parameter if no context with name
+   * @throws std::invalid_argument if no context with name
    * @return Context Pointer : for register Object factory, casting might be
    * needed.
    */
@@ -216,7 +216,7 @@ public:
    * @brief Create an Layer Object with Layer name
    *
    * @param type layer name
-   * @param props property
+   * @param properties property
    * @return unitque_ptr<T> unique pointer to the Layer object
    */
   std::unique_ptr<nntrainer::Layer>
@@ -230,7 +230,7 @@ public:
    * @brief Create an Layer Object with Layer key
    *
    * @param int_key key
-   * @param props property
+   * @param properties property
    * @return unitque_ptr<T> unique pointer to the Layer object
    */
   std::unique_ptr<nntrainer::Layer>

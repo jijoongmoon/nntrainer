@@ -78,9 +78,10 @@ namespace {
  *
  * @note This is NOT the only reader of NNTR_ENGINE: the CUDA context, the CUDA
  *       helpers' engine_selected() gate and the CausalLM application read it
- *       too. Every reader goes through nntr_engine_env() (env_compat.h), which
- *       lowercases the same way, so NNTR_ENGINE=CUDA cannot register a context
- *       here that another reader's gate then declines.
+ *       too. Every reader lowercases the same way -- through nntr_engine_env()
+ *       (env_compat.h), or by hand in CudaContext::initialize() -- so
+ *       NNTR_ENGINE=CUDA cannot register a context here that another reader's
+ *       gate then declines.
  */
 const std::string &requestedEngine() {
   static const std::string eng = nntr_engine_env();
@@ -141,13 +142,13 @@ void Engine::add_default_object() {
 
 #if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
   // Engine-conditional, the mirror of the CUDA gate below (see bringUpWanted).
-  // ClContext::Global() is leaked-by-design (never destroyed, cl_context.h), so
-  // on a non-OpenCL run it would leave a cl_context + command queue and ~50
-  // compiled programs alive for the whole process for nothing. Skipping the
-  // registration is safe because an engine name that is not registered resolves
-  // to "cpu" in parseComputeEngine, and every "gpu" consumer on the production
-  // path already try/catches a missing context.
-  // NNTR_CL_EAGER_CTX=1 restores the unconditional bring-up.
+  // ClContext::Global() is a function-local static that lives until process
+  // exit, so on a non-OpenCL run it would keep a cl_context + command queue
+  // and ~50 compiled programs alive for the whole process for nothing. Skipping
+  // the registration is safe because an engine name that is not registered
+  // resolves to "cpu" in parseComputeEngine, and every "gpu" consumer on the
+  // production path already try/catches a missing context. NNTR_CL_EAGER_CTX=1
+  // restores the unconditional bring-up.
   if (bringUpWanted("gpu", "NNTR_CL_EAGER_CTX", /*on_by_default=*/true)) {
     auto &cl_context = nntrainer::ClContext::Global();
 
