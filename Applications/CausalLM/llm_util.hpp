@@ -19,6 +19,7 @@
 
 #include <base_properties.h>
 #include <common.h>
+#include <env_compat.h>
 #include <layer.h>
 #include <model.h>
 /***************** ALAIS *******************/
@@ -98,14 +99,13 @@ T unwrap(std::optional<T> &&value, const std::string &error_msg) {
 // binary a single cached instance instead of one per TU.
 inline std::string causallm_engine() {
   static const std::string eng = []() -> std::string {
-    const char *e = std::getenv("NNTR_ENGINE");
-    if (e != nullptr) {
-      const std::string s(e);
-      if (s == "cpu")
-        return "cpu";
-      if (s == "cuda") // additive NVIDIA CUDA backend (engine=cuda)
-        return "cuda";
-    }
+    // Lowercased, like every other reader: an exact compare turned
+    // NNTR_ENGINE=CUDA into "gpu" here while the Engine brought CUDA up.
+    const std::string s = nntr_engine_env();
+    if (s == "cpu")
+      return "cpu";
+    if (s == "cuda") // additive NVIDIA CUDA backend (engine=cuda)
+      return "cuda";
 #if defined(ENABLE_OPENCL)
     return "gpu";
 #else

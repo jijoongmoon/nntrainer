@@ -295,10 +295,10 @@ inline void announceDetArmOnce() {
  * fallback walks absolute rows, so a CPU run must keep the linear cache.
  */
 inline bool kvRingEngineEligible() {
-  const char *e = std::getenv("NNTR_ENGINE");
-  if (e != nullptr && std::string(e) == "cpu")
+  const std::string e = nntr_engine_env();
+  if (e == "cpu")
     return false;
-  if (e != nullptr && std::string(e) == "cuda")
+  if (e == "cuda")
     return true;
 #if defined(ENABLE_OPENCL)
   return true; // no explicit engine + an OpenCL build == the gpu engine
@@ -330,8 +330,7 @@ inline bool kvRingEngineEligible() {
  * removes the statically-knowable mismatches.
  */
 inline bool kvRingArmAvailable() {
-  const char *e = std::getenv("NNTR_ENGINE");
-  if (e != nullptr && std::string(e) == "cuda")
+  if (nntr_engine_env() == "cuda")
     return nntr_env_on("NNTR_CUDA_ATTN"); // cuda_attention_interleaved_fp16
 #if defined(ENABLE_OPENCL)
   // The two OpenCL flash arms sit in the CONCAT-layout GPU attention block,
@@ -577,9 +576,7 @@ inline bool prefillBlockPays() {
   if (const char *g = std::getenv("NNTR_PREFILL_GROW"))
     if (g[0] == '0' || g[0] == '1')
       return g[0] == '1';
-  const char *e = std::getenv("NNTR_ENGINE");
-  const std::string eng = (e != nullptr) ? std::string(e) : std::string();
-  if (eng == "cuda")
+  if (nntr_engine_env() == "cuda")
     return nntr_env_on("NNTR_CUDA_ATTN");
   // Every OpenCL arm measured -- Adreno image, Intel Xe flash/XMX, Intel dp4a
   // -- is slower end to end AND larger with the plane grown, so the plane stays

@@ -26,6 +26,7 @@
 #include <context.h>
 #include <dynamic_library_loader.h>
 #include <engine.h>
+#include <env_compat.h>
 #if defined(ENABLE_HEXKL) && ENABLE_HEXKL == 1
 #include <htp_context.h>
 #endif
@@ -72,21 +73,14 @@ namespace {
  * setenv() has no effect. Unset means "no preference", which keeps the
  * historical default (see bringUpWanted's on_by_default).
  *
- * @note This is the only reader of NNTR_ENGINE in the tree. A backend that adds
- *       its own read must route through this function rather than comparing
- *       getenv() exactly, or NNTR_ENGINE=GPU registers a context that the
- *       backend's own gate then declines.
+ * @note This is NOT the only reader of NNTR_ENGINE: the CUDA context, the CUDA
+ *       helpers' engine_selected() gate and the CausalLM application read it
+ *       too. Every reader goes through nntr_engine_env() (env_compat.h), which
+ *       lowercases the same way, so NNTR_ENGINE=CUDA cannot register a context
+ *       here that another reader's gate then declines.
  */
 const std::string &requestedEngine() {
-  static const std::string eng = []() -> std::string {
-    const char *e = std::getenv("NNTR_ENGINE");
-    if (e == nullptr)
-      return std::string();
-    std::string s(e);
-    std::transform(s.begin(), s.end(), s.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
-    return s;
-  }();
+  static const std::string eng = nntr_engine_env();
   return eng;
 }
 

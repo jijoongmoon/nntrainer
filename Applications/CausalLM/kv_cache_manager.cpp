@@ -19,6 +19,7 @@
 
 #include <basic_planner.h>
 #include <engine.h>
+#include <env_compat.h>
 #include <mem_allocator.h>
 #include <nntrainer_log.h>
 
@@ -120,10 +121,9 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
   // cache.
   std::shared_ptr<nntrainer::MemAllocator> svm_alloc;
   const char *_svm_pool_env = std::getenv("NNTR_GPU_SVM_POOL");
-  const char *_eng = std::getenv("NNTR_ENGINE");
+  const std::string _eng = nntr_engine_env();
   const bool svm_pool_on = !_svm_pool_env || std::atoi(_svm_pool_env) != 0;
-  const bool gpu_engine =
-    !_eng || (std::string(_eng) != "cpu" && std::string(_eng) != "cuda");
+  const bool gpu_engine = _eng != "cpu" && _eng != "cuda";
   if (svm_pool_on && gpu_engine) {
     auto allocs = nntrainer::Engine::Global().getAllocators();
     auto it = allocs.find("gpu");

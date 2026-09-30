@@ -18,7 +18,25 @@
 #ifndef __NNTR_ENV_COMPAT_H__
 #define __NNTR_ENV_COMPAT_H__
 
+#include <cctype>
 #include <cstdlib>
+#include <string>
+
+/**
+ * @brief NNTR_ENGINE as every reader has to see it: lowercased, "" if unset.
+ *        The Engine registers contexts under lowercased names, so a reader
+ *        that compares the raw value (NNTR_ENGINE=CUDA against "cuda") ends
+ *        up disagreeing with the context that was brought up: the context
+ *        exists, but the reader's own gate declines every path it guards.
+ *        Every NNTR_ENGINE comparison goes through this.
+ */
+static inline std::string nntr_engine_env() {
+  const char *e = std::getenv("NNTR_ENGINE");
+  std::string s = e != nullptr ? std::string(e) : std::string();
+  for (auto &c : s)
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return s;
+}
 
 /**
  * @brief VALUE-checked env truthiness: set AND not starting with '0'.

@@ -14,6 +14,8 @@
 #include "cuda_common.h"
 #include "cuda_stream_manager.h"
 
+#include <env_compat.h>
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -265,10 +267,10 @@ ContextManager &ContextManager::Global() {
 }
 
 bool engine_selected() {
-  static const bool on = []() {
-    const char *e = std::getenv("NNTR_ENGINE");
-    return e != nullptr && std::string(e) == "cuda";
-  }();
+  // Lowercased like the Engine's own read: with an exact compare here,
+  // NNTR_ENGINE=CUDA registered the CUDA context while every residency probe
+  // below answered "not reachable".
+  static const bool on = nntr_engine_env() == "cuda";
   return on;
 }
 

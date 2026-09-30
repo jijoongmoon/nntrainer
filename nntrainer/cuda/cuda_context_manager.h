@@ -166,7 +166,8 @@ private:
 };
 
 /**
- * @brief True iff this run selected the CUDA engine (NNTR_ENGINE=cuda,
+ * @brief True iff this run selected the CUDA engine (NNTR_ENGINE=cuda, any
+ *        case -- the same lowercased read the Engine and CudaContext use,
  *        static-cached). The residency probes below and every shared-layer
  *        CUDA touch must short-circuit on this: cudart is statically linked,
  *        so on a non-cuda run of the unified binary the first cudart call

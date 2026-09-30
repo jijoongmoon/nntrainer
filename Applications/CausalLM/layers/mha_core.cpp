@@ -655,11 +655,10 @@ struct MhaAttnTimer {
   }
   static void drain() {
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
-    if (const char *e = std::getenv("NNTR_ENGINE"))
-      if (std::string(e) == "cuda") {
-        nntrainer::cuda::StreamManager::Global().finish();
-        return;
-      }
+    if (nntr_engine_env() == "cuda") {
+      nntrainer::cuda::StreamManager::Global().finish();
+      return;
+    }
 #endif
 #if defined(ENABLE_OPENCL)
     nntrainer::cl_queue_finish();
