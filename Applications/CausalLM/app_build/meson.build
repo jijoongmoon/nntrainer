@@ -2,7 +2,7 @@
 # builds the CausalLM app (libcausallm.so + libquick_dot_ai_api.so +
 # quick_dot_ai_test) by linking a PREBUILT nntrainer engine via
 # cxx.find_library() - exactly how QuickAI's root meson project works today,
-# relocated into nntrainer and made Gauss-free.
+# relocated into nntrainer with public models only.
 #
 # This project intentionally mirrors QuickAI's root meson.build / src/meson.build
 # / api/meson.build / api-app/meson.build (proven, working techniques - sources
@@ -12,9 +12,9 @@
 # gemma4-e2b-qnn model) directly into libcausallm.so, the way
 # Applications/CausalLM/meson.build does for the in-tree nntrainer build.
 #
-# Gauss-free: this project must never reference gauss models/descriptors. The
-# proprietary gauss overlay is built by QuickAI's own meson project against
-# the prebuilt libcausallm.so/libqnn_context.so produced here.
+# Public models only: this project must never reference proprietary models or
+# descriptors. A proprietary model overlay is built by its own downstream meson
+# project against the prebuilt libcausallm.so/libqnn_context.so produced here.
 project('causallm-app', 'c', 'cpp',
   version: '0.2.0',
   license: ['apache-2.0'],
@@ -426,7 +426,8 @@ endif
 # this links libcausallm directly and takes a filesystem <model_path> [prompt],
 # loading config.json / nntr_config.json from that directory (mirrors the
 # in-tree Applications/CausalLM/meson.build target). Public CPU models only —
-# the architectures main.cpp registers; gauss/QNN models are not registered here.
+# the architectures main.cpp registers; proprietary/QNN models are not
+# registered here.
 executable('nntr_causallm',
     causallm_root / 'main.cpp',
     dependencies: [nntrainer_dep, causallm_dep, openmp_dep, thread_dep, log_dep],

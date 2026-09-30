@@ -37,7 +37,7 @@ public:
    *          under Android's per-namespace loading / -fvisibility=hidden, i.e.
    *          libcausallm, libquick_dot_ai_api, and the optional model plugin
    *          libqai_ext_model each got their OWN Factory. A model registered
-   *          into one (e.g. a gauss model self-registering from the plugin's
+   *          into one (e.g. a model self-registering from the plugin's
    *          __attribute__((constructor))) was then invisible to another (the
    *          api's load_into_handle calling create()), surfacing as
    *          "Factory::create returned nullptr". A single out-of-line
