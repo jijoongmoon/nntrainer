@@ -2,10 +2,11 @@
 # Regenerate the OpenCL kernel C++ source strings from the .cl files.
 #
 # meson's configure_file (cl_kernels/meson.build) emits one <kernel>.cpp
-# per <kernel>.cl by wrapping each line in an R"(...)" "\n" literal. The
-# ndk-build flow does not re-run meson, so editing a .cl file leaves the
-# bundled .cpp stale and the GPU silently runs the old kernel source. This
-# helper re-emits the .cpp strings so ndk-build picks up the latest .cl.
+# per <kernel>.cl by wrapping each line in an R"(...)" "\n" literal at
+# configure time. A build that does not re-run that configure step leaves the
+# generated .cpp stale after a .cl edit, and the GPU silently runs the old
+# kernel source. This helper re-emits the .cpp strings into an existing build
+# directory so the next build picks up the latest .cl.
 #
 # Usage: tools/regen_cl_kernels.sh [builddir]
 set -euo pipefail

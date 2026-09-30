@@ -17,9 +17,10 @@
  *          next, and both kernels read/write cl_mem directly.
  *
  *          Lifetime: the pool is process-global. Backings are reference-
- *          counted via shared_ptr. A backing inserted under a tensor
- *          name is reachable to any GPU layer in the same process until
- *          all owners drop their references. Model teardown should
+ *          counted via shared_ptr, and the pool itself holds a strong
+ *          reference. A backing inserted under a tensor name is reachable
+ *          to any GPU layer in the same process until it is erase()d or
+ *          the pool is clear()ed. Model teardown should
  *          explicitly clear() the pool (no automatic gc — backings
  *          outlive the layer that produced them by design, since the
  *          consumer might still hold a reference).

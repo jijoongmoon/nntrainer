@@ -45,7 +45,7 @@ enum class Encoding : uint8_t {
  */
 enum class Layout : uint8_t {
   ROW_MAJOR, ///< [outer][inner] linear (e.g. [N][K] for weight, [M][K] for act)
-  OSV32_ISV2, ///< Int4QTensor disk layout (osv32 + 2's-comp nibbles)
+  OSV32_ISV2, ///< legacy QINT4 disk layout (osv32 + 2's-comp nibbles)
   PHWC4,  ///< paper §3.1 activation layout: [P, H, W, C/4] image2d-friendly
   OHWI,   ///< paper §3.8 K-cache layout: [cache_size, 1, 1, dh] weight-form
   OHWI_T, ///< paper §3.8 V-cache layout: [dh, 1, 1, cache_size] reversed
@@ -53,14 +53,14 @@ enum class Layout : uint8_t {
 
 /**
  * @brief Physical view kind. Paper §3.2 lists buffer + image1d + image2d
- *        + image3d + texture array. We currently implement BUFFER and
- *        IMAGE_2D; IMAGE_1D / IMAGE_3D enumerated for future use.
+ *        + image3d + texture array. TensorBacking::imageView creates all four
+ *        kinds below; only BUFFER and IMAGE_2D have callers today.
  */
 enum class ViewKind : uint8_t {
   BUFFER,   ///< raw cl_mem buffer view (zero-copy, always available)
-  IMAGE_1D, ///< cl_image1d (future — paper "1D image buffers")
-  IMAGE_2D, ///< cl_image2d_from_buffer (implemented)
-  IMAGE_3D, ///< cl_image3d (future)
+  IMAGE_1D, ///< cl_image1d_buffer (paper "1D image buffers")
+  IMAGE_2D, ///< cl_image2d_from_buffer
+  IMAGE_3D, ///< cl_image3d
 };
 
 /**
@@ -107,8 +107,9 @@ struct ViewSpecHash {
 
 /**
  * @brief ViewSpec factory helpers for the common cases. Each one returns
- *        a ViewSpec ready to pass to TensorBacking::imageView. Encoding
- *        is read from the backing's metadata to pick the right channel type.
+ *        a ViewSpec ready to pass to TensorBacking::imageView. Each helper
+ *        fixes its own channel order and type; nothing is read from the
+ *        backing's metadata.
  *
  * make_image2d_rgba_uint32: packed view for v8c-style 16-byte texels
  *   (8 halves or 16 int8 per texel). Used by the v8c FC weight image.
@@ -155,8 +156,9 @@ bool image2dViewFits(const ViewSpec &spec, const DeviceImageCaps &caps);
  *        Picks an LWS for a 2D GEMM dispatch that (a) divides the global size
  *        on both axes and (b) fits the device's max work-group size. Starts
  *        from a preferred (px, py) and, if px*py exceeds the device max work-
- *        group size, halves py then px until it fits. Returns {0,0} if no valid
- *        divisor-LWS exists (caller then passes NULL lws = driver chooses).
+ *        group size, halves the larger axis first until it fits. Returns
+ *        false if no valid divisor-LWS exists (caller then passes NULL lws =
+ *        driver chooses).
  *        With caps.max_work_group_size==0 (unknown) the preferred LWS is used
  *        as-is when it divides gws — preserving the prior hardcoded behavior.
  * @param gws_x global size, dim 0      @param gws_y global size, dim 1

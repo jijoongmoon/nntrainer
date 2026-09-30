@@ -11,7 +11,8 @@
  *
  * @details out[i] = gelu(in[i]). It lives here rather than in a Layer so the
  * backend-neutral ActivationLayer covers the GPU too: ClComputeOps::activation
- * forwards here for the gelu and tanh_gelu modes and throws for the rest.
+ * forwards here for the gelu and tanh_gelu modes and runs the rest on the
+ * host table.
  * Same two-symbol shape as the other whole-ops in this directory.
  */
 

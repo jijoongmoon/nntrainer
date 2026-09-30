@@ -19,16 +19,18 @@
  *
  * The second family is the whole-op table a backend-neutral layer calls
  * without asking a predicate first: fc, apply_activation, layer_norm,
- * activation, residual_op, geglu, swiglu and the scopy family. These have no
- * supports_*() escape hatch, so every op a layer registered on the gpu engine
- * can reach has to resolve here — the base ComputeOps default throws, and a
- * layer has nowhere to catch that. The list is closed against the layers this
- * context registers: FullyConnectedLayerCl (fc, apply_activation,
+ * activation, residual_op / residual_op2, geglu, swiglu, sigmoid_glu,
+ * sigmoid_add, mean_rows, l2_normalize_rows and the scopy family. These have
+ * no supports_*() escape hatch, so every op a layer registered on the gpu
+ * engine can reach has to resolve here — the base ComputeOps default throws,
+ * and a layer has nowhere to catch that. The list follows the layers this
+ * context registers, among them FullyConnectedLayerCl (fc, apply_activation,
  * fc_prebuild_weight), AdditionLayer (residual_op), SwiGLULayer (swiglu),
- * LayerNormalizationLayer (layer_norm), ActivationLayer (activation), plus
- * Tensor::copy (scopy). ActivationLayer is the one entry that can still
- * throw, and only for a mode with no OpenCL kernel: supports_activation() is
- * the query, and the message names the fix.
+ * GeGLULayer (geglu), SigmoidGluLayer / SigmoidAddLayer, LayerNormalization-
+ * Layer (layer_norm), ActivationLayer (activation), plus Tensor::copy
+ * (scopy). ActivationLayer does not throw either: a mode with no
+ * OpenCL kernel runs on the host table, and supports_activation() reports
+ * which modes are accelerated.
  *
  * This file is what unblocks GPU dispatch end-to-end:
  *   ClContext (Engine-registered) -> ContextData -> ClComputeOps
@@ -119,14 +121,12 @@ public:
   // shapes, exactly as the layer used to do inline.
   //
   // dotCl is contracted to PRODUCE its output, not accumulate into it, which
-  // is why no zero-fill precedes this call. One shape does not honour that
-  // yet: the FP32 general-GEMM branch still dispatches through the CLBlast
-  // wrapper with beta = 1.0, so it reads the destination it is about to
-  // overwrite. That branch is deleted by the CLBlast removal this PR depends
-  // on, which routes the same shape to sgemm_cl -- which stores, like the
-  // other three shapes and like the whole FP16 branch. Do not add a zero-fill
-  // here to paper over it: that would cost a full-output memset on every
-  // forward for one transitional branch.
+  // is why no zero-fill precedes this call. The GEMV and GEMM shapes store,
+  // in both the FP32 and the FP16 branch (the FP32 general GEMM goes to
+  // sgemm_cl). One shape does not honour it: the 1 x 1 dot (M == 1 and
+  // N == 1) adds dot_cl's result to the value already in the destination.
+  // Do not add a zero-fill here to paper over it: that would cost a
+  // full-output memset on every forward for one scalar shape.
   //
   // A quantized weight goes to the v8c int8xint4 GEMM first. dotCl_v8c
   // returns false rather than throwing when it declines the call (the weight
@@ -227,9 +227,11 @@ public:
   // both are handed the same tensors on the same context, so they cannot hold
   // different beliefs about whether a host loop is valid on them. This
   // function used to throw instead, arguing that a tensor here may live in
-  // device memory the host has unmapped -- but no tensor is device-resident on
-  // this tree yet, and while that stays true the throw only produces a worse
-  // outcome than the loop. ClContext registers the core ActivationLayer gated
+  // device memory the host has unmapped -- but a device-resident (GPU_CLMEM)
+  // tensor still keeps its slice of the shared plane unless the application
+  // sets ResidencyPolicy::skip_shared_slice, which no model in tree does, and
+  // while that stays true the throw only produces a worse outcome than the
+  // loop. ClContext registers the core ActivationLayer gated
   // on the gelu kernels building, not on the mode, so engine=gpu with
   // activation=relu constructed successfully and then failed at the first
   // forward, mid-inference, while the fused epilogue computed the identical
@@ -238,8 +240,8 @@ public:
   // supports_activation() below still reports only the accelerated pair: it
   // answers "is this mode accelerated here", which is what a caller choosing
   // between paths wants to know. This function answers "can this mode be
-  // served", and now it always can. When residency becomes real, this host
-  // branch and apply_activation() change together.
+  // served", and now it always can. If that shared slice is ever dropped,
+  // this host branch and apply_activation() change together.
   void activation(const Tensor &in, Tensor &out, int act_type,
                   unsigned int active_rows, unsigned int row_offset) override {
     switch (static_cast<ActivationType>(act_type)) {
@@ -320,8 +322,8 @@ public:
         hidden.getMemoryData() && hidden.getMemoryData()->isSVM() &&
         input.getMemoryData() && input.getMemoryData()->isSVM() &&
         hidden.size() == input.size();
-      // NNTR_ADD_DRAIN=1 drains after the copy; the in-order queue already
-      // sequences the add behind it, so the default is not to.
+      // NNTR_ADD_DRAIN set (any value) drains after the copy; the in-order
+      // queue already sequences the add behind it, so the default is not to.
       static const bool add_drain = std::getenv("NNTR_ADD_DRAIN") != nullptr;
       if (svm16 &&
           nntrainer::gpu_copy_f16_cl(

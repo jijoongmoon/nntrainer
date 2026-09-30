@@ -23,7 +23,6 @@ namespace nntrainer {
  * @brief Process data and dimensions for OpenCL dot operation
  * @param[in] input Tensor
  * @param[in] m Tensor
- * @param[in] RunLayerContext reference
  * @param[in] trans bool
  * @param[in] trans_m bool
  */
@@ -35,7 +34,6 @@ Tensor dotCl(Tensor const &input, Tensor const &m, bool trans = false,
  * @param[in] input Tensor
  * @param[in] m Tensor
  * @param[in] result Tensor
- * @param[in] RunLayerContext reference
  * @param[in] trans bool
  * @param[in] trans_m bool
  */
@@ -47,7 +45,6 @@ void dotCl(Tensor const &input, Tensor const &m, Tensor &result,
  * @param[in] input Tensor
  * @param[in] m Tensor
  * @param[in] result Tensor
- * @param[in] RunLayerContext reference
  * @param[in] trans bool
  * @param[in] trans_m bool
  */
@@ -58,7 +55,6 @@ void dotBatchedCl(Tensor const &input, Tensor const &m, Tensor &result,
  * @brief Multiply value element by element immediately
  * @param[in] input Tensor
  * @param[in] value multiplier
- * @param[in] RunLayerContext reference
  */
 void multiplyCl(Tensor &input, float const &value);
 
@@ -72,7 +68,7 @@ void add_i_cl(Tensor &result, Tensor const &input);
 /**
  * @brief Process data and dimensions for transpose operation
  * @param[in] direction string
- * @param[in] input Tensor
+ * @param[in] in Tensor
  * @param[in] result Tensor
  */
 void transposeCl(const std::string &direction, Tensor const &in,

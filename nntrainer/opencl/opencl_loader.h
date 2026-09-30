@@ -334,8 +334,9 @@ void clBumpHandleEpoch();
 
 /**
  * @brief Handle-epoch-tracking wrappers around the creation entry points. They
- * are the ONLY way this tree should create memory objects, so that the epoch
- * above is a complete record.
+ * are the way this tree should create memory objects, so that the epoch above
+ * is a complete record. A few call sites in blas_kernels.cpp still call
+ * clCreateBuffer / clCreateSubBuffer directly and are not recorded.
  */
 cl_mem clCreateBufferT(cl_context context, cl_mem_flags flags, size_t size,
                        void *host_ptr, cl_int *errcode_ret);
@@ -357,8 +358,9 @@ void *clSVMAllocT(cl_context context, cl_svm_mem_flags flags, size_t size,
  * is also completely anonymous: it says 1 665 MiB and nothing about which of
  * the weight repack, the activation plane, the KV mirrors or a grow-only
  * scratch buffer is holding it. The ledger closes that gap by recording every
- * allocation this tree makes -- the four creation wrappers above are the only
- * way it makes one -- against a tag pushed by the call site, and every release,
+ * allocation made through the four creation wrappers above (the raw
+ * clCreateBuffer / clCreateSubBuffer calls noted there are not counted)
+ * against a tag pushed by the call site, and every release,
  * so the dump is live bytes and not merely cumulative ones.
  *
  * The counting is ON by default -- NNTR_GPU_MEM_ACCT=0 opts out, and when it

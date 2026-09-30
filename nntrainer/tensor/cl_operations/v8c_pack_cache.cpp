@@ -210,8 +210,8 @@ Manager &mgr() {
   return m;
 }
 
-// Fallback cache dir for read-only model dirs (same convention as the
-// tokenizer snapshot cache): $XDG_CACHE_HOME|~/.cache + /nntrainer/v8cpack.
+// Fallback cache dir for read-only model dirs:
+// $XDG_CACHE_HOME|~/.cache + /nntrainer/v8cpack.
 std::string fallback_pack_path(const std::string &src, uint64_t size,
                                int64_t mtime_ns) {
   const char *xdg = std::getenv("XDG_CACHE_HOME");
@@ -631,7 +631,7 @@ void load_complete() {
   // business on the first-token path. The thread owns copies/fd; it touches
   // no model memory, so lifetime is trivial. Joined in the Manager dtor at
   // exit (a detached writer's rename never lands when a one-shot CLI exits
-  // first -- same lesson as the tokenizer snapshot writer).
+  // first).
   m.join_finalizer();
   int fd = m.tmp_fd;
   std::string tmp = m.tmp_path;

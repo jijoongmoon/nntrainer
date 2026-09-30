@@ -297,7 +297,9 @@ void rmsnorm_cl_fp16(const _FP16 *input, const _FP16 *gamma, _FP16 *result,
     // write. rmsnorm_cl_fp16_coop_q writes both, so the pair costs one
     // dispatch instead of two -- worth three to four times its GPU cost on a
     // backend whose submission floor is ~7.4 us against ~2-7 us kernels.
-    // Speculative: when no FC claims the quantisation it is simply unread.
+    // Speculative: when no FC claims the quantisation it is simply unread --
+    // and on this tree no FC claims it (the FC-side consumer is not present),
+    // so each site stops fusing after a few strikes in v8cNormQuantBegin.
     //
     // That arithmetic only holds while the dispatch floor dominates, i.e. for
     // decode-shaped calls. Over a prefill the quant half runs 256 lanes per

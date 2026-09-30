@@ -1,8 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
-// Flash-attention-style single-kernel prefill / decode attention for
-// Adreno (paper ML Drift §3.6 fusion + Dao et al. 2022 online softmax).
+// Flash-attention-style single-kernel prefill / decode attention
+// (paper ML Drift §3.6 fusion + Dao et al. 2022 online softmax).
 //
-// REPLACES: the three-kernel two_conv_attention.cl path which is
+// NOTE: the header below describes the first (skeleton) kernel. The file now
+// also holds the cooperative, vectorised and Block-Q prefill kernels, the
+// split-KV decode pair and an Intel subgroup variant, and the host picks the
+// Block-Q variant by default whenever the flash path is used.
+//
+// ORIGINAL MOTIVATION: replace the three-kernel two_conv_attention.cl path,
 // (a) slower than CPU NEON on Adreno 830 due to VGPR spill (each WI's
 // TM_QK*TN_QK accumulator floods the register file), and (b) routes
 // the full scores[H, M, N_kv] tensor through global memory between
@@ -27,7 +32,7 @@
 //   the single-WI serial form. Tiling/LDS cooperation is a follow-up.
 //   gws = (num_heads_q * M,); lws chosen by host (small, e.g. 64).
 //
-// K-LAYOUT NOTE: the gpu_native NNTR_OHWI_IMG=0 path stores cache_k_svm
+// K-LAYOUT NOTE: the OHWI (non-image) attention path stores cache_k_svm
 //   in OHWI form  K[head_kv * S_max * d + n * d + x]  (qk_matmul_f16_ohwi
 //   layout, NOT the pure concat [N_kv, HD_KV]). V stays concat
 //   V[n * HD_KV + head_kv * d + x] (sv_matmul_f16 layout). To feed the

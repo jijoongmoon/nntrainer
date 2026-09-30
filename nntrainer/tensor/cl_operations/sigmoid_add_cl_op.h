@@ -35,8 +35,8 @@ class Tensor;
 bool registerSigmoidAddClKernels(ClContext &cl_context);
 
 /**
- * @brief Raw SigmoidAdd kernel dispatch, exposed for the OpenCL kernel
- *        micro-benchmarks. The layer path goes through sigmoid_add_cl_op()
+ * @brief Raw SigmoidAdd kernel dispatch on plain pointers; nothing in tree
+ *        calls it. The layer path goes through sigmoid_add_cl_op()
  * below.
  * @param in1 gate operand
  * @param in2 the operand added to the gate

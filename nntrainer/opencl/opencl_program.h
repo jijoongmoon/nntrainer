@@ -79,7 +79,6 @@ public:
    *
    * @param context OpenCL context
    * @param device_id OpenCL device id
-   * @param size binary file size
    * @param binary data saved as binary
    * @param binary_name name of binary file for logging
    * @param compiler_options string compiler options

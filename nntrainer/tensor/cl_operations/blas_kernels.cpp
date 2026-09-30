@@ -1656,7 +1656,8 @@ void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
   // epilogue as the dp4a kernel (byte-identical output). Requires the buffer
   // path (raw cl_mem) + the Intel matrix-multiply / 2d_block_io extensions; on
   // a non-XMX device registerClKernel fails -> kx null -> fall through to dp4a.
-  // M is padded up to MT*8*SG_M (=32) by the grid; M_valid guards the stores
+  // M is padded up to MT*8*SG_M (128 with the default MT=4, SG_M=4) by the
+  // grid; M_valid guards the stores
   // and the A/weight 2D-block reads clamp OOB rows to 0 (surface height = M).
   // FIX 1 (XMX/DPAS capability gate): NNTR_FC_XMX=0 force-disables (explicit
   // override always wins). Otherwise (=1 or unset) XMX is only actually used
@@ -1886,9 +1887,11 @@ void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
                                                nullptr, 0, nullptr, nullptr);
   } else {
     constexpr size_t TM = 4, TN = 8;
-    // NNTR_V8C_MFAST: swap so M/TM is the fast-varying (dim0) axis; the kernel
-    // (-DV8C_MFAST) reads m0 from gid0, n0 from gid1 to match. Weight-reuse
-    // dispatch order. Default keeps {N/TN, M/TM}.
+    // NNTR_V8C_MFAST: swap so M/TM is the fast-varying (dim0) axis; the image
+    // kernel (-DV8C_MFAST) reads m0 from gid0, n0 from gid1 to match.
+    // Weight-reuse dispatch order. Default keeps {N/TN, M/TM}. The _buf kernel
+    // does not read V8C_MFAST (it always takes n0 from gid0), so the swap is
+    // only consistent on the image path.
     std::array<size_t, 3> gws =
       v8c_mfast ? std::array<size_t, 3>{(size_t)M / TM, (size_t)N / TN, 1}
                 : std::array<size_t, 3>{(size_t)N / TN, (size_t)M / TM, 1};
@@ -1897,7 +1900,7 @@ void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
     // in the standalone microbench which used a tuned LWS. Pick a device-
     // specialized LWS (4×16 sweet spot, capped to the device max work-group
     // size and required to divide gws); fall back to NULL when none fits
-    // (small-M prefill). NNTR_V8C_LWS="lx,ly" overrides.
+    // (small-M prefill). There is no env override.
     std::array<size_t, 2> picked{};
     const bool lws_ok = v8c_pick_lws(gws[0], gws[1], picked);
     std::array<size_t, 3> lws = {picked[0], picked[1], 1};

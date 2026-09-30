@@ -75,7 +75,7 @@ public:
   ClContext() : Context(std::make_shared<ContextData>()) {}
 
   /**
-   * @brief destructor to release opencl commandQueue
+   * @brief destructor to release the opencl buffers, commandQueue and context
    */
   ~ClContext() override { releaseClResources(); };
 
@@ -201,7 +201,7 @@ public:
    * @brief Create an Object from the string key
    *
    * @tparam T Type of object, currently, only Layer is supported
-   * @param key integer key
+   * @param key string key
    * @param props property
    * @return PtrType<T> unique pointer to the object
    */
@@ -245,7 +245,7 @@ public:
   /**
    * @brief Create a Layer object from the integer key
    *
-   * @param type integer key
+   * @param int_key integer key
    * @param properties property
    * @return std::unique_ptr<nntrainer::Layer> unique pointer to the object
    */

@@ -308,12 +308,11 @@ bool two_conv_attention_prefill_f16_cl(
     o_arg = sc.o_buf;
   }
 
-  // CRITICAL: the shared command queue is created with
-  // CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE. Without an explicit event
-  // chain or barrier, the kernels we enqueue below are free to overtake
-  // the CL_FALSE writes above and read uninitialized Q/K/V. Force
-  // ordering with a single clFinish — measured overhead ~0.1ms per
-  // prefill, negligible vs ~900ms total mha time.
+  // The shared command queue is in order (CommandQueueManager creates it
+  // with properties 0), so the kernels enqueued below already run after
+  // the CL_FALSE writes above. This clFinish dates from when the queue was
+  // out of order and is kept as a conservative sync point — measured
+  // overhead ~0.1ms per prefill, negligible vs ~900ms total mha time.
   opencl::clFinish(q);
 
   // Pre-K1 sync point for profiling. Always cheap when env unset.
@@ -1398,17 +1397,6 @@ bool gpu_copy_f16_row_cl(const uint16_t *in, uint16_t *out_base, unsigned int N,
   return true;
 }
 
-// Create a cl_mem OHWI mirror buffer + image2d_from_buffer view for the K or V
-// cache, so the Adreno image attention (two_conv_attention_prefill_f16_ohwi_
-// kvimg_view_cl) can read K/V via read_imageui (texture cache). The layer-graph
-// KV cache is SVM (no cl_mem handle) and an image cannot wrap an SVM pointer,
-// so this is a separate cl_mem mirror filled by k_scatter_ohwi /
-// v_scatter_ohwi_t, writing the cache_{k,v} OHWI mirrors plus
-// cache_{k,v}_image_ohwi creation.
-//   K: OHWI [hKV, S_max, d]            -> image w=d/8,     h=hKV*S_max,
-//   pitch=d*2 V: reversed-OHWI [hKV, d, S_max]   -> image w=S_max/8, h=hKV*d,
-//   pitch=S_max*2
-// Returns false (and leaves *buf / *image null) on failure; caller falls back.
 unsigned int kimg_gsh_for(unsigned int num_heads_KV, unsigned int max_S) {
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
@@ -1475,6 +1463,17 @@ unsigned int ohwi_mirror_capacity(unsigned int rows) {
   return (rows + s_align - 1u) / s_align * s_align;
 }
 
+// Create a cl_mem OHWI mirror buffer + image2d_from_buffer view for the K or V
+// cache, so the Adreno image attention (two_conv_attention_prefill_f16_ohwi_
+// kvimg_view_cl) can read K/V via read_imageui (texture cache). The layer-graph
+// KV cache is SVM (no cl_mem handle) and an image cannot wrap an SVM pointer,
+// so this is a separate cl_mem mirror filled by k_scatter_ohwi /
+// v_scatter_ohwi_t, writing the cache_{k,v} OHWI mirrors plus
+// cache_{k,v}_image_ohwi creation.
+//   K: OHWI [hKV, S_max, d]            -> image w=d/8,     h=hKV*S_max,
+//   pitch=d*2 V: reversed-OHWI [hKV, d, S_max]   -> image w=S_max/8, h=hKV*d,
+//   pitch=S_max*2
+// Returns false (and leaves *buf / *image null) on failure; caller falls back.
 bool create_ohwi_kv_mirror(bool is_v, unsigned int num_heads_KV,
                            unsigned int head_dim, unsigned int max_S,
                            cl_mem *out_buf, cl_mem *out_image,
@@ -2703,13 +2702,14 @@ bool two_conv_attention_prefill_f16_ohwi_cl(
     o_arg = sc.o_buf;
   }
 
-  // Out-of-order queue barrier (same as concat variant).
+  // Conservative sync point (same as concat variant); the queue is in order.
   opencl::clFinish(q);
 
-  // Intel NEO honors CL_QUEUE_OUT_OF_ORDER literally: the K1→K2→K3 chain
-  // (data-dependent through `scores`) is NOT auto-serialized, so K3 can
-  // read an unwritten `scores` and emit all-zero O. Adreno's driver
-  // serializes same-buffer-dependent kernels in practice, so this gate
+  // These barriers date from an out-of-order queue, on which Intel NEO did
+  // NOT auto-serialize the K1→K2→K3 chain (data-dependent through `scores`),
+  // so K3 could read an unwritten `scores` and emit all-zero O. The queue is
+  // now in order, so they are redundant. Adreno's driver serializes
+  // same-buffer-dependent kernels in practice, so this gate
   // (NNTR_V8C_BUF, the existing Intel device-specialization signal)
   // keeps the Adreno path bit-identical. The barriers carry no math
   // change — pure ordering.
@@ -3014,10 +3014,10 @@ bool two_conv_attention_prefill_f16_ohwi_full_cl(
 // `v_buf_in`. Similarly, when `k_image_in` is non-null we dispatch the
 // image2d-K kernel (qk_matmul_f16_ohwi_img); otherwise we use the
 // SVM-K kernel (qk_matmul_f16_ohwi) with K_svm.
-// NNTR_SV_IMG_RW=1: the sv kernel with the V mirror bound as a
-// __read_write image (CL2.0, own program): on this driver a read-write image
-// cannot be served by the sampler's texture path, so the arm asks whether the
-// stale read is specific to that path.
+// NNTR_SV_IMG_RW (default on; =0 restores the sampled read): the sv kernel
+// with the V mirror bound as a __read_write image (CL2.0, own program). On
+// this driver a read-write image cannot be served by the sampler's texture
+// path, which is what avoids the stale read described at the dispatch site.
 static const std::string sv_imgrw_kernel = std::string(R"CL(
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 )CL") + R"CL(
@@ -3710,7 +3710,8 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
       if (nq > 0)
         nx = (nx / nq + 1) * nq;
     }
-    // The LWS is env-overridable + measured (NNTR_QK_LWS="x,y,z"); default
+    // The LWS is env-overridable + measured (NNTR_QK_LWS="x,y,z"). The current
+    // default is {8,8,1} (see the re-sweep note below); originally
     // {16,4,1} won a fair A/B/A/B sweep at M=1024 on Adreno 830 (SD8 Elite):
     // qk_matmul_f16_ohwi_img 76.5 ms vs 110.2 ms for the prior {64,1,1}
     // (-30.6%; thermal pair: 76.49/76.55 vs 110.21/110.21), token 7212
@@ -3985,7 +3986,8 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
     }
     // TDX=8 tiled: each WI computes 8 output channels, so the x grid is
     // head_dim/8 work-items. Workgroup (LWS_X x's, LWS_Y=4 m's).
-    // The LWS is env-overridable + measured (NNTR_SV_LWS="x,y,z"); default
+    // The LWS is env-overridable + measured (NNTR_SV_LWS="x,y,z"). The current
+    // default is {4,16,1} (see the re-sweep note below); originally
     // {8,8,1} won a fair A/B/A/B sweep at M=1024 on Adreno 830 (SD8 Elite):
     // sv_matmul_f16_ohwi_img 108.2 ms vs 150.6 ms for the prior {16,4,1}
     // (-28%; ~166 ms for driver NULL lws), token 7212 match=1 unchanged.
@@ -3996,7 +3998,8 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
     // v8c_pick_lws + NULL-fallback pattern in blas_kernels.cpp): if any
     // gws[i] % lws[i] != 0 we fall back to NULL (driver-chosen workgroup).
     constexpr size_t TDX = 8;
-    // Parse NNTR_SV_LWS once. "0,0,0" (or unset/garbage) => NULL lws.
+    // Parse NNTR_SV_LWS once. Unset/garbage => default {4,16,1}; "0,0,0" =>
+    // NULL lws.
     // 2026-06-18 re-sweep on Adreno 840 / M=999 (after the M_pad-align fix):
     // {4,16,1} best (paired with QK {8,8,1}); the old {8,8,1} (Adreno 830 /
     // M=1024) is recoverable via NNTR_SV_LWS=8,8,1.
@@ -4079,7 +4082,8 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
 // [H_kv,d,S_max]), but computing each (head_q, m) row entirely in-kernel via
 // LDS scores — the [H,M,N_kv] scores tensor is NEVER written to DRAM. One
 // enqueue replaces qk_matmul + softmax_row + sv_matmul. Kernel:
-// fused_row_attention_f16_ohwi_img (two_conv_attention.cl). NNTR_FLASH_IMG.
+// fused_row_attention_f16_ohwi_img (two_conv_attention.cl). Nothing in tree
+// calls it at present.
 // =============================================================================
 bool fused_row_attention_f16_ohwi_img_cl(
   const uint16_t *Q_svm, cl_mem K_image_ohwi, cl_mem V_image_ohwi,
@@ -4226,8 +4230,9 @@ bool flash_attention_prefill_f16_cl(
   // query_row), FLASH_COOP_LWS WIs each own a disjoint slice of head_dim,
   // tree-reduce the score dot in LDS and cooperatively run the shared
   // online-softmax (acc[d] lives in LDS, no per-WI d-wide private acc => no
-  // register spill). The naive 1-WI variant (skeleton) is the default flash
-  // path and remains reachable (NNTR_FLASH=1 without COOP) for A/B.
+  // register spill). Block-Q is the default flash variant; the naive 1-WI
+  // variant (skeleton) remains reachable for A/B with NNTR_FLASH_BLOCKQ=0 and
+  // neither NNTR_FLASH_COOP nor NNTR_FLASH_VEC set.
   static const int flash_coop = []() {
     const char *e = std::getenv("NNTR_FLASH_COOP");
     return (e && std::atoi(e) != 0) ? 1 : 0;
@@ -4363,8 +4368,10 @@ bool flash_attention_prefill_f16_cl(
     return v8c_use_buffer_path() ? 1 : 0; // Intel buffer path => 1
   }();
   // FLASH_COOP_LWS: WG size for the coop variant (work-items cooperating
-  // over head_dim). Default 64. LDS footprint is tiny (q_sh[d]+acc_sh[d]+
-  // red_sh[BLOCK_KV*LWS] ~ 1-3 KB), well within Adreno's 32 KB at any LWS.
+  // over head_dim). Default: under Block-Q 16/32/64 by head_dim, otherwise
+  // 16 on the Intel/buffer path and 64 elsewhere (see below). LDS footprint
+  // is tiny (q_sh[d]+acc_sh[d]+red_sh[BLOCK_KV*LWS] ~ 1-3 KB), well within
+  // Adreno's 32 KB at any LWS.
   // Must be a power of two (log-step reduction). Override via env.
   // NOTE (gemma4): NOT process-wide static — depends on the LIVE head_dim so a
   // model with TWO head_dims (gemma4: 256 sliding / 512 full) gets the right
@@ -4505,13 +4512,14 @@ bool flash_attention_prefill_f16_cl(
   const bool use_xmx = flash_blockq && flash_xmx_req && causal && xmx_win_ok &&
                        (int)head_dim % 16 == 0 && (int)head_dim <= 512 &&
                        ClContext::Global().caps().dpas;
-  // DPAS row-tile (M dimension). TM=8 measured best at every d incl. 512:
-  // the register budget (~FXA_TM*d*6B/16 per lane) spills at TM8/d512, but
+  // DPAS row-tile (M dimension). TM=8 measured better than TM=4 at every d
+  // incl. 512: the register budget (~FXA_TM*d*6B/16 per lane) spills at
+  // TM8/d512, but
   // halving the per-visit DPAS count + tile count still nets -26% vs TM4
   // (gemma4 32K full-attn 147->108s). The d=512 kernel remains latency-bound
   // (~9ns/visit vs 0.56 at d=128 -- 16KB SLM V-tile caps residency and the
   // KCH=32 SLM VNNI gather serializes); the planned v2 is a dual-subgroup
-  // d-split WG. NNTR_FLASH_XMX_TM=4/8 overrides for experiments.
+  // d-split WG. NNTR_FLASH_XMX_TM=4/8/16 overrides for experiments.
   static const int xmx_tm_env = []() {
     const char *e = std::getenv("NNTR_FLASH_XMX_TM");
     const int v = e ? std::atoi(e) : 0;
@@ -4521,9 +4529,9 @@ bool flash_attention_prefill_f16_cl(
   // traffic-proportionally), and 16 rows per K/V pass halves that traffic --
   // measured 32K full-attn -29% (gemma4 d=512/NSG4).
   const int xmx_tm = xmx_tm_env ? xmx_tm_env : 16;
-  // v2: subgroups per WG, each owning a d-slice (d=512 -> 2 so the per-lane
-  // chunk count returns to the d=256 register envelope and lane residency
-  // doubles). NNTR_FLASH_XMX_NSG=1/2 overrides for A/B.
+  // v2: subgroups per WG, each owning a d-slice. Default 1, 4 at d>=512 and
+  // 2 at windowed d=256 (see below). NNTR_FLASH_XMX_NSG=1/2/4 overrides for
+  // A/B.
   static const int xmx_nsg_env = []() {
     const char *e = std::getenv("NNTR_FLASH_XMX_NSG");
     const int v = e ? std::atoi(e) : 0;
@@ -4559,9 +4567,9 @@ bool flash_attention_prefill_f16_cl(
   // divide head_dim (no current dim hits this; env overrides could).
   if ((int)head_dim % (16 * xmx_nsg) != 0)
     xmx_nsg = 1;
-  // Exchange batching (NSG>1 only): key-tiles per psum exchange. Default 2
-  // (one WG-barrier pair per 32 keys; +XB*NSG*TM*64B SLM). NNTR_FLASH_XMX_XB
-  // = 1/2/4 overrides for A/B.
+  // Exchange batching (NSG>1 only): key-tiles per psum exchange. Default 1
+  // (see below); XB=2 is one WG-barrier pair per 32 keys, at +XB*NSG*TM*64B
+  // SLM. NNTR_FLASH_XMX_XB = 1/2/4 overrides for A/B.
   static const int xmx_xb_env = []() {
     const char *e = std::getenv("NNTR_FLASH_XMX_XB");
     const int v = e ? std::atoi(e) : 0;

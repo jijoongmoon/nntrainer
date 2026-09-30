@@ -3,7 +3,7 @@
  * Copyright (C) 2024 Yash Singh <yash.singh@samsung.com>
  * Copyright (C) 2025 Michal Wlasiuk <testmailsmtp12345@gmail.com>
  *
- * @file	attention_kernels_templates.hpp
+ * @file	attention_kernels_templates.h
  * @date	07 July 2025
  * @brief	Common attention OpenCL kernels (common templates used by
  * attention_kernels_fp16.cpp and attention_kernels.cpp)

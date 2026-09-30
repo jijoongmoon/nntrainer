@@ -66,6 +66,8 @@
 // Tuned on Intel Arc Lunar Lake Xe2 (NEO 25.18) at M1024/N4096/K4096:
 // MT=4,NT=4,SG_M=1 -> ~30.6 TOP/s (one subgroup per WG maximizes the number
 // of concurrent workgroups = occupancy; larger SG_M serialized hard here).
+// That is a standalone-benchmark figure: the host FC path compiles with its
+// own defaults (MT=4, NT=2, SG_M=4) unless NNTR_XMX_* overrides them.
 #ifndef MT
 #define MT 4          // DPAS M-tiles per subgroup: rows = MT*8
 #endif

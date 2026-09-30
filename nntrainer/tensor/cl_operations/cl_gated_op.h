@@ -8,9 +8,9 @@
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  Shared kernel-argument binding for the two-operand elementwise
- *         OpenCL whole-ops (GeGLU / SwiGLU).
+ *         OpenCL whole-ops (GeGLU / SwiGLU / SigmoidGLU / SigmoidAdd).
  *
- * @details Both have the same kernel shape -- `(in1, in2) -> out`, one work
+ * @details All have the same kernel shape -- `(in1, in2) -> out`, one work
  * item per element, arguments 0/1/2 -- and the same residency question, so
  * they share one binder instead of a copy of it each. Only the kernel object
  * and the maths inside it differ.

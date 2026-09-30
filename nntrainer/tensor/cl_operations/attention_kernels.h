@@ -25,10 +25,10 @@ namespace nntrainer {
 
 /**
  * @brief     Rotary Embedding process
- * @param[in] in _FP16 * input
- * @param[in] out _FP16 * output
- * @param[out] freqs_cos cosine of the frequencies
- * @param[out] freqs_sin sine of the frequencies
+ * @param[in] in float * input
+ * @param[in] out float * output
+ * @param[in] freqs_cos cosine of the frequencies
+ * @param[in] freqs_sin sine of the frequencies
  * @param[in] cos_ vector of cos values
  * @param[in] sin_ vector of sin values
  * @param[in] batch size of batch
@@ -37,7 +37,7 @@ namespace nntrainer {
  * @param[in] width width of input
  * @param[in] dim hidden dim size
  * @param[in] from sequence order
- * @param[in] max_timestep max timestep
+ * @param[in] max_timestamp max timestep
  * @param[in] in_size size of input
  * @param[in] out_size size of output
  */
@@ -57,8 +57,8 @@ void rotary_emb_cl(float *in, float *out,
  * @brief     Rotary Embedding process
  * @param[in] in _FP16 * input
  * @param[in] out _FP16 * output
- * @param[out] freqs_cos cosine of the frequencies
- * @param[out] freqs_sin sine of the frequencies
+ * @param[in] freqs_cos cosine of the frequencies
+ * @param[in] freqs_sin sine of the frequencies
  * @param[in] cos_ vector of cos values
  * @param[in] sin_ vector of sin values
  * @param[in] batch size of batch
@@ -67,7 +67,7 @@ void rotary_emb_cl(float *in, float *out,
  * @param[in] width width of input
  * @param[in] dim hidden dim size
  * @param[in] from sequence order
- * @param[in] max_timestep max timestep
+ * @param[in] max_timestamp max timestep
  * @param[in] in_size size of input
  * @param[in] out_size size of output
  */
@@ -305,7 +305,7 @@ bool two_conv_attention_prefill_f16_ohwi_kvimg_view_cl(
 /// path's scores round-trip + L2 thrash) and 3 enqueues collapse to 1.
 /// Q stays SVM; O written SVM. Adreno image path only (read_imageui).
 /// Constraints: max_seq_len <= 1024, head_dim <= 128, both %8==0.
-/// Selected by the caller; NNTR_FLASH_IMG=1 forces it on where available.
+/// Selected by the caller; nothing in tree calls it at present.
 bool fused_row_attention_f16_ohwi_img_cl(
   const uint16_t *Q_svm, cl_mem K_image_ohwi, cl_mem V_image_ohwi,
   uint16_t *O_svm, unsigned int M, unsigned int N_kv, unsigned int num_heads_Q,
@@ -371,12 +371,6 @@ bool flash_decode_f16_cl(const uint16_t *Q_host, const uint16_t *K_host,
 void attention_prewarm_programs(ClContext &cc);
 
 /**
- * @brief Create a cl_mem OHWI mirror buffer + image2d view for the K (is_v=0)
- *        or V (is_v=1) cache, enabling the Adreno image attention path. The
- *        mirror is filled by k_scatter_ohwi_cl / v_scatter_ohwi_t_cl.
- * @return true on success (*out_buf, *out_image set); false on failure.
- */
-/**
  * @brief Packing shift for the OHWI K image view (see kimg_read in
  *        two_conv_attention.cl). Returns the smallest s with
  *        (num_heads_KV*max_S)>>s <= CL_DEVICE_IMAGE2D_MAX_HEIGHT, i.e. 0
@@ -394,6 +388,12 @@ unsigned int kimg_gsh_for(unsigned int num_heads_KV, unsigned int max_S);
  */
 unsigned int ohwi_mirror_capacity(unsigned int rows);
 
+/**
+ * @brief Create a cl_mem OHWI mirror buffer + image2d view for the K (is_v=0)
+ *        or V (is_v=1) cache, enabling the Adreno image attention path. The
+ *        mirror is filled by k_scatter_ohwi_cl / v_scatter_ohwi_t_cl.
+ * @return true on success (*out_buf, *out_image set); false on failure.
+ */
 bool create_ohwi_kv_mirror(bool is_v, unsigned int num_heads_KV,
                            unsigned int head_dim, unsigned int max_S,
                            cl_mem *out_buf, cl_mem *out_image,
@@ -571,12 +571,6 @@ bool v_scatter_ohwi_t_img_cl(const uint16_t *src_svm, void *dst_image,
                              unsigned int src_off = 0);
 
 /**
- * @brief [kv-img-write] Inverse gathers on the image path: with the writes on
- *        the image, a BUFFER read of the mirror is the same aliasing hazard
- *        reversed, so the boundary sync reads the image too. Same semantics as
- *        k_gather_ohwi_cl / v_gather_ohwi_t_cl.
- */
-/**
  * @brief [kv-img-write] mode 2 V scatter: rebuild the mirror-local texels
  *        covering [m_from, m_to) from the concat V slab (`vcache_svm` = this
  *        batch's slab base), mapping each lane's absolute position through the
@@ -589,6 +583,12 @@ bool v_scatter_ohwi_t_img_slab_cl(const uint16_t *vcache_svm, void *dst_image,
                                   unsigned int m_to, unsigned int base_abs,
                                   unsigned int ring_cap, unsigned int to_abs);
 
+/**
+ * @brief [kv-img-write] Inverse gathers on the image path: with the writes on
+ *        the image, a BUFFER read of the mirror is the same aliasing hazard
+ *        reversed, so the boundary sync reads the image too. Same semantics as
+ *        k_gather_ohwi_cl / v_gather_ohwi_t_cl.
+ */
 bool k_gather_ohwi_img_cl(void *src_image, uint16_t *dst_svm, unsigned int M,
                           unsigned int num_heads_KV, unsigned int head_dim,
                           unsigned int max_S, unsigned int position,

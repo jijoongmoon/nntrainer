@@ -412,11 +412,14 @@ void ClBufferPool::allocate() {
    *  that now exists") true from either path. */
   recordPlannerLayout();
 
-  /** Under the GPU ledger, say how the two planes relate. The device plane is
-   *  one buffer per planner offset, sized to the largest token there, so its
-   *  TOTAL is the sum over offsets -- which is not the same number as the
-   *  shared plane's span, and the ledger showing 310 MiB of device buffers
-   *  against a 132 MiB shared plane is otherwise unreadable. */
+  /** Under the GPU ledger, say how the two planes relate. With
+   *  NNTR_CLMEM_SUBBUF=0 the device plane is one buffer per planner offset,
+   *  sized to the largest token there, so its TOTAL is the sum over offsets --
+   *  which is not the same number as the shared plane's span, and the ledger
+   *  showing 310 MiB of device buffers against a 132 MiB shared plane is
+   *  otherwise unreadable. By default it is instead one base buffer with a
+   *  sub-buffer per aligned offset (see createDeviceBufferLocked), which is
+   *  why the line also reports how many offsets are aligned. */
   if (opencl::clMemAcctOn()) {
     size_t sum = 0, biggest = 0;
     cl_uint align_bits = 0;

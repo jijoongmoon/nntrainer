@@ -107,8 +107,8 @@ public:
    * touched shared memory -- the real producer-to-consumer boundary -- rather
    * than after every dispatch. The flag is set by SetKernelSVMArguments and
    * cleared here on read, so it describes exactly the dispatch being enqueued
-   * whatever order the arguments were bound in. The dispatch path is single
-   * threaded, so the process-wide flag is not a race.
+   * whatever order the arguments were bound in. The flag is thread_local, so
+   * it pairs each bind with the enqueue on the same thread.
    *
    * @return true when the dispatch being enqueued bound shared memory
    */

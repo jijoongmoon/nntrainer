@@ -97,7 +97,7 @@ public:
 
 private:
   std::tuple<props::Print> transpose_props; /**< transpose layer properties :
-                                            unit - number of output neurons */
+                                            print - print layer info */
 };
 } // namespace nntrainer
 

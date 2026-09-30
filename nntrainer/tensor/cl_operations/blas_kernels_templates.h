@@ -39,7 +39,9 @@ namespace nntrainer {
  *
  * @param op     primitive + dtype, e.g. "sgemm_cl<fp16>"
  * @param step   which OpenCL step refused
- * @param d0d1d2 shape triple (M,N,K for gemm; dim1,dim2,lda for gemv)
+ * @param d0     first shape value (M for gemm; dim1 for gemv)
+ * @param d1     second shape value (N for gemm; dim2 for gemv)
+ * @param d2     third shape value (K for gemm; lda for gemv)
  */
 [[noreturn]] inline void clBlasFail(const char *op, const char *step,
                                     unsigned int d0, unsigned int d1,

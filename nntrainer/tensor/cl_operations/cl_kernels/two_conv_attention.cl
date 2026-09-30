@@ -289,7 +289,8 @@ static inline void tca_score_band(const int M, const int N_kv, const int causal,
 // (e.g. Intel NEO) whose SPIR-V backend cannot compile integer-coordinate
 // read_imageui — otherwise clBuildProgram fails for the whole program and the
 // image-FREE attention kernels (qk_matmul_f16_ohwi / softmax_row_f16 /
-// sv_matmul_f16) used by the NNTR_OHWI_IMG=0 path could not register either.
+// sv_matmul_f16) used by the buffer (non-image) OHWI path could not register
+// either.
 // Default (Adreno) builds with no option, keeping that path bit-identical.
 // [kimg-pack] The OHWI K mirror is an image2d VIEW over the [H_kv, S_max, d]
 // buffer. One image row per (head, seq) row makes the height H_kv*S_max, which

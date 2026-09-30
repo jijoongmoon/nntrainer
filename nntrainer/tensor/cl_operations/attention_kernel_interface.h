@@ -2,7 +2,7 @@
 /**
  * Copyright (C) 2024 Yash Singh <yash.singh@samsung.com>
  *
- * @file	blas_kernel_interface.h
+ * @file	attention_kernel_interface.h
  * @date	28 August 2024
  * @brief	Interface for attention OpenCL kernels
  * @see		https://github.com/nntrainer/nntrainer

@@ -492,11 +492,6 @@ struct V8cWeightEntry {
 // flag still overrides); this file-local name forwards to it.
 static bool v8c_buffer_path() { return v8c_use_buffer_path(); }
 
-// [engine=gpu fold] The v8c int8×QINT4 FC GEMM is the GPU FC path's default —
-// this gate is only reached from dotCl_v8c (ClComputeOps::fc), i.e. an
-// engine=gpu FC, and the host fallback it guards is byte-identical, so
-// defaulting it ON
-
 // The v8c int8×QINT4 FC GEMM is the GPU FC path's default — this gate is only
 // reached from the GPU compute-ops FC dispatch, and the host fallback it guards
 // is byte-identical, so it defaults ON. NNTR_FC_INT8_GPU=0 disables it for A/B.
@@ -623,7 +618,9 @@ struct V8cScratch {
   // [norm->FC quant handoff] A fused norm (rmsnorm_cl_fp16_coop_q) fills one
   // of these slots with the quantisation of the row it just wrote, and
   // publishes which device buffer that row lives in. An FC whose input IS
-  // that buffer then skips its own quant kernel.
+  // that buffer would then skip its own quant kernel -- but no FC on this tree
+  // consumes the handoff yet: the FC always runs its own quant, so the fields
+  // below are only written and the nq_* statistics stay 0.
   //
   // The key is NOT the handle alone -- a pooled sub-buffer handle does not
   // identify a tensor on this backend, which is the KV-sharing defect above.
@@ -649,8 +646,9 @@ static V8cScratch &v8c_scratch() {
 // Fusion accounting. The two quant-elision paths (a norm that emitted the
 // quantisation, and a sibling FC reusing a fanout's quantisation) both hinge
 // on a window of the dispatch write log staying clean, and whether a given
-// graph keeps it clean is not something to guess at -- NNTR_FUSE_STATS=1
-// prints the tally at exit so a decline can be attributed instead of assumed.
+// graph keeps it clean is not something to guess at -- NNTR_FUSE_STATS set
+// (any value) prints the tally at exit so a decline can be attributed instead
+// of assumed.
 struct V8cFuseStats {
   unsigned long long share_hit = 0; /**< FCs served by a sibling's quant */
   unsigned long long quant = 0;     /**< FCs that ran their own quant */
@@ -868,10 +866,11 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
   // A rebuild from the tensor's own payload after that payload was released
   // (DROP_PLAIN below) would permute zeros into a device weight and every FC
   // through it would answer wrong with rc = 0. The only way here is a cache
-  // entry that was dropped without its tensor going away (the teardown hook
-  // cl_fc_release_caches() runs after the model objects are freed, so a
-  // healthy run never takes this). Refuse, do not decline: a nullptr return
-  // would send the call to the host fallback, which is guarded the same way.
+  // entry that was dropped without its tensor going away (entries are only
+  // replaced on a reused-key mismatch above; there is no teardown hook that
+  // frees this cache, so a healthy run never takes this). Refuse, do not
+  // decline: a nullptr return would send the call to the host fallback, which
+  // is guarded the same way.
   if (nib_override == nullptr)
     refuseIfQs4cxPayloadDropped(nibbles, "v8c weight rebuild");
   // int4 weights are QS4CX: row-major plain nibbles (uint4 = int4+8, no XOR) +
@@ -1207,7 +1206,9 @@ static inline float v8c_h2f(uint16_t h) {
 // the gemma4 decode cell, 122 of the 227 norms a token ran published a
 // quantisation nobody took, and their share of the extra GPU time exceeded the
 // dispatch floor the 105 productive ones removed. So a site that has published
-// several times and never once been collected stops fusing.
+// several times and never once been collected stops fusing. Nothing on this
+// tree increments `claimed` (there is no FC-side consumer of the handoff), so
+// every site stops after kNormSiteStrikes publications.
 //
 // The site key is the gamma pointer: a model weight, unique per norm layer and
 // stable for the process, which is exactly the identity wanted here (the
@@ -1224,7 +1225,7 @@ static std::unordered_map<const void *, NormSite> &v8c_norm_sites() {
 
 // How many unclaimed publications a site gets before it is written off. Small:
 // the decision is stable after the first token, and a site that is productive
-// is claimed on its very first publication.
+// would be claimed on its very first publication.
 static constexpr unsigned int kNormSiteStrikes = 4;
 
 bool v8cNormQuantBegin(const void *site, unsigned int rows, unsigned int K,
@@ -1569,9 +1570,9 @@ static void v8c_write_output_resident(cl_mem y_fp16, Tensor &output,
   size_t out_bytes = (size_t)n * (out_fp16 ? sizeof(uint16_t) : sizeof(float));
   // async map: the FC output is always consumed by the next GPU op — never
   // read on the host here — so the in-order queue orders this map before the
-  // next op's unmap and the host need not block. NNTR_FC_SVM_SYNC=1 makes the
-  // map BLOCKING (coarse-grained-SVM coherence probe for drivers where the
-  // async handoff shows stale reads).
+  // next op's unmap and the host need not block. NNTR_FC_SVM_SYNC set (any
+  // value) makes the map BLOCKING (coarse-grained-SVM coherence probe for
+  // drivers where the async handoff shows stale reads).
   static const bool fc_svm_sync = std::getenv("NNTR_FC_SVM_SYNC") != nullptr;
   cc->command_queue_inst_.enqueueSVMMap(out_svm, out_bytes, true,
                                         /** event */ nullptr,
@@ -2096,11 +2097,11 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
                      w->row_sum_w_int4.get(), gemm_y_arg, M_pad, N, K, M);
     // NNTR_XE3_FC_SYNC: narrowed coarse-grain-SVM coherence fix. The in-order
     // queue does not give kernel->kernel coarse-grained-SVM coherence on some
-    // Intel drivers; the global drain (NNTR_XE3_SYNC, clFinish after EVERY
-    // SVM dispatch) fixes it but serializes decode. A clFinish after the FC
-    // GEMM alone is sufficient (it is the dominant SVM-producing op), so
-    // draining only here keeps coherence while restoring decode pipelining.
-    // Value-parsed so NNTR_XE3_FC_SYNC=0 disables.
+    // Intel drivers. A clFinish after the FC GEMM (the dominant SVM-producing
+    // op) covers that handoff. It does NOT replace the global drain: on a
+    // coarse-grain-only device needsCoarseSVMDrain() still drains after every
+    // SVM dispatch, so on such Intel parts both run. Value-parsed so
+    // NNTR_XE3_FC_SYNC=0 disables.
     static const bool xe3_fc_sync = []() {
       const char *e = std::getenv("NNTR_XE3_FC_SYNC");
       if (e)

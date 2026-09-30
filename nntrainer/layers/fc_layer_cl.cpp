@@ -265,13 +265,13 @@ void FullyConnectedLayerCl::read(ReadSource src, RunLayerContext &run_context,
   //
   // The mapping is alive for exactly this call (the loader unmaps it when the
   // node is done), which is why the build has to happen here and not later.
-  // The default is tied to NNTR_V8C_DROP_PLAIN rather than being ON
-  // everywhere, because it rests on exactly the same fact: that on this lane
-  // every QS4CX FC is dispatched by the v8c path, so the host FC fallback --
-  // the one reader of the payload -- is unreachable in a healthy run. Where
-  // that has been measured, DROP_PLAIN is already on (ClContext turns the
-  // pair on for Adreno) and skipping the copy is strictly better than making
-  // it and then madvising it away. Where it has not, the copy stays.
+  // The default follows the NNTR_V8C_DROP_PLAIN environment variable rather
+  // than being ON everywhere, because it rests on exactly the same fact: that
+  // on this lane every QS4CX FC is dispatched by the v8c path, so the host FC
+  // fallback -- the one reader of the payload -- is unreachable in a healthy
+  // run. Only an explicit NNTR_V8C_DROP_PLAIN=1 turns it on: nothing in the
+  // tree sets that variable, and the built-in Android DROP_PLAIN default does
+  // not enable zero-copy. Otherwise the copy stays.
   // NNTR_LOAD_ZEROCOPY=1/0 overrides either way.
   static const bool zerocopy_on = []() {
     const char *e = std::getenv("NNTR_LOAD_ZEROCOPY");

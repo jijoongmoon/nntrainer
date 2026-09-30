@@ -51,14 +51,14 @@ namespace {
  * There is deliberately no vendor clause. What is being worked around is a
  * property of coarse-grain shared memory, which the queue does not order;
  * scoping the repair to the one device it was first measured on would leave
- * every other coarse-grain device racing. Adreno is coarse-grain and is not
- * Intel, and this backend now probes the vendor ICD path specifically to reach
- * it, so a vendor clause would exclude a primary target of that work from the
- * fix. "Not observed elsewhere" is an absence of measurement rather than a
- * distinction a reader can act on, and what it would leave in place is a wrong
- * result, not a slow one. The cost where the drain was not needed is one
- * clFinish per dispatch that touched shared memory: throughput, measurable,
- * and recoverable.
+ * every other coarse-grain device racing. A coarse-grain device need not be
+ * Intel, and this backend probes non-Intel ICDs (Adreno) as well, so a vendor
+ * clause could exclude a primary target from the fix; a device that reports a
+ * fine-grain capability gets no drain whatever its vendor. "Not observed
+ * elsewhere" is an absence of measurement rather than a distinction a reader
+ * can act on, and what it would leave in place is a wrong result, not a slow
+ * one. The cost where the drain was not needed is one clFinish per dispatch
+ * that touched shared memory: throughput, measurable, and recoverable.
  *
  * Both fine-grain capabilities count. A device advertising FINE_GRAIN_SYSTEM
  * without FINE_GRAIN_BUFFER is coherent just the same, and testing only the
@@ -134,12 +134,13 @@ bool CommandQueueManager::CreateCommandQueue() {
   // getting GPU device ID
   cl_device_id device_id = context_instance.GetDeviceId();
 
-  // In-order queue. Nothing in this tree enqueues a wait list or waits on an
-  // event, so out-of-order execution bought no overlap; what it did do is let
-  // the device reorder two kernels that hand off through a shared buffer,
-  // which is exactly how consecutive layers on the OpenCL memory allocator
-  // communicate. Submission order is the only ordering guarantee those
-  // handoffs have.
+  // In-order queue. No kernel dispatch in this tree enqueues a wait list (the
+  // only event waits are on asynchronous weight uploads, before their host
+  // staging is freed), so out-of-order execution bought no overlap between
+  // kernels; what it did do is let the device reorder two kernels that hand
+  // off through a shared buffer, which is exactly how consecutive layers on
+  // the OpenCL memory allocator communicate. Submission order is the only
+  // ordering guarantee those handoffs have.
   command_queue_ = clCreateCommandQueue(context, device_id, 0, &error_code);
   if (!command_queue_) {
     ml_loge("Failed to create a command queue. OpenCL error code: %d : ",
@@ -439,7 +440,7 @@ bool CommandQueueManager::DispatchCommand(
   const int (&work_group_size)[3], cl_event *event,
   std::vector<cl_event> events_to_wait) {
 
-  // work_dim of 2 has been hardcoded, might be modified later based on
+  // work_dim of 3 has been hardcoded, might be modified later based on
   // requirements
 
   // setting the local_work_size referred to as the size of the
@@ -494,7 +495,7 @@ bool CommandQueueManager::DispatchCommand(
   const int (&work_group_size)[3], cl_event *event,
   std::vector<cl_event> events_to_wait) {
 
-  // work_dim of 2 has been hardcoded, might be modified later based on
+  // work_dim of 3 has been hardcoded, might be modified later based on
   // requirements
 
   // setting the local_work_size referred to as the size of the

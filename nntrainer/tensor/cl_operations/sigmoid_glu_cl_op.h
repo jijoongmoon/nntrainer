@@ -35,8 +35,8 @@ class Tensor;
 bool registerSigmoidGluClKernels(ClContext &cl_context);
 
 /**
- * @brief Raw SigmoidGlu kernel dispatch, exposed for the OpenCL kernel
- *        micro-benchmarks. The layer path goes through sigmoid_glu_cl_op()
+ * @brief Raw SigmoidGlu kernel dispatch on plain pointers; nothing in tree
+ *        calls it. The layer path goes through sigmoid_glu_cl_op()
  * below.
  * @param in1 gate operand
  * @param in2 second operand

@@ -106,7 +106,8 @@ public:
    * @param buffer cl_mem buffer object
    * @param size_in_bytes size of data region
    * @param data pointer for the region
-   * @param origin_offset offset in the memory region
+   * @param host_origin_offset offset in the host memory region
+   * @param buffer_origin_offset offset in the buffer memory region
    * @param async flag for asynchronous operation
    * @return true if writing is successful or false otherwise
    */
@@ -173,8 +174,8 @@ public:
    *
    * @param svm_ptr Pointer to the SVM memory region to be unmapped
    * @param event  Optional event object that can be used to query or wait for
-   * the mapping operation to complete. If not provided, the mapping will be
-   * blocking.
+   * the unmap operation to complete. The unmap is always enqueued
+   * non-blocking.
    * @return true if unmapping is successful, false otherwise.
    */
   bool enqueueSVMUnmap(void *svm_ptr, cl_event *event = nullptr);

@@ -75,14 +75,6 @@ bool Kernel::CreateKernelFromProgram(Program program,
   return true;
 }
 
-/**
- * @brief Set the Kernel Arguments
- *
- * @param arg_index index of the argument
- * @param arg_value value of the argument
- * @param size size of the argument
- * @return true if successful or false otherwise
- */
 // NNTR_CL_ARG_CACHE=0 turns the argument cache off, so the same binary can be
 // its own control arm.
 static bool argCacheEnabled() {
@@ -120,6 +112,14 @@ bool Kernel::argCacheHit(cl_uint arg_index, const void *arg_value, size_t size,
   return false;
 }
 
+/**
+ * @brief Set the Kernel Arguments
+ *
+ * @param arg_index index of the argument
+ * @param arg_value value of the argument
+ * @param size size of the argument
+ * @return true if successful or false otherwise
+ */
 bool Kernel::SetKernelArguments(cl_uint arg_index, const void *arg_value,
                                 size_t size) {
   if (argCacheHit(arg_index, arg_value, size, 1))
@@ -138,11 +138,10 @@ bool Kernel::SetKernelArguments(cl_uint arg_index, const void *arg_value,
 }
 
 /**
- * @brief Set the Kernel Arguments
+ * @brief Set the Kernel SVM Arguments
  *
  * @param arg_index index of the argument
- * @param arg_value value of the argument
- * @param size size of the argument
+ * @param arg_value SVM pointer to bind
  * @return true if successful or false otherwise
  */
 bool Kernel::SetKernelSVMArguments(cl_uint arg_index, const void *arg_value) {

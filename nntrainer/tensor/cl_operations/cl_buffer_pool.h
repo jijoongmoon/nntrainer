@@ -60,19 +60,20 @@ public:
   /**
    * @brief ClBufferPool destructor. Releases the device buffers.
    *
-   * @note This deliberately differs from ~ClBufferManager(), which releases
-   *       nothing. That one is a function-local static whose destructor only
-   *       ever runs at process teardown, where calling into a user-mode
-   *       OpenCL driver that has already run its own finalizers has been seen
-   *       to fault. A ClBufferPool is owned by a TensorPool, which is owned by
-   *       a Manager inside a model, so it is destroyed while the model is --
-   *       long before teardown -- and its buffers are per-graph rather than
-   *       process-lifetime. Releasing them is therefore both safe and
-   *       necessary: a process that builds several models in turn would
-   *       otherwise hold every earlier graph's device memory. A TensorPool
-   *       kept alive in a static past the end of main() is the one case where
-   *       this destructor reaches the driver at teardown; own the model, not a
-   *       static handle to it.
+   * @note This differs from ~ClBufferManager(). That one is a function-local
+   *       static whose destructor only ever runs at process teardown, where
+   *       calling into a user-mode OpenCL driver that has already run its own
+   *       finalizers has been seen to fault; it calls releaseBuffers(), which
+   *       normally finds nothing left because ClContext's exit handler has
+   *       already released the buffers. A ClBufferPool is owned by a
+   *       TensorPool, which is owned by a Manager inside a model, so it is
+   *       destroyed while the model is -- long before teardown -- and its
+   *       buffers are per-graph rather than process-lifetime. Releasing them
+   *       is therefore both safe and necessary: a process that builds
+   *       several models in turn would otherwise hold every earlier graph's
+   *       device memory. A TensorPool kept alive in a static past the end of
+   *       main() is the one case where this destructor reaches the driver at
+   *       teardown; own the model, not a static handle to it.
    */
   ~ClBufferPool() override;
 

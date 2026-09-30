@@ -28,10 +28,10 @@ namespace nntrainer {
 
 /**
  * @brief     signed 4-bit integer gemv async computation : C = A*B
- * @param[in] weight std::vector<void *> for int4 quantized weight
- * @param[in] scale std::vector<uint16_t *> for scales
+ * @param[in] weights std::vector<void *> for int4 quantized weight
+ * @param[in] scales std::vector<uint16_t *> for scales
  * @param[in] input uint16_t * for input
- * @param[in] output std::vector<uint16_t *> for output
+ * @param[in] outputs std::vector<uint16_t *> for output
  * @param[in] K hidden dimension
  * @param[in] Ns output dimensions
  */
@@ -43,10 +43,10 @@ void gemv_int4_async_cl(std::vector<void *> weights,
 
 /**
  * @brief     signed 4-bit integer gemv async computation : C = A*B
- * @param[in] weight std::vector<void *> for int4 quantized weight
- * @param[in] scale std::vector<uint16_t *> for scales
+ * @param[in] weights std::vector<void *> for int4 quantized weight
+ * @param[in] scales std::vector<uint16_t *> for scales
  * @param[in] input float * for input
- * @param[in] output std::vector<float *> for output
+ * @param[in] outputs std::vector<float *> for output
  * @param[in] K hidden dimension
  * @param[in] Ns output dimensions
  */
@@ -141,15 +141,14 @@ void sgemv_q6_k_cl(void *matAdata, float *vecXdata, float *vecYdata,
                    unsigned int M, unsigned int N);
 
 /**
- * @brief     sgemv computation : Y = A*X + Y
+ * @brief     sgemv computation : Y = A*X
  * @param[in] matAdata float * for Matrix A
  * @param[in] vecXdata float * for Vector X
  * @param[in] vecYdata float * for Vector Y
- * @param[in] transA bool transpose
+ * @param[in] TransA bool transpose
  * @param[in] dim1 number of A's columns
  * @param[in] dim2 number of A's rows
  * @param[in] lda number of X's columns
- * @param[in] context RunLayerContext reference
  */
 void sgemv_cl(const float *matAdata, const float *vecXdata, float *vecYdata,
               bool TransA, unsigned int dim1, unsigned int dim2,
@@ -160,16 +159,15 @@ void sgemv_cl(const float *matAdata, const float *vecXdata, float *vecYdata,
  * @param[in] vecAdata float * for Vector A
  * @param[in] vecXdata float * for Vector X
  * @param[in] dim1 number of elements in both input vectors
- * @param[in] context RunLayerContext reference
  * @return    float dot product result
  */
 float dot_cl(const float *vecAdata, const float *vecXdata, unsigned int dim1);
 
 /**
- * @brief     sgemm computation : Y = op(A)*op(B) + C,
+ * @brief     sgemm computation : C = op(A)*op(B),
  * where op(X) is one of X or X**T
- * @param[in] transA bool transpose
- * @param[in] transB bool transpose
+ * @param[in] TransA bool transpose
+ * @param[in] TransB bool transpose
  * @param[in] A float * for Matrix A
  * @param[in] B float * for Matrix B
  * @param[in] C float * for Matrix C
@@ -179,7 +177,6 @@ float dot_cl(const float *vecAdata, const float *vecXdata, unsigned int dim1);
  * @param[in] lda number of A's columns
  * @param[in] ldb number of B's columns
  * @param[in] ldc number of C's columns
- * @param[in] context RunLayerContext reference
  */
 void sgemm_cl(bool TransA, bool TransB, const float *A, const float *B,
               float *C, unsigned int M, unsigned int N, unsigned int K,
@@ -215,13 +212,12 @@ void rmsnorm_cl(const float *input, const float *gamma, float *result,
  * @param[in] X float * input
  * @param[in] N unsigned int number of elements
  * @param[in] alpha float multiplier
- * @param[in] context RunLayerContext reference
  */
 void sscal_cl(float *X, const unsigned int N, const float alpha);
 
 /**
  * @brief     transpose computation
- * @param[in] input float * for Input Tensor
+ * @param[in] in float * for Input Tensor
  * @param[in] res float * for Output Tensor
  * @param[in] input_batch_size  represents the number of samples in the input
  * tensor
@@ -287,15 +283,14 @@ void transpose_32_16(float *data, int M, int K);
 #ifdef ENABLE_FP16
 
 /**
- * @brief     fp16 sgemv computation : Y = A*X + Y
+ * @brief     fp16 sgemv computation : Y = A*X
  * @param[in] matAdata fp16 * for Matrix A
  * @param[in] vecXdata fp16 * for Vector X
  * @param[in] vecYdata fp16 * for Vector Y
- * @param[in] transA bool transpose
+ * @param[in] TransA bool transpose
  * @param[in] dim1 number of A's columns
  * @param[in] dim2 number of A's rows
  * @param[in] lda number of X's columns
- * @param[in] context RunLayerContext reference
  */
 void sgemv_cl(const _FP16 *matAdata, const _FP16 *vecXdata, _FP16 *vecYdata,
               bool TransA, unsigned int dim1, unsigned int dim2,
@@ -306,16 +301,15 @@ void sgemv_cl(const _FP16 *matAdata, const _FP16 *vecXdata, _FP16 *vecYdata,
  * @param[in] vecAdata fp16 * for Vector A
  * @param[in] vecXdata fp16 * for Vector X
  * @param[in] dim1 number of elements in both input vectors
- * @param[in] context RunLayerContext reference
  * @return    fp16 dot product result
  */
 _FP16 dot_cl(const _FP16 *vecAdata, const _FP16 *vecXdata, unsigned int dim1);
 
 /**
- * @brief     fp16 sgemm computation : Y = op(A)*op(B) + C,
+ * @brief     fp16 sgemm computation : C = op(A)*op(B),
  * where op(X) is one of X or X**T
- * @param[in] transA bool transpose
- * @param[in] transB bool transpose
+ * @param[in] TransA bool transpose
+ * @param[in] TransB bool transpose
  * @param[in] A fp16 * for Matrix A
  * @param[in] B fp16 * for Matrix B
  * @param[in] C fp16 * for Matrix C
@@ -325,7 +319,6 @@ _FP16 dot_cl(const _FP16 *vecAdata, const _FP16 *vecXdata, unsigned int dim1);
  * @param[in] lda number of A's columns
  * @param[in] ldb number of B's columns
  * @param[in] ldc number of C's columns
- * @param[in] context RunLayerContext reference
  */
 void sgemm_cl(bool TransA, bool TransB, const _FP16 *A, const _FP16 *B,
               _FP16 *C, unsigned int M, unsigned int N, unsigned int K,
@@ -371,13 +364,12 @@ void scalar_mul_cl_fp16(const _FP16 *input, _FP16 *result, float scalar,
  * @param[in] X _FP16 * input
  * @param[in] N unsigned int number of elements
  * @param[in] alpha float multiplier
- * @param[in] context RunLayerContext reference
  */
 void sscal_cl(_FP16 *X, const unsigned int N, const float alpha);
 
 /**
  * @brief     transpose computation
- * @param[in] input fp16 * for Input Tensor
+ * @param[in] in fp16 * for Input Tensor
  * @param[in] res fp16 * for Output Tensor
  * @param[in] input_batch_size  represents the number of samples in the input
  * tensor
@@ -570,7 +562,7 @@ void quantize_act_v8c_fp32_cl(cl_mem act_fp32, cl_mem out_int8,
 #include <memory>
 namespace nntrainer {
 /**
- * @brief Convert a channel-wise QINT4 weight (Int4QTensor osv32_isv2 + fp16
+ * @brief Convert a channel-wise QINT4 weight (osv32_isv2 packed int4 + fp16
  *        per-group scales) into a v8c-ready backing: row-major + offset-encoded
  *        int4 in a single cl_mem buffer (image2d view created on demand via
  *        TensorBacking::imageView), plus a fp32 per-channel scale cl_mem.
@@ -578,7 +570,7 @@ namespace nntrainer {
  *        (one scale per output row) during the conversion. ONE-TIME at FC init.
  * @param[in] osv32_packed   pointer to osv32 packed int4 bytes (N*K/2 bytes)
  * @param[in] fp16_scales    pointer to fp16 scales (N*K/group_size values)
- * @param[in] group_size     32 (Int4QTensor default)
+ * @param[in] group_size     32 (the QINT4 default)
  * @param[in] N              output channels
  * @param[in] K              input dim
  * @param[out] out_scale_buf cl_mem (fp32, [N], CL_MEM_READ_ONLY) — caller owns

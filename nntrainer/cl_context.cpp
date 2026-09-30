@@ -2,7 +2,7 @@
 /**
  * Copyright (C) 2024 Debadri Samaddar <s.debadri@samsung.com>
  *
- * @file    cl_context.h
+ * @file    cl_context.cpp
  * @date    23 Feb 2024
  * @see     https://github.com/nntrainer/nntrainer
  * @author  Debadri Samaddar <s.debadri@samsung.com>
@@ -340,9 +340,9 @@ void ClContext::add_default_object() {
   // engine=gpu}) land on ClComputeOps::layer_norm / ::activation. Registration
   // is gated on the kernels building, so a device that cannot compile them
   // leaves the type unregistered rather than accepting the layer and throwing
-  // at the first forward. Both keys are explicit: the auto-assigned key is
-  // str_map.size() + 1, which silently collides with an enum key once the
-  // registration list grows.
+  // at the first forward. Both keys are explicit: the auto-assigned key starts
+  // at str_map.size() + 1 and only skips keys already taken, so it can claim
+  // an enum value that a later explicit registration then fails on.
   if (registerLayerNormClKernels(*this)) {
     registerFactory(nntrainer::createLayer<LayerNormalizationLayer>,
                     LayerNormalizationLayer::type,
@@ -701,15 +701,16 @@ bool ClContext::clCreateKernel(std::string &kernel_string,
 
   /** ---- Negative cache: a kernel that cannot be built is not free. --------
    *
-   *  Measured on a mobile GPU handset with a FULLY warm kernel cache: 76-114 ms
-   *  of every init -- a third of the whole non-load init -- is six
-   *  clCreateProgramWithSource+clBuildProgram calls that all end in "Failed to
-   *  register kernel". They are three legacy INT4 kernels
-   *  (fully_connected_gpu_int4_gemv, quantize_input_int4,
-   *  quantize_input_int4_pad) that this device declines, prewarmed by
-   *  initBlasClKernels for a dispatch path the quantized GEMM lane never takes,
-   *  and they are six rather than three because the kernel ring's clone attempt
-   *  and the singleton path below it each pay the same compile for the same
+   *  Measured on a mobile GPU handset with a FULLY warm kernel cache, when
+   *  initBlasClKernels still prewarmed the legacy INT4 kernels on every vendor
+   *  (it now does so only on Intel): 76-114 ms of every init -- a third of the
+   *  whole non-load init -- was six clCreateProgramWithSource+clBuildProgram
+   *  calls that all ended in "Failed to register kernel". They were three
+   *  legacy INT4 kernels (fully_connected_gpu_int4_gemv, quantize_input_int4,
+   *  quantize_input_int4_pad) that this device declines, prewarmed for a
+   *  dispatch path the quantized GEMM lane never takes, and they were six
+   *  rather than three because the kernel ring's clone attempt and the
+   *  singleton path below it each pay the same compile for the same
    *  deterministic failure. Nothing observed it, because a null kernel is only
    *  ever a silent decline here.
    *
@@ -785,8 +786,9 @@ bool ClContext::clCreateKernel(std::string &kernel_string,
   if (KERNEL_CACHE_ENABLED && kernel_cache_usable && binary_data.empty() &&
       !opencl::Program::DEFAULT_KERNEL_PATH.empty() &&
       kernelCacheDir() != opencl::Program::DEFAULT_KERNEL_PATH) {
-    // Fall back to the legacy working-directory location so a cache written
-    // before the directory was resolvable is still used.
+    // Fall back to the default cache location (Program::DEFAULT_KERNEL_PATH)
+    // when NNTR_KERNEL_CACHE_DIR points elsewhere, so a cache written there
+    // is still used.
     const std::string legacy_path =
       opencl::Program::DEFAULT_KERNEL_PATH + "/" + binary_file_name;
     binary_data = readBinaryFile(legacy_path);
@@ -812,10 +814,10 @@ bool ClContext::clCreateKernel(std::string &kernel_string,
       ml_logw("Cached kernel binary %s was rejected; recompiling from source",
               binary_read_path.c_str());
     } else if (served_from_legacy_dir) {
-      // Promote the hit into the resolved directory. The legacy location is
-      // the process working directory, so an entry that lives only there is
-      // lost the moment the application is started from anywhere else -- and
-      // nothing ever writes it back, because the fallback is read-only by
+      // Promote the hit into the resolved directory. An entry that lives only
+      // in the default location is missed whenever that location is not
+      // consulted (on Android it is relative to the working directory) --
+      // and nothing ever writes it back, because the fallback is read-only by
       // design. Copying the accepted binary across costs one small write on
       // the launch that found it and keeps the cache whole afterwards. The
       // key already folds in the device name and driver version, so this
@@ -905,10 +907,10 @@ const DeviceCaps &ClContext::caps() const {
     device_caps_.backend = "gpu";
 
     try {
-      // GetDeviceId() opens the default GPU device if it is not open yet and
-      // fills the DeviceInfo the queries below read, so from here on every
-      // field is a real clGetDeviceInfo answer rather than a build-time
-      // default.
+      // GetDeviceId() does not open a device; it returns null unless clInit()
+      // has already opened one, which also filled the DeviceInfo the queries
+      // below read, so from here on every field is a real clGetDeviceInfo
+      // answer rather than a build-time default.
       if (context_inst_.GetDeviceId() == nullptr)
         return;
       const opencl::DeviceInfo *info = context_inst_.getDeviceInfo();

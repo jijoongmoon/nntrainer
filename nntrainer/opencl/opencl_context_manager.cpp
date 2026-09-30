@@ -337,8 +337,8 @@ bool ContextManager::CreateCLContext() {
                                         CL_PRIORITY_HINT_HIGH_QCOM,
                                         0};
 
-  // creating valid ARM GPU OpenCL context, will return NULL with error code if
-  // fails
+  // creating valid OpenCL context for the selected device, will return NULL
+  // with error code if fails
   context_ = clCreateContext(qcom_hint ? hint_props : properties, 1,
                              &device_id_, nullptr, nullptr, &error_code);
   if (!context_ && qcom_hint) {

@@ -15,8 +15,9 @@
  * bytes. For the biggest weight (an untied lm-head class N) that permute is
  * the longest single-node span of the whole model load. This cache persists
  * the packed payload + row sums next to the model .bin
- * (<model.bin>.v8cpack; falls back to $XDG_CACHE_HOME/nntrainer/v8cpack
- * when the model dir is not writable), so later launches mmap the pack and
+ * (<model.bin>.v8cpack; falls back to $XDG_CACHE_HOME/nntrainer/v8cpack,
+ * or $HOME/.cache/nntrainer/v8cpack when XDG_CACHE_HOME is unset, when the
+ * model dir is not writable), so later launches mmap the pack and
  * skip the permute entirely -- the device upload still happens, from the
  * mapped pages, with no staging copy.
  *
@@ -86,8 +87,9 @@ void load_complete();
 
 /**
  * @brief Look up a record. Returns true and fills @p out only when every key
- *        field and both checksums match. Thread-safe (immutable after
- *        set_source).
+ *        field and both checksums match, and (unless the source-fingerprint
+ *        check is switched off) @p src_fnv matches the record's source
+ *        fingerprint. Thread-safe (immutable after set_source).
  */
 bool lookup(const char *name, unsigned int N, unsigned int K, size_t row_bytes,
             size_t payload_len, uint64_t src_fnv, Hit &out);
