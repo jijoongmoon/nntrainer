@@ -1808,6 +1808,33 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
   const bool quant_direct_clmem = fc_quant_direct && device_clmem_in &&
                                   !skip_upload_and_quant && clmem_in != nullptr;
 
+  // [norm->FC quant handoff] The producing norm already quantised this row
+  // (see v8cNormQuantBegin). Take it only when the bytes at the input handle
+  // are provably still the ones it quantised -- the dispatch write log answers
+  // that -- and when the scratch it filled is large enough for this call's
+  // padded M, since the FC's own grow-only ensure would otherwise reallocate
+  // the buffer out from under the cached int8.
+  bool nq_hit = false;
+  if (quant_direct_clmem && cur_dtype == 1) {
+    auto &fs = v8c_fuse_stats();
+    if (sc.nq_slot < 0) {
+      ++fs.nq_none;
+    } else if (sc.nq_src != static_cast<void *>(clmem_in)) {
+      ++fs.nq_other;
+    } else if (sc.nq_rows != M || sc.nq_K != K ||
+               sc.act_i8_bytes[sc.nq_slot] < (size_t)M_pad * K ||
+               sc.act_scale_bytes[sc.nq_slot] < sizeof(float) * M_pad ||
+               sc.act_zp_bytes[sc.nq_slot] < sizeof(int) * M_pad ||
+               sc.act_rs_bytes[sc.nq_slot] < sizeof(int) * M_pad) {
+      ++fs.nq_shape;
+    } else if (!opencl::Kernel::bufferUnchangedSince(
+                 static_cast<void *>(clmem_in), sc.nq_seq)) {
+      ++fs.nq_dirty;
+    } else {
+      nq_hit = true;
+    }
+  }
+
   // SVM-pool input: the activation lives in GPU-visible SVM (the default
   // allocator for GPU graphs), so stage it with a device-side copy kernel
   // instead of a host upload.
@@ -1820,8 +1847,9 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
   // fanout's quant WRITE lands in a buffer distinct from the prior fanout's
   // still-in-flight GEMM image READ (a WAR hazard through the image alias
   // the driver may not track).
-  const int act_slot =
-    quant_cache_hit ? sc.last_quant_slot : v8c_ring_advance(sc);
+  const int act_slot = quant_cache_hit ? sc.last_quant_slot
+                       : nq_hit        ? sc.nq_slot
+                                       : v8c_ring_advance(sc);
   // Grow only the chosen slot to this call's (M_pad, K). Grow-only => a hit
   // (same M_pad,K as the miss that filled it) never reallocates, so the
   // cached int8/scale/zp/rs survive for the wk/wv reuse.
@@ -1930,7 +1958,25 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
     // fp->int8 asymmetric act quant + zero-point + row_sum over M_pad rows.
     // Padded rows map to (scale=1, zp=0, q=0, row_sum=0), so they contribute
     // zero in the GEMM and don't pollute valid rows. Skipped on cache hit.
-    if (!skip_upload_and_quant) {
+    if (nq_hit) {
+      ++v8c_fuse_stats().nq_hit;
+      if (sc.nq_site != nullptr)
+        ++v8c_norm_sites()[sc.nq_site].claimed;
+      // Seed the sibling shared-quant cache from the handoff: a sibling FC of
+      // this fanout that can no longer reach the handoff (the norm published
+      // once, and the handoff is consumed by shape) still reaches the same
+      // int8 through the cache above.
+      sc.last_quant_in_ptr = cur_in_ptr;
+      sc.last_quant_M = M;
+      sc.last_quant_K = K;
+      sc.last_quant_M_pad = M_pad;
+      sc.last_quant_dtype = cur_dtype;
+      sc.last_quant_slot = act_slot;
+      sc.last_quant_seq = sc.nq_seq;
+      // [norm->FC quant handoff] The fused norm already wrote act_i8 /
+      // act_scale / act_zp / act_rs for this exact row into this slot. Nothing
+      // to stage, nothing to quantise; the GEMM binding below is unchanged.
+    } else if (!skip_upload_and_quant) {
       // [Lever 1] quant the producer cl_mem (M real rows) directly when
       // quant_direct_clmem; otherwise the staged sc.act_in (M_pad rows,
       // including the zero pad).
