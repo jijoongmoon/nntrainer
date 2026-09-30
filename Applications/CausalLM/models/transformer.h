@@ -447,6 +447,19 @@ public:
   virtual bool kvRingByDefault() const { return false; }
 
   /**
+   * @brief Whether this model wants the OpenCL device activation plane kept as
+   *        its own allocation rather than aliased onto the shared SVM plane.
+   * @details false (the default) keeps the aliased plane, which holds the
+   * activations once instead of twice. A model returns true when its prefill
+   * was measured slower with the aliased plane; the OpenCL pool honours that
+   * on Adreno only, where the cost was measured, and keeps the aliased plane
+   * on every other device. NNTR_CLMEM_ALIAS_SVM overrides the answer either
+   * way. No model in this tree returns true: the measured case is a 2B-class
+   * model with per-layer embeddings that an application registers itself.
+   */
+  virtual bool prefersPrivateActivationPlane() const { return false; }
+
+  /**
    * @brief Per-layer physical KV-cache row count.
    * @details The row counterpart of getKVCacheWidth(). Every KV sizing site --
    * each model's placeholder factory and the KVCacheManager allocation -- must

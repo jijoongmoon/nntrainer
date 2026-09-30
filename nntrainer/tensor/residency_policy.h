@@ -96,6 +96,17 @@ struct ResidencyPolicy {
    *  and asks the pool to drop the shared slice of every other device-resident
    *  tensor. NNTR_CLMEM_SKIP_SHARED still overrides in both directions. */
   bool skip_shared_slice = false;
+  /** the model being built asks for the device activation plane to be its own
+   *  allocation instead of a view on the shared plane (CL_MEM_USE_HOST_PTR).
+   *  ClBufferPool honours it on Adreno only, the one driver where the aliased
+   *  plane was measured to cost a model prefill time; elsewhere the plane stays
+   *  aliased. NNTR_CLMEM_ALIAS_SVM still overrides in both directions.
+   *
+   *  Unlike the fields above, this one is written per model, by the
+   *  application, before that model's graph is built, so a second model in the
+   *  same process does not inherit the first one's answer. It is read only at
+   *  allocation. */
+  bool prefer_private_device_plane = false;
   /** layer types that are engine-neutral consumers of the device plane */
   std::vector<std::string> engine_neutral_types;
 

@@ -49,6 +49,7 @@
 #include <neuralnet.h>
 #include <per_layer_slice_gpu.h>
 #include <qs4cx_tensor.h>
+#include <residency_policy.h>
 #include <rms_norm.h>
 #include <rms_norm_gpu.h>
 
@@ -472,6 +473,12 @@ void Transformer::initialize() {
     model_props.emplace_back(withKey("fsu_lookahead", FSU_LOOKAHEAD));
   }
   model->setProperty(model_props);
+
+  // The model's activation-plane preference reaches the OpenCL pool through
+  // the residency policy. Written for every model, before the graph is built,
+  // so a model loaded after another one does not inherit its answer.
+  nntrainer::ResidencyPolicy::global().prefer_private_device_plane =
+    prefersPrivateActivationPlane();
 
   // build symbolic tensor graph and compile from (input, output)
   auto [x, y] = constructModel();

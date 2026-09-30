@@ -480,14 +480,29 @@ void *ClBufferPool::devicePlaneBaseLocked(size_t span) {
     return nullptr;
   }
 
-  /** NNTR_CLMEM_ALIAS_SVM=1 -- one PHYSICAL plane, two views. Opt-in.
+  /** NNTR_CLMEM_ALIAS_SVM -- one PHYSICAL plane, two views. Default ON,
+   *  except for a model that asks for a private plane
+   *  (ResidencyPolicy::prefer_private_device_plane) running on Adreno. The
+   *  variable decides when it is set: 0 gives two separate allocations, any
+   *  other value the aliased plane, whatever the model asked for.
    *
-   *  Opt-in, not default, because making the two views one plane also makes
-   *  every undrained write through one view a real hazard for the other: what
-   *  was a stale copy nobody read becomes the bytes the next kernel reads. On
-   *  one driver the answer is not stable with this on. It stays off until the
-   *  long-prefill correctness series that fixes exactly those drain hazards
-   *  lands, and the default can be flipped then.
+   *  The Adreno exception is measured, not assumed: a 2B-class model with
+   *  per-layer embeddings ran its prefill 5 % slower with the aliased plane
+   *  (TTFT 748 -> 787 ms) and saved 85 MiB of kgsl page_alloc for it, while
+   *  the dense 1.5B model and Gemma-4 kept their prefill rate and saved 45 and
+   *  133 MiB, and no Intel lane lost prefill. So the cost is per model and per
+   *  driver, and only the model can say it pays it.
+   *
+   *  This was opt-in while the two views being one plane turned every
+   *  undrained write through one view into a real hazard for the other: what
+   *  was a stale copy nobody read becomes the bytes the next kernel reads, and
+   *  on one driver the answer was then not stable. The drain-hazard fixes this
+   *  waited for are now in the tree -- the model declares which prefill writes
+   *  must be drained and the dispatch-scoped shared-write hazard covers the
+   *  rest -- so with the aliasing on the generated text is unchanged, and the
+   *  measured device-resident footprint drops by the size of the second copy
+   *  (45-133 MiB of kgsl page_alloc on the models measured).
+   *  Hence the default flip; the variable stays as the way out.
    *
    *  The double charge this pool is measured for is not one layout held twice
    *  by accident: it is two real allocations of the same bytes. The shared
@@ -508,18 +523,29 @@ void *ClBufferPool::devicePlaneBaseLocked(size_t span) {
    *  than shadow-copies. CL_MEM_USE_HOST_PTR permits a copy, and a copy here
    *  is a net LOSS -- the same bytes a third time, plus a coherence problem.
    *  The GPU ledger and /sys/class/kgsl/kgsl/page_alloc answer it directly:
-   *  aliasing shows act:device_plane charged and the kgsl counter NOT moving;
-   *  a shadow copy shows both moving. Default OFF until that measurement
-   *  exists on the device in question.
+   *  aliasing shows act:device_plane charged and the driver's page_alloc
+   *  counter NOT moving; a shadow copy shows both moving. That measurement is
+   *  what the default is based on: on the device in question the counter did
+   *  not move. A driver that shadow-copies instead wants
+   *  NNTR_CLMEM_ALIAS_SVM=0.
    *
    *  Alignment is already satisfied: every planner offset is a multiple of
    *  CL_DEVICE_MEM_BASE_ADDR_ALIGN (128 B on Adreno, 36 of 36 offsets), and
    *  clSVMAlloc returns page-aligned memory for a plane this size, which is
    *  what USE_HOST_PTR wants for a zero-copy mapping. */
-  static const bool alias_svm = [] {
-    const char *e = std::getenv("NNTR_CLMEM_ALIAS_SVM");
-    return e != nullptr && e[0] != 0 && e[0] != '0';
-  }();
+  constexpr uint32_t qualcomm_vendor_id = 0x5143; // Adreno
+  const char *alias_env = std::getenv("NNTR_CLMEM_ALIAS_SVM");
+  bool alias_svm = true;
+  if (alias_env != nullptr && alias_env[0] != 0) {
+    alias_svm = alias_env[0] != '0';
+  } else if (ResidencyPolicy::global().prefer_private_device_plane &&
+             cc->caps().vendor_id == qualcomm_vendor_id) {
+    alias_svm = false;
+    std::fprintf(stderr, "[clmempool] device plane kept private: the model "
+                         "asks for it on Adreno (NNTR_CLMEM_ALIAS_SVM=1 "
+                         "aliases it anyway)\n");
+    std::fflush(stderr);
+  }
 
   cl_int err = CL_SUCCESS;
   cl_mem base = nullptr;
@@ -527,11 +553,12 @@ void *ClBufferPool::devicePlaneBaseLocked(size_t span) {
   if (alias_svm) {
     void *host = getMemoryPoolAddress();
     if (host == nullptr) {
-      ml_logw("ClBufferPool: NNTR_CLMEM_ALIAS_SVM=1 but there is no contiguous "
-              "shared plane to alias (per-offset path); using a private plane");
+      ml_logw("ClBufferPool: the device plane cannot be aliased: there is no "
+              "contiguous shared plane (per-offset path); using a private "
+              "plane");
     } else if (size() < span) {
-      ml_logw("ClBufferPool: NNTR_CLMEM_ALIAS_SVM=1 but the shared plane "
-              "(%zu B) is smaller than the device span (%zu B); using a "
+      ml_logw("ClBufferPool: the device plane cannot be aliased: the shared "
+              "plane (%zu B) is smaller than the device span (%zu B); using a "
               "private plane",
               size(), span);
     } else {
