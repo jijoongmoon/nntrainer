@@ -13,7 +13,7 @@
  * limitations under the License.
  *
  *
- * @file	moe_layer.cpp
+ * @file	qwen_moe_layer.cpp
  * @date	09 June 2025
  * @brief	This is a Mixture of Expert Layer Class for Neural Network
  * @see		https://github.com/nnstreamer/

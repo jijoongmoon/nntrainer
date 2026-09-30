@@ -443,8 +443,9 @@ TEST(KVRing, layer_eligibility_truth_table) {
 /**
  * @brief The read view the layer builds always fits the allocation the model
  *        made, over a sweep of positions.
- * @details Transformer::getKVCacheRows() allocates max(cap, max_seq) rows and
- * MHACoreLayer clamps its attention read view to min(cache_to, cap). Both are
+ * @details Transformer::getKVCacheRows() allocates `cap ? cap : max_seq` rows
+ * and MHACoreLayer clamps a ringed layer's attention read view to
+ * min(cache_to, cap). Both are
  * reproduced here from the same kv_ring.h entry points; the assertion is the
  * property that a drift between them would break -- the view never runs off the
  * end of the buffer, and a ringed layer never reads more rows than it stores.

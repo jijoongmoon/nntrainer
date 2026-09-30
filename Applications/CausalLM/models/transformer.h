@@ -231,9 +231,6 @@ public:
               ml::train::ISA target_isa = ml::train::ISA::DEFAULT);
 
   /**
-   * @brief run the Transformer model
-   */
-  /**
    * @brief Token position at or beyond which a captured decode-step graph
    *        stops being valid, or 0 for "never expires".
    * @details A captured graph freezes every launch parameter the host computed
@@ -276,6 +273,9 @@ public:
     return {};
   }
 
+  /**
+   * @brief run the Transformer model
+   */
   virtual void run(const WSTR prompt, bool do_sample = false,
                    const WSTR system_prompt = WSTR(),
                    const WSTR tail_prompt = WSTR(), bool log_output = true);
@@ -630,8 +630,8 @@ protected:
   /**
    * @brief Create the per-layer external KV-cache placeholder Tensors that
    *        feed mha_core's input slots 3 and 4. The actual storage is owned
-   *        by the host (e.g. KVCacheManager) and is bound at runtime via
-   *        Model::setExternalTensors using the names
+   *        by the host (e.g. KVCacheManager) and is bound at runtime by
+   *        CausalLM::allocateAndBindKVCache (Tensor::setData) using the names
    *          "cache_k_l<layer_id>" and "cache_v_l<layer_id>".
    * @param layer_id  attention layer index
    * @param n_heads   total query heads (used together with GQA_SIZE to derive
@@ -673,9 +673,6 @@ protected:
   virtual ml::train::ModelFormat
   formatFromExtension(const std::string &weight_path);
 
-  /**
-   * @brief register Outputs
-   */
   bool is_initialized = false; /**< Flag to check if the model is initialized */
   ModelHandle model;
 

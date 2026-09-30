@@ -506,7 +506,8 @@ void GptOssMoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       }
     }
 
-    // Parallel processing for multiple tokens with many active experts
+    // Multi-token path: one output buffer per active expert, filled by the
+    // (serial) per-expert loop below and then combined.
     std::vector<nntrainer::Tensor> expert_outputs(num_experts);
     for (int expert_idx = 0; expert_idx < static_cast<int>(num_experts);
          ++expert_idx) {
@@ -517,7 +518,7 @@ void GptOssMoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       }
     }
 
-    // #pragma omp parallel for schedule(dynamic)
+    // Serial per-expert loop (no OpenMP parallel-for here).
     for (int expert_idx = 0; expert_idx < static_cast<int>(num_experts);
          ++expert_idx) {
       const auto &assignments = expert_assignments[expert_idx];

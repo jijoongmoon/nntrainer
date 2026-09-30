@@ -55,7 +55,7 @@
 namespace causallm {
 
 /**
- * @brief Load a file as a binary string.
+ * @brief Get model format from weight file extension.
  */
 ml::train::ModelFormat
 Transformer::formatFromExtension(const std::string &weight_path) {
@@ -68,6 +68,9 @@ Transformer::formatFromExtension(const std::string &weight_path) {
   return ml::train::ModelFormat::MODEL_FORMAT_BIN;
 }
 
+/**
+ * @brief Load a file as a binary string.
+ */
 std::string LoadBytesFromFile(const std::string &path) {
   std::ifstream file(path, std::ios::binary | std::ios::ate);
   if (!file.is_open()) {
@@ -209,7 +212,8 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
    *  half of the GPU footprint at all.
    *
    *  Lowering it does NOT shorten the prompt a model can take: with chunked
-   *  prefill on (which the KV ring turns on by default on OpenCL and CUDA) the
+   *  prefill on (the KV ring, which is opt-in via NNTR_KV_WINDOW_RING or a
+   *  model's kvRingByDefault(), turns it on for OpenCL and CUDA) the
    *  prompt is bounded by the KV budget and fed in chunks of this height. It
    *  trades prefill throughput -- more, smaller launches -- for plane bytes,
    *  which is a measurement, not an assumption, so it is a dial rather than a
@@ -415,18 +419,18 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
     ATTN_LOGIT_SOFTCAPPING = cfg["attn_logit_softcapping"].get<float>();
   }
 
-  // [Adreno image-attn model vetting] now lives in the model classes that
-  // have geometry the OHWI kernels cannot serve (gemma4: global_head_dim=512
-  // exceeds the proven d<=256 tiling — see Gemma4Transformer::setupParameters).
-  // The sliding-window case is handled IN the kernels since qk_matmul_f16_ohwi
-  // (+_img) grew a local_window argument (n + W <= q_pos lower-bound mask),
-  // so window < max_seq_len no longer forces the flash path.
+  // [Adreno image-attn model vetting] none is needed: gemma4's
+  // global_head_dim=512 runs correctly on the OHWI image kernels (see the note
+  // in Gemma4Transformer::setupParameters). The sliding-window case is handled
+  // IN the kernels since qk_matmul_f16_ohwi (+_img) grew a local_window
+  // argument (n + W <= q_pos lower-bound mask), so window < max_seq_len no
+  // longer forces the flash path.
 
   return;
 };
 
 /**
- * @brief Build and compile the symbolic transformer graph.
+ * @brief Join the async tokenizer load.
  */
 void Transformer::ensureTokenizer() {
   std::lock_guard<std::mutex> lk(tokenizer_join_mtx_);
@@ -434,6 +438,9 @@ void Transformer::ensureTokenizer() {
     tokenizer = tokenizer_future_.get();
 }
 
+/**
+ * @brief Build and compile the symbolic transformer graph.
+ */
 void Transformer::initialize() {
 
   // [NNTR_INIT_TRACE] init-latency dissection (round-13 follow-up).
@@ -524,11 +531,11 @@ std::pair<Tensor, Tensor> Transformer::constructModel() {
     h = createTransformerDecoderBlock(i, h);
   }
 
-  // final rms_norm. NOTE: stays on CausalLM's custom RMSNormLayer
-  // ("rms_norm" type, app_context only) so the fused-rmsq + v8c FC
-  // consumer chain works. The nntrainer GPU RMSNormLayerCl uses type
-  // "rmsnorm" (different) and has a separate reduction-order drift
-  // issue documented in.
+  // final rms_norm. NOTE: stays on CausalLM's "rms_norm" type (the custom
+  // RMSNormLayer on cpu, RMSNormLayerGPU on gpu, CudaRMSNormLayer on cuda --
+  // see registerCustomLayers) so the fused-rmsq + v8c FC consumer chain works.
+  // The nntrainer GPU RMSNormLayerCl uses type "rmsnorm" (different) and has a
+  // separate reduction-order drift issue.
   LayerHandle out_norm(
     createLayer("rms_norm", {withKey("name", "output_norm"),
                              withKey("epsilon", std::to_string(NORM_EPS)),
@@ -867,7 +874,8 @@ Tensor Transformer::wireAttentionKVCache(const int layer_id, int n_heads,
   if (use_int8)
     return mha({q, k, v});
   // External KV cache placeholders (per-layer). Their actual storage is owned
-  // by the host (KVCacheManager) and bound at runtime via setExternalTensors.
+  // by the host (KVCacheManager) and bound at runtime by
+  // CausalLM::allocateAndBindKVCache.
   auto [cache_k, cache_v] = createKVCachePlaceholders(layer_id, n_heads);
   return mha({q, k, v, cache_k, cache_v});
 }
@@ -1022,7 +1030,8 @@ void Transformer::registerCustomLayers() {
   tryRegister("gpu", nntrainer::createLayer<causallm::PerLayerSliceLayerGPU>);
   // MHACoreLayer on the gpu context enables engine=gpu attention. The same
   // class runs on both backends: forwarding() dispatches the GPU kernels when
-  // NNTR_MHA_GPU is set and Q/K/V/cache are SVM-resident, else the CPU NEON
+  // NNTR_MHA_GPU is on (value-checked; =0 disables) and Q/K/V/cache are
+  // SVM-resident, else the CPU NEON
   // path. Additive — a node with no engine= property keeps routing to CPU.
   tryRegister("gpu", nntrainer::createLayer<causallm::MHACoreLayer>);
 

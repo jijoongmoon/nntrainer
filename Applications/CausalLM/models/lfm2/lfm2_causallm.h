@@ -29,7 +29,7 @@ namespace causallm {
  * @brief Lfm2Transformer - model-specific attention variant and conv block
  * @note Overrides createAttention() for lfm2-specific behavior
  * @note Provides createConvBlock() and setupLfm2Parameters() shared by
- *       Lfm2CausalLM and Lfm2VlDecoder
+ *       the LFM2 model classes (e.g. Lfm2CausalLM)
  */
 class Lfm2Transformer : virtual public Transformer {
 public:
@@ -111,7 +111,9 @@ public:
   /**
    * @brief Run prefill with in-memory input embeddings (skips file I/O).
    *
-   * @param inputs_embeds  Pointer to merged embeddings [B * INIT_SEQ_LEN * DIM]
+   * @param inputs_embeds  Pointer to merged embeddings [B * n_tokens * DIM]
+   * @param n_tokens       Number of prompt rows in inputs_embeds (must not
+   *                       exceed INIT_SEQ_LEN)
    */
   void run_with_embeddings(const void *inputs_embeds, size_t n_tokens,
                            std::vector<int> seed_tokens, bool do_sample,

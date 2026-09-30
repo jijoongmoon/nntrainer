@@ -12,7 +12,7 @@
  * limitations under the License.
  *
  *
- * @file	qwen3_moe_causallm.cpp
+ * @file	qwen3_slim_moe_causallm.cpp
  * @date	23 July 2025
  * @brief	This defines a qwen3_moe causal language model.
  * @see		https://github.com/nnstreamer/

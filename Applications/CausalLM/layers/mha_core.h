@@ -15,10 +15,11 @@
  *         in a layer, this layer is attached after Q / K / V
  *         fully connected layer to post-process them
  *         including KV-Cache.
- *         For inference, incremental_forwarding is called,
- *         which takes inputs of seq_len = 1 via `from` / `to` param.
- *         For training, forwarding is called,
- *         which takes all input seqences at once.
+ *         For inference, forwarding processes the current input rows
+ *         at the KV-cache write position, and incremental_forwarding
+ *         takes the step rows [`from`, `to`) (one or more rows).
+ *         Training is not supported (forwarding is a no-op when
+ *         training is set in internal-cache mode).
  */
 
 #ifndef __MHA_CORE_H__
@@ -271,8 +272,10 @@ public:
 };
 
 /**
- * @brief RopePartialRotaryFactor (Gemma4/Gemma3n). Accepted for model
- *        compatibility; our mha_core applies full rotary.
+ * @brief RopePartialRotaryFactor (Gemma4/Gemma3n). Outside yarn, a factor
+ *        != 1 routes the RoPE table through _compute_proportional_parameters,
+ *        which gives rotary frequencies to only factor * head_dim / 2 of the
+ *        head_dim / 2 pairs; the rest pass through unrotated.
  */
 class RopePartialRotaryFactor : public nntrainer::Property<float> {
 public:
@@ -311,10 +314,10 @@ public:
  * about a pack, and it is emphatically not a model name. The RISK condition is
  * a consumer reading an SVM write issued in an earlier submission, which every
  * model on this chain does; deciding THAT in code, where the chain is built
- * rather than from a config flag, is the per-dispatch hazard check this series
- * lands next (Kernel::noteUndrainedSvmPlane), which would replace this
- * declaration with the thing it stands for. Until then a pack that does not set
- * it is unobserved, not proven safe.
+ * rather than from a config flag, is the per-dispatch hazard check
+ * (Kernel::noteUndrainedSvmPlane, opt-in via NNTR_SVM_HAZARD_DRAIN=1), which
+ * is meant to replace this declaration with the thing it stands for. Until it
+ * does, a pack that does not set it is unobserved, not proven safe.
  */
 void setPrefillKvDrain(bool on);
 
@@ -355,20 +358,20 @@ public:
   WIN_EXPORT MHACoreLayer();
 
   /**
-   * @brief Destructor of MhaPost Layer
+   * @brief Destructor of MhaCore Layer
    */
   WIN_EXPORT ~MHACoreLayer();
 
   /**
-   *  @brief  Move constructor of CustomMultiHeadAttentionLayer.
-   *  @param[in] CustomMultiHeadAttentionLayer &&
+   *  @brief  Move constructor of MHACoreLayer.
+   *  @param[in] MHACoreLayer &&
    */
   WIN_EXPORT
   MHACoreLayer(MHACoreLayer &&rhs) noexcept = default;
 
   /**
    * @brief  Move assignment operator.
-   * @parma[in] rhs CustomMultiHeadAttentionLayer to be moved.
+   * @param[in] rhs MHACoreLayer to be moved.
    */
   WIN_EXPORT MHACoreLayer &operator=(MHACoreLayer &&rhs) = default;
 
@@ -379,7 +382,8 @@ public:
 
   /**
    * @brief forwarding function of MhaCore Layer
-   *        Please note that forwarding function is used only for training.
+   *        This is the inference entry point: it runs attention over the
+   *        current input rows and updates the KV cache.
    */
   WIN_EXPORT void forwarding(nntrainer::RunLayerContext &context,
                              bool training) override;
@@ -404,7 +408,8 @@ public:
     ml::train::TensorDim &cache_value_dim,
     ml::train::TensorDim &cache_value_step_dim, nntrainer::Tensor &sink_step);
   /**
-   * @copydoc Layer::calcDerivative(RunLayerContext &context)
+   * @copydoc Layer::incremental_forwarding(RunLayerContext &context, unsigned
+   * int from, unsigned int to, bool training)
    */
   WIN_EXPORT void incremental_forwarding(nntrainer::RunLayerContext &context,
                                          unsigned int from, unsigned int to,
@@ -422,13 +427,14 @@ public:
 
   /**
    * @copydoc bool supportBackwarding() const
-   * @note In current version, we do not support backwarding yet.
-   * It will be updated ASAP.
+   * @note Returns true, but backwarding is not implemented yet:
+   * calcDerivative() and calcGradient() are no-ops.
    */
   WIN_EXPORT bool supportBackwarding() const override { return true; };
 
   /**
-   * @copydoc Layer::setBatch(RunLayerContext &context, unsigned int batch)
+   * @copydoc Layer::exportTo(Exporter &exporter, ml::train::ExportMethods
+   * method)
    */
   WIN_EXPORT void
   exportTo(nntrainer::Exporter &exporter,
@@ -525,7 +531,8 @@ private:
    *        (true when num_inputs >= 5, i.e., Q, K, V + cache_key + cache_value)
    *        In external mode mha_core does not allocate its own cache tensors,
    *        and reads cache slots from input[3] (cache_key) and input[4]
-   *        (cache_value) which are bound by the host via setExternalTensors.
+   *        (cache_value) which are bound by the host (e.g.
+   *        CausalLM::allocateAndBindKVCache).
    */
   bool use_external_cache = false;
 
@@ -806,7 +813,7 @@ private:
   void _compute_default_parameters(int head_dim, float theta);
 
   /**
-   * @brief _compute frequency parameters for default ROPE
+   * @brief _compute frequency parameters for YaRN ROPE
    */
   void _compute_yarn_parameters(int head_dim, float theta);
 

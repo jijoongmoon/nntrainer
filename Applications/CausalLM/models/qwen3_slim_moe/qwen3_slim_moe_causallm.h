@@ -2,7 +2,7 @@
 /**
  * Copyright (C) 2025 Eunju Yang <ej.yang@samsung.com>
  *
- * @file   qwen3_moe_causallm.h
+ * @file   qwen3_slim_moe_causallm.h
  * @brief  Slimmed-down Qwen3-MoE causal language model implementation.
  * @date   15 July 2025
  * @see    https://github.com/nntrainer/nntrainer
@@ -21,7 +21,7 @@ namespace causallm {
 
 /**
  * @brief Qwen3SlimMoECausalLM class
- * @note  This class inherits Qwewn3CaUSALlm
+ * @note  This class inherits Qwen3CausalLM
  */
 class Qwen3SlimMoECausalLM : public Qwen3CausalLM {
 

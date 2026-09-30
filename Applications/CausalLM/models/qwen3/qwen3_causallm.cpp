@@ -87,10 +87,10 @@ Tensor Qwen3Transformer::createAttention(const int layer_id, int seq_len,
   Tensor v = wv(value);
 
   // KV cache wiring. Default is external (5-input mha) with FP16
-  // placeholders owned by KVCacheManager. When NNTR_KV_INT8=1, switch to
-  // 3-input mode so mha_core allocates an INT8 cache + FP16 scale
-  // tensors internally - createKVCachePlaceholders only emits FP16
-  // tensors so it can't host the int8 path.
+  // placeholders owned by KVCacheManager. When NNTR_KV_INT8 is set (any
+  // value), switch to 3-input mode so mha_core allocates an INT8 cache +
+  // FP16 scale tensors internally - createKVCachePlaceholders only emits
+  // FP16 tensors so it can't host the int8 path.
   static const bool _kv_int8_setup = std::getenv("NNTR_KV_INT8") != nullptr;
 
   // Attention core layer

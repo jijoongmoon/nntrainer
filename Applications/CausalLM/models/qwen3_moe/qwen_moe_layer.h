@@ -2,7 +2,7 @@
 /**
  * Copyright (C) 2025 Eunju Yang <ej.yang@samsung.com>
  *
- * @file   moe_layer.h
+ * @file   qwen_moe_layer.h
  * @date   09 June 2025
  * @brief  This is Mixture of Expert Layer Class of Neural Network
  * @see    https://github.com/nntrainer/nntrainer

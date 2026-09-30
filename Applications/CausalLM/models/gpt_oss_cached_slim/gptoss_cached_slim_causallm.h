@@ -2,7 +2,7 @@
 /**
  * Copyright (C) 2025 Eunju Yang <ej.yang@samsung.com>
  *
- * @file   gptoss_causallm.h
+ * @file   gptoss_cached_slim_causallm.h
  * @brief  Cached, slimmed-down GPT-OSS causal language model implementation.
  * @date   26 Aug 2025
  * @see    https://github.com/nntrainer/nntrainer

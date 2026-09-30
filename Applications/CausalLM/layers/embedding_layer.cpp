@@ -2,13 +2,13 @@
 /**
  * Copyright (C) 2020 Jijoong Moon <jijoong.moon@samsung.com>
  *
- * @file   embedding.cpp
+ * @file   embedding_layer.cpp
  * @date   04 March 2021
  * @brief  This is Embedding Layer Class of Neural Network
  * @see    https://github.com/nntrainer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @bug    No known bugs except for NYI items
- * @note   This embedding layer supports FP32/FP16/Q6_K data type only.
+ * @note   This embedding layer supports FP32/FP16/Q6_K/Q4_0/QS4CX data types.
  */
 
 #if defined(ENABLE_OPENCL)
@@ -1205,10 +1205,11 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     return;
   }
 
-  // A GGML-format sidecar (q4_0/q6_k manifest) is decoded by this SAME loop
-  // as the in-bin weight — identical row bytes, identical dequant — so every
-  // backend handoff below (CUDA dev-act staging, SVM/clmem raise) covers both
-  // sources; only the row base pointer differs (mmap'd file vs weight tensor).
+  // A row-block sidecar (q4_0/q6_k GGML or QS4CX manifest) is decoded by this
+  // SAME loop as the in-bin weight — identical row bytes, identical dequant —
+  // so every backend handoff below (CUDA dev-act staging, SVM/clmem raise)
+  // covers both sources; only the row base pointer differs (mmap'd file vs
+  // weight tensor).
   nntrainer::Tensor *weight_p =
     ggml_lut ? nullptr : &context.getWeight(weight_idx);
   nntrainer::Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);

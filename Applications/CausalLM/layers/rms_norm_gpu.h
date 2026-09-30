@@ -7,8 +7,7 @@
  *         cl_context so engine=gpu routes here. Uses only GPU compute
  *         + raw host pointers (no Tensor::multiply / Tensor::add_i /
  *         Tensor::inv_sqrt_i) because those CPU Tensor ops crash on
- *         gpu-context-allocated tensors — same family of bug as the
- *         AdditionLayerCL FP32 fast-path workaround.
+ *         gpu-context-allocated tensors.
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @bug    No known bugs except for NYI items
  */

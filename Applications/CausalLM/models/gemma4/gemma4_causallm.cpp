@@ -169,9 +169,10 @@ void Gemma4Transformer::setupParameters(json &cfg, json &generation_cfg,
   // global_head_dim=512) runs correctly on the OHWI image kernels — the
   // earlier "d>256 corrupts" observation was an artifact of mixing image and
   // flash layers per call (state desync), not a kernel tiling limit. With
-  // the kernels' sliding-window mask and the uniform per-process image
-  // state, no model-level vetting is needed here (device-validated:
-  // uniform-image gemma4 @999 tok coherent, prefill 2323 vs flash 1060 TPS).
+  // the kernels' sliding-window mask and the per-layer image decision
+  // (img_arm_want in mha_core), no model-level vetting is needed here
+  // (device-validated: gemma4 @999 tok coherent, prefill 2323 vs flash
+  // 1060 TPS).
 
   ATTENTION_K_EQ_V =
     cfg.contains("attention_k_eq_v") && cfg["attention_k_eq_v"].get<bool>();
@@ -564,8 +565,8 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
 
   // Fused GeGLU: gelu_tanh(gate) * per_layer_input_slice on GPU. Replaces the
   // separate tanh_gelu activation + element-wise multiply (same gelu(a)*b
-  // pattern as the FFN GeGLU); no CL activation/multiply exists and those CPU
-  // ops break SVM/cl_mem residency.
+  // pattern as the FFN GeGLU); no GPU element-wise multiply layer exists and
+  // the CPU op breaks SVM/cl_mem residency.
   std::vector<std::string> per_layer_input_mul_props = {
     withKey("name",
             "layer" + std::to_string(layer_id) + "_per_layer_input_mul"),
@@ -701,11 +702,11 @@ Tensor Gemma4Transformer::createSharedAttention(const int layer_id,
   layer_v_norms[layer_id] = shared_v_norm;
 
   // Shared attention core receives [Q_norm, shared_K_norm, shared_V_norm].
-  // use_gemm_attention=true routes prefill onto the GPU flash path
-  // (mha_core.cpp:1941). The flash kernel handles d=256 sliding (window mask)
-  // + GQA; the d=512 full layers fail the VPL<=8 check and fall back to the
-  // (x86-FP16-Q-safe) CPU gemm_attention. Without this flag prefill attention
-  // runs entirely on the slow CPU non-gemm path (~222 TPS @ M=1024).
+  // use_gemm_attention=true routes prefill onto the GPU flash path (the
+  // flash_attention_prefill_f16_cl call in MHACoreLayer). The flash kernel
+  // handles d=256 sliding (window mask) + GQA, and the d=512 full layers too
+  // (LWS=64 keeps VPL<=8). Without this flag prefill attention runs entirely
+  // on the slow CPU non-gemm path (~222 TPS @ M=1024).
   std::vector<std::string> a_params = {
     withKey("name", A), withKey("num_heads", n_heads),
     withKey("num_heads_kv", curr_kv_heads),
@@ -870,11 +871,11 @@ Tensor Gemma4Transformer::createAttention(const int layer_id, int seq_len,
                : FULL_ATTENTION_ROPE_PARTIAL_ROTARY_FACTOR;
 
   // Attention core receives [Q_norm, K_norm, V_norm].
-  // use_gemm_attention=true routes prefill onto the GPU flash path
-  // (mha_core.cpp:1941). The flash kernel handles d=256 sliding (window mask)
-  // + GQA; the d=512 full layers fail the VPL<=8 check and fall back to the
-  // (x86-FP16-Q-safe) CPU gemm_attention. Without this flag prefill attention
-  // runs entirely on the slow CPU non-gemm path (~222 TPS @ M=1024).
+  // use_gemm_attention=true routes prefill onto the GPU flash path (the
+  // flash_attention_prefill_f16_cl call in MHACoreLayer). The flash kernel
+  // handles d=256 sliding (window mask) + GQA, and the d=512 full layers too
+  // (LWS=64 keeps VPL<=8). Without this flag prefill attention runs entirely
+  // on the slow CPU non-gemm path (~222 TPS @ M=1024).
   std::vector<std::string> a_params = {
     withKey("name", A), withKey("num_heads", n_heads),
     withKey("num_heads_kv", curr_kv_heads),
@@ -947,9 +948,10 @@ Tensor Gemma4Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
   LayerHandle ffn_up(createLayer("fully_connected", ffn_up_props));
   Tensor up = ffn_up(input);
 
-  // Fused GeGLU: gelu_tanh(gate) * up on GPU (GeGLULayerCl). Replaces the
-  // separate tanh_gelu activation + element-wise multiply -- there is no CL
-  // activation/multiply, and those CPU ops break SVM/cl_mem residency.
+  // Fused GeGLU: gelu_tanh(gate) * up (backend-neutral GeGLULayer). Replaces
+  // the separate tanh_gelu activation + element-wise multiply -- there is no
+  // GPU element-wise multiply layer, and the CPU op breaks SVM/cl_mem
+  // residency.
   std::vector<std::string> ffn_geglu_props = {
     withKey("name", "layer" + std::to_string(layer_id) + "_ffn_geglu"),
     withKey("engine", causallm_engine())};
@@ -999,8 +1001,8 @@ void Gemma4Transformer::registerCustomLayers() {
 #endif
   // S1.1 GPU-context registration of ReshapedRMSNormLayer is now centralized in
   // CausalLM::registerCustomLayers (shared by all models). The q/k/v_norm +
-  // per_layer_projection_norm here still build with engine=GPU; pairs with
-  // NNTR_VNORM_GPU=1 for the gamma-free v_norm/PLE-norm GPU path.
+  // per_layer_projection_norm here still build with engine=GPU; the gamma-free
+  // v_norm/PLE-norm GPU path is on by default (NNTR_VNORM_HOST opts out).
 }
 
 void Gemma4CausalLM::registerCustomLayers() {
@@ -1014,13 +1016,13 @@ std::pair<Tensor, Tensor> Gemma4CausalLM::constructModel() {
   // create lm_head layer (using fully_connected option)
   // QINT4 lm_head (S4): UNTIE from the Q6_K input embedding so the output
   // projection runs as a v8c QINT4 GPU GEMV (dotCl_v8c, fully_connected path,
-  // ~3ms) instead of the ALU-bound gpu_native Q6_K GEMV (~17.5ms/token). The
+  // ~3ms) instead of the ALU-bound Q6_K GEMV (~17.5ms/token). The
   // input embedding must stay Q6_K (row-gather dequant) so the two cannot share
   // one weight; output_of_causallm carries a separate, transposed
   // [hidden,vocab] QINT4 copy. Used by BOTH nntr_quantize (constructs this
   // model to quantize output_of_causallm as a per-channel section-A FC weight)
-  // and inference. Gated on LMHEAD_DTYPE == QINT4 so Q6_K/Q4_0 lmheads keep the
-  // tied path. Untie is a config flag (LMHEAD_UNTIE), NOT derived from
+  // and inference. Gated on the LMHEAD_UNTIE config flag, so lmheads without it
+  // keep the tied path. Untie is a config flag (LMHEAD_UNTIE), NOT derived from
   // LMHEAD_DTYPE: the quantizer builds this same untied graph with an FP32
   // source weight (weight_dtype follows the source dtype) and the dtype map
   // quantizes output_of_causallm to QINT4 on save; inference rebuilds it with

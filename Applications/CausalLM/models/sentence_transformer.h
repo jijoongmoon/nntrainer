@@ -8,8 +8,9 @@
  * @see     https://github.com/nntrainer/nntrainer
  * @author  Eunju Yang <ej.yang@samsung.com>
  * @bug     No known bugs except for NYI items
- * @note    This embedding.h constructs a class for SentenceTransformer model
- * which can be a parent of models with embedding (encoder) structure.
+ * @note    This sentence_transformer.h constructs a class for
+ * SentenceTransformer model which can be a parent of models with embedding
+ * (encoder) structure.
  */
 
 #ifndef __SENTENCE_TRANSFORMER_H__

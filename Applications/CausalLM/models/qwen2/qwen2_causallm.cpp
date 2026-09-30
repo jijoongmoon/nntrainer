@@ -2,7 +2,7 @@
 /**
  * Copyright (C) 2026 Seunghui Lee <shsh1004.lee@samsung.com>
  *
- * @file   qwen2_causallm.h
+ * @file   qwen2_causallm.cpp
  * @date   6 January 2026
  * @brief  This defines a qwen2 causal language model.
  * @see    https://github.com/nntrainer/nntrainer

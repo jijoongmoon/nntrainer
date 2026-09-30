@@ -84,8 +84,10 @@ T unwrap(std::optional<T> &&value, const std::string &error_msg) {
 
 /**
  * @brief Compute engine for CausalLM model layers.
- * @return "gpu" by default (the v8c OpenCL inference path), or "cpu" when the
- *         NNTR_ENGINE=cpu env var is set. engine=cpu runs the model on the
+ * @return "cpu" when NNTR_ENGINE=cpu, "cuda" when NNTR_ENGINE=cuda (both
+ *         compared lowercased), otherwise "gpu" (the OpenCL inference path)
+ *         in an ENABLE_OPENCL build and "cpu" in a build without OpenCL.
+ *         engine=cpu runs the model on the
  *         standard CPU layers + CpuComputeOps (e.g. Q4_0-FP32 host inference /
  *         CPU-only deployment), instead of the engine=gpu Cl layers whose
  *         ClComputeOps throws NI for plain CPU BLAS ops. An absent engine prop

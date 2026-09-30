@@ -14,7 +14,7 @@
  *
  * @file	causallm_common_properties.h
  * @date	23 July 2025
- * @brief	This defines a qwen3 causal language model.
+ * @brief	This defines layer properties shared by the CausalLM layers.
  * @see		https://github.com/nnstreamer/
  * @author	Eunju Yang <ej.yang@samsung.com>
  * @bug		No known bugs except for NYI items
@@ -96,7 +96,7 @@ WIN_EXPORT class RMS_NORM_GAMMA_INIT final
   : public nntrainer::EnumProperty<nntrainer::props::InitializerInfo> {
 public:
   /**
-   * @brief Construct a CUSTOM_RMS_NORM_GAMMA_INIT object
+   * @brief Construct a RMS_NORM_GAMMA_INIT object
    */
   WIN_EXPORT RMS_NORM_GAMMA_INIT(
     nntrainer::Initializer value = nntrainer::Initializer::ONES) {

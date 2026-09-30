@@ -106,12 +106,12 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
     }
   }
 
-  // GPU-resident KV cache: when the graph runs on the SVM pool
-  // (NNTR_GPU_SVM_POOL) and the gpu-svm allocator is available, allocate the
-  // per-layer K/V from an SVM MemoryPool so their MemoryData reports
+  // GPU-resident KV cache: on the OpenCL gpu engine, unless
+  // NNTR_GPU_SVM_POOL=0, and when the gpu-svm allocator is available, allocate
+  // the per-layer K/V from an SVM MemoryPool so their MemoryData reports
   // isSVM()=true. That is the precondition for mha_core's GPU flash attention
   // path (svm_ok); without it attention falls back to the host (CPU) GEMM and
-  // is ~60x slower. Mirrors gpu_native's SVM K/V cache.
+  // is ~60x slower.
   // [engine=gpu fold] the SVM-resident pool is now the default — but ONLY for
   // the OpenCL gpu engine. On a CUDA build the gpu-svm (OpenCL) allocator is
   // also registered, so without the engine guard a cuda run would wrongly bind
@@ -137,12 +137,11 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
   // (cudaMallocManaged) allocator so the cache is device-accessible. That lets
   // GPU attention read it without the per-call host->device mirror and lets GPU
   // RoPE write K straight into the device cache -- the precondition for a fully
-  // on-GPU decode chain. Same pooled path as the OpenCL SVM cache below.
-  // VALUE-checked (=0 disables), same contract as the other SAFE cuda env:
-  // CudaContext auto-defaults it to "1" (setenv overwrite=0), so a presence
-  // check made =0 impossible to honor -- the only way to force a plain-host KV
-  // cache (WDDM, where the UVM setZero host-faults / attention can't reach a
-  // managed cache) is an explicit NNTR_CUDA_KV_UVM=0.
+  // on-GPU decode chain. Same pooled path as the OpenCL SVM cache above.
+  // Opt-in and VALUE-checked: any value other than one starting with '0'
+  // enables it; unset or =0 keeps a plain-host KV cache (needed on WDDM,
+  // where the UVM setZero host-faults / attention can't reach a managed
+  // cache).
   // Device-resident KV (NNTR_CUDA_KV_DEV=1, opt-in): the cache lives in
   // cudaMalloc DEVICE memory instead of UVM/pinned. WDDM (cMA==0) campaign
   // tier: managed KV hangs (remigration storm) and pinned KV pays PCIe on
@@ -302,8 +301,8 @@ void KVCacheManager::validateKVSources(unsigned int num_layers) const {
     // Same physical plane means same physical geometry. KV width is
     // per-layer, so a source/sharer drift (e.g. a narrow layer pointed at a
     // wide one) is exactly the mistake this check exists to catch, and it is
-    // cheap. Every layer holds max_seq_len rows here, so width is the only
-    // axis that can differ.
+    // cheap. Only width is checked here; a row-count (per-layer cap)
+    // mismatch is caught by the full-dim check in aliasLayerCache().
     if (kv_widths_[i] != kv_widths_[static_cast<unsigned int>(src)])
       throw std::invalid_argument(
         "KVCacheManager::allocate: KV alias geometry mismatch, layer " +
@@ -369,11 +368,12 @@ void KVCacheManager::reportKVShare(unsigned int num_layers,
   //
   // STDERR, deliberately, and not ml_logi like the window-ring line above.
   // ml_logi is not a witness in a shipping build: under -D__LOGGING__ (which
-  // is how this app is built) it goes to a CWD-relative ./logs/*.out file that
-  // no run harness reads, and in the non-__LOGGING__ DEBUG variant INFO goes
-  // to STDOUT -- which is the generated-text stream, i.e. inside the slice a
-  // golden md5 hashes. stderr is the channel the app already uses for run
-  // diagnostics and the only one that is both visible and safe here.
+  // is how this app is built) it goes to a logs/*.out file (NNTR_LOG_DIR, else
+  // the user cache dir; CWD-relative on Android) that no run harness reads,
+  // and in the non-__LOGGING__ DEBUG variant INFO goes to STDOUT -- which is
+  // the generated-text stream, i.e. inside the slice a golden md5 hashes.
+  // stderr is the channel the app already uses for run diagnostics and the only
+  // one that is both visible and safe here.
   if (layer_kv_sources_.empty())
     return;
 

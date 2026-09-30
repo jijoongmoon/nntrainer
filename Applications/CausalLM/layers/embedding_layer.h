@@ -2,7 +2,7 @@
 /**
  * Copyright (C) 2021 Jijoong Moon <jijoong.moon@samsung.com>
  *
- * @file   embedding.h
+ * @file   embedding_layer.h
  * @date   04 March 2021
  * @brief  This is Embedding Layer Class of Neural Network
  * @see    https://github.com/nntrainer/nntrainer
@@ -78,12 +78,13 @@ public:
 
 /**
  * @brief Shared sidecar embedding LUT loaded from raw UINT16, JSON manifest,
- *        or GGML (q4_0/q6_k) row payload.
+ *        or row-block (GGML q4_0/q6_k, or QS4CX) payload.
  *
- * The payload is mmap'd read-only when possible (POSIX) so a multi-hundred-MB
- * table stays out of resident memory and rows are paged in on demand; `bytes`
- * is the fallback container (Windows / mmap failure). Always access the
- * payload through data()/payload_size().
+ * The payload is mapped read-only when possible (mmap on POSIX, MapViewOfFile
+ * via the mman shim on Windows) so a multi-hundred-MB table stays out of
+ * resident memory and rows are paged in on demand; `bytes` is the fallback
+ * container (mapping failure). Always access the payload through
+ * data()/payload_size().
  */
 struct QuantLut {
   std::vector<uint8_t> bytes;
@@ -97,7 +98,7 @@ struct QuantLut {
   bool is_raw_u16 = false;
   bool is_signed4 = false;
 
-  /// GGML row-block payload (Q4_0/Q6_K); NONE for the packed-4bit/raw formats.
+  /// Row-block payload (Q4_0/Q6_K/QS4CX); NONE for the packed-4bit/raw formats.
   nntrainer::TensorDim::DataType ggml_dtype =
     nntrainer::TensorDim::DataType::NONE;
   size_t row_bytes = 0; ///< payload stride per row (ggml mode)
@@ -189,7 +190,7 @@ public:
 
   /**
    * @brief  Move assignment operator.
-   * @parma[in] rhs EmbeddingLayer to be moved.
+   * @param[in] rhs EmbeddingLayer to be moved.
    */
   WIN_EXPORT EmbeddingLayer &operator=(EmbeddingLayer &&rhs) = default;
 
@@ -278,7 +279,8 @@ private:
    *  buffer and the second lookup overwrote the first one's still-in-flight
    *  async H2D copy => corrupted residual seed => CUDA garbage. */
   void *cuda_stage = nullptr;
-  size_t cuda_stage_cap = 0; ///< capacity in BYTES (activation dtype varies)
+  size_t cuda_stage_cap = 0; ///< capacity: BYTES on the sidecar-LUT path,
+                             ///< FP16 elements on the weight/row-block path
 
   /// On-GPU LUT gather (CUDA M==1 decode): cuda_emb_gather handle for this
   /// layer's sidecar (-2 = not attempted, -1 = unavailable/refused, >= 0 =
@@ -295,4 +297,4 @@ private:
 } // namespace causallm
 
 #endif /* __cplusplus */
-#endif /* __EMBEDDING_H__ */
+#endif /* __EMBEDDING_LAYER_H__ */

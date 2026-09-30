@@ -146,8 +146,9 @@ void RMSNormLayerGPU::incremental_forwarding(
 #if defined(ENABLE_OPENCL) && defined(ENABLE_FP16)
   // FP16 residual stream: run the norm as a GPU kernel (rmsnorm_cl_fp16,
   // SVM-direct when the graph runs on the SVM pool), not on the host. This is
-  // the residency path; the host FP32 norm further down is the fallback for a
-  // graph whose activations are not device-resident. The kernel folds gamma in.
+  // the residency path; FP16 never reaches the host norm further down, which
+  // serves only FP32 activations that are not on the SVM plane. The kernel
+  // folds gamma in.
   const bool fp16 =
     in.getDataType() == ml::train::TensorDim::DataType::FP16 &&
     gamma.getDataType() == ml::train::TensorDim::DataType::FP16 &&

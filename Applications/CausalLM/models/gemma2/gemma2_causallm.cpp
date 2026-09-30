@@ -95,8 +95,9 @@ Tensor Gemma2Transformer::createTransformerDecoderBlock(const int layer_id,
 
   // NNTR_FUSE_ADDNORM: fuse the post-norm RMSNorm with its residual add into a
   // single 2-input "rms_norm" node (out = rmsnorm(sublayer)*gamma + residual),
-  // removing the separate AdditionLayerCL (v8c_add_h2h GPU kernel + dispatch
-  // idle). Default off -> the original separate norm + addition graph.
+  // removing the separate AdditionLayer (its add kernel + dispatch idle).
+  // Presence-checked: any value enables it; unset -> the original separate
+  // norm + addition graph.
   static const bool fuse_addnorm = std::getenv("NNTR_FUSE_ADDNORM") != nullptr;
 
   LayerHandle post_attn_norm(createLayer(
@@ -252,9 +253,10 @@ Tensor Gemma2Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
      withKey("engine", causallm_engine())}));
   Tensor up = ffn_up(input);
 
-  // Fused GeGLU: gelu_tanh(gate) * up (GPU GeGLULayerCl). Replaces the separate
-  // tanh_gelu activation + element-wise multiply (no CL multiply/activation
-  // exists, and those CPU ops break on SVM-resident tensors).
+  // Fused GeGLU: gelu_tanh(gate) * up (backend-neutral GeGLULayer). Replaces
+  // the separate tanh_gelu activation + element-wise multiply (no GPU
+  // element-wise multiply layer exists, and the CPU op breaks on SVM-resident
+  // tensors).
   LayerHandle geglu(createLayer(
     "geglu",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_geglu"),

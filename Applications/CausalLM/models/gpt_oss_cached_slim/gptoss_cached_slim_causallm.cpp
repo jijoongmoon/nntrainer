@@ -12,7 +12,7 @@
  * limitations under the License.
  *
  *
- * @file	gptoss_causallm.cpp
+ * @file	gptoss_cached_slim_causallm.cpp
  * @brief	This defines a gpt_oss causal language model.
  * @date    26 Aug 2025
  * @see		https://github.com/nnstreamer/

@@ -14,7 +14,7 @@
  * @author Eunju Yang <ej.yang@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  This file defines CausalLM's basic actions
- * @note   This causal_lm.h constructs a class for Transformer-based Causal
+ * @note   This causal_lm.cpp implements a class for Transformer-based Causal
  * Language Model (CausalLM). It aims to support AutoModelForCausalLM with
  * nntrainer. It supports the following models:
  *          - Llama
@@ -213,8 +213,8 @@ CausalLM::CausalLM(json &cfg, json &generation_cfg, json &nntr_cfg) :
   // is host-produced but uploaded to cl_mem (RAISE), the final norm output is
   // GPU-produced but read back once by the host lm_head (LOWER), and mha_core
   // is a CPU-registered layer that binds/consumes Q/K/V on the GPU plane
-  // (engine- neutral). NNTR_CLMEM_RAISE/LOWER still override the raise/lower
-  // patterns.
+  // (engine- neutral). Patterns already set on the ResidencyPolicy before this
+  // constructor runs are kept.
   auto &rp = nntrainer::ResidencyPolicy::global();
 #ifndef _WIN32
   if (rp.raise_patterns.empty())
@@ -227,7 +227,8 @@ CausalLM::CausalLM(json &cfg, json &generation_cfg, json &nntr_cfg) :
   // just this tensor is bit-reproducible 6/6 with NO drain at baseline cost
   // (2079/18.5 vs base 2075/18.2 — zero). The raise's own rationale (layer0
   // coarse-SVM ingress) did not reproduce in any of those runs. Keep the
-  // embedding on SVM on Windows; NNTR_CLMEM_RAISE overrides for A/B.
+  // embedding on SVM on Windows; a raise pattern set on the ResidencyPolicy
+  // beforehand overrides for A/B.
 #endif
   if (rp.lower_patterns.empty())
     rp.lower_patterns = "output_norm:out0";
@@ -921,7 +922,8 @@ std::vector<unsigned int> CausalLM::generate(float *logits, bool do_sample,
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
   // Terminal drain for the selective-sync (NNTR_CUDA_ASYNC) decode path: ensure
   // the GPU has finished producing the logits before the host reads them here.
-  // No-op in default mode (every GPU op already drained per-op). cuda engine
+  // Called unconditionally; under drained (non-async) submission every GPU op
+  // already drained per-op, so it has nothing left to wait for. cuda engine
   // ONLY: in a dual-enabled (CUDA+OpenCL) binary this ran on OpenCL runs too,
   // and StreamManager::Global() lazily CREATES the CUDA context -- the first
   // stray CUDA touch on a non-cuda run (NVIDIA VRAM burned on an Intel run).
@@ -1506,8 +1508,8 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
               "the fp-activation QS4CX route");
   }
 
-  // Per-weight CUDA prewarm walk, gated by NNTR_CUDA_PREWARM (default on, set
-  // by the cuda context). Two things depend on it:
+  // Per-weight CUDA prewarm walk, gated by NNTR_CUDA_PREWARM (on unless it
+  // starts with '0'; unset means on). Two things depend on it:
   //   - correctness: without it every QS4CX weight's derived device caches (the
   //     dp4a int4 repack, the fp16/fp32 per-channel scale copies) are built
   //     LAZILY inside the first forward that uses the weight. Those builds
@@ -2016,9 +2018,9 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       : 0.0;
   performance_metrics.first_token_ms =
     decode_step_ms.empty() ? 0.0 : decode_step_ms.front();
-  /* Median, not mean: one throttle notch or one scheduler hiccup in 127 steps
-   * moves a mean and does not move a median, and the question these sweeps ask
-   * is what a step costs, not what the worst step cost. */
+  // Median, not mean: one throttle notch or one scheduler hiccup in 127 steps
+  // moves a mean and does not move a median, and the question these sweeps ask
+  // is what a step costs, not what the worst step cost.
   if (decode_step_ms.size() >= 2) {
     std::vector<double> tail(decode_step_ms.begin() + 1, decode_step_ms.end());
     std::sort(tail.begin(), tail.end());
@@ -2032,8 +2034,8 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   }
 
   if (log_output) {
-    /* Its own row, per the measurement rule: TTFT is not prefill + a constant,
-     * and prefill_ms is only queue-drained when the drain was armed. */
+    // Its own row, per the measurement rule: TTFT is not prefill + a constant,
+    // and prefill_ms is only queue-drained when the drain was armed.
     std::cout << "[PERF-SPLIT] prefill_tok=" << init_len
               << " prefill_ms=" << prefill_duration.count()
               << " drain_ms=" << performance_metrics.prefill_drain_ms
@@ -2064,7 +2066,9 @@ void CausalLM::releaseDeviceCaches() {
   // model's worth of device packs per cycle nor takes a stale hit and computes
   // with the previous model's weights. Each hook is a pure reset that makes no
   // driver call when its lane was never used, so a CPU/OpenCL-only process
-  // never pokes cudart.
+  // never pokes cudart. Only the CUDA caches are handled here; the OpenCL
+  // process-global caches (v8c weight packs and their scratch) have no
+  // release hook on this tree.
   nntrainer::cuda::cuda_fc_qs4cx_release_weight_caches();
   nntrainer::cuda::cuda_attention_release_caches();
   nntrainer::cuda_reset_decode_graph_cache();

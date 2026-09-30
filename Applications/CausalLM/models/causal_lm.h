@@ -364,15 +364,15 @@ protected:
    * @brief Externalized KV cache (host-owned). Allocated by allocateKVCache()
    *        once the model has been compiled (so we have the layer count,
    *        head count, etc.) and bound to mha_core's input slots
-   *        cache_k_l<i> / cache_v_l<i> via Model::setExternalTensors.
+   *        cache_k_l<i> / cache_v_l<i> by allocateAndBindKVCache().
    */
   KVCacheManager kv_cache;
   bool kv_cache_bound = false; /**< True once KV cache tensors are bound */
 
   /**
-   * @brief Allocate kv_cache and bind it to all mha_core layers via
-   *        Model::setExternalTensors. Idempotent — safe to call once after
-   *        initialize().
+   * @brief Allocate kv_cache and bind it to all mha_core layers by pointing
+   *        each cache placeholder at its buffer (Tensor::setData).
+   *        Idempotent — safe to call once after initialize().
    */
   virtual void allocateAndBindKVCache();
 
@@ -381,7 +381,7 @@ protected:
    *        (with their original MemoryData, isSVM() intact) into the graph's
    *        input placeholders instead of letting the framework re-wrap the
    *        raw pointers in fresh (flag-less) Tensor::Map MemoryData.
-   * @details With in-place input layers (NNTR_INPUT_INPLACE relaxation) the
+   * @details With in-place input layers (InputLayer::initializeInPlace) the
    *          mha_core cache input views alias the input placeholder directly
    *          (view-of-view flattening), so whatever MemoryData fills the
    *          placeholder reaches mha_core's svm_ok gate. A Map wrap of the

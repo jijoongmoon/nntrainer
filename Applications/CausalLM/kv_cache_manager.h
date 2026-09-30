@@ -387,17 +387,19 @@ private:
    * @brief Per-layer cache storage
    */
   struct LayerCache {
-    nntrainer::Tensor key_cache;   /**< (batch, 1, max_seq_len, kv_width) */
-    nntrainer::Tensor value_cache; /**< (batch, 1, max_seq_len, kv_width) */
+    nntrainer::Tensor key_cache;   /**< (batch, 1, getLayerCap(i), kv_width) */
+    nntrainer::Tensor value_cache; /**< (batch, 1, getLayerCap(i), kv_width) */
   };
 
   std::vector<LayerCache> layer_caches_; /**< per-layer KV caches */
 
   /**
-   * @brief Optional SVM-backed memory pool. When NNTR_GPU_SVM_POOL is set and
-   * the GPU (gpu-svm) allocator is available, the KV caches are allocated from
-   * this pool so their MemoryData reports isSVM()=true — required for the
-   * GPU flash attention path (mha_core). Null on the host (CPU) path.
+   * @brief Optional device-accessible memory pool for the KV caches. On the
+   * OpenCL gpu engine it is backed by the gpu-svm allocator (on by default;
+   * NNTR_GPU_SVM_POOL=0 disables) so the caches' MemoryData reports
+   * isSVM()=true — required for the GPU flash attention path (mha_core). On a
+   * CUDA build it is backed by the cuda device (NNTR_CUDA_KV_DEV=1) or cuda-uvm
+   * (NNTR_CUDA_KV_UVM) allocator. Null on the host (CPU) path.
    */
   std::shared_ptr<nntrainer::MemoryPool> svm_pool_;
 

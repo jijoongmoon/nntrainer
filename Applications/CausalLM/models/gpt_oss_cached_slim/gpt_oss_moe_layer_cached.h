@@ -33,7 +33,7 @@
 namespace causallm {
 
 /**
- * @class   GptOssMoELayer
+ * @class   CachedSlimGptOssMoELayer
  * @brief   Mixture of Expert Layer
  */
 class WIN_EXPORT CachedSlimGptOssMoELayer : public nntrainer::LayerImpl {

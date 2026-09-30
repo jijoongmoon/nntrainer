@@ -145,7 +145,7 @@ inline size_t readGpuBytes() {
 /**
  * @brief Peak of RssAnon + accelerator over one run.
  *
- * @details start() resets, so the value belongs to the request that called it
+ * @details arm() resets, so the value belongs to the request that called it
  * and not to the worker's history. A thread samples rather than the token
  * loop, because the peak of the GPU arm is inside load and inside the first
  * prefill chunk, neither of which has a per-token callback to hang off.

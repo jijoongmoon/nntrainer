@@ -81,4 +81,4 @@ private:
 };
 } // namespace causallm
 
-#endif /* __QWEN3_CAUSAL_LM_H__ */
+#endif /* __QWEN_CAUSAL_LM_H__ */

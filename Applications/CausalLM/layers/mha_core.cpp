@@ -37,20 +37,11 @@
 static std::mutex rope_init_mtx;
 
 // Minimum prefill step_size for routing attention/RoPE onto the GPU paths.
-// Below the threshold the prefill falls to the host path. This is HEAD-DIM
-// AWARE because the GPU flash/RoPE prefill kernels are only verified correct
-// for head_dim 256/512 (e.g. gemma): those models keep q/k-norm GPU-resident,
-// so the host fallback would read a stale SVM shadow -> they MUST take the GPU
-// path, which is also a big win even at tiny step_size (~5.7x on Intel Arc,
-// 16-token prefill). head_dim 128 (e.g. qwen3) keeps q/k-norm on the HOST, so
-// the host prefill path is numerically correct there, whereas the Intel GPU
-// flash kernel (flash_attention_prefill_f16_cl) produces GARBAGE for head_dim
-// 128 at small/medium step_size (only very long prefill happens to survive) --
-// so route its prefill to the host path. Env override: NNTR_MIN_PREFILL.
-//   Regression context: commit 143543f71 lowered the x86 gate to 1 for ALL
-//   head_dims (verified only on gemma / head_dim 256); that silently broke
-//   qwen3 short-prompt coherence on Intel while the 1k-prompt benchmarks (long
-//   prefill) kept passing.
+// Below the threshold the prefill falls to the host path. The threshold no
+// longer depends on head_dim (the parameter is ignored): x86 returns 1 for
+// every head_dim (see the note below on the former head_dim=128 issue), and
+// ARM returns 1 with NNTR_MHA_GPU on, else 32. Env override:
+// NNTR_MIN_PREFILL.
 static unsigned int min_prefill_thr(unsigned int head_dim) {
   static const int env = []() {
     const char *e = std::getenv("NNTR_MIN_PREFILL");
@@ -72,8 +63,8 @@ static unsigned int min_prefill_thr(unsigned int head_dim) {
   // ARM (Adreno): the image attention path is coherent (incl. qwen3); the
   // host-NEON crossover / GPU-request behaviour is unchanged from before.
   (void)head_dim;
-  // value-checked (=0 disables): the CL bundle auto-injects NNTR_MHA_GPU=1,
-  // so a presence check could never be turned off (env_compat.h trap).
+  // value-checked (=0 disables), so an explicit NNTR_MHA_GPU=0 turns it off
+  // (env_compat.h trap).
   if (nntr_env_on("NNTR_MHA_GPU"))
     return 1u;
   return 32u;
@@ -999,10 +990,8 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
   // call served by the flash kernels would read a mirror the buffer does not
   // have. Per LAYER is safe for exactly the reason per call is not: each layer
   // owns its own K/V cache and its own mirror, so the two arms never share a
-  // store. Sliding windows are handled IN the OHWI kernels (local_window arg);
-  // the per-MODEL safety decision for geometry the kernels cannot serve
-  // (d > 256 → force NNTR_KV_IMG_ATTN=0) is made in the model class before
-  // layers finalize.
+  // store. Sliding windows are handled IN the OHWI kernels (local_window
+  // arg).
   // [determinism] img_arm_want (= causallm::imageAttnLayer above) is the ONE
   // place this layer's arm is decided, so the mirror prebuild, the Q staging,
   // the decode-RoPE gate, the engage and the ring rule cannot disagree about
@@ -1167,10 +1156,11 @@ void MHACoreLayer::ensure_rope_flat_lut() {
  * @note In external KV cache mode (use_external_cache == true), this
  *       implements the inference forward pass using cache tensors supplied
  *       as input[3] (cache_key) and input[4] (cache_value). The host (e.g.
- *       KVCacheManager via setExternalTensors) is responsible for owning
- *       these buffers and for calling setCacheIndex() before each step to
- *       set the write position. After this call cache_index is advanced by
- *       input.height().
+ *       KVCacheManager, bound by CausalLM::allocateAndBindKVCache) is
+ *       responsible for owning these buffers and for calling setCacheIndex()
+ *       before each step to set the write position. After this call
+ *       cache_index is advanced by step_size (incremental_step_size when set,
+ *       else input.height()).
  *
  *       In legacy 3/4-input mode (use_external_cache == false) training is
  *       NYI and incremental_forwarding() is the inference path.
@@ -1337,12 +1327,11 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
 
 /**
  * @note This incremental_forwarding method is invoked for inference mode.
- *       Please note that Transformer Decoder's MHA takes only one sequence at a
- * step. Incremental forwarding function is used for this.
+ *       It processes the step rows [_from, _to), one row (decode) or
+ *       several (prefill chunk).
  */
-// NYI guard fires inside incremental_forwarding() if kv_int8 was set.
-// The cache + scale tensors are allocated (Phase 1), but the
-// write/read paths are not yet implemented (Phase 2/3).
+// kv_int8 (internal cache mode only): the INT8 cache + FP16 scale tensors are
+// allocated in finalize() and consumed by the int8 write/read paths below.
 void MHACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                                           unsigned int _from, unsigned int _to,
                                           bool training) {
@@ -1821,7 +1810,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   // sub-buffer whenever a non-cl_mem path wrote it (the wo FC reads cl_mem).
   // Offset-0 views only (batch 0; b_size==1 on the live path).
   // NNTR_CLMEM_MHA_OFF=1 (bisect): ignore residency handles entirely -- the
-  // mha consumes the legacy SVM plane (valid only with NNTR_CLMEM_DUALOUT).
+  // mha consumes the legacy SVM plane.
   // NNTR_KV_STAGE_TPROF: host time from mha entry to the rope-Q enqueue
   // (decomposes the copy_h2h->rope GPU-idle gap: executor/plumbing vs rope
   // wrapper).
@@ -1921,10 +1910,9 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   // window -- the K side-fill and the V SVM cache write (the last undrained
   // SVM writes in the mha window) are skipped, and any host/SVM slab reader
   // first gathers the missing rows back from the mirrors (sync_kv_slab,
-  // one drained boundary sync at decode entry). Pair with NNTR_CLMEM_QKV=1
-  // for the full island-free window. v1 limit: prefill must fit the mirror
-  // capacity (engage-gate misses beyond S_max leave the slab stale) and the
-  // save_kvcache path is not synced.
+  // one drained boundary sync at decode entry). v1 limit: prefill must fit
+  // the mirror capacity (engage-gate misses beyond S_max leave the slab
+  // stale) and the save_kvcache path is not synced.
   static const bool mha_clmem_mode = []() {
     // 2026-06-12 re-baseline: DEFAULT ON (inert without NNTR_KV_IMG_ATTN
     // staging; NNTR_MHA_CLMEM=0 restores the SVM side-fills).
@@ -2206,10 +2194,11 @@ void MHACoreLayer::one_batch_incremental_forwarding(
         // is a consumer reading an SVM write from an earlier submission, which
         // every model on this chain does; a pack that does not set the flag is
         // unobserved, not proven safe. Deciding the risk condition
-        // structurally, where the chain is built, is the follow-up this series
-        // lands next (Kernel::noteUndrainedSvmPlane) and is what should retire
-        // this flag. NNTR_KV_PREFILL_NODRAIN overrides either way and outranks
-        // the pack: =1 no drain, =0 drain.
+        // structurally, where the chain is built, is the per-dispatch hazard
+        // check (Kernel::noteUndrainedSvmPlane, opt-in via
+        // NNTR_SVM_HAZARD_DRAIN=1) and is what should retire this flag.
+        // NNTR_KV_PREFILL_NODRAIN overrides either way and outranks the pack:
+        // =1 no drain, =0 drain.
         static const int _kv_nodrain_override = [] {
           const char *e = std::getenv("NNTR_KV_PREFILL_NODRAIN");
           return e == nullptr ? -1 : (std::atoi(e) != 0 ? 1 : 0);
@@ -2354,26 +2343,26 @@ void MHACoreLayer::one_batch_incremental_forwarding(
     // IMAGE-attention path (NNTR_KV_IMG_ATTN), which is a SEPARATE env from
     // NNTR_KV_OHWI: is_kv_ohwi_enabled()/kv_ohwi_now are FALSE there, so the
     // concat branch is also skipped and gpu_rope_done stays false -> the host
-    // fallback (1810) runs lower_q()+lower_kv() (two BLOCKING
+    // RoPE fallback (the !gpu_rope_done branch) runs lower_q()+lower_kv() (two
+    // BLOCKING
     // clEnqueueReadBuffer drains, ~16-35 ms/token over 35 layers) and host
     // apply_rotary_emb. Rotate Q/K/V ON THE GPU instead, landing the bytes in
     // exactly the SVM buffers the existing GPU OHWI scatter + image attention
     // already consume:
     //   * Q  -> rotate IN-PLACE into query_step's SVM plane (Q_p). The OHWI
-    //          decode qk kernel reads Q_p with q_clmem=nullptr (see 2340), so
+    //          decode qk kernel reads Q_p with q_clmem=nullptr, so
     //          the rotation must land in the SVM shadow. When the FC parked Q
     //          in a planner cl_mem (q_cl != null) we read cl_mem -> SVM
     //          (drained once, then null q_cl) so Q_p is fresh.
     //   * K  -> rotate from key_step into b_cache_key_step's SVM concat cache
-    //          slice (kc_p). k_scatter_ohwi_cl reads b_cache_key_step (2317).
-    //          This is the SAME destination the host `else` branch writes
-    //          (1881) and the SAME destination the concat GPU-RoPE writes
-    //          (kc_p, 1619).
+    //          slice (kc_p). k_scatter_ohwi_cl reads b_cache_key_step.
+    //          This is the SAME destination the host RoPE fallback writes
+    //          and the SAME destination the concat GPU-RoPE writes (kc_p).
     //   * V  -> flat copy value_step -> b_cache_value_step's SVM slice (no
     //   RoPE).
-    //          v_scatter_ohwi_t_cl reads b_cache_value_step (2326) when
+    //          v_scatter_ohwi_t_cl reads b_cache_value_step when
     //          v_stage_svm is null (the unstaged decode path here). Matches the
-    //          host V copy (1892) byte-for-byte.
+    //          host fallback's V copy byte-for-byte.
     // Token-identical: rope_inplace_f16_cl == apply_rotary_emb_tensor_v2 for
     // the rotated bytes (the concat GPU-RoPE already depends on this
     // equivalence) and the destinations are identical to the host fallback's.
@@ -2394,7 +2383,8 @@ void MHACoreLayer::one_batch_incremental_forwarding(
       _ohwi_gpu_rope_env || std::get<props::GpuOhwiRope>(mha_core_props).get();
     // Invariant: OHWI GPU-RoPE only feeds the image-attention layout — run
     // it only when this layer's attention actually takes the image path
-    // (use_image_attn == 1; uniform per process, see the prebuild note).
+    // (use_image_attn == 1; decided per layer by img_arm_want, see the
+    // prebuild note).
     if (!gpu_rope_done && _ohwi_gpu_rope && !_gpu_rope_off && _mha_gpu_on &&
         _img_arm && use_image_attn == 1 && use_gemm_attention && !kv_int8 &&
         (to - from) == 1 &&
@@ -2669,8 +2659,8 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                 // M2-B: read the RoPE position from the device d_pos buffer so
                 // a captured decode graph stays valid across tokens. Set d_pos
                 // here only when NOT capturing (non-graph decode); under
-                // capture the neuralnet scaffold sets it once per token before
-                // the replay.
+                // capture CudaContext::runDecode sets it once per token before
+                // the replay (and once inside the capture).
                 static const bool m2b = nntrainer::cuda::decodeGraphEnabled();
                 if (m2b) {
                   if (!nntrainer::cuda::StreamManager::Global().isCapturing())
@@ -2806,7 +2796,8 @@ void MHACoreLayer::one_batch_incremental_forwarding(
           // GPU attention (NNTR_CUDA_ATTN) + UVM KV cache (NNTR_CUDA_KV_UVM),
           // prefill attention reads the cache on the GPU (same stream), so a
           // GPU V copy is a GPU->GPU handoff -- no host read, no drain. Gated
-          // by NNTR_CUDA_VCOPY_PREFILL while validating; removes the per-layer
+          // by NNTR_CUDA_VCOPY_PREFILL (defaulted on by the CudaContext device
+          // profiles; =0 restores the host copy); removes the per-layer
           // finishIfAsync bubble that made async-on prefill slow.
           static const bool vcopy_prefill =
             nntr_env_on("NNTR_CUDA_VCOPY_PREFILL");
@@ -3180,14 +3171,14 @@ void MHACoreLayer::one_batch_incremental_forwarding(
         cache_key.getMemoryData()->isSVM() &&
         cache_value.getMemoryData()->isSVM() &&
         attention_output_step.getMemoryData()->isSVM();
-      // SVM-gated by default. With the current KVCacheManager (plain
-      // host-tensor cache), svm_ok is false and the non-SVM wrapper
+      // SVM-gated by default. KVCacheManager allocates the KV cache
+      // from the SVM pool on the gpu engine (unless NNTR_GPU_SVM_POOL=0);
+      // with a host-tensor cache svm_ok is false and the non-SVM wrapper
       // path would upload the full H_kv*S_max*d slab per layer per
       // step (4MB at S_max=2048, ~7x more than the live N_kv slice
-      // would need). Phase 2.5 will allocate the KV cache through the
-      // SVM allocator; until then, opting into NNTR_KV_OHWI_GPU_FORCE=1
-      // exercises the non-SVM path (slow + drift-prone, for kernel
-      // validation only).
+      // would need). Opting into NNTR_KV_OHWI_GPU_FORCE=1 exercises the
+      // non-SVM path anyway (slow + drift-prone, for kernel validation
+      // only).
       static const bool _ohwi_force =
         std::getenv("NNTR_KV_OHWI_GPU_FORCE") != nullptr;
       static int _ohwi_logged = 0;
@@ -3345,7 +3336,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
         const uint16_t *V_p =
           reinterpret_cast<const uint16_t *>(b_cached_value.getData<_FP16>());
 
-        // Adreno image attention (gpu_native's ~9x prefill path, §3.7/§3.8).
+        // Adreno image attention (the texture-cache prefill path).
         // Read K/V via image2d_from_buffer (read_imageui texture cache) instead
         // of the SVM buffer flash kernel. The SVM KV cache can't back an image
         // (clCreateImage needs a cl_mem handle), so keep per-layer cl_mem OHWI
@@ -3354,26 +3345,23 @@ void MHACoreLayer::one_batch_incremental_forwarding(
         // NNTR_KV_IMG_ATTN (Adreno only — read_imageui won't build on Intel
         // NEO, which keeps the flash path below). Preempts flash on success.
         if (use_image_attn < 0) {
-          // Value-checked so NNTR_KV_IMG_ATTN=0 really disables the image
-          // path (the Adreno auto-default in cl_context uses overwrite=0 and
-          // cannot override a user-provided 0).
+          // Value-checked (imageAttnRequested in kv_ring.h) so
+          // NNTR_KV_IMG_ATTN=0 really disables the image path.
           use_image_attn = img_arm_want ? 1 : 0;
         }
-        // Sliding-window layers past their window must NOT take the image
-        // path: qk_matmul_f16_ohwi_img has only the causal upper-bound mask
-        // (n > q_off + m) and no window lower bound (n + W <= m), so once
-        // cache_to exceeds the window it silently computes full causal
-        // attention over evicted keys (gemma4 W=512: 999-tok Adreno prefill
-        // degenerates into word salad, severity ~ (cache_to - W)). Route
-        // those calls to the flash kernels below, which take local_window.
+        // Sliding-window layers: the OHWI image kernels take the effective
+        // window (win_img below) and mask keys older than it (n + W <= m).
+        // Without that lower bound, once cache_to exceeds the window they
+        // would compute full causal attention over evicted keys (gemma4
+        // W=512: a 999-tok Adreno prefill degenerated into word salad).
         // The OHWI image kernels take a window but not a ring capacity. A
         // ringed layer reaches them through a SLIDING mirror instead (see
         // kv_mirror_base): linear addressing over a ring-cap-high mirror.
         if (use_image_attn == 1 && svm_ok && !kv_int8 && head_dim % 8 == 0) {
           // NNTR_KV_MIRROR_CAP (experiment): clamp the OHWI mirror S_max.
-          // gpu_native runs S_max=1024 and its qk_matmul_f16_ohwi_img is
-          // 4.7x faster than ours at S_max=2048 (59.8 vs ~281ms at M=1024,
-          // same kernel/wrapper) -- isolates whether the K-image height
+          // A reference build at S_max=1024 ran qk_matmul_f16_ohwi_img
+          // 4.7x faster than S_max=2048 (59.8 vs ~281ms at M=1024, same
+          // kernel/wrapper) -- this isolates whether the K-image height
           // (hKV*S_max rows) is the texture-cache culprit. NOT safe for
           // sequences beyond the cap (attention reads garbage rows).
           static const unsigned int mirror_cap = []() {
@@ -3544,7 +3532,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
           // A ringed layer has no other validated arm on this bundle: the
           // buffer (flash) arm under the image bundle is exact on a LINEAR
           // cache but measured wrong on a 2048-row ring on Adreno 840, and
-          // image attention is all-or-nothing per process anyway. Stop with
+          // the arm is fixed per layer at finalize (img_arm_want). Stop with
           // the way out rather than emit plausible text.
           NNTR_THROW_IF(kv_ring_cap != 0 && !mirror_fits, std::runtime_error)
             << "[kv-window-ring] the Adreno image-attention mirror cannot "
@@ -3650,8 +3638,8 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             // cache_from. Staged chain (kv_stage_on): K reads the cl_mem
             // staging temp the GPU RoPE wrote (src_clmem) and V reads
             // value_step directly -- pure kernel chains, no host drain.
-            // Unstaged: both read the SVM cache slices the (drained)
-            // RoPE/copy wrote. In-order queue (NNTR_GPU_SVM_POOL) keeps
+            // Unstaged: both read the SVM cache slices the RoPE/copy wrote
+            // (left undrained on the image chain). The in-order queue keeps
             // RoPE -> scatter -> attention ordered with no explicit sync.
             const double _kvst_t1 = _kvst_on() ? _kvst_now() : 0;
             // [rq-scalar-off] Unstaged (k_stage == null) the source is the
@@ -3766,10 +3754,10 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                 /*src_clmem=*/v_stage_clmem, /*src_off=*/v_sc_off);
             kv_v_valid_to = cache_to;
             const double _kvst_tv = _kvst_on() ? _kvst_now() : 0;
-            // S3 decode: OHWI rotates Q on the HOST (query_step SVM, in-place);
-            // q_attn_clmem (= q_cl, the FC output cl_mem) is NOT rotated
-            // because the GPU-RoPE staging path is gated off for OHWI. Binding
-            // it would feed the qk kernel an UNROTATED Q -> degenerate decode
+            // S3 decode: Q is rotated in place in its SVM plane (Q_p), by the
+            // OHWI GPU RoPE or the host fallback; q_attn_clmem (= q_cl, the FC
+            // output cl_mem) is NOT rotated. Binding it would feed the qk
+            // kernel an UNROTATED Q -> degenerate decode
             // attention. For decode (step_size==1) pass null so the kernel
             // reads Q_p (the SVM query). Prefill: the concat GPU-RoPE now
             // rotates straight into the SVM plane Q_p on the image path
@@ -3929,16 +3917,15 @@ void MHACoreLayer::one_batch_incremental_forwarding(
           }
         }
 
-        // gpu_native's proven d=256 attention: register-tiled, barrier-free,
-        // scores-free flash (FBQ_SG Block-Q when NNTR_V8C_BUF). This is the
-        // SAME public kernel gpu_native uses for the ~875-TPS Intel path
-        // (qwen3_forward.cpp). The layer-graph previously only had the scalar
-        // two_conv path (materializes a [hQ,M,N_kv] fp16 scores tensor in DRAM,
-        // ~820ms at M=1024 d=256) and otherwise fell to host gemm_attention
-        // (~8.5s, M=1024). Concat K (non-OHWI b_cached_key) => max_seq_len=0.
-        // SVM-only; falls through to two_conv/host when svm_ok is false.
-        // The SVM-pointer fallbacks below read Q via its SVM shadow: lower
-        // first when Q is GPU_CLMEM-resident and the image path did not run.
+        // d=256 attention: register-tiled, barrier-free, scores-free flash
+        // (FBQ_SG Block-Q when NNTR_V8C_BUF). The layer-graph previously only
+        // had the scalar two_conv path (materializes a [hQ,M,N_kv] fp16 scores
+        // tensor in DRAM, ~820ms at M=1024 d=256) and otherwise fell to host
+        // gemm_attention (~8.5s, M=1024). Concat K (non-OHWI b_cached_key) =>
+        // max_seq_len=0. SVM-only; falls through to two_conv/host when svm_ok
+        // is false. The SVM-pointer fallbacks below read Q via its SVM shadow:
+        // lower first when Q is GPU_CLMEM-resident and the image path did not
+        // run.
         if (!ok && q_rope_staged != nullptr) {
           // The rotated Q lives only in the q_stage temp; the SVM fallbacks
           // below read Q's SVM plane. Land it there (drained) and drop the
@@ -4471,8 +4458,9 @@ void MHACoreLayer::gemm_attention(nntrainer::Tensor &query_step,
   // Opt-in GPU attention (engine=cuda, UVM): the interleaved fp16 query +
   // fp16 KV cache feed a flash core on the device, replacing the host O(M^2)
   // loop below. Matches gemm_attention exactly (scale 1/sqrt(d), causal +
-  // sliding mask, GQA, NO softcap). Default OFF (NNTR_CUDA_ATTN) until
-  // verified; falls through to the host path when off / not device-resident.
+  // sliding mask, GQA, NO softcap). Gated by NNTR_CUDA_ATTN, which the
+  // CudaContext device profile defaults on (=0 disables); falls through to the
+  // host path when off / not device-resident.
   {
     static const bool cuda_attn = nntr_env_on("NNTR_CUDA_ATTN");
     if (cuda_attn && q_fp16 && o_fp16 && !kv_int8 && Q_fp16_src && O_fp16) {

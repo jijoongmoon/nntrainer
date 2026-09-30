@@ -438,7 +438,8 @@ void SlimMoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       }
     }
 
-    // Parallel processing for multiple tokens with many active experts
+    // Multi-token path: one output buffer per active expert, filled by the
+    // (serial) per-expert loop below and then combined.
     std::vector<nntrainer::Tensor> expert_outputs(num_experts);
     for (int expert_idx = 0; expert_idx < static_cast<int>(num_experts);
          ++expert_idx) {

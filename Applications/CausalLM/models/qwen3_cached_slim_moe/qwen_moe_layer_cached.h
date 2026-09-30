@@ -2,7 +2,7 @@
 /**
  * Copyright (C) 2025 Eunju Yang <ej.yang@samsung.com>
  *
- * @file   qwen_moe_layer_fsu.h
+ * @file   qwen_moe_layer_cached.h
  * @date   09 June 2025
  * @brief  This is Mixture of Expert Layer Class of Neural Network
  * @see    https://github.com/nntrainer/nntrainer
@@ -38,7 +38,7 @@
 namespace causallm {
 
 /**
- * @class   SlimMoELayer
+ * @class   CachedSlimMoELayer
  * @brief   Mixture of Expert Layer
  */
 class WIN_EXPORT CachedSlimMoELayer : public nntrainer::LayerImpl {

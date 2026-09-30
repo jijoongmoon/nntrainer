@@ -45,9 +45,11 @@ namespace causallm {
  *               The throughput arm: the OHWI image path serves every layer the
  *               bundle can host. It is the arm every published number was
  *               taken on and the one that matches the previous release's
- *               speed. Its output is NOT guaranteed bit-identical run to run
- *               past ~2K keys on this driver (a rate that falls with the read
- *               span; see imageAttnLayer()).
+ *               speed. Its output was not bit-identical run to run past ~2K
+ *               keys on this driver until the sv kernel bound the V mirror
+ *               read-write (NNTR_SV_IMG_RW, now the default); the measured
+ *               cells reproduce with that binding, but this arm makes no
+ *               per-layer guarantee (see imageAttnLayer()).
  *   kPerLayer   (NNTR_DETERMINISTIC=1)
  *               The reproducible arm, opt-in. imageAttnLayer() decides per
  *               layer from detImageWindowMax(), which is 0: no layer takes the
@@ -63,9 +65,9 @@ namespace causallm {
  *               reproduce.
  *
  * The deterministic arm used to be the default and the fast one the opt-out;
- * the measured cost above is why that was reversed. NNTR_DETERMINISTIC=0,
- * NNTR_ALLOW_NONDETERMINISTIC=1 and the pack's nntr_config
- * "allow_nondeterministic" are still accepted and now simply name the default.
+ * the measured cost above is why that was reversed. NNTR_DETERMINISTIC=0 and
+ * the pack's nntr_config "allow_nondeterministic" are still accepted and now
+ * simply name the default; NNTR_ALLOW_NONDETERMINISTIC is no longer read.
  * An explicit NNTR_DETERMINISTIC outranks the pack key either way.
  *
  * Every consumer -- the mirror prebuild, the Q staging, the decode-RoPE gate,
@@ -94,18 +96,19 @@ inline bool &packAllowsNondeterministic() {
  * @details NNTR_DETERMINISTIC is value-checked: =1 (any non-zero) selects the
  * reproducible per-layer arm, =0 or unset is the fast default. It is the
  * pre-existing cross-lane knob the API sets, so the same variable that pins
- * the CUDA submission order and the OpenCL subgroup reduction order also picks
- * the Adreno arm. NNTR_ALLOW_NONDETERMINISTIC and the pack opt-out are read
- * for compatibility only: both resolve to the default.
+ * the cuBLAS FP32 math mode and the OpenCL reduction order also picks the
+ * Adreno arm (CUDA async submission does not read it).
+ * NNTR_ALLOW_NONDETERMINISTIC is not read anywhere, and the pack opt-out is
+ * not read here: both name the default, so ignoring them changes nothing.
  */
 inline DetArm detArm() {
   DetArm arm = DetArm::kFast; // the baseline: no environment needed
   const char *d = std::getenv("NNTR_DETERMINISTIC");
   if (d != nullptr && d[0] != '\0')
     arm = nntr_env_on("NNTR_DETERMINISTIC") ? DetArm::kPerLayer : DetArm::kFast;
-  // NNTR_ALLOW_NONDETERMINISTIC=1 and packAllowsNondeterministic() name the
-  // default and change nothing; they are kept so a caller or a pack written
-  // against the previous contract keeps working.
+  // packAllowsNondeterministic() (still set from a pack's nntr_config) names
+  // the default and changes nothing, so a pack written against the previous
+  // contract keeps working. NNTR_ALLOW_NONDETERMINISTIC is not read at all.
   //
   // Not cached: every input is a pure read, and a cache would make the answer
   // depend on WHO asked first -- which is exactly the failure mode the pack
@@ -131,8 +134,8 @@ inline DetArm detArm() {
 /**
  * @brief Has the caller asked for bit-identical output above everything else?
  * @details True only on the reproducible arm, i.e. with NNTR_DETERMINISTIC=1.
- * The CUDA submission policy, the cuBLAS FP32 math mode and the OpenCL
- * subgroup reduction order read that same variable themselves; this is the
+ * The cuBLAS FP32 math mode and the OpenCL reduction order read that same
+ * variable themselves (CUDA async submission does not); this is the
  * one-word spelling of it for the layer side and the unit test.
  */
 inline bool determinismFirst() { return detArm() == DetArm::kPerLayer; }
@@ -387,17 +390,18 @@ inline bool kvRingArmAvailable() {
  * request is the model's own default -- false for every model that has not
  * said otherwise, so those keep the linear cache exactly as before; a model
  * whose sliding layers are the point of its architecture (a dense stack that
- * is 5/6 sliding at W=512) declares true and gets the ring with no variable
- * set. The model feeds the same boolean to both consumers (its own sizing
- * through Transformer::kvRingByDefault(), mha_core through the
- * `kv_window_ring` property), so the two sides still cannot disagree.
+ * is 5/6 sliding at W=512) can declare true and get the ring with no variable
+ * set (no in-tree model does so yet). Such a model must feed the same boolean
+ * to both consumers (its own sizing through Transformer::kvRingByDefault(),
+ * mha_core through the `kv_window_ring` property), so the two sides cannot
+ * disagree.
  *
  * A request is granted only where it is also correct -- the engine can host it
  * (kvRingEngineEligible) and a ring-aware attention arm is reachable
  * (kvRingArmAvailable). A refused EXPLICIT request is reported once so the
  * reason is visible instead of showing up as a silent performance or memory
- * difference; a refused model default is not an error (the cpu engine and the
- * Adreno image-attention bundle simply keep the linear cache).
+ * difference; a refused model default is not an error (e.g. the cpu engine, or
+ * an OpenCL arm that is not ring-aware, simply keeps the linear cache).
  */
 inline bool kvRingEnabled(bool model_default = false) {
   const char *req = std::getenv("NNTR_KV_WINDOW_RING");
