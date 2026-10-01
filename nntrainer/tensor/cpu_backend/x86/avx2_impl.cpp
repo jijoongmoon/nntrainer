@@ -13,6 +13,7 @@
  */
 
 #include "avx2_impl.h"
+#include <algorithm>
 #include <array>
 #if __has_include(<bit>)
 #include <bit>
@@ -2522,6 +2523,298 @@ void causal_depthwise_conv1d_k3_decode(const float *x_cur,
     y_cur[c] = w0[c] * x_cur[c] + w1[c] * s1[c] + w2[c] * s0[c];
     state[c] = s1[c];        // s0 <- s1
     state[W + c] = x_cur[c]; // s1 <- x_cur
+  }
+}
+
+} // namespace nntrainer::avx2
+
+namespace {
+
+/**
+ * @brief 8x8 transpose of 32-bit lanes: on return r[j] holds lane j of each
+ * of the eight inputs, input i in lane i.
+ */
+inline void transpose8x8_epi32(__m256i r[8]) {
+  const __m256i t0 = _mm256_unpacklo_epi32(r[0], r[1]);
+  const __m256i t1 = _mm256_unpackhi_epi32(r[0], r[1]);
+  const __m256i t2 = _mm256_unpacklo_epi32(r[2], r[3]);
+  const __m256i t3 = _mm256_unpackhi_epi32(r[2], r[3]);
+  const __m256i t4 = _mm256_unpacklo_epi32(r[4], r[5]);
+  const __m256i t5 = _mm256_unpackhi_epi32(r[4], r[5]);
+  const __m256i t6 = _mm256_unpacklo_epi32(r[6], r[7]);
+  const __m256i t7 = _mm256_unpackhi_epi32(r[6], r[7]);
+  const __m256i u0 = _mm256_unpacklo_epi64(t0, t2);
+  const __m256i u1 = _mm256_unpackhi_epi64(t0, t2);
+  const __m256i u2 = _mm256_unpacklo_epi64(t1, t3);
+  const __m256i u3 = _mm256_unpackhi_epi64(t1, t3);
+  const __m256i u4 = _mm256_unpacklo_epi64(t4, t6);
+  const __m256i u5 = _mm256_unpackhi_epi64(t4, t6);
+  const __m256i u6 = _mm256_unpacklo_epi64(t5, t7);
+  const __m256i u7 = _mm256_unpackhi_epi64(t5, t7);
+  r[0] = _mm256_permute2x128_si256(u0, u4, 0x20);
+  r[1] = _mm256_permute2x128_si256(u1, u5, 0x20);
+  r[2] = _mm256_permute2x128_si256(u2, u6, 0x20);
+  r[3] = _mm256_permute2x128_si256(u3, u7, 0x20);
+  r[4] = _mm256_permute2x128_si256(u0, u4, 0x31);
+  r[5] = _mm256_permute2x128_si256(u1, u5, 0x31);
+  r[6] = _mm256_permute2x128_si256(u2, u6, 0x31);
+  r[7] = _mm256_permute2x128_si256(u3, u7, 0x31);
+}
+
+/**
+ * @brief Decode the eight nibbles of every 32-bit lane of @a t (already
+ * XOR-ed with 0x88888888, so each nibble is a two's complement int4) into
+ * eight fp32 vectors holding int4 * 2^28, nibble i to dst[i * stride].
+ * Moving the nibble to the top bits and clearing the rest sign-extends it
+ * for free; the 2^28 is cancelled by QS4CX_LHS_SCALE on the activation.
+ */
+inline void qs4cx_decode_word(__m256i t, float *dst, size_t stride) {
+  const __m256i top = _mm256_set1_epi32(static_cast<int>(0xF0000000u));
+  _mm256_store_ps(dst, _mm256_cvtepi32_ps(_mm256_slli_epi32(t, 28)));
+  _mm256_store_ps(dst + stride, _mm256_cvtepi32_ps(_mm256_and_si256(
+                                  _mm256_slli_epi32(t, 24), top)));
+  _mm256_store_ps(dst + 2 * stride, _mm256_cvtepi32_ps(_mm256_and_si256(
+                                      _mm256_slli_epi32(t, 20), top)));
+  _mm256_store_ps(dst + 3 * stride, _mm256_cvtepi32_ps(_mm256_and_si256(
+                                      _mm256_slli_epi32(t, 16), top)));
+  _mm256_store_ps(dst + 4 * stride, _mm256_cvtepi32_ps(_mm256_and_si256(
+                                      _mm256_slli_epi32(t, 12), top)));
+  _mm256_store_ps(dst + 5 * stride, _mm256_cvtepi32_ps(_mm256_and_si256(
+                                      _mm256_slli_epi32(t, 8), top)));
+  _mm256_store_ps(dst + 6 * stride, _mm256_cvtepi32_ps(_mm256_and_si256(
+                                      _mm256_slli_epi32(t, 4), top)));
+  _mm256_store_ps(dst + 7 * stride,
+                  _mm256_cvtepi32_ps(_mm256_and_si256(t, top)));
+}
+
+/**
+ * @brief acc[r][8g..8g+7] += x[r][k] * wv[k][8g..8g+7] for k < kl, r < MR,
+ * g < G, one fused multiply-add per k in ascending k.
+ */
+template <int G, int MR>
+inline void qs4cx_fma_rows(size_t kl, const float *wv, const float *x,
+                           size_t ldx, float *acc) {
+  constexpr size_t NR = 8 * G;
+  constexpr size_t LD = nntrainer::avx2::QS4CX_ROWS_PER_BLOCK;
+  __m256 c[MR][G];
+  for (int r = 0; r < MR; ++r)
+    for (int g = 0; g < G; ++g)
+      c[r][g] = _mm256_loadu_ps(acc + r * LD + 8 * g);
+  for (size_t k = 0; k < kl; ++k) {
+    __m256 wk[G];
+    for (int g = 0; g < G; ++g)
+      wk[g] = _mm256_load_ps(wv + k * NR + 8 * g);
+    for (int r = 0; r < MR; ++r) {
+      const __m256 b = _mm256_broadcast_ss(x + r * ldx + k);
+      for (int g = 0; g < G; ++g)
+        c[r][g] = _mm256_fmadd_ps(b, wk[g], c[r][g]);
+    }
+  }
+  for (int r = 0; r < MR; ++r)
+    for (int g = 0; g < G; ++g)
+      _mm256_storeu_ps(acc + r * LD + 8 * g, c[r][g]);
+}
+
+/**
+ * @brief qs4cx_f32acc_rows() for G groups of eight weight rows. K is walked
+ * in chunks of 64: each chunk of the 8 * G rows is decoded once into wv
+ * (row-interleaved, so one vector load gives eight outputs' weights at one
+ * k) and then applied to every activation row.
+ */
+template <int G>
+void qs4cx_f32acc_rows_impl(size_t M, size_t K, const float *x, size_t ldx,
+                            const uint8_t *w, size_t row_bytes, size_t nrows,
+                            float *acc) {
+  constexpr size_t NR = 8 * G;
+  constexpr size_t LD = nntrainer::avx2::QS4CX_ROWS_PER_BLOCK;
+  // Activation rows per pass: enough independent accumulators (MR * G) to
+  // cover the fused multiply-add latency without spilling registers.
+  constexpr int MR = (G == 1) ? 8 : (G == 2) ? 4 : 2;
+
+  alignas(32) float wv[64 * NR];
+  const uint8_t *rows[NR];
+  for (size_t i = 0; i < NR; ++i)
+    rows[i] = w + (i < nrows ? i : 0) * row_bytes;
+
+  for (size_t m = 0; m < M; ++m)
+    std::fill(acc + m * LD, acc + m * LD + NR, 0.0f);
+
+  const __m256i flip = _mm256_set1_epi32(static_cast<int>(0x88888888u));
+  for (size_t kc = 0; kc < K; kc += 64) {
+    const size_t kl = std::min<size_t>(64, K - kc);
+    const size_t nbytes = (kl + 1) / 2;
+    const size_t nwords = (kl + 7) / 8;
+    for (int g = 0; g < G; ++g) {
+      __m256i r[8];
+      for (int i = 0; i < 8; ++i) {
+        const uint8_t *p = rows[g * 8 + i] + kc / 2;
+        if (nbytes == 32) {
+          r[i] = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(p));
+        } else {
+          alignas(32) uint8_t tail[32] = {};
+          std::memcpy(tail, p, nbytes);
+          r[i] = _mm256_load_si256(reinterpret_cast<const __m256i *>(tail));
+        }
+        r[i] = _mm256_xor_si256(r[i], flip);
+      }
+      transpose8x8_epi32(r);
+      for (size_t j = 0; j < nwords; ++j)
+        qs4cx_decode_word(r[j], wv + 8 * j * NR + 8 * g, NR);
+    }
+
+    size_t m = 0;
+    for (; m + MR <= M; m += MR)
+      qs4cx_fma_rows<G, MR>(kl, wv, x + m * ldx + kc, ldx, acc + m * LD);
+    for (; m < M; ++m)
+      qs4cx_fma_rows<G, 1>(kl, wv, x + m * ldx + kc, ldx, acc + m * LD);
+  }
+}
+
+} // namespace
+
+namespace nntrainer::avx2 {
+
+void qs4cx_prepare_lhs_f16(size_t N, const uint16_t *input, float *output) {
+  const __m256 scale = _mm256_set1_ps(QS4CX_LHS_SCALE);
+  size_t i = 0;
+  for (; i + 8 <= N; i += 8) {
+    const __m128i h =
+      _mm_loadu_si128(reinterpret_cast<const __m128i *>(input + i));
+    _mm256_storeu_ps(output + i, _mm256_mul_ps(_mm256_cvtph_ps(h), scale));
+  }
+  if (i < N) {
+    alignas(16) uint16_t h[8] = {};
+    alignas(32) float f[8];
+    std::memcpy(h, input + i, (N - i) * sizeof(uint16_t));
+    _mm256_store_ps(f, _mm256_mul_ps(_mm256_cvtph_ps(_mm_load_si128(
+                                       reinterpret_cast<__m128i *>(h))),
+                                     scale));
+    std::memcpy(output + i, f, (N - i) * sizeof(float));
+  }
+}
+
+void qs4cx_f32acc_rows(size_t M, size_t K, const float *x, size_t ldx,
+                       const uint8_t *w, size_t row_bytes, size_t nrows,
+                       float *acc) {
+  switch ((nrows + 7) / 8) {
+  case 1:
+    qs4cx_f32acc_rows_impl<1>(M, K, x, ldx, w, row_bytes, nrows, acc);
+    break;
+  case 2:
+    qs4cx_f32acc_rows_impl<2>(M, K, x, ldx, w, row_bytes, nrows, acc);
+    break;
+  case 3:
+    qs4cx_f32acc_rows_impl<3>(M, K, x, ldx, w, row_bytes, nrows, acc);
+    break;
+  case 4:
+    qs4cx_f32acc_rows_impl<4>(M, K, x, ldx, w, row_bytes, nrows, acc);
+    break;
+  default:
+    break;
+  }
+}
+
+void qs4cx_qa8dx_rows(size_t M, size_t K, const int8_t *lhs, size_t lhs_stride,
+                      const uint8_t *w, size_t row_bytes, size_t nrows,
+                      int32_t *iacc) {
+  constexpr size_t LD = QS4CX_ROWS_PER_BLOCK;
+  constexpr size_t LHS_HEAD = sizeof(float) + sizeof(int32_t);
+  const size_t K32 = K / 32 * 32;
+  const __m256i ones16 = _mm256_set1_epi16(1);
+  const __m256i ones8 = _mm256_set1_epi8(1);
+  const __m128i m0f = _mm_set1_epi8(0x0F);
+
+  auto hsum = [](__m256i v) {
+    __m128i s =
+      _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
+    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0x4E));
+    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0xB1));
+    return _mm_cvtsi128_si32(s);
+  };
+  auto nibble = [](const uint8_t *row, size_t k) {
+    const uint8_t b = row[k >> 1];
+    return static_cast<int32_t>((k & 1) ? (b >> 4) : (b & 0x0F));
+  };
+  auto unpack32 = [&](const uint8_t *p) {
+    const __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i *>(p));
+    const __m128i lo = _mm_and_si128(b, m0f);
+    const __m128i hi = _mm_and_si128(_mm_srli_epi16(b, 4), m0f);
+    return _mm256_set_m128i(_mm_unpackhi_epi8(lo, hi),
+                            _mm_unpacklo_epi8(lo, hi));
+  };
+
+  // Per activation row: offset and sum of the int8 values.
+  // Per weight row: sum of the unsigned nibbles. With them the exact integer
+  // sum of (x + offset) * (u - 8) follows from the sum of x * u alone.
+  std::vector<int32_t> xsum(M), xoff(M);
+  for (size_t m = 0; m < M; ++m) {
+    const int8_t *row = lhs + m * lhs_stride;
+    std::memcpy(&xoff[m], row + sizeof(float), sizeof(int32_t));
+    const int8_t *xv = row + LHS_HEAD;
+    __m256i s = _mm256_setzero_si256();
+    for (size_t k = 0; k < K32; k += 32) {
+      const __m256i v =
+        _mm256_loadu_si256(reinterpret_cast<const __m256i *>(xv + k));
+      s = _mm256_add_epi32(
+        s, _mm256_madd_epi16(_mm256_maddubs_epi16(ones8, v), ones16));
+    }
+    int32_t t = hsum(s);
+    for (size_t k = K32; k < K; ++k)
+      t += xv[k];
+    xsum[m] = t;
+  }
+
+  for (size_t i0 = 0; i0 < nrows; i0 += 4) {
+    const uint8_t *rows[4];
+    int32_t usum[4];
+    for (size_t q = 0; q < 4; ++q) {
+      rows[q] = w + (i0 + q < nrows ? i0 + q : i0) * row_bytes;
+      __m256i s = _mm256_setzero_si256();
+      for (size_t k = 0; k < K32; k += 32)
+        s = _mm256_add_epi64(s, _mm256_sad_epu8(unpack32(rows[q] + k / 2),
+                                                _mm256_setzero_si256()));
+      __m128i s2 = _mm_add_epi64(_mm256_castsi256_si128(s),
+                                 _mm256_extracti128_si256(s, 1));
+      s2 = _mm_add_epi64(s2, _mm_unpackhi_epi64(s2, s2));
+      int32_t t = static_cast<int32_t>(_mm_cvtsi128_si64(s2));
+      for (size_t k = K32; k < K; ++k)
+        t += nibble(rows[q], k);
+      usum[q] = t;
+    }
+
+    for (size_t m = 0; m < M; m += 2) {
+      const size_t mr = std::min<size_t>(2, M - m);
+      const int8_t *xr[2] = {lhs + m * lhs_stride + LHS_HEAD,
+                             lhs + (m + mr - 1) * lhs_stride + LHS_HEAD};
+      __m256i a[2][4];
+      for (int r = 0; r < 2; ++r)
+        for (int q = 0; q < 4; ++q)
+          a[r][q] = _mm256_setzero_si256();
+      for (size_t k = 0; k < K32; k += 32) {
+        __m256i u[4];
+        for (int q = 0; q < 4; ++q)
+          u[q] = unpack32(rows[q] + k / 2);
+        for (int r = 0; r < 2; ++r) {
+          const __m256i v =
+            _mm256_loadu_si256(reinterpret_cast<const __m256i *>(xr[r] + k));
+          for (int q = 0; q < 4; ++q)
+            a[r][q] = _mm256_add_epi32(
+              a[r][q],
+              _mm256_madd_epi16(_mm256_maddubs_epi16(u[q], v), ones16));
+        }
+      }
+      for (size_t r = 0; r < mr; ++r) {
+        const size_t mm = m + r;
+        for (size_t q = 0; q < 4 && i0 + q < nrows; ++q) {
+          int32_t xu = hsum(a[r][q]);
+          for (size_t k = K32; k < K; ++k)
+            xu += static_cast<int32_t>(xr[r][k]) * nibble(rows[q], k);
+          iacc[mm * LD + i0 + q] =
+            xu - 8 * xsum[mm] +
+            xoff[mm] * (usum[q] - 8 * static_cast<int32_t>(K));
+        }
+      }
+    }
   }
 }
 

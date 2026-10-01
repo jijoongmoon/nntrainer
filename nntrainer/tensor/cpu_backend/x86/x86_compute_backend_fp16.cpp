@@ -21,6 +21,10 @@
 #include <cblas_interface.h>
 #endif
 #include <ggml_interface.h>
+#include <thread_manager.h>
+
+#include <algorithm>
+#include <vector>
 
 #define ROW_MAJOR 0
 #define COL_MAJOR 1
@@ -358,22 +362,61 @@ uint32_t nntr_gemm_qai8dxp_qsi4cxp_unpacked(
   if (!transB)
     throw std::invalid_argument{"Only [n,k] shape available"};
 
-  // online quant lhs
-  const size_t lhs_ref_size_qa8dx = m * (k + sizeof(int32_t) + sizeof(float));
-
-  std::vector<uint8_t> lhs_qa8dx(lhs_ref_size_qa8dx);
-
-  __fallback_quant_qa8dx_f32(m, k, (const float *)lhs_native_mtx_f32,
-                             (int8_t *)lhs_qa8dx.data());
-
-  // do matmul
-  __fallback_matmul_mxn_mxk_nxk_f32_qa8dx_qs4cx(
-    m, n, k, (const int8_t *)lhs_qa8dx.data(),
-    (const uint8_t *)rhs_native_mtx_qs4cx, (const float *)rhs_scales_f32,
-    dst_mtx_f32, lower_bound, upper_bound);
+  gemm_qs4cx_qa8dx_f32(m, n, k, (const float *)lhs_native_mtx_f32,
+                       (const uint8_t *)rhs_native_mtx_qs4cx,
+                       (const float *)rhs_scales_f32, dst_mtx_f32, lower_bound,
+                       upper_bound);
   // @todo enable kxn matmul
 
   return 1;
+}
+
+void gemm_qs4cx_fp16(size_t M, size_t N, size_t K, const _FP16 *lhs,
+                     const uint8_t *rhs_qs4cx, const float *rhs_scales,
+                     _FP16 *dst, float beta) {
+  if (M == 0 || N == 0)
+    return;
+  static_assert(sizeof(_FP16) == sizeof(uint16_t),
+                "_FP16 must be a 16-bit IEEE half");
+  constexpr size_t RB = avx2::QS4CX_ROWS_PER_BLOCK;
+  // Activation rows converted per pass: bounds the fp32 copy to MC * K
+  // floats however long the prompt is.
+  constexpr size_t MC = 256;
+  const size_t row_bytes = (K + 1) / 2;
+  auto &tm = ThreadManager::Global();
+  // Blocks of 32 weight rows, or of 8 when 32 would leave pool threads idle
+  // (small N). Each block is one task; the pool balances them.
+  const size_t threads = tm.getComputeThreadCount();
+  const size_t nb_rows = (N >= RB * 2 * threads) ? RB : 8;
+  const size_t nblk = (N + nb_rows - 1) / nb_rows;
+
+  std::vector<float> xs(std::min(M, MC) * K);
+  for (size_t m0 = 0; m0 < M; m0 += MC) {
+    const size_t mc = std::min(MC, M - m0);
+    avx2::qs4cx_prepare_lhs_f16(
+      mc * K, reinterpret_cast<const uint16_t *>(lhs + m0 * K), xs.data());
+    tm.parallel_for(0, nblk, [&](size_t b) {
+      thread_local std::vector<float> acc;
+      if (acc.size() < mc * RB)
+        acc.resize(mc * RB);
+      const size_t n0 = b * nb_rows;
+      const size_t nr = std::min(nb_rows, N - n0);
+      avx2::qs4cx_f32acc_rows(mc, K, xs.data(), K, rhs_qs4cx + n0 * row_bytes,
+                              row_bytes, nr, acc.data());
+      // The reference epilogue, operation for operation.
+      for (size_t mi = 0; mi < mc; ++mi) {
+        _FP16 *yr = dst + (m0 + mi) * N;
+        for (size_t i = 0; i < nr; ++i) {
+          const size_t nn = n0 + i;
+          float v = acc[mi * RB + i] * rhs_scales[nn];
+          if (beta != 0.0f)
+            v += beta * (float)yr[nn];
+          v = std::min(std::max(v, -65504.f), 65504.f);
+          yr[nn] = (_FP16)v;
+        }
+      }
+    });
+  }
 }
 
 size_t nntr_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(size_t n, size_t k,

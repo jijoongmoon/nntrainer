@@ -458,6 +458,28 @@ _FP16 __fallback_max(const unsigned int N, _FP16 *X);
  * @param Y  _FP16 * for Vector Y
  */
 void __fallback_softmax(const unsigned int N, _FP16 *X, _FP16 *Y);
+
+/**
+ * @brief Reference GEMM of an fp16 activation and a QS4CX weight:
+ * dst[m][n] = clamp(scale[n] * sum_k lhs[m][k] * (w[n][k] - 8)
+ *                   + beta * dst[m][n], +-65504)
+ * The sum is accumulated in fp32 in ascending k from 0. This is the order
+ * the SIMD kernels reproduce bit for bit.
+ *
+ * @param M number of activation rows
+ * @param N number of weight rows (outputs)
+ * @param K reduction length
+ * @param lhs fp16 activation, M x K row-major
+ * @param rhs_qs4cx plain QS4CX weight: N rows of ceil(K/2) bytes, even k in
+ * the low nibble, each nibble int4 + 8
+ * @param rhs_scales per-row fp32 scale, N values
+ * @param dst fp16 output, M x N row-major
+ * @param beta scale of the previous dst content
+ */
+void __fallback_gemm_qs4cx_fp16(size_t M, size_t N, size_t K, const _FP16 *lhs,
+                                const uint8_t *rhs_qs4cx,
+                                const float *rhs_scales, _FP16 *dst,
+                                float beta);
 #endif
 
 /**

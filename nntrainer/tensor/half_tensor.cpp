@@ -762,17 +762,18 @@ Tensor &HalfTensor::dot(Tensor const &input, Tensor &output, bool trans,
     NNTR_THROW_IF(trans || trans_in, std::invalid_argument)
       << "[HalfTensor::dot] a QS4CX weight cannot be transposed: trans and "
          "trans_in must both be false";
-    // Both arms read the plain nibbles (the x86 loop directly, the Arm arm
+    // Both arms read the plain nibbles (the x86 kernel directly, the Arm arm
     // through packF16Activation). Refuse a payload a GPU backend released.
     refuseIfQs4cxPayloadDropped(input.getData<uint8_t>(),
                                 "HalfTensor::dot QS4CX");
 #if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) ||              \
   defined(__i386__)
-    // x86 reference GEMM: the KAI fp16 micro-kernel is ARM i8mm only and the
-    // packed-GEMM fallback is NYI here, so this branch used to kill the
-    // process whenever a GPU path declined. Compute directly from the PLAIN
-    // nibbles + per-channel fp32 scales in fp32: correct but slow, for
-    // diagnostics and fallback only.
+    // x86 GEMM: the KAI fp16 micro-kernel is ARM i8mm only and the
+    // packed-GEMM fallback is NYI here, so x86 computes directly from the
+    // PLAIN nibbles + per-channel fp32 scales: gemm_qs4cx_fp16(), an AVX2
+    // kernel threaded over N. Each output is accumulated in fp32 in ascending
+    // k, exactly like the scalar reference __fallback_gemm_qs4cx_fp16(), so
+    // the two are bit-identical for any thread count.
     //
     // Nibble convention -- the one and only in-tree QS4CX plain layout, the
     // one __fallback_quant_nxk_qs4cx_f32() writes, Int4Utils documents,
@@ -780,34 +781,11 @@ Tensor &HalfTensor::dot(Tensor const &input, Tensor &output, bool trans,
     // FloatTensor::dotQs4cx() hands the fp32 kernels: N rows of ceil(K/2)
     // bytes, row-major [N, K]; EVEN k in the LOW nibble; each stored uint4 is
     // int4 + 8. Decoding it any other way and decoding it here must not
-    // disagree, so this loop mirrors the producer term for term.
+    // disagree, so the kernel mirrors the producer term for term.
     if (!input.isPackedF16Activation()) {
-      const uint8_t *plain = input.getData<uint8_t>();
-      const float *fscale = input.getScale<float>();
-      const _FP16 *xact = (const _FP16 *)getData();
-      _FP16 *yout = output.getData<_FP16>();
-      const size_t Ms = M, Ns = N, Ks = K;
-      const size_t row_bytes = (Ks + 1) / 2;
-      auto &tm = ThreadManager::Global();
-      tm.parallel_for(0, Ns, [&](size_t nn) {
-        const uint8_t *wrow = plain + nn * row_bytes;
-        const float s = fscale[nn];
-        for (size_t mi = 0; mi < Ms; ++mi) {
-          const _FP16 *xr = xact + mi * Ks;
-          _FP16 *yr = yout + mi * Ns;
-          float acc = 0.f;
-          for (size_t kk = 0; kk < Ks; ++kk) {
-            const uint8_t byte = wrow[kk >> 1];
-            const uint8_t u4 = (kk & 1) ? (uint8_t)(byte >> 4) : (byte & 0x0F);
-            acc += (float)xr[kk] * (float)((int32_t)u4 - 8);
-          }
-          float v = acc * s;
-          if (beta != 0.0f)
-            v += beta * (float)yr[nn];
-          v = std::min(std::max(v, -65504.f), 65504.f);
-          yr[nn] = (_FP16)v;
-        }
-      });
+      gemm_qs4cx_fp16(M, N, K, (const _FP16 *)getData(),
+                      input.getData<uint8_t>(), input.getScale<float>(),
+                      output.getData<_FP16>(), beta);
       break;
     }
 #endif

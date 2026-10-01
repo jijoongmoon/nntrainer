@@ -14,6 +14,8 @@
 #include "nntrainer_test_util.h"
 #include "util_func.h"
 #include <cmath>
+#include <cstring>
+#include <fallback_internal.h>
 #include <fstream>
 #include <iostream>
 #include <nntrainer_error.h>
@@ -6499,6 +6501,50 @@ TEST(nntrainer_Tensor, dot_qs4cx_fp16_activation_trans_n) {
 
   EXPECT_THROW(a.dot(q, out, false, true, 0.0f), std::invalid_argument);
 }
+
+#if defined(__x86_64__) || defined(_M_X64)
+/**
+ * @brief On x86 an fp16 activation times a QS4CX weight runs the AVX2
+ * kernel; it must equal the scalar reference __fallback_gemm_qs4cx_fp16()
+ * bit for bit (same ascending-k fp32 sum per output), here with M, N and K
+ * all off the kernel's block sizes.
+ */
+TEST(nntrainer_Tensor, dot_qs4cx_fp16_activation_x86_matches_reference_p) {
+  const unsigned int M = 11;
+  const unsigned int K = 157;
+  const unsigned int N = 45;
+
+  nntrainer::Tensor q(
+    {1, 1, K, N, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QS4CX}},
+    true);
+  uint8_t *raw = q.getData<uint8_t>();
+  for (size_t i = 0; i < N * ((K + 1) / 2); ++i)
+    raw[i] = static_cast<uint8_t>((i * 37u + 11u) & 0xFFu);
+  float *scale = q.getScale<float>();
+  for (unsigned int n = 0; n < N; ++n)
+    scale[n] = 0.01f + 0.003f * static_cast<float>(n);
+
+  nntrainer::Tensor a(
+    {1, 1, M, K, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::FP16}}, true);
+  for (unsigned int m = 0; m < M; ++m)
+    for (unsigned int k = 0; k < K; ++k)
+      a.setValue(0, 0, m, k,
+                 2.0f * std::sin(0.37f * static_cast<float>(k) +
+                                 1.3f * static_cast<float>(m)));
+
+  nntrainer::Tensor out(
+    {1, 1, M, N, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::FP16}}, true);
+  out.setZero();
+  a.dot(q, out, false, false, 0.0f);
+
+  std::vector<_FP16> ref(M * N, static_cast<_FP16>(0.0f));
+  nntrainer::__fallback_gemm_qs4cx_fp16(M, N, K, a.getData<_FP16>(), raw, scale,
+                                        ref.data(), 0.0f);
+  EXPECT_EQ(
+    std::memcmp(out.getData<_FP16>(), ref.data(), ref.size() * sizeof(_FP16)),
+    0);
+}
+#endif
 
 GTEST_API_ int main(int argc, char **argv) {
   int result = -1;

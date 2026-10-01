@@ -372,6 +372,82 @@ void transform_int4_osv32_isv2_to_q4_0x8(size_t N, size_t K,
                                          size_t scale_group_size,
                                          void *dst_q4_0x);
 
+/**
+ * @brief Number of QS4CX weight rows one call of qs4cx_f32acc_rows() or
+ * qs4cx_qa8dx_rows() covers at most.
+ */
+constexpr size_t QS4CX_ROWS_PER_BLOCK = 32;
+
+/**
+ * @brief Power-of-two factor qs4cx_prepare_lhs_f16() folds into the
+ * activation. The weight side decodes each nibble as (int4 << 28), so the
+ * pair multiplies back to activation * int4 exactly.
+ */
+constexpr float QS4CX_LHS_SCALE = 1.0f / 268435456.0f; // 2^-28
+
+/**
+ * @brief Convert an fp16 activation to the fp32 operand qs4cx_f32acc_rows()
+ * reads: every element is widened (F16C, exact) and multiplied by
+ * QS4CX_LHS_SCALE (a power of two, exact for every fp16 value).
+ *
+ * @param[in] N number of elements
+ * @param[in] input fp16 values as raw IEEE half bits
+ * @param[out] output fp32 values, input * 2^-28
+ */
+void qs4cx_prepare_lhs_f16(size_t N, const uint16_t *input, float *output);
+
+/**
+ * @brief Raw fp32 dot products of up to QS4CX_ROWS_PER_BLOCK QS4CX weight
+ * rows with every activation row.
+ *
+ * acc[m * QS4CX_ROWS_PER_BLOCK + i] = sum over k of x[m][k] * (w[i][k] - 8)
+ * for m < M and i < nrows. Each sum is accumulated in fp32 strictly in
+ * ascending k, starting from 0, one rounding per k: the order the scalar
+ * reference loop uses. The vector lanes run across weight rows (outputs),
+ * never across k, and every product is exact (an fp16 value times a 4-bit
+ * integer), so a fused multiply-add rounds exactly like the reference's
+ * multiply then add. The result is therefore bit-identical to the scalar
+ * loop for any M, K and nrows.
+ *
+ * @param[in] M number of activation rows
+ * @param[in] K reduction length
+ * @param[in] x activation rows prepared by qs4cx_prepare_lhs_f16()
+ * @param[in] ldx leading dimension of @a x
+ * @param[in] w first weight row: plain QS4CX nibbles, ceil(K/2) bytes a
+ * row, even k in the low nibble, each nibble int4 + 8
+ * @param[in] row_bytes bytes between weight rows
+ * @param[in] nrows number of weight rows, 1 .. QS4CX_ROWS_PER_BLOCK
+ * @param[out] acc M x QS4CX_ROWS_PER_BLOCK sums; lanes past @a nrows are
+ * scratch
+ */
+void qs4cx_f32acc_rows(size_t M, size_t K, const float *x, size_t ldx,
+                       const uint8_t *w, size_t row_bytes, size_t nrows,
+                       float *acc);
+
+/**
+ * @brief Integer dot products of up to QS4CX_ROWS_PER_BLOCK QS4CX weight
+ * rows with qa8dx-quantized activation rows.
+ *
+ * For m < M and i < nrows, writes
+ * iacc[m * QS4CX_ROWS_PER_BLOCK + i] = sum over k of
+ *   (x[m][k] + offset[m]) * (w[i][k] - 8)
+ * which is the integer the scalar qa8dx x qs4cx reference accumulates. The
+ * arithmetic is exact int32, so the order of the sum does not matter.
+ *
+ * @param[in] M number of activation rows
+ * @param[in] K reduction length
+ * @param[in] lhs qa8dx rows: fp32 scale, int32 offset, then K int8 values
+ * @param[in] lhs_stride bytes between qa8dx rows
+ * @param[in] w first weight row (plain QS4CX nibbles)
+ * @param[in] row_bytes bytes between weight rows
+ * @param[in] nrows number of weight rows, 1 .. QS4CX_ROWS_PER_BLOCK
+ * @param[out] iacc M x QS4CX_ROWS_PER_BLOCK sums; lanes past @a nrows are
+ * scratch
+ */
+void qs4cx_qa8dx_rows(size_t M, size_t K, const int8_t *lhs, size_t lhs_stride,
+                      const uint8_t *w, size_t row_bytes, size_t nrows,
+                      int32_t *iacc);
+
 } // namespace nntrainer::avx2
 
 #endif /* __cplusplus */

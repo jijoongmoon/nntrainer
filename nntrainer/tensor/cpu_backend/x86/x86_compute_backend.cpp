@@ -22,7 +22,12 @@
 #include <ggml_interface.h>
 #include <nntrainer_error.h>
 #include <q4_0_utils.h>
+#include <thread_manager.h>
 #include <x86_compute_backend.h>
+
+#include <algorithm>
+#include <cstring>
+#include <vector>
 
 #define ROW_MAJOR 0
 #define COL_MAJOR 1
@@ -599,6 +604,14 @@ void gemm_qai8dxp_qsi4cxp_rhs_unpacked(
   size_t m, size_t n, size_t k, void *lhs_native_mtx_f32,
   void *rhs_native_mtx_qs4cx, void *rhs_scales_f32, float *dst_act_mtx_f32,
   size_t idx_variant, bool is_nxk, float lower_bound, float upper_bound) {
+  if (is_nxk) {
+    gemm_qs4cx_qa8dx_f32(m, n, k, (const float *)lhs_native_mtx_f32,
+                         (const uint8_t *)rhs_native_mtx_qs4cx,
+                         (const float *)rhs_scales_f32, dst_act_mtx_f32,
+                         lower_bound, upper_bound);
+    return;
+  }
+
   // online quant lhs
   const size_t lhs_ref_size_qa8dx = m * (k + sizeof(int32_t) + sizeof(float));
 
@@ -608,17 +621,51 @@ void gemm_qai8dxp_qsi4cxp_rhs_unpacked(
                              (int8_t *)lhs_qa8dx.data());
 
   // do matmul
-  if (is_nxk) {
-    __fallback_matmul_mxn_mxk_nxk_f32_qa8dx_qs4cx(
-      m, n, k, (const int8_t *)lhs_qa8dx.data(),
-      (const uint8_t *)rhs_native_mtx_qs4cx, (const float *)rhs_scales_f32,
-      dst_act_mtx_f32, lower_bound, upper_bound);
-  } else {
-    __fallback_matmul_mxn_mxk_kxn_f32_qa8dx_qs4cx(
-      m, n, k, (const int8_t *)lhs_qa8dx.data(),
-      (const uint8_t *)rhs_native_mtx_qs4cx, (const float *)rhs_scales_f32,
-      dst_act_mtx_f32, lower_bound, upper_bound);
-  }
+  __fallback_matmul_mxn_mxk_kxn_f32_qa8dx_qs4cx(
+    m, n, k, (const int8_t *)lhs_qa8dx.data(),
+    (const uint8_t *)rhs_native_mtx_qs4cx, (const float *)rhs_scales_f32,
+    dst_act_mtx_f32, lower_bound, upper_bound);
+}
+
+void gemm_qs4cx_qa8dx_f32(size_t m, size_t n, size_t k, const float *lhs_f32,
+                          const uint8_t *rhs_qs4cx, const float *rhs_scales_f32,
+                          float *dst_f32, float lower_bound,
+                          float upper_bound) {
+  if (m == 0 || n == 0)
+    return;
+  // Same online activation quantization as the reference: per row an fp32
+  // scale, an int32 offset, then k int8 values.
+  const size_t lhs_stride = k + sizeof(int32_t) + sizeof(float);
+  std::vector<int8_t> lhs_qa8dx(m * lhs_stride);
+  __fallback_quant_qa8dx_f32(m, k, lhs_f32, lhs_qa8dx.data());
+
+  constexpr size_t RB = avx2::QS4CX_ROWS_PER_BLOCK;
+  const size_t row_bytes = (k + 1) / 2;
+  const size_t nblk = (n + RB - 1) / RB;
+  auto &tm = ThreadManager::Global();
+  tm.parallel_for(0, nblk, [&](size_t b) {
+    thread_local std::vector<int32_t> iacc;
+    if (iacc.size() < m * RB)
+      iacc.resize(m * RB);
+    const size_t n0 = b * RB;
+    const size_t nr = std::min(RB, n - n0);
+    avx2::qs4cx_qa8dx_rows(m, k, lhs_qa8dx.data(), lhs_stride,
+                           rhs_qs4cx + n0 * row_bytes, row_bytes, nr,
+                           iacc.data());
+    // The reference epilogue, operation for operation.
+    for (size_t mi = 0; mi < m; ++mi) {
+      float lhs_scale;
+      std::memcpy(&lhs_scale, lhs_qa8dx.data() + mi * lhs_stride,
+                  sizeof(float));
+      for (size_t i = 0; i < nr; ++i) {
+        float main_acc = iacc[mi * RB + i] * rhs_scales_f32[n0 + i];
+        main_acc = main_acc * lhs_scale;
+        main_acc = std::max(main_acc, lower_bound);
+        main_acc = std::min(main_acc, upper_bound);
+        dst_f32[mi * n + n0 + i] = main_acc;
+      }
+    }
+  });
 }
 
 void gemm_qai8dxp_qsi4cxp(size_t m, size_t n, size_t k,

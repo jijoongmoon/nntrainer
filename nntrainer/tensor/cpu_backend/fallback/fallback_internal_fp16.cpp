@@ -509,4 +509,30 @@ void __fallback_clamp(const _FP16 *input, _FP16 *output, size_t length,
   }
 }
 
+void __fallback_gemm_qs4cx_fp16(size_t M, size_t N, size_t K, const _FP16 *lhs,
+                                const uint8_t *rhs_qs4cx,
+                                const float *rhs_scales, _FP16 *dst,
+                                float beta) {
+  const size_t row_bytes = (K + 1) / 2;
+  for (size_t n = 0; n < N; ++n) {
+    const uint8_t *wrow = rhs_qs4cx + n * row_bytes;
+    const float s = rhs_scales[n];
+    for (size_t m = 0; m < M; ++m) {
+      const _FP16 *xr = lhs + m * K;
+      _FP16 *yr = dst + m * N;
+      float acc = 0.f;
+      for (size_t k = 0; k < K; ++k) {
+        const uint8_t byte = wrow[k >> 1];
+        const uint8_t u4 = (k & 1) ? (uint8_t)(byte >> 4) : (byte & 0x0F);
+        acc += (float)xr[k] * (float)((int32_t)u4 - 8);
+      }
+      float v = acc * s;
+      if (beta != 0.0f)
+        v += beta * (float)yr[n];
+      v = std::min(std::max(v, -65504.f), 65504.f);
+      yr[n] = (_FP16)v;
+    }
+  }
+}
+
 } // namespace nntrainer

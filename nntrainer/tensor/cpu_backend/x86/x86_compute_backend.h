@@ -413,6 +413,28 @@ void transpose_matrix(const unsigned int M, const unsigned int N,
                       const _FP16 *src, unsigned int ld_src, _FP16 *dst,
                       unsigned int ld_dst);
 
+/**
+ * @brief GEMM of an fp16 activation and a plain QS4CX weight, AVX2:
+ * dst[m][n] = clamp(scale[n] * sum_k lhs[m][k] * (w[n][k] - 8)
+ *                   + beta * dst[m][n], +-65504)
+ * Threaded over N (blocks of weight rows) on the ThreadManager pool. Every
+ * sum is accumulated in fp32 in ascending k, as __fallback_gemm_qs4cx_fp16()
+ * does, so the result is bit-identical to it for any thread count.
+ *
+ * @param M number of activation rows
+ * @param N number of weight rows (outputs)
+ * @param K reduction length
+ * @param lhs fp16 activation, M x K row-major
+ * @param rhs_qs4cx plain QS4CX weight: N rows of ceil(K/2) bytes, even k in
+ * the low nibble, each nibble int4 + 8
+ * @param rhs_scales per-row fp32 scale, N values
+ * @param dst fp16 output, M x N row-major
+ * @param beta scale of the previous dst content
+ */
+void gemm_qs4cx_fp16(size_t M, size_t N, size_t K, const _FP16 *lhs,
+                     const uint8_t *rhs_qs4cx, const float *rhs_scales,
+                     _FP16 *dst, float beta);
+
 #endif
 // init_backend() is declared in compute_ops.h (canonical location).
 
@@ -1450,6 +1472,29 @@ void gemm_qai8dxp_qsi4cxp_rhs_unpacked(
   void *rhs_native_mtx_qs4cx, void *rhs_scales_f32, float *dst_act_mtx_f32,
   size_t idx_variant, bool is_nxk, float lower_bound = -FLT_MAX,
   float upper_bound = FLT_MAX);
+
+/**
+ * @brief qai8dx x qs4cx GEMM of an fp32 activation and a plain [n, k] QS4CX
+ * weight, AVX2. The activation is quantized per row to int8 exactly as
+ * __fallback_quant_qa8dx_f32() does, the dot products are exact int32 sums,
+ * and the epilogue repeats the reference's float operations, so the result
+ * is bit-identical to __fallback_matmul_mxn_mxk_nxk_f32_qa8dx_qs4cx().
+ * Threaded over n on the ThreadManager pool.
+ *
+ * @param[in] m M for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] n N for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] k K for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] lhs_f32 fp32 activation, m x k row-major
+ * @param[in] rhs_qs4cx plain QS4CX weight, n rows of ceil(k/2) bytes
+ * @param[in] rhs_scales_f32 per-row fp32 scale, n values
+ * @param[out] dst_f32 fp32 output, m x n row-major
+ * @param[in] lower_bound clipping param
+ * @param[in] upper_bound clipping param
+ */
+void gemm_qs4cx_qa8dx_f32(size_t m, size_t n, size_t k, const float *lhs_f32,
+                          const uint8_t *rhs_qs4cx, const float *rhs_scales_f32,
+                          float *dst_f32, float lower_bound = -FLT_MAX,
+                          float upper_bound = FLT_MAX);
 
 /**
  * @brief run qai8dxp_qsi4cxp GEMM with offline packed rhs
