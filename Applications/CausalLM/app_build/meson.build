@@ -209,6 +209,7 @@ causallm_src = [
   causallm_root / 'chat_template.cpp',
   causallm_root / 'factory.cpp',
   causallm_root / 'huggingface_tokenizer.cpp',
+  causallm_root / 'tokenizer_cache.cpp',
   causallm_root / 'kv_cache_manager.cpp',
   causallm_root / 'llm_util.cpp',
   causallm_root / 'models' / 'causal_lm.cpp',
@@ -260,6 +261,23 @@ causallm_src = [
 causallm_core_cpp_args = []
 quick_dot_ai_api_cpp_args = []
 quick_dot_ai_test_cpp_args = []
+
+# Persistent tokenizer snapshot cache: on only when the tokenizer archive
+# exports the snapshot entry points (an older archive still links without
+# them and every load parses tokenizer.json). See ../meson.build.
+tokenizer_cache_opt = get_option('tokenizer-cache')
+tokenizer_cache = false
+if not tokenizer_cache_opt.disabled()
+  tokenizer_cache = cxx.has_function('tokenizers_new_from_snapshot',
+    args: [tokenizer_path],
+    dependencies: [thread_dep, log_dep])
+  if not tokenizer_cache and tokenizer_cache_opt.enabled()
+    error('tokenizer-cache is enabled, but @0@ does not export the snapshot entry points. Rebuild it with ../tools/build_tokenizers_c.sh.'.format(tokenizer_path))
+  endif
+endif
+if not tokenizer_cache
+  causallm_core_cpp_args += ['-DCAUSALLM_DISABLE_TOKENIZER_CACHE']
+endif
 
 # Single QNN switch. Keep the QNN ABI-affecting definitions on the targets
 # that consume them instead of applying them to the whole Meson project.

@@ -30,6 +30,7 @@
 causallm_src = [
     meson.current_source_dir() / 'chat_template.cpp',
     meson.current_source_dir() / 'huggingface_tokenizer.cpp',
+    meson.current_source_dir() / 'tokenizer_cache.cpp',
     meson.current_source_dir() / 'llm_util.cpp',
     meson.current_source_dir() / 'kv_cache_manager.cpp',
     meson.current_source_dir() / 'api' / 'streamer.cpp',
@@ -167,20 +168,40 @@ if not fs.exists(tokenizer_check_path)
     endif
 endif
 
-tokenizer_link_args = [tokenizer_path]
+tokenizer_system_libs = []
 if get_option('platform') == 'windows'
-    tokenizer_link_args += [
+    tokenizer_system_libs += [
         'bcrypt.lib',
         'ntdll.lib',
         'userenv.lib',
         'ws2_32.lib'
     ]
 endif
+tokenizer_link_args = [tokenizer_path] + tokenizer_system_libs
 
 cpp_args = []
 
 if get_option('default_library') == 'shared'
     cpp_args += [ '-DPLUGGABLE' ]
+endif
+
+# Persistent tokenizer snapshot cache (tokenizer_cache.cpp). It needs the
+# snapshot entry points of the in-tree crate (tools/build_tokenizers_c.sh).
+# An archive built before they existed still links everything else, so
+# 'auto' probes the archive that is linked and, without them, builds the
+# cache out: every load then parses tokenizer.json as before.
+tokenizer_cache_opt = get_option('causallm-tokenizer-cache')
+tokenizer_cache = false
+if not tokenizer_cache_opt.disabled()
+    tokenizer_cache = cxx.has_function('tokenizers_new_from_snapshot',
+        args: [tokenizer_check_path] + tokenizer_system_libs,
+        dependencies: [thread_dep, libdl_dep])
+    if not tokenizer_cache and tokenizer_cache_opt.enabled()
+        error('causallm-tokenizer-cache is enabled, but @0@ does not export the snapshot entry points. Rebuild it with Applications/CausalLM/tools/build_tokenizers_c.sh.'.format(tokenizer_check_path))
+    endif
+endif
+if not tokenizer_cache
+    cpp_args += [ '-DCAUSALLM_DISABLE_TOKENIZER_CACHE' ]
 endif
 
 # ── xgrammar (wrapper + vendored library), compiled into libcausallm.so ──

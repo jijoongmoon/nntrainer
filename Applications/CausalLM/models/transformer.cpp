@@ -41,6 +41,7 @@
 #endif
 
 #include <llm_util.hpp>
+#include <tokenizer_cache.h>
 #include <tokenizers_cpp.h>
 #include <transformer.h>
 
@@ -176,8 +177,14 @@ Transformer::Transformer(json &cfg, json &generation_cfg, json &nntr_cfg,
 #if defined(_WIN32)
       SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
 #endif
-      auto tok =
-        tokenizers::Tokenizer::FromBlobJSON(LoadBytesFromFile(tok_path));
+      // Through the persistent snapshot cache (tokenizer_cache.cpp): a hit
+      // rebuilds the BPE from the snapshot's vocab/merges tables instead of
+      // re-parsing the JSON; a miss, a stale key or a corrupt file parses
+      // exactly as before (same FromBlobJSON call, same bytes) and rewrites
+      // the snapshot in the background. The side thread only hides the parse
+      // while the rest of the load is longer than it, which a small model's
+      // is not. NNTR_TOKENIZER_CACHE=0 opts out.
+      auto tok = causallm::LoadTokenizerCached(tok_path);
       // [NNTR_INIT_TRACE] ordering marker: where in the load pipeline the
       // async parse actually completes (contention forensics -- if this
       // lands after "load_weight begins" the side thread competes with the

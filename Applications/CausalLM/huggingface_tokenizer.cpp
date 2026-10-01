@@ -132,4 +132,39 @@ Tokenizer::FromBlobByteLevelBPE(const std::string &vocab,
     vocab.data(), vocab.length(), merges.data(), merges.length(),
     added_tokens.data(), added_tokens.length()));
 }
+
+#ifndef CAUSALLM_DISABLE_TOKENIZER_CACHE
+std::unique_ptr<Tokenizer> Tokenizer::FromSnapshot(const std::string &blob) {
+  TokenizerHandle handle =
+    tokenizers_new_from_snapshot(blob.data(), blob.length());
+  if (handle == nullptr) {
+    return nullptr; // caller falls back to the JSON parse path
+  }
+  return std::make_unique<HFTokenizer>(handle);
+}
+
+std::string Tokenizer::SnapshotFromJSON(const std::string &json) {
+  char *data = nullptr;
+  size_t len = 0;
+  tokenizers_snapshot_from_json(json.data(), json.length(), &data, &len);
+  if (data == nullptr || len == 0) {
+    return {};
+  }
+  std::string blob(data, len);
+  tokenizers_snapshot_free(data);
+  return blob;
+}
+#else
+// The linked libtokenizers_c predates the snapshot entry points: no snapshot
+// can be read or written, so every load takes the JSON parse path.
+std::unique_ptr<Tokenizer> Tokenizer::FromSnapshot(const std::string &blob) {
+  (void)blob;
+  return nullptr;
+}
+
+std::string Tokenizer::SnapshotFromJSON(const std::string &json) {
+  (void)json;
+  return {};
+}
+#endif
 } // namespace tokenizers

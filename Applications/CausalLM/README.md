@@ -199,6 +199,26 @@ archive has to be rebuilt whenever the crate gains symbols), not a build step:
 run the script with `--update-prebuilt` and commit the result together with the
 rustc version, size and sha256 it printed.
 
+#### Tokenizer snapshot cache
+
+Parsing a large BPE `tokenizer.json` takes several hundred ms and a few hundred
+MB of transient heap on every load. The first load therefore writes a snapshot
+of the parsed tables, keyed by the size and mtime of `tokenizer.json`, and later
+loads rebuild the tokenizer from it. Anything unexpected in the snapshot (stale
+key, truncation, checksum mismatch, a version this build did not write) falls
+back to the normal parse and rewrites it; tokenization is identical either way.
+
+- Location: `<tokenizer.json>.ntkc` next to the model, or
+  `$XDG_CACHE_HOME/nntrainer/tokenizer/` (else `~/.cache/...`) when the model
+  directory is read-only. `NNTR_TOKENIZER_CACHE_DIR=<dir>` makes `<dir>` the only
+  location used, for embedders whose model tree is read-only and which have no
+  home directory (Android apps, Windows services).
+- `NNTR_TOKENIZER_CACHE=0` turns it off at run time.
+- Build option `-Dcausallm-tokenizer-cache=auto|enabled|disabled` (default
+  `auto`: on when the linked tokenizer library exports the snapshot entry
+  points). An archive built before those existed still links, without the cache;
+  rebuild it with `tools/build_tokenizers_c.sh`.
+
 ### 3. Windows Build & Test
 
 Windows CausalLM builds need a `tokenizers_c.lib` that matches the local
