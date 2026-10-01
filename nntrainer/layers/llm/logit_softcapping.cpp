@@ -13,6 +13,7 @@
 #include "logit_softcapping.h"
 
 #include <algorithm>
+#include <cstring>
 #include <stdexcept>
 
 #if defined(ENABLE_OPENCL)
@@ -156,7 +157,10 @@ void LogitSoftCappingLayer::applyOnRange(nntrainer::RunLayerContext &context,
       // Adreno 840 at vocab 262144 -- all of it on the token's critical path.
       // The replay closure is what makes this safe: if anything downstream
       // ends up needing the host row after all, it re-runs exactly these four
-      // lines on the materialized input.
+      // lines on the materialized input. The second closure runs the same
+      // four lines on a handful of values: sampled decoding takes its top-k
+      // candidates off the GPU uncapped and caps just those, element for
+      // element what the full row would hold at the same ids.
       if (softcap > 0.0f &&
           in_chunk.getDataType() == nntrainer::TensorDim::DataType::FP16 &&
           nntrainer::cl_lmhead_defer_softcap(
@@ -166,6 +170,24 @@ void LogitSoftCappingLayer::applyOnRange(nntrainer::RunLayerContext &context,
               in_chunk.multiply(1.0f / softcap, out_chunk);
               acti_func.run_fn(out_chunk, out_chunk);
               out_chunk.multiply(softcap, out_chunk);
+            },
+            [this, softcap, dim = in_chunk.getDim()](
+              const void *in_vals, void *out_vals, unsigned int count) mutable {
+              nntrainer::TensorDim d = dim;
+              d.batch(1);
+              d.channel(1);
+              d.height(1);
+              d.width(count);
+              nntrainer::Tensor in_t(d);
+              nntrainer::Tensor out_t(d);
+              std::memcpy(in_t.getData<_FP16>(), in_vals,
+                          sizeof(_FP16) * count);
+              out_t.copyData(in_t);
+              in_t.multiply(1.0f / softcap, out_t);
+              acti_func.run_fn(out_t, out_t);
+              out_t.multiply(softcap, out_t);
+              std::memcpy(out_vals, out_t.getData<_FP16>(),
+                          sizeof(_FP16) * count);
             }))
         continue;
 #endif

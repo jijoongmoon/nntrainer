@@ -111,6 +111,36 @@ bool cuda_argmax_penalized_fp16(const unsigned short *logits_dev,
                                 unsigned int n_bad, float penalty,
                                 unsigned int *token_out_host);
 
+/** @brief Most candidates cuda_topk_fp16/fp32 return. */
+constexpr unsigned int CUDA_TOPK_MAX = 256;
+
+/**
+ * @brief On-GPU top-k selection over device-resident fp16 logits [vocab], for
+ *        sampled decoding.
+ * @details Returns up to @p want (id, fp32 value) pairs that are provably the
+ *          @p count highest logits of the row, in rank order -- higher value
+ *          first, lower id on an exact tie -- so every other token's logit is
+ *          <= logits[count - 1]. Only per-block candidate lists cross to the
+ *          host (8 KiB per 32 Ki of vocabulary), not the row. The order is a
+ *          strict total order on integer keys, so the result does not depend
+ *          on the launch shape. Runs after the decode graph replay on the
+ *          backend stream, like cuda_argmax_fp16 (not captured: its scratch
+ *          is allocated outside capture and the host reads its output right
+ *          away).
+ * @param want 1..CUDA_TOPK_MAX
+ * @param count receives how many were proven (<= want)
+ * @return false (caller falls back to the host row) on a bad argument,
+ *         scratch allocation under capture, or a kernel failure.
+ */
+bool cuda_topk_fp16(const unsigned short *logits_dev, unsigned int vocab,
+                    unsigned int want, unsigned int *ids, float *logits,
+                    unsigned int *count);
+
+/** @brief fp32 variant of cuda_topk_fp16. */
+bool cuda_topk_fp32(const float *logits_dev, unsigned int vocab,
+                    unsigned int want, unsigned int *ids, float *logits,
+                    unsigned int *count);
+
 } // namespace nntrainer::cuda
 
 #endif // __CUDA_ELEMENTWISE_H__

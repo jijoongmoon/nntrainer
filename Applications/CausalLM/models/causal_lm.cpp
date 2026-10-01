@@ -202,6 +202,24 @@ void materialize_cl_pending_logits() {
 } // namespace
 #endif
 
+namespace {
+/**
+ * @brief NNTR_SAMPLE_DEVICE_TOPK, default ON with "=0" opting out: sampled
+ *        decoding on the OpenCL / CUDA lanes takes its top-k candidates from
+ *        the GPU instead of reading back and scanning the whole logits row.
+ * @note The candidates give the same token as the full row (the sampler
+ *       declines and the row is read whenever they cannot prove it), so the
+ *       env is a bisection lever, not a policy knob.
+ */
+bool sample_device_topk_enabled() {
+  static const bool on = []() {
+    const char *e = std::getenv("NNTR_SAMPLE_DEVICE_TOPK");
+    return e == nullptr || e[0] != '0';
+  }();
+  return on;
+}
+} // namespace
+
 #include <utf8_stream_util.h>
 
 #include "api/streamer.h"
@@ -1014,6 +1032,19 @@ std::vector<unsigned int> CausalLM::generate(float *logits, bool do_sample,
 #endif
 
   std::vector<unsigned int> outputs;
+  // Sampled decoding whose top-k fits the device selection: the token depends
+  // only on the TOP_K best logits, so the GPU lanes select candidates on the
+  // device and the host samples from those. More candidates than TOP_K are
+  // asked for: fp16 logits tie often, and the sampler can only settle the cut
+  // when the candidates reach past the tie at rank TOP_K (see
+  // sampleTokenFromTopCandidates). Same exclusions as the greedy device path:
+  // anything that rewrites the row on the host keeps the row.
+  constexpr unsigned int kDeviceTopKMax = 64;
+  [[maybe_unused]] const bool topk_shape =
+    do_sample && logits_processor == nullptr && BATCH_SIZE == 1 && TOP_K > 0 &&
+    TOP_K <= kDeviceTopKMax && TOP_K < NUM_VOCAB &&
+    sample_device_topk_enabled();
+  [[maybe_unused]] const unsigned int topk_want = 2 * TOP_K + 32;
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
   // Repetition penalty / bad-words activity, with EXACTLY the host-path
   // predicates below (generate() applies each only under its own triple
@@ -1032,9 +1063,12 @@ std::vector<unsigned int> CausalLM::generate(float *logits, bool do_sample,
   // Tell the NEXT incrementalInference whether the full-vocab host row is
   // going to be read at all. Recomputed every call, so a run that switches
   // sampling on pays one deferred conversion and then stops deferring.
-  g_greedy_hint = cuda_argmax_enabled() && do_sample == false &&
-                  logits_processor == nullptr && BATCH_SIZE == 1 &&
-                  dev_penalty_fits;
+  const bool cuda_topk = topk_shape &&
+                         topk_want <= nntrainer::cuda::CUDA_TOPK_MAX &&
+                         !rp_active && !bw_active;
+  g_greedy_hint = cuda_argmax_enabled() && logits_processor == nullptr &&
+                  BATCH_SIZE == 1 &&
+                  ((do_sample == false && dev_penalty_fits) || cuda_topk);
 #endif
 #if defined(ENABLE_OPENCL)
   // Same predicates the host path below applies, so the device route can never
@@ -1047,13 +1081,53 @@ std::vector<unsigned int> CausalLM::generate(float *logits, bool do_sample,
   // pays one deferred readback and then stops deferring. Unlike the CUDA lane
   // there is no on-device penalty kernel here, so any penalty keeps the host
   // row. Guarded on the engine: on a cuda or cpu run this arms nothing.
+  const bool cl_topk = topk_shape &&
+                       topk_want <= nntrainer::CL_LMHEAD_TOPK_MAX &&
+                       !cl_rp_active && !cl_bw_active;
   const bool cl_greedy = causallm_engine() == "gpu" && do_sample == false &&
                          logits_processor == nullptr && BATCH_SIZE == 1 &&
                          !cl_rp_active && !cl_bw_active;
-  nntrainer::cl_lmhead_set_greedy_hint(cl_greedy);
+  nntrainer::cl_lmhead_set_greedy_hint(cl_greedy ||
+                                       (causallm_engine() == "gpu" && cl_topk));
 #endif
   for (unsigned int iteration = 0; iteration < BATCH_SIZE; ++iteration) {
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+    // CUDA on-GPU top-k for sampled decoding: select the best candidates on
+    // the GPU (after the decode graph replay, like the argmax below -- the
+    // selection is not captured), read back their (id, logit) pairs and draw
+    // from them on the host. The logits here are the device row the host path
+    // would widen (softcap included, it runs on the device on this lane), so
+    // the draw is the full-row draw; when the candidates cannot prove it the
+    // row is read as before and nothing of the RNG has been used.
+    if (cuda_topk && cuda_argmax_enabled() && g_cuda_logits_dev != nullptr) {
+      unsigned int cand_ids[nntrainer::cuda::CUDA_TOPK_MAX];
+      float cand_logits[nntrainer::cuda::CUDA_TOPK_MAX];
+      unsigned int n = 0;
+      const bool ok =
+        g_cuda_logits_fp16
+          ? nntrainer::cuda::cuda_topk_fp16(
+              reinterpret_cast<const unsigned short *>(g_cuda_logits_dev),
+              NUM_VOCAB, topk_want, cand_ids, cand_logits, &n)
+          : nntrainer::cuda::cuda_topk_fp32(
+              reinterpret_cast<const float *>(g_cuda_logits_dev), NUM_VOCAB,
+              topk_want, cand_ids, cand_logits, &n);
+      unsigned int tok = 0;
+      if (ok &&
+          sampleTokenFromTopCandidates(cand_ids, cand_logits, n, TEMPERATURE,
+                                       TOP_K, TOP_P, rng, &tok)) {
+        g_cuda_logits_dev = nullptr;
+        // The deferred host row was never needed -- drop it unfilled.
+        g_pending_logits = PendingLogits{};
+        // Same early page-warm of the next token's rows as the argmax path.
+        nntrainer::cuda::emb_gather_notify_token(tok);
+        outputs.push_back(tok);
+        logits = logits + NUM_VOCAB;
+        if (input_ids != nullptr)
+          input_ids = input_ids + MAX_SEQ_LEN;
+        continue;
+      }
+      // else: fall through; the host path below materializes the row.
+    }
     // CUDA on-GPU greedy argmax: reduce the device-resident
     // lm_head logits to the token id on the GPU and read back only 4 bytes,
     // skipping the host std::max_element over the full-vocab buffer. Gated to
@@ -1107,6 +1181,31 @@ std::vector<unsigned int> CausalLM::generate(float *logits, bool do_sample,
 #endif
 
 #if defined(ENABLE_OPENCL)
+    // OpenCL on-GPU top-k for sampled decoding: the same idea as the greedy
+    // reduction below, for the best few dozen logits instead of one. A
+    // deferred softcap is applied to just those values on the host by the
+    // layer's own code, so the draw is the full-row draw; when the candidates
+    // cannot prove it the row is materialized below and the RNG is untouched.
+    if (cl_topk && g_cl_pending_logits.host != nullptr &&
+        g_cl_pending_logits.host == logits) {
+      unsigned int cand_ids[nntrainer::CL_LMHEAD_TOPK_MAX];
+      float cand_logits[nntrainer::CL_LMHEAD_TOPK_MAX];
+      unsigned int n = 0;
+      unsigned int tok = 0;
+      if (nntrainer::cl_lmhead_dev_topk(NUM_VOCAB, topk_want, cand_ids,
+                                        cand_logits, &n) &&
+          sampleTokenFromTopCandidates(cand_ids, cand_logits, n, TEMPERATURE,
+                                       TOP_K, TOP_P, rng, &tok)) {
+        // The deferred row was never needed -- drop it unfilled.
+        nntrainer::cl_lmhead_release_logits();
+        g_cl_pending_logits = ClPendingLogits{};
+        outputs.push_back(tok);
+        logits = logits + NUM_VOCAB;
+        if (input_ids != nullptr)
+          input_ids = input_ids + MAX_SEQ_LEN;
+        continue;
+      }
+    }
     // OpenCL on-GPU greedy argmax: reduce the device-resident lm_head row to a
     // token id on the GPU and read back 4 bytes, skipping the softcapping pass
     // over the vocabulary, the fp16 -> fp32 widening and the max_element. The

@@ -759,9 +759,11 @@ bool lmhead_int4_v8c_gemv_cl(void *w_buf_clmem, void *scale_buf_clmem,
  * @brief Tell the NEXT decode lm_head GEMV whether the full-vocabulary host
  *        row is going to be read at all.
  *
- * Greedy decoding reads one index out of [vocab]; sampling, a logits processor
- * and the repetition / bad-word passes read the whole row. Only the first case
- * can leave the row on the device. This is a HINT, never a correctness input:
+ * Greedy decoding reads one index out of [vocab] and sampled decoding with a
+ * small top_k reads only the top_k best (cl_lmhead_dev_topk); a logits
+ * processor and the repetition / bad-word passes read the whole row. Only the
+ * first two can leave the row on the device, and the caller sets the hint for
+ * either of them. This is a HINT, never a correctness input:
  * a wrong guess costs one deferred readback (cl_lmhead_materialize_logits),
  * it cannot produce a wrong token or an unfilled read.
  */
@@ -806,10 +808,46 @@ bool cl_lmhead_dev_argmax(unsigned int vocab, unsigned int *token_out);
  * @param softcap the cap value the reduction will reproduce
  * @param replay  re-runs the node's host math on a materialized input; called
  *                by cl_lmhead_materialize_logits() if the row is ever needed
+ * @param apply   runs the same host math on @a count fp16 values (in, out,
+ *                count); lets cl_lmhead_dev_topk() cap just the candidates.
+ *                Without it a softcapped row is never sampled on the device
  * @return false when this is not the deferred row (the node then runs as usual)
  */
-bool cl_lmhead_defer_softcap(const void *in_row, void *out_row, float softcap,
-                             std::function<void()> replay);
+bool cl_lmhead_defer_softcap(
+  const void *in_row, void *out_row, float softcap,
+  std::function<void()> replay,
+  std::function<void(const void *, void *, unsigned int)> apply = nullptr);
+
+/** @brief Most candidates cl_lmhead_dev_topk() returns. */
+constexpr unsigned int CL_LMHEAD_TOPK_MAX = 256;
+
+/**
+ * @brief Select the best logits of the deferred, device-resident lm_head row
+ *        on the GPU and read back only per-group candidate lists.
+ *
+ * Returns up to @a want (id, logit) pairs that are provably the @a count
+ * highest logits of the row, in rank order -- higher logit first, lower id on
+ * an exact tie -- so every other token's logit is <= logits[count - 1]. That
+ * is what causallm::sampleTokenFromTopCandidates() expects. A deferred
+ * softcap is applied to the candidates on the host through the layer's own
+ * code (the @c apply closure of cl_lmhead_defer_softcap), so the values equal
+ * what the full host row would hold at those ids. The row stays pending: if
+ * the sampler cannot use the candidates the caller still materializes it, and
+ * on success it drops it with cl_lmhead_release_logits().
+ *
+ * @param vocab must equal the deferred row's length
+ * @param want most candidates wanted, 1..CL_LMHEAD_TOPK_MAX
+ * @param ids receives the token ids
+ * @param logits receives their logits (fp32, widened from the fp16 row)
+ * @param count receives how many were proven (<= want)
+ * @return false when there is no deferred row for this vocab, a deferred
+ *         post-op cannot be applied to a subset, or the kernel could not run.
+ */
+bool cl_lmhead_dev_topk(unsigned int vocab, unsigned int want,
+                        unsigned int *ids, float *logits, unsigned int *count);
+
+/** @brief Drop the deferred lm_head row without reading it. */
+void cl_lmhead_release_logits();
 
 /**
  * @brief Pay the readback a deferral skipped, filling the host row.

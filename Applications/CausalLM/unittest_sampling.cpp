@@ -27,6 +27,7 @@
 using causallm::kDefaultSamplingSeed;
 using causallm::sampleIndex;
 using causallm::sampleToken;
+using causallm::sampleTokenFromTopCandidates;
 using causallm::samplingRanksBefore;
 using causallm::SamplingRng;
 using causallm::samplingUniform;
@@ -105,6 +106,24 @@ std::vector<float> makeRandomLogits(int n, SamplingRng &gen) {
   for (int i = 0; i < n; ++i)
     l[i] = static_cast<float>(causallm::samplingUniform(gen) * 30.0 - 15.0);
   return l;
+}
+
+/**
+ * @brief The n highest raw logits in rank order, as a device top-k returns
+ *        them.
+ */
+void rawTopN(const std::vector<float> &l, std::size_t n,
+             std::vector<unsigned int> &ids, std::vector<float> &vals) {
+  std::vector<std::pair<unsigned int, float>> c(l.size());
+  for (std::size_t i = 0; i < l.size(); ++i)
+    c[i] = {static_cast<unsigned int>(i), l[i]};
+  std::sort(c.begin(), c.end(), samplingRanksBefore);
+  ids.resize(n);
+  vals.resize(n);
+  for (std::size_t i = 0; i < n; ++i) {
+    ids[i] = c[i].first;
+    vals[i] = c[i].second;
+  }
 }
 
 } // namespace
@@ -273,4 +292,71 @@ TEST(causallm_sampling, topk_selection_matches_full_sort_p) {
     }
   }
   EXPECT_GT(draws, 10000);
+}
+
+/**
+ * @brief Sampling from the device-style top-(k+1) candidates gives the same
+ *        token and RNG use as the full row whenever it accepts; when it
+ *        declines, the RNG is untouched.
+ */
+TEST(causallm_sampling, top_candidates_match_full_row_p) {
+  SamplingRng gen(77);
+  const unsigned int ks[] = {1, 2, 5, 40, 64};
+  const float temps[] = {0.0f, 0.3f, 0.7f, 1.0f, 1.7f};
+  const float tps[] = {0.0f, 0.9f, 0.95f, 1.0f};
+  int accepted = 0, declined = 0;
+  for (int row = 0; row < 24; ++row) {
+    const int len = 4099;
+    const auto logits = (row % 2 == 0) ? makeTiedLogits(len, 9 + row, gen)
+                                       : makeRandomLogits(len, gen);
+    for (unsigned int k : ks) {
+      std::vector<unsigned int> ids;
+      std::vector<float> vals;
+      rawTopN(logits, k + 1, ids, vals);
+      for (float t : temps) {
+        for (float tp : tps) {
+          SamplingRng a(row * 7u + k), b(row * 7u + k);
+          unsigned int tok = 0;
+          if (sampleTokenFromTopCandidates(ids.data(), vals.data(), k + 1, t, k,
+                                           tp, a, &tok)) {
+            EXPECT_EQ(tok,
+                      referenceSampleToken(logits.data(), len, t, k, tp, b));
+            ++accepted;
+          } else {
+            ++declined;
+          }
+          EXPECT_EQ(a(), b());
+        }
+      }
+    }
+  }
+  EXPECT_GT(accepted, 0);
+  EXPECT_GT(declined, 0); // tied rows put equal scores on the boundary
+}
+
+/**
+ * @brief Two different logits that one temperature maps to the same score
+ *        at the top-k boundary: the candidates cannot prove which token the
+ *        full row would keep, so they decline instead of guessing.
+ */
+TEST(causallm_sampling, top_candidates_decline_merged_boundary_n) {
+  const float t = 3.0f;
+  float x = 1.0f;
+  while (x / t != std::nextafter(x, 2.0f) / t)
+    x = std::nextafter(x, 2.0f);
+  const float hi = std::nextafter(x, 2.0f);
+  // Raw order is 0, 1, 3 (hi), 2 (x), but x / t == hi / t, so with top_k 3 the
+  // full row keeps {0, 1, 2} (lower id wins the merged tie) while the raw
+  // top-3 holds {0, 1, 3}.
+  std::vector<float> logits = {9.0f, 8.0f, x, hi, -1.0f};
+  std::vector<unsigned int> ids;
+  std::vector<float> vals;
+  rawTopN(logits, 4, ids, vals);
+  ASSERT_EQ(ids[2], 3u);
+  ASSERT_EQ(ids[3], 2u);
+  SamplingRng a(5), b(5);
+  unsigned int tok = 0;
+  EXPECT_FALSE(sampleTokenFromTopCandidates(ids.data(), vals.data(), 4, t, 3,
+                                            1.0f, a, &tok));
+  EXPECT_EQ(a(), b());
 }

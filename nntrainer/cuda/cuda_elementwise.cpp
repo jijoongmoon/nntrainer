@@ -21,6 +21,11 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
+#include <cstring>
+#include <functional>
+#include <vector>
+
 namespace nntrainer::cuda {
 
 static const char *ELTWISE_SRC = R"CU(
@@ -548,6 +553,228 @@ bool cuda_argmax_penalized_fp16(const unsigned short *logits_dev,
   // Same early page-warm as argmax_dispatch (emb gather).
   emb_gather_notify_token(*g_am_oidx_host);
   return true;
+}
+
+// On-GPU top-k for sampled decoding: instead of copying the whole logits row
+// to the host, each block of 128 threads writes the TK_KEEP best of its
+// TK_PER_BLOCK consecutive elements, in rank order, one per round ("largest
+// key below the previous winner"), and the host merges those short lists.
+// Every element becomes a 64-bit key (its value bits mapped to an
+// order-preserving unsigned in the high word, 0xffffffff - id in the low
+// word): a strict total order, higher value first and lower id on an exact
+// tie, so the result does not depend on the launch shape. A zero key means
+// "nothing left in this block". The merge keeps only what the lists prove:
+// a full list may hide more good elements, but all of them rank below its
+// last kept key, so the union's keys above the highest such floor are exactly
+// the row's best (same scheme as the OpenCL lane).
+static const char *TOPK_SRC = R"CU(
+extern "C" {
+#define TK_T 128
+#define TK_EPT 8
+__device__ __forceinline__ unsigned long long tk_key16(unsigned short h,
+                                                       unsigned int i) {
+  unsigned int k = (h & 0x8000u) ? ((~(unsigned int)h) & 0xffffu)
+                                 : ((unsigned int)h | 0x8000u);
+  return ((unsigned long long)k << 32) | (0xffffffffu - i);
+}
+__device__ __forceinline__ unsigned long long tk_key32(float f,
+                                                       unsigned int i) {
+  unsigned int u = (unsigned int)__float_as_int(f);
+  unsigned int k = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+  return ((unsigned long long)k << 32) | (0xffffffffu - i);
+}
+__device__ __forceinline__ unsigned long long tk_warp_max(
+  unsigned long long v) {
+  for (int o = 16; o > 0; o >>= 1) {
+    unsigned long long u = __shfl_xor_sync(0xffffffffu, v, o);
+    v = u > v ? u : v;
+  }
+  return v;
+}
+__device__ __forceinline__ void tk_rounds(unsigned long long *c, int K,
+                                          unsigned long long *out) {
+  __shared__ unsigned long long sw[TK_T / 32];
+  unsigned long long prev = 0xffffffffffffffffull;
+  for (int r = 0; r < K; ++r) {
+    unsigned long long b = 0ull;
+    for (int e = 0; e < TK_EPT; ++e)
+      if (c[e] < prev && c[e] > b) b = c[e];
+    b = tk_warp_max(b);
+    if ((threadIdx.x & 31) == 0) sw[threadIdx.x >> 5] = b;
+    __syncthreads();
+    unsigned long long m = 0ull;
+    for (int w = 0; w < TK_T / 32; ++w) m = sw[w] > m ? sw[w] : m;
+    __syncthreads();
+    prev = m;
+    if (threadIdx.x == 0) out[r] = m;
+  }
+}
+__global__ void topk_part_f16(const unsigned short *logits, int n, int K,
+                              unsigned long long *part) {
+  unsigned long long c[TK_EPT];
+  const int base = blockIdx.x * (TK_T * TK_EPT);
+  for (int e = 0; e < TK_EPT; ++e) {
+    int i = base + e * TK_T + threadIdx.x;
+    c[e] = i < n ? tk_key16(logits[i], (unsigned int)i) : 0ull;
+  }
+  tk_rounds(c, K, part + (size_t)blockIdx.x * K);
+}
+__global__ void topk_part_f32(const float *logits, int n, int K,
+                              unsigned long long *part) {
+  unsigned long long c[TK_EPT];
+  const int base = blockIdx.x * (TK_T * TK_EPT);
+  for (int e = 0; e < TK_EPT; ++e) {
+    int i = base + e * TK_T + threadIdx.x;
+    c[e] = i < n ? tk_key32(logits[i], (unsigned int)i) : 0ull;
+  }
+  tk_rounds(c, K, part + (size_t)blockIdx.x * K);
+}
+}
+)CU";
+
+namespace {
+constexpr int TK_THREADS = 128;               // == TK_T
+constexpr int TK_PER_BLOCK = TK_THREADS * 8;  // TK_T * TK_EPT
+constexpr int TK_KEEP = 32;                   // candidates kept per block
+unsigned long long *g_tk_part = nullptr;      // [blocks * TK_KEEP] device
+unsigned long long *g_tk_part_host = nullptr; // pinned staging for the D2H
+size_t g_tk_blocks = 0;
+
+/** @brief exact fp16 bits -> fp32 */
+float tk_h2f(unsigned short h) {
+  unsigned int s = ((unsigned int)(h & 0x8000u)) << 16;
+  unsigned int e = (h >> 10) & 0x1Fu, m = h & 0x3FFu, o;
+  if (e == 0u) {
+    if (m == 0u)
+      o = s;
+    else {
+      int x = -1;
+      do {
+        m <<= 1;
+        x++;
+      } while ((m & 0x400u) == 0u);
+      m &= 0x3FFu;
+      o = s | ((unsigned int)(127 - 15 - x) << 23) | (m << 13);
+    }
+  } else if (e == 0x1Fu)
+    o = s | 0x7F800000u | (m << 13);
+  else
+    o = s | ((e + (127u - 15u)) << 23) | (m << 13);
+  float f;
+  std::memcpy(&f, &o, sizeof(f));
+  return f;
+}
+
+// Scratch for a given block count; never allocates under graph capture.
+bool ensure_topk_scratch(size_t blocks) {
+  if (g_tk_part && g_tk_part_host && g_tk_blocks >= blocks)
+    return true;
+  if (StreamManager::Global().isCapturing())
+    return false;
+  if (g_tk_part)
+    cudaFree(g_tk_part);
+  if (g_tk_part_host)
+    cudaFreeHost(g_tk_part_host);
+  g_tk_part = nullptr;
+  g_tk_part_host = nullptr;
+  g_tk_blocks = 0;
+  const size_t bytes = sizeof(unsigned long long) * blocks * TK_KEEP;
+  if (cudaMalloc(&g_tk_part, bytes) != cudaSuccess) {
+    g_tk_part = nullptr;
+    return false;
+  }
+  if (cudaHostAlloc(&g_tk_part_host, bytes, cudaHostAllocDefault) !=
+      cudaSuccess) {
+    g_tk_part_host = nullptr;
+    return false;
+  }
+  g_tk_blocks = blocks;
+  return true;
+}
+
+bool topk_dispatch(const void *logits_dev, bool is_fp16, unsigned int vocab,
+                   unsigned int want, unsigned int *ids, float *logits,
+                   unsigned int *count) {
+  if (logits_dev == nullptr || vocab == 0 || want == 0 ||
+      want > CUDA_TOPK_MAX || ids == nullptr || logits == nullptr ||
+      count == nullptr)
+    return false;
+  const size_t blocks = (vocab + TK_PER_BLOCK - 1) / TK_PER_BLOCK;
+  if (!ensure_topk_scratch(blocks))
+    return false;
+  auto kp = CudaContext::Global().registerCudaKernel(
+    TOPK_SRC, is_fp16 ? "topk_part_f16" : "topk_part_f32");
+  if (!kp) {
+    ml_loge("[CUDA] topk: kernel registration failed");
+    return false;
+  }
+  int vn = (int)vocab, k = TK_KEEP;
+  kp->SetKernelArguments(0, &logits_dev, sizeof(logits_dev));
+  kp->SetKernelArguments(1, &vn, sizeof(vn));
+  kp->SetKernelArguments(2, &k, sizeof(k));
+  kp->SetKernelArguments(3, &g_tk_part, sizeof(g_tk_part));
+  const int b1[3] = {TK_THREADS, 1, 1};
+  const int g1[3] = {(int)blocks, 1, 1};
+  if (!StreamManager::Global().DispatchCommand(*kp, g1, b1))
+    return false;
+
+  // Drain (graph replay + the selection), then read back the block lists.
+  StreamManager::Global().finish();
+  const size_t nkeys = blocks * TK_KEEP;
+  if (cudaMemcpy(g_tk_part_host, g_tk_part, sizeof(unsigned long long) * nkeys,
+                 cudaMemcpyDeviceToHost) != cudaSuccess)
+    return false;
+
+  unsigned long long floor_key = 0ull;
+  for (size_t b = 0; b < blocks; ++b)
+    floor_key = std::max(floor_key, g_tk_part_host[b * TK_KEEP + TK_KEEP - 1]);
+  static std::vector<unsigned long long> best;
+  best.clear();
+  for (size_t i = 0; i < nkeys; ++i)
+    if (g_tk_part_host[i] > floor_key)
+      best.push_back(g_tk_part_host[i]);
+  if (best.size() > want) {
+    std::nth_element(best.begin(), best.begin() + want, best.end(),
+                     std::greater<unsigned long long>());
+    best.resize(want);
+  }
+  std::sort(best.begin(), best.end(), std::greater<unsigned long long>());
+  if (best.empty())
+    return false;
+
+  for (size_t r = 0; r < best.size(); ++r) {
+    const unsigned long long key = best[r];
+    const unsigned int id = 0xffffffffu - (unsigned int)(key & 0xffffffffu);
+    const unsigned int hi = (unsigned int)(key >> 32);
+    if (id >= vocab)
+      return false;
+    ids[r] = id;
+    if (is_fp16) {
+      const unsigned short h = (hi & 0x8000u) ? (unsigned short)(hi & 0x7fffu)
+                                              : (unsigned short)(~hi & 0xffffu);
+      logits[r] = tk_h2f(h);
+    } else {
+      const unsigned int u = (hi & 0x80000000u) ? (hi & 0x7fffffffu) : ~hi;
+      std::memcpy(&logits[r], &u, sizeof(float));
+    }
+  }
+  *count = (unsigned int)best.size();
+  return true;
+}
+} // namespace
+
+bool cuda_topk_fp16(const unsigned short *logits_dev, unsigned int vocab,
+                    unsigned int want, unsigned int *ids, float *logits,
+                    unsigned int *count) {
+  return topk_dispatch(logits_dev, /*is_fp16=*/true, vocab, want, ids, logits,
+                       count);
+}
+
+bool cuda_topk_fp32(const float *logits_dev, unsigned int vocab,
+                    unsigned int want, unsigned int *ids, float *logits,
+                    unsigned int *count) {
+  return topk_dispatch(logits_dev, /*is_fp16=*/false, vocab, want, ids, logits,
+                       count);
 }
 
 template <typename K> static bool dispatch1d(K &kernel, unsigned int n) {

@@ -17,6 +17,7 @@
 #include "cl_tensor_view.h"
 #include "util_func.h"
 #include "v8c_pack_cache.h"
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cerrno>
@@ -3506,9 +3507,10 @@ bool lmhead_gemv_q6_k_cl(const void *w_q6k_host, const float *act_f32_host,
 // std::max_element returns).
 //
 // The deferral is driven by a HINT the caller sets before the step
-// (cl_lmhead_set_greedy_hint): sampling, a logits processor and the penalty
-// passes all consume the whole row on the host and set it false. A wrong guess
-// is never a wrong token -- the row stays claimable through
+// (cl_lmhead_set_greedy_hint): a logits processor and the penalty passes
+// consume the whole row on the host and set it false; sampled decoding sets it
+// when it is going to take its top-k from the device (cl_lmhead_dev_topk). A
+// wrong guess is never a wrong token -- the row stays claimable through
 // cl_lmhead_materialize_logits(), which pays exactly the work the hint tried
 // to skip, post-op included.
 // ===========================================================================
@@ -3545,6 +3547,8 @@ struct ClLmHeadPending {
   bool out_fp16 = false; /**< dtype of the host row */
   float softcap = 0.0f;  /**< >0: the post-op the reduction must reproduce */
   std::function<void()> replay; /**< re-runs the skipped post-op on the host */
+  /** @brief runs the same post-op on a few fp16 values (in, out, count) */
+  std::function<void(const void *, void *, unsigned int)> apply;
   bool live = false;
 };
 static ClLmHeadPending cl_lmhead_pending;
@@ -4042,8 +4046,10 @@ bool cl_lmhead_logits_deferred(const void *host_row) {
          cl_lmhead_pending.claim == host_row;
 }
 
-bool cl_lmhead_defer_softcap(const void *in_row, void *out_row, float softcap,
-                             std::function<void()> replay) {
+bool cl_lmhead_defer_softcap(
+  const void *in_row, void *out_row, float softcap,
+  std::function<void()> replay,
+  std::function<void(const void *, void *, unsigned int)> apply) {
   // Only the row this deferral owns, only a real cap, and only a post-op that
   // can be replayed -- anything else keeps its own host pass.
   if (!cl_lmhead_pending.live || in_row == nullptr || out_row == nullptr ||
@@ -4053,6 +4059,7 @@ bool cl_lmhead_defer_softcap(const void *in_row, void *out_row, float softcap,
   cl_lmhead_pending.claim = out_row;
   cl_lmhead_pending.softcap = softcap;
   cl_lmhead_pending.replay = std::move(replay);
+  cl_lmhead_pending.apply = std::move(apply);
   return true;
 }
 
@@ -4274,6 +4281,206 @@ bool cl_lmhead_dev_argmax(unsigned int vocab, unsigned int *token_out) {
   *token_out = (unsigned int)tok;
   return true;
 }
+
+// ===========================================================================
+// On-GPU top-k for sampled decoding.
+//
+// Sampling (temperature -> top-k -> top-p -> draw) only ever looks at the k
+// best logits, so like the greedy argmax above it does not need the row on the
+// host -- it needs the best candidates. The kernel below splits the row into
+// groups of TOPK_LS * TOPK_EPT consecutive elements and writes each group's
+// TOPK_KEEP best, in rank order, one per round ("largest key below the
+// previous winner"). The host then merges those short lists (cl_lmhead_
+// dev_topk) and samples with causallm::sampleTokenFromTopCandidates.
+//
+// Exactness of the merge: a group whose list is full may hold more good
+// elements than it kept, but all of them rank below its last kept one. So
+// every key above the highest such "floor" over all full lists is present in
+// the union, and the union's entries above that floor are exactly the global
+// best ones, in order. Only those are handed to the sampler, which in turn
+// declines (and the row is read as before) if they cannot settle the top-k.
+//
+// Values are RAW, not softcapped: a deferred softcap is applied on the host to
+// the candidates through the layer's own elementwise code (the apply closure
+// handed over in cl_lmhead_defer_softcap), so the sampler sees bit for bit the
+// numbers the full-row path would have given it. Softcapping is monotone, so
+// the raw best are also the capped best up to ties, and ties are again what
+// the sampler's boundary check catches.
+//
+// Ordering is on a 64-bit integer key: the fp16 bits mapped to an
+// order-preserving unsigned value in the high word, (0xffffffff - id) in the
+// low word. That is a strict total order, so the result does not depend on how
+// the work is split, and no float compare is involved (the kernels build with
+// -cl-finite-math-only). A zero key means "nothing left in this group".
+// ===========================================================================
+static const std::string lmhead_topk_kernel = R"CL(
+#define TOPK_LS 64
+#define TOPK_EPT 16
+
+inline ulong topk_key(ushort h, uint i) {
+  const uint k = (h & 0x8000u) ? ((~(uint)h) & 0xffffu) : ((uint)h | 0x8000u);
+  return ((ulong)k << 32) | (ulong)(0xffffffffu - i);
+}
+
+__kernel void lmhead_topk_f16_part(__global const ushort *logits,
+                                   __global ulong *part, const int N,
+                                   const int K) {
+  const int lid = get_local_id(0);
+  const int base = get_group_id(0) * (TOPK_LS * TOPK_EPT);
+  ulong c[TOPK_EPT];
+  for (int e = 0; e < TOPK_EPT; ++e) {
+    const int i = base + e * TOPK_LS + lid;
+    c[e] = (i < N) ? topk_key(logits[i], (uint)i) : 0ul;
+  }
+  __local ulong lv[TOPK_LS];
+  ulong prev = 0xfffffffffffffffful;
+  for (int r = 0; r < K; ++r) {
+    ulong b = 0ul;
+    for (int e = 0; e < TOPK_EPT; ++e)
+      if (c[e] < prev && c[e] > b)
+        b = c[e];
+    lv[lid] = b;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int off = TOPK_LS / 2; off > 0; off >>= 1) {
+      if (lid < off && lv[lid + off] > lv[lid])
+        lv[lid] = lv[lid + off];
+      barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    prev = lv[0];
+    if (lid == 0)
+      part[get_group_id(0) * K + r] = prev;
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+}
+)CL";
+
+// Must match TOPK_LS / TOPK_EPT in the source above.
+static constexpr int TOPK_LS = 64;
+static constexpr int TOPK_PER_GROUP = 64 * 16;
+// Candidates each group keeps. 32 of 1 024: with 256 groups over a 262 144
+// vocabulary a group rarely holds more than a few of the row's best, and when
+// one does the merge simply proves fewer candidates.
+static constexpr int TOPK_KEEP = 32;
+
+/**
+ * @brief Merge per-group candidate lists (each sorted, zero = none) into the
+ *        global best, keeping only what the lists prove (see above).
+ * @param keys groups * keep keys
+ * @param want at most this many are returned
+ * @param out receives the proven best keys, best first
+ */
+static void topk_merge_groups(const uint64_t *keys, int groups, int keep,
+                              unsigned int want, std::vector<uint64_t> &out) {
+  uint64_t floor = 0;
+  for (int g = 0; g < groups; ++g)
+    floor = std::max(floor, keys[(size_t)g * keep + keep - 1]);
+  out.clear();
+  for (size_t i = 0; i < (size_t)groups * keep; ++i)
+    if (keys[i] > floor)
+      out.push_back(keys[i]);
+  if (out.size() > want) {
+    std::nth_element(out.begin(), out.begin() + want, out.end(),
+                     std::greater<uint64_t>());
+    out.resize(want);
+  }
+  std::sort(out.begin(), out.end(), std::greater<uint64_t>());
+}
+
+bool cl_lmhead_dev_topk(unsigned int vocab, unsigned int want,
+                        unsigned int *ids, float *logits, unsigned int *count) {
+  if (ids == nullptr || logits == nullptr || count == nullptr || want == 0 ||
+      want > CL_LMHEAD_TOPK_MAX || vocab == 0 || !cl_lmhead_pending.live ||
+      cl_lmhead_pending.n != vocab ||
+      (cl_lmhead_pending.softcap != 0.0f && !cl_lmhead_pending.apply))
+    return false;
+  const int groups = (int)((vocab + TOPK_PER_GROUP - 1) / TOPK_PER_GROUP);
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  if (!blas_cc)
+    return false;
+  cl_context ctx = blas_cc->context_inst_.GetContext();
+  cl_command_queue q = blas_cc->command_queue_inst_.GetCommandQueue();
+  if (!ctx || !q)
+    return false;
+
+  ClContext::SharedPtrClKernel k_part =
+    blas_cc->registerClKernel(lmhead_topk_kernel, "lmhead_topk_f16_part");
+  if (!k_part) {
+    static int logged = 0;
+    if (!logged++)
+      std::fprintf(stderr, "[lmhead-topk] registerClKernel failed\n");
+    return false;
+  }
+
+  // Per-group lists. The lm_head N never changes, so this is sized once and
+  // steady decode allocates nothing on the device.
+  static cl_mem part = nullptr;
+  static size_t part_groups = 0;
+  if (part == nullptr || part_groups < (size_t)groups) {
+    if (part != nullptr)
+      opencl::clReleaseMemObjectT(part);
+    cl_int e = CL_SUCCESS;
+    part = opencl::clCreateBuffer(ctx, CL_MEM_READ_WRITE,
+                                  sizeof(uint64_t) * (size_t)groups * TOPK_KEEP,
+                                  nullptr, &e);
+    if (e != CL_SUCCESS || !part) {
+      part = nullptr;
+      part_groups = 0;
+      return false; // the row is still pending; the caller reads it instead
+    }
+    part_groups = (size_t)groups;
+  }
+
+  cl_mem src = cl_lmhead_pending.buf;
+  const int N_i = (int)vocab;
+  const int K_i = TOPK_KEEP;
+  const int gws[3] = {groups * TOPK_LS, 1, 1};
+  const int lws[3] = {TOPK_LS, 1, 1};
+  if (!k_part->SetKernelArguments(0, &src, sizeof(cl_mem)) ||
+      !k_part->SetKernelArguments(1, &part, sizeof(cl_mem)) ||
+      !k_part->SetKernelArguments(2, &N_i, sizeof(int)) ||
+      !k_part->SetKernelArguments(3, &K_i, sizeof(int)))
+    return false;
+  if (!blas_cc->command_queue_inst_.DispatchCommand(k_part, gws, lws))
+    return false;
+
+  // The one blocking sync of the step. The queue is in-order, so this also
+  // waits for the GEMV that produced the row.
+  static std::vector<uint64_t> keys;
+  keys.resize((size_t)groups * TOPK_KEEP);
+  if (opencl::clEnqueueReadBuffer(q, part, CL_TRUE, 0,
+                                  sizeof(uint64_t) * keys.size(), keys.data(),
+                                  0, nullptr, nullptr) != CL_SUCCESS)
+    return false;
+  static std::vector<uint64_t> best;
+  topk_merge_groups(keys.data(), groups, TOPK_KEEP, want, best);
+  if (best.empty())
+    return false;
+
+  const unsigned int n = (unsigned int)best.size();
+  uint16_t raw[CL_LMHEAD_TOPK_MAX];
+  for (unsigned int r = 0; r < n; ++r) {
+    const uint32_t id = 0xffffffffu - (uint32_t)(best[r] & 0xffffffffu);
+    const uint32_t key = (uint32_t)(best[r] >> 32);
+    if (id >= vocab) // cannot happen for a reduction that saw the row
+      return false;
+    ids[r] = id;
+    raw[r] =
+      (key & 0x8000u) ? (uint16_t)(key & 0x7fffu) : (uint16_t)(~key & 0xffffu);
+  }
+  uint16_t capped[CL_LMHEAD_TOPK_MAX];
+  const uint16_t *vals = raw;
+  if (cl_lmhead_pending.softcap != 0.0f) {
+    cl_lmhead_pending.apply(raw, capped, n);
+    vals = capped;
+  }
+  for (unsigned int r = 0; r < n; ++r)
+    logits[r] = compute_fp16_to_fp32(vals[r]);
+  *count = n;
+  return true;
+}
+
+void cl_lmhead_release_logits() { cl_lmhead_pending = ClLmHeadPending{}; }
 
 // High-precision lm_head GEMV on an UNQUANTIZED FP32 weight. The Q6_K lm_head
 // (q6k_gemv_lmhead above) loses ~1.66 logit on the first-token argmax (the

@@ -240,6 +240,53 @@ inline unsigned int sampleToken(const float *logits, int len, float temperature,
   return samplingDrawRanked(cand.data(), cand.size(), top_p, rng);
 }
 
+/**
+ * @brief Draw one token from the n highest logits of a row instead of the
+ *        whole row -- the entry point for a top-k selected on a device.
+ * @details @a ids / @a logits must hold the n highest logits of the row in
+ *          rank order (higher logit first, lower id on an exact tie), so that
+ *          every token outside them has a logit <= logits[n - 1]. The token
+ *          drawn is the one sampleToken() would draw from the full row, with
+ *          the same RNG use, provided the k-th best score is strictly above
+ *          the score of entry n - 1. Dividing by the temperature can merge two
+ *          neighbouring logits into one score, and then the tie-break by id
+ *          could pull in a token the device did not return; in that case (and
+ *          for any non-finite candidate) nothing is drawn and false is
+ *          returned, so the caller can sample the full row instead.
+ * @param ids candidate token ids, in rank order
+ * @param logits candidate logits, same order
+ * @param n number of candidates; must exceed the effective top-k
+ * @param temperature softmax temperature; <= 1e-5 means argmax
+ * @param top_k number of candidates to keep (> 0)
+ * @param top_p nucleus mass
+ * @param rng RNG, advanced by exactly one step only when a token is sampled
+ * @param token receives the token on success
+ * @return false when the candidates cannot prove the result; rng untouched
+ */
+inline bool sampleTokenFromTopCandidates(const unsigned int *ids,
+                                         const float *logits, std::size_t n,
+                                         float temperature, unsigned int top_k,
+                                         float top_p, SamplingRng &rng,
+                                         unsigned int *token) {
+  const bool argmax = temperature <= 1e-5f;
+  const std::size_t k = argmax ? 1 : top_k;
+  if (k == 0 || n <= k || token == nullptr)
+    return false;
+  std::vector<SamplingCandidate> cand(n);
+  for (std::size_t i = 0; i < n; ++i) {
+    if (!std::isfinite(logits[i]))
+      return false;
+    cand[i] = {ids[i], argmax ? logits[i] : logits[i] / temperature};
+  }
+  const float last = cand[n - 1].second;
+  std::sort(cand.begin(), cand.end(), samplingRanksBefore);
+  if (!(cand[k - 1].second > last))
+    return false;
+  *token =
+    argmax ? cand[0].first : samplingDrawRanked(cand.data(), k, top_p, rng);
+  return true;
+}
+
 } // namespace causallm
 
 #endif /* __CAUSALLM_TOKEN_SAMPLER_H__ */
