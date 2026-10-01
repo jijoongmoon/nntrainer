@@ -592,6 +592,19 @@ void Transformer::load_weight(const std::string &weight_path) {
    *  some a model directory, and the override that resolves it is the same one
    *  either way. */
   weight_path_ = weight_path;
+
+  /** Pack the QS4CX weights for the CPU GEMM here, as part of the load,
+   *  rather than leaving it to whichever caller remembers repack_weight(). A
+   *  load path that did not call it (the library API) used to pay for the
+   *  pack inside the first request instead -- every FC of an fp16-activation
+   *  graph packed lazily on its first forward, an untied head on the first
+   *  decode token -- and an fp32-activation graph re-packed every FC on every
+   *  call. repack_weight() is idempotent, so a caller that still calls it
+   *  afterwards (the CLI) does no extra work, and it is a no-op on the GPU
+   *  engines. A swap (FSU) model keeps packing on demand: it streams weights
+   *  precisely so that they are not all resident at once. */
+  if (!MEMORY_SWAP)
+    repack_weight();
 };
 
 unsigned int Transformer::prefillPlaneFor(unsigned int prompt_tokens) const {
@@ -708,9 +721,9 @@ void Transformer::repack_weight() {
   // [perf/thermal] The KAI rhs-pack below is consumed ONLY by the ARM CPU
   // KleidiAI GEMM. The GPU (v8c) and x86 paths read the plain on-disk QS4CX
   // blob directly (see the comment at the pack() call). On a GPU run the whole
-  // loop is therefore redundant CPU work — and it is single-threaded, so for a
-  // large model it pins one core to a thermal shutdown (Adreno: GPU idle at 0%,
-  // one CPU core -> ~104C -> device reboot; 96%+ of CPU was in
+  // loop is therefore redundant CPU work — when it was still single-threaded,
+  // a large model pinned one core to a thermal shutdown (Adreno: GPU idle at
+  // 0%, one CPU core -> ~104C -> device reboot; 96%+ of CPU was in
   // kai_run_rhs_pack). Skip it on every non-CPU engine — "gpu" (OpenCL) AND
   // "cuda" both consume the plain blob; only the ARM CPU (KAI) run packs.
   // (On ARM64 CUDA the old =="gpu" check let packF16Activation allocate a

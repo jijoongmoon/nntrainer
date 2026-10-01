@@ -145,12 +145,15 @@ public:
 
   /**
    * @brief Load the model weights from a file
+   * @note Ends with repack_weight() unless the model swaps its weights (FSU),
+   * so every load path leaves the CPU GEMM's packed weights ready.
    */
   virtual void load_weight(const std::string &weight_path);
 
   /**
    * @brief Repack all QS4CX weights after loading
-   * @note Must be called after load_weight() for QS4CX quantized tensors
+   * @note load_weight() already calls it; calling it again is a no-op, since
+   * every weight packs at most once.
    * @note Prepares weights for efficient computation by eagerly packing them
    */
   virtual void repack_weight();
