@@ -104,8 +104,8 @@ inline std::size_t sampleIndex(const double *weights, std::size_t n,
 
 /**
  * @brief Candidate order used by top-k: higher score first, lower token id on
- *        an exact tie. A strict weak order, so std::partial_sort's result is
- *        fully determined.
+ *        an exact tie. A strict total order, so any sort or selection
+ *        under it is fully determined.
  * @param a first candidate {token id, score}
  * @param b second candidate {token id, score}
  * @return true if a ranks before b
@@ -117,38 +117,69 @@ inline bool samplingRanksBefore(const std::pair<unsigned int, float> &a,
   return a.first < b.first;
 }
 
+/** @brief A sampling candidate: {token id, score}. */
+using SamplingCandidate = std::pair<unsigned int, float>;
+
 /**
- * @brief Apply temperature, top-k and top-p to logits and draw one token.
- * @param logits raw logits (not modified)
+ * @brief Select the @a k best candidates of logits / temperature, in rank
+ *        order (samplingRanksBefore).
+ * @details One pass over the row with a k-entry heap whose front is the
+ *          worst candidate kept so far: O(V + k log k) for typical rows, no
+ *          V-sized allocation. Because ids are scanned in increasing order, a
+ *          later id never wins an exact tie, so only a strictly greater score
+ *          can displace the heap front. The ranking is a strict total order,
+ *          so the result is exactly what a full sort followed by taking the
+ *          first k returns.
+ * @param logits raw logits
  * @param len vocabulary size
- * @param temperature softmax temperature; <= 1e-5 means argmax
- * @param top_k number of candidates to keep; 0 or >= len keeps all
+ * @param temperature divisor applied to every logit (1.0 keeps them as is)
+ * @param k number of candidates wanted; >= len selects the whole row
+ * @param out receives min(k, len) candidates, best first
+ */
+inline void samplingSelectTopK(const float *logits, std::size_t len,
+                               float temperature, std::size_t k,
+                               std::vector<SamplingCandidate> &out) {
+  out.clear();
+  if (len == 0 || k == 0)
+    return;
+  if (k >= len) {
+    out.resize(len);
+    for (std::size_t i = 0; i < len; ++i)
+      out[i] = {static_cast<unsigned int>(i), logits[i] / temperature};
+    std::sort(out.begin(), out.end(), samplingRanksBefore);
+    return;
+  }
+  out.reserve(k);
+  std::size_t i = 0;
+  for (; i < k; ++i)
+    out.emplace_back(static_cast<unsigned int>(i), logits[i] / temperature);
+  // With samplingRanksBefore as "less", the heap front is the candidate that
+  // ranks last, i.e. the one the next better score evicts.
+  std::make_heap(out.begin(), out.end(), samplingRanksBefore);
+  float worst = out.front().second;
+  for (; i < len; ++i) {
+    const float s = logits[i] / temperature;
+    if (!(s > worst))
+      continue;
+    std::pop_heap(out.begin(), out.end(), samplingRanksBefore);
+    out.back() = {static_cast<unsigned int>(i), s};
+    std::push_heap(out.begin(), out.end(), samplingRanksBefore);
+    worst = out.front().second;
+  }
+  std::sort_heap(out.begin(), out.end(), samplingRanksBefore);
+}
+
+/**
+ * @brief Softmax, top-p and the draw over candidates already in rank order.
+ * @param cand candidates, best first (scores already divided by temperature)
+ * @param k number of candidates (> 0)
  * @param top_p nucleus mass; see the file comment for the boundary rule
- * @param rng RNG, advanced by exactly one step unless argmax is taken
+ * @param rng RNG, advanced by exactly one step unless the row is all masked
  * @return sampled token id
  */
-inline unsigned int sampleToken(const float *logits, int len, float temperature,
-                                unsigned int top_k, float top_p,
-                                SamplingRng &rng) {
-  if (len <= 0)
-    return 0;
-
-  if (temperature <= 1e-5f) {
-    // std::max_element returns the first maximum, i.e. the lowest id.
-    return static_cast<unsigned int>(
-      std::distance(logits, std::max_element(logits, logits + len)));
-  }
-
-  std::vector<std::pair<unsigned int, float>> cand(len);
-  for (int i = 0; i < len; ++i)
-    cand[i] = {static_cast<unsigned int>(i), logits[i] / temperature};
-
-  std::size_t k = static_cast<std::size_t>(len);
-  if (top_k > 0 && top_k < static_cast<unsigned int>(len))
-    k = top_k;
-  std::partial_sort(cand.begin(), cand.begin() + k, cand.end(),
-                    samplingRanksBefore);
-
+inline unsigned int samplingDrawRanked(const SamplingCandidate *cand,
+                                       std::size_t k, float top_p,
+                                       SamplingRng &rng) {
   const double max_score = cand[0].second;
   if (!std::isfinite(max_score))
     return cand[0].first; // every candidate masked: nothing to draw from
@@ -176,6 +207,37 @@ inline unsigned int sampleToken(const float *logits, int len, float temperature,
   }
 
   return cand[sampleIndex(probs.data(), keep, rng)].first;
+}
+
+/**
+ * @brief Apply temperature, top-k and top-p to logits and draw one token.
+ * @param logits raw logits (not modified)
+ * @param len vocabulary size
+ * @param temperature softmax temperature; <= 1e-5 means argmax
+ * @param top_k number of candidates to keep; 0 or >= len keeps all
+ * @param top_p nucleus mass; see the file comment for the boundary rule
+ * @param rng RNG, advanced by exactly one step unless argmax is taken
+ * @return sampled token id
+ */
+inline unsigned int sampleToken(const float *logits, int len, float temperature,
+                                unsigned int top_k, float top_p,
+                                SamplingRng &rng) {
+  if (len <= 0)
+    return 0;
+
+  if (temperature <= 1e-5f) {
+    // std::max_element returns the first maximum, i.e. the lowest id.
+    return static_cast<unsigned int>(
+      std::distance(logits, std::max_element(logits, logits + len)));
+  }
+
+  std::size_t k = static_cast<std::size_t>(len);
+  if (top_k > 0 && top_k < static_cast<unsigned int>(len))
+    k = top_k;
+  std::vector<SamplingCandidate> cand;
+  samplingSelectTopK(logits, static_cast<std::size_t>(len), temperature, k,
+                     cand);
+  return samplingDrawRanked(cand.data(), cand.size(), top_p, rng);
 }
 
 } // namespace causallm

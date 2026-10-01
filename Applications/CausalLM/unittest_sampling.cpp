@@ -17,7 +17,9 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cmath>
+#include <utility>
 #include <vector>
 
 #include <token_sampler.h>
@@ -25,6 +27,7 @@
 using causallm::kDefaultSamplingSeed;
 using causallm::sampleIndex;
 using causallm::sampleToken;
+using causallm::samplingRanksBefore;
 using causallm::SamplingRng;
 using causallm::samplingUniform;
 
@@ -35,6 +38,72 @@ std::vector<float> makeLogits(int n) {
   std::vector<float> l(n);
   for (int i = 0; i < n; ++i)
     l[i] = std::sin(0.37f * i) * 4.0f + 0.001f * (i % 7);
+  return l;
+}
+
+/**
+ * @brief The sampler as it was before the top-k selection became a one-pass
+ *        heap: a V-sized candidate array and std::partial_sort. Kept as the
+ *        reference the selection must reproduce exactly.
+ */
+unsigned int referenceSampleToken(const float *logits, int len,
+                                  float temperature, unsigned int top_k,
+                                  float top_p, SamplingRng &rng) {
+  if (temperature <= 1e-5f)
+    return static_cast<unsigned int>(
+      std::distance(logits, std::max_element(logits, logits + len)));
+  std::vector<std::pair<unsigned int, float>> cand(len);
+  for (int i = 0; i < len; ++i)
+    cand[i] = {static_cast<unsigned int>(i), logits[i] / temperature};
+  std::size_t k = static_cast<std::size_t>(len);
+  if (top_k > 0 && top_k < static_cast<unsigned int>(len))
+    k = top_k;
+  std::partial_sort(cand.begin(), cand.begin() + k, cand.end(),
+                    samplingRanksBefore);
+  const double max_score = cand[0].second;
+  if (!std::isfinite(max_score))
+    return cand[0].first;
+  std::vector<double> probs(k);
+  double sum = 0.0;
+  for (std::size_t i = 0; i < k; ++i) {
+    probs[i] = std::exp(static_cast<double>(cand[i].second) - max_score);
+    sum += probs[i];
+  }
+  for (std::size_t i = 0; i < k; ++i)
+    probs[i] /= sum;
+  std::size_t keep = k;
+  if (top_p > 0.0f && top_p < 1.0f) {
+    const double p = top_p;
+    double above = 0.0;
+    keep = 1;
+    for (std::size_t i = 1; i < k; ++i) {
+      above += probs[i - 1];
+      if (!(above < p))
+        break;
+      keep = i + 1;
+    }
+  }
+  return cand[sampleIndex(probs.data(), keep, rng)].first;
+}
+
+/**
+ * @brief Random logits drawn from a small set of levels, so exact ties are
+ *        common everywhere in the row, including at the top-k boundary.
+ */
+std::vector<float> makeTiedLogits(int n, int levels, SamplingRng &gen) {
+  std::vector<float> l(n);
+  for (int i = 0; i < n; ++i)
+    l[i] = static_cast<float>(gen() % levels) * 0.25f - 4.0f;
+  return l;
+}
+
+/**
+ * @brief Random continuous logits.
+ */
+std::vector<float> makeRandomLogits(int n, SamplingRng &gen) {
+  std::vector<float> l(n);
+  for (int i = 0; i < n; ++i)
+    l[i] = static_cast<float>(causallm::samplingUniform(gen) * 30.0 - 15.0);
   return l;
 }
 
@@ -171,4 +240,37 @@ TEST(causallm_sampling, sample_index_skips_zero_weight_p) {
   SamplingRng rng(kDefaultSamplingSeed);
   for (int i = 0; i < 1000; ++i)
     EXPECT_EQ(sampleIndex(w, 4, rng), 1u);
+}
+
+/**
+ * @brief The one-pass top-k selection draws exactly the token (and leaves
+ *        exactly the RNG state) of the full-sort reference, on random rows
+ *        with and without ties, for every top_k / temperature / top_p shape.
+ */
+TEST(causallm_sampling, topk_selection_matches_full_sort_p) {
+  SamplingRng gen(2024);
+  const unsigned int ks[] = {0, 1, 2, 5, 40, 64, 100, 999, 1000, 5000};
+  const float temps[] = {0.3f, 0.7f, 1.0f, 1.7f};
+  const float tps[] = {0.0f, 0.5f, 0.9f, 0.95f, 1.0f};
+  int draws = 0;
+  for (int row = 0; row < 24; ++row) {
+    const int len = (row % 3 == 0) ? 1000 : 4099;
+    const auto logits = (row % 2 == 0) ? makeTiedLogits(len, 7 + row, gen)
+                                       : makeRandomLogits(len, gen);
+    for (unsigned int k : ks) {
+      for (float t : temps) {
+        for (float tp : tps) {
+          SamplingRng a(row * 131u + k), b(row * 131u + k);
+          for (int step = 0; step < 3; ++step) {
+            ASSERT_EQ(sampleToken(logits.data(), len, t, k, tp, a),
+                      referenceSampleToken(logits.data(), len, t, k, tp, b))
+              << "row " << row << " k " << k << " T " << t << " p " << tp;
+            ++draws;
+          }
+          EXPECT_EQ(a(), b());
+        }
+      }
+    }
+  }
+  EXPECT_GT(draws, 10000);
 }
