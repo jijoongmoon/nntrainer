@@ -706,7 +706,9 @@ Tensor Gemma4Transformer::createSharedAttention(const int layer_id,
   // flash_attention_prefill_f16_cl call in MHACoreLayer). The flash kernel
   // handles d=256 sliding (window mask) + GQA, and the d=512 full layers too
   // (LWS=64 keeps VPL<=8). Without this flag prefill attention runs entirely
-  // on the slow CPU non-gemm path (~222 TPS @ M=1024).
+  // on the slow CPU non-gemm path (~222 TPS @ M=1024). It follows the
+  // nntr_config key "use_flash_attention" (default true), so a pack can still
+  // select the per-row path.
   std::vector<std::string> a_params = {
     withKey("name", A), withKey("num_heads", n_heads),
     withKey("num_heads_kv", curr_kv_heads),
@@ -720,7 +722,7 @@ Tensor Gemma4Transformer::createSharedAttention(const int layer_id,
             std::to_string(rope_partial_rotary_factor)),
     withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
     withKey("attn_logit_softcapping", std::to_string(ATTN_LOGIT_SOFTCAPPING)),
-    withKey("use_gemm_attention", "true"),
+    withKey("use_gemm_attention", USE_FLASH_ATTENTION ? "true" : "false"),
     // Decode-GPU path is token-identical for gemma4: both the flash decode
     // attention and the GPU-RoPE-decode are validated, so enable both by
     // default (no NNTR_MHA_GPU_DECODE env needed). The env flag still forces
@@ -875,7 +877,9 @@ Tensor Gemma4Transformer::createAttention(const int layer_id, int seq_len,
   // flash_attention_prefill_f16_cl call in MHACoreLayer). The flash kernel
   // handles d=256 sliding (window mask) + GQA, and the d=512 full layers too
   // (LWS=64 keeps VPL<=8). Without this flag prefill attention runs entirely
-  // on the slow CPU non-gemm path (~222 TPS @ M=1024).
+  // on the slow CPU non-gemm path (~222 TPS @ M=1024). It follows the
+  // nntr_config key "use_flash_attention" (default true), so a pack can still
+  // select the per-row path.
   std::vector<std::string> a_params = {
     withKey("name", A), withKey("num_heads", n_heads),
     withKey("num_heads_kv", curr_kv_heads),
@@ -889,7 +893,7 @@ Tensor Gemma4Transformer::createAttention(const int layer_id, int seq_len,
             std::to_string(rope_partial_rotary_factor)),
     withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
     withKey("attn_logit_softcapping", std::to_string(ATTN_LOGIT_SOFTCAPPING)),
-    withKey("use_gemm_attention", "true"),
+    withKey("use_gemm_attention", USE_FLASH_ATTENTION ? "true" : "false"),
     // Decode-GPU path is token-identical for gemma4: both the flash decode
     // attention and the GPU-RoPE-decode are validated, so enable both by
     // default (no NNTR_MHA_GPU_DECODE env needed). The env flag still forces

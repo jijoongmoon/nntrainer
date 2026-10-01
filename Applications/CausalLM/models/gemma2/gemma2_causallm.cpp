@@ -202,7 +202,9 @@ Tensor Gemma2Transformer::createAttention(const int layer_id, int seq_len,
       withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
       withKey("attn_logit_softcapping", std::to_string(ATTN_LOGIT_SOFTCAPPING)),
       withKey("is_causal", IS_CAUSAL ? "true" : "false"),
-      withKey("use_gemm_attention", "true"),
+      // nntr_config "use_flash_attention" (default true) selects the flash
+      // arm; false keeps this layer on the per-row path.
+      withKey("use_gemm_attention", USE_FLASH_ATTENTION ? "true" : "false"),
       // Decode-GPU: flash decode attention (B) is token-identical for gemma2,
       // so enable it by default. GPU-RoPE-decode (A) DIVERGES on gemma2, so
       // keep it OFF -> decode runs GPU flash attention + HOST RoPE (the fast,
