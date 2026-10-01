@@ -16,6 +16,7 @@
 #include <cpu_backend.h>
 #include <qs4cx_tensor.h>
 #include <tensor.h>
+#include <thread_manager.h>
 
 #include <atomic>
 #include <cstring>
@@ -229,7 +230,8 @@ void *QS4CX_Tensor::getData() const {
 }
 
 void QS4CX_Tensor::pack() {
-  if (packed_data) {
+  if (packed_f32.load(std::memory_order_acquire) ||
+      packed_f16.load(std::memory_order_acquire)) {
     return;
   }
   // Host reader of the plain nibbles + scales (the KAI rhs pack).
@@ -245,17 +247,21 @@ void QS4CX_Tensor::pack() {
 
   size_t packed_size = nntrainer::get_rhs_packed_size_qsi4cxp_qs4cxs1s0(
     N, K, opt_kernel_idx, true);
-  packed_data = std::make_unique<uint8_t[]>(packed_size);
+  // Left uninitialized: the packer writes every byte of it. Zeroing it first
+  // would only fault the whole buffer in on this thread before the parallel
+  // pack touches it again.
+  std::unique_ptr<uint8_t[]> buf(new uint8_t[packed_size]);
 
   // getScale() places the fp32 scales at whichever record stride this tensor
   // was loaded with, so ask it rather than repeating one of the two strides.
-  nntrainer::rhs_pack_qsi4cxp_qs4cxs1s0(N, K, packed_data.get(), getData(),
-                                        (uint8_t *)getScale(), opt_kernel_idx,
-                                        true);
+  // A backend without a packer throws here, before anything is published.
+  nntrainer::rhs_pack_qsi4cxp_qs4cxs1s0(
+    N, K, buf.get(), getData(), (uint8_t *)getScale(), opt_kernel_idx, true);
 
-  if (!packed_data) {
-    throw std::runtime_error{"something wrong"};
-  }
+  packed_data = std::move(buf);
+  // Publish last: a thread that sees this flag through the unlocked check in
+  // FloatTensor::dotQs4cx must also see the buffer filled above.
+  packed_f32.store(true, std::memory_order_release);
 }
 
 void *QS4CX_Tensor::getPackedData() const {
@@ -268,7 +274,8 @@ void *QS4CX_Tensor::getPackedData() const {
 
 void QS4CX_Tensor::packF16Activation() {
 #if defined(__aarch64__) || defined(__arm__)
-  if (packed_data) {
+  if (packed_f16.load(std::memory_order_acquire) ||
+      packed_f32.load(std::memory_order_acquire)) {
     return;
   }
   // Host reader of the plain nibbles + scales (the fp16-activation KAI rhs).
@@ -279,24 +286,33 @@ void QS4CX_Tensor::packF16Activation() {
   // call, so this changes when it is built, not what is computed. fp16-act
   // graphs never touch pack()'s fp32-facade layout, so packed_data can hold
   // this one instead — one packed copy in RAM instead of two.
+  //
+  // Each super-row is built straight into its final place from its own plain
+  // rows (Int4Utils::packPlainToKaiRhsPackedRows), so the work splits across
+  // the thread pool and needs no full-size Section A or staging copy: the
+  // only allocation is the packed buffer itself, and its pages are first
+  // touched by the thread that fills them.
   const size_t K = height();
   const size_t N = width();
+  const size_t packed_size = Int4Utils::kaiRhsPackedBytes(N, K);
+  std::unique_ptr<uint8_t[]> buf(new uint8_t[packed_size]);
 
-  std::vector<uint8_t> section_a(Int4Utils::kaiNibblePayloadBytes(N, K));
-  Int4Utils::packPlainToSectionA((const uint8_t *)getData(), N, K,
-                                 section_a.data());
-
-  std::vector<uint16_t> fp16_scales(N);
+  const uint8_t *plain = (const uint8_t *)getData();
   const float *scales = (const float *)getScale();
-  for (size_t n = 0; n < N; ++n)
-    fp16_scales[n] = compute_fp32_to_fp16(scales[n]);
+  const size_t super_rows = (N + Int4Utils::KAI_NR - 1) / Int4Utils::KAI_NR;
+  // 16 super-rows (64 output channels) per task: small enough to balance a
+  // 1.5K-row projection over the pool, large enough to keep the per-task
+  // overhead out of a vocabulary-sized head.
+  constexpr size_t kSuperRowsPerTask = 16;
+  const size_t tasks = (super_rows + kSuperRowsPerTask - 1) / kSuperRowsPerTask;
+  uint8_t *dst = buf.get();
+  ThreadManager::Global().parallel_for(0, tasks, [&](size_t t) {
+    const size_t sr0 = t * kSuperRowsPerTask;
+    Int4Utils::packPlainToKaiRhsPackedRows(plain, scales, N, K, sr0,
+                                           sr0 + kSuperRowsPerTask, dst);
+  });
 
-  std::vector<uint8_t> packed;
-  Int4Utils::assembleKaiRhsPacked(section_a.data(), fp16_scales.data(), N, K,
-                                  packed);
-
-  packed_data = std::make_unique<uint8_t[]>(packed.size());
-  std::memcpy(packed_data.get(), packed.data(), packed.size());
+  packed_data = std::move(buf);
   // Publish last: a thread that sees this flag through the unlocked check in
   // HalfTensor::dot must also see the buffer filled above.
   packed_f16.store(true, std::memory_order_release);

@@ -241,8 +241,12 @@ public:
 
   /**
    * @brief Eagerly pack the weight data after loading
-   * @note Must be called after load_weight() to prepare for computation
-   * @note Prepares weight data for efficient matrix multiplication
+   * @note Prepares the fp32-activation KAI rhs once, so the GEMM does not pack
+   * the weight on every call. FloatTensor::dotQs4cx() calls it lazily when the
+   * load path did not. The pack runs in parallel over the ThreadManager, so
+   * it must not be called from inside a parallel_for. The buffer is published
+   * only after it is complete, and nothing is kept if the backend has no
+   * packer (x86 throws NYI).
    */
   void pack() override;
 
@@ -253,7 +257,9 @@ public:
    * assembleKaiRhsPacked), so this only moves WHEN it is built. The layout is
    * NOT interchangeable with pack()'s fp32-facade rhs; repack_weight() picks
    * one of the two by the model's activation dtype. ARM-only (no-op
-   * elsewhere, mirroring pack()'s NYI behavior on x86).
+   * elsewhere, mirroring pack()'s NYI behavior on x86). Built in parallel
+   * over the ThreadManager straight into the final buffer, so the same
+   * no-nested-parallel_for rule as pack() applies.
    */
   void packF16Activation() override;
 
@@ -261,7 +267,7 @@ public:
    * @copydoc TensorBase::isPackedF16Activation()
    */
   bool isPackedF16Activation() const override {
-    return packed_f16.load(std::memory_order_acquire) && packed_data != nullptr;
+    return packed_f16.load(std::memory_order_acquire);
   }
 
   /**
@@ -271,8 +277,7 @@ public:
    * interchangeable, so the fp16 one must not be reported here.
    */
   bool isPacked() const override {
-    return !packed_f16.load(std::memory_order_acquire) &&
-           packed_data != nullptr;
+    return packed_f32.load(std::memory_order_acquire);
   }
 
   /**
@@ -323,6 +328,12 @@ private:
    * thread that sees the flag set also sees the buffer it names.
    */
   std::atomic<bool> packed_f16 = {false};
+  /**
+   * @brief packed_data holds pack()'s fp32-activation KAI rhs
+   * @note Same double-checked-lock contract as packed_f16, for the lazy pack
+   * in FloatTensor::dotQs4cx(). At most one of the two flags is ever set.
+   */
+  std::atomic<bool> packed_f32 = {false};
 };
 
 /**

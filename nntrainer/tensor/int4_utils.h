@@ -38,7 +38,8 @@ namespace nntrainer {
  * IS reachable it is the one used: QS4CX_Tensor::pack() calls
  * rhs_pack_qsi4cxp_qs4cxs1s0() through cpu_backend, not anything here. The
  * one Arm path still assembling its own is the fp16-scale rhs
- * (QS4CX_Tensor::packF16Activation), because the fp16 QS4CX KleidiAI
+ * (QS4CX_Tensor::packF16Activation, via packPlainToKaiRhsPackedRows), because
+ * the fp16 QS4CX KleidiAI
  * interface is not in the tree yet; it moves over with that interface.
  */
 class Int4Utils {
@@ -289,6 +290,33 @@ public:
                                    const uint16_t *fp16_scales,
                                    size_t rows_count, size_t columns_count,
                                    std::vector<uint8_t> &out_kai_packed);
+
+  /**
+   * @brief Build super-rows [sr_begin, sr_end) of the fp16-activation KAI
+   *        rhs_packed buffer straight from a plain QS4CX record.
+   *
+   * Byte-identical to packPlainToSectionA() followed by assembleKaiRhsPacked()
+   * with each scale rounded to fp16 first. It writes every super-row into its
+   * final place in @a out_kai_packed instead of going through two full-size
+   * intermediate copies, and a super-row reads only its own KAI_NR plain
+   * rows, so disjoint ranges can be filled from different threads.
+   *
+   * @param plain_nibbles  plain row-major nibbles, N x ceil(K/2) bytes.
+   * @param fp32_scales    per-output-channel fp32 scales, size N.
+   * @param rows_count     N (output channels).
+   * @param columns_count  K (input channels).
+   * @param sr_begin       first super-row to write.
+   * @param sr_end         one past the last super-row to write.
+   * @param out_kai_packed the WHOLE buffer, kaiRhsPackedBytes(N, K) bytes.
+   *                       Every byte of the given super-rows is written, so it
+   *                       does not have to be zeroed first.
+   */
+  static void packPlainToKaiRhsPackedRows(const uint8_t *plain_nibbles,
+                                          const float *fp32_scales,
+                                          size_t rows_count,
+                                          size_t columns_count, size_t sr_begin,
+                                          size_t sr_end,
+                                          uint8_t *out_kai_packed);
 
   /**
    * @brief     Quantize one float value to 4-bits integer

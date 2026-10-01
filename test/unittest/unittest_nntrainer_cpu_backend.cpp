@@ -504,6 +504,66 @@ TEST(nntrainer_cpu_backend_standalone, qint4_legacy_reader_to_qs4cx) {
   }
 }
 
+/**
+ * @brief The fused, row-range fp16-activation rhs builder
+ *   (Int4Utils::packPlainToKaiRhsPackedRows) must give, byte for byte, the
+ *   buffer the two-step path gives (packPlainToSectionA, then
+ *   assembleKaiRhsPacked over fp16-rounded scales), whether it is filled in
+ *   one call or in disjoint pieces. Covers a partial last super-row
+ *   (N % 4 != 0) and a K that is not a multiple of 32.
+ */
+TEST(nntrainer_cpu_backend_standalone, qs4cx_kai_rhs_rows_match_two_step) {
+  nntrainer::init_backend();
+
+  const std::vector<std::pair<size_t, size_t>> shapes = {
+    {4, 32}, {10, 64}, {64, 96}, {130, 80}, {1536, 512}};
+
+  for (auto &shape : shapes) {
+    const size_t N = shape.first;
+    const size_t K = shape.second;
+    const size_t row_bytes = (K + 1) / 2;
+
+    std::mt19937 rng(static_cast<unsigned int>(N * 131 + K));
+    std::uniform_int_distribution<int> byte_dist(0, 255);
+    std::uniform_real_distribution<float> scale_dist(1e-4f, 0.1f);
+    std::vector<uint8_t> plain(N * row_bytes);
+    for (auto &b : plain)
+      b = static_cast<uint8_t>(byte_dist(rng));
+    std::vector<float> scales(N);
+    for (auto &s : scales)
+      s = scale_dist(rng);
+
+    // Two-step reference.
+    std::vector<uint8_t> sec_a(
+      nntrainer::Int4Utils::kaiNibblePayloadBytes(N, K));
+    nntrainer::Int4Utils::packPlainToSectionA(plain.data(), N, K, sec_a.data());
+    std::vector<uint16_t> fp16_scales(N);
+    for (size_t n = 0; n < N; ++n)
+      fp16_scales[n] = nntrainer::compute_fp32_to_fp16(scales[n]);
+    std::vector<uint8_t> ref;
+    nntrainer::Int4Utils::assembleKaiRhsPacked(sec_a.data(), fp16_scales.data(),
+                                               N, K, ref);
+    ASSERT_EQ(ref.size(), nntrainer::Int4Utils::kaiRhsPackedBytes(N, K));
+
+    const size_t super_rows =
+      (N + nntrainer::Int4Utils::KAI_NR - 1) / nntrainer::Int4Utils::KAI_NR;
+
+    // One call over every super-row, into a poisoned buffer.
+    std::vector<uint8_t> whole(ref.size(), 0x5A);
+    nntrainer::Int4Utils::packPlainToKaiRhsPackedRows(
+      plain.data(), scales.data(), N, K, 0, super_rows, whole.data());
+    EXPECT_EQ(whole, ref) << "single call mismatch N=" << N << " K=" << K;
+
+    // Disjoint pieces of 3 super-rows, filled back to front; the first piece
+    // filled may run past the end, which is clamped.
+    std::vector<uint8_t> pieces(ref.size(), 0xA5);
+    for (size_t sr = (super_rows - 1) / 3 * 3 + 3; sr >= 3; sr -= 3)
+      nntrainer::Int4Utils::packPlainToKaiRhsPackedRows(
+        plain.data(), scales.data(), N, K, sr - 3, sr, pieces.data());
+    EXPECT_EQ(pieces, ref) << "split fill mismatch N=" << N << " K=" << K;
+  }
+}
+
 float test_gemm_q4_0(const uint32_t M, const uint32_t K, const uint32_t N,
                      const float *weights, const float *activations,
                      std::vector<float> &ref_dst, bool print = false) {

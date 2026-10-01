@@ -270,6 +270,65 @@ void Int4Utils::assembleKaiRhsPacked(const uint8_t *section_a,
   }
 }
 
+void Int4Utils::packPlainToKaiRhsPackedRows(const uint8_t *plain_nibbles,
+                                            const float *fp32_scales,
+                                            size_t rows_count,
+                                            size_t columns_count,
+                                            size_t sr_begin, size_t sr_end,
+                                            uint8_t *out_kai_packed) {
+  const size_t k_internal =
+    ((columns_count + KAI_K_PAD_MULTIPLE - 1) / KAI_K_PAD_MULTIPLE) *
+    KAI_K_PAD_MULTIPLE;
+  const size_t super_row_count = (rows_count + KAI_NR - 1) / KAI_NR;
+  const size_t nibble_bytes_per_super_row = KAI_NR * (k_internal / 2);
+  const size_t trailer_bytes_per_super_row = KAI_NR * (4 + 4 + 4);
+  const size_t super_row_stride =
+    nibble_bytes_per_super_row + trailer_bytes_per_super_row;
+  const size_t plain_row_bytes = (columns_count + 1) / 2;
+  const size_t block_length_in_bytes = KAI_KR / KAI_SR; // = 8
+
+  sr_end = std::min(sr_end, super_row_count);
+  for (size_t sr_idx = sr_begin; sr_idx < sr_end; ++sr_idx) {
+    uint8_t *dst_row = out_kai_packed + sr_idx * super_row_stride;
+    const size_t n_first = sr_idx * KAI_NR;
+    const size_t n_here = std::min(KAI_NR, rows_count - n_first);
+
+    // Section A nibbles of this super-row, written in place. Handing
+    // packPlainToSectionA() just these rows gives the same bytes as the
+    // whole-matrix call: its only cross-row step is clamping a padded row to
+    // the last valid one, and for the final, partial super-row that is still
+    // row N - 1.
+    packPlainToSectionA(plain_nibbles + n_first * plain_row_bytes, n_here,
+                        columns_count, dst_row);
+
+    // The trailer, exactly as assembleKaiRhsPacked() derives it.
+    int32_t sums[KAI_NR] = {0, 0, 0, 0};
+    for (size_t dst_byte_idx = 0; dst_byte_idx < nibble_bytes_per_super_row;
+         ++dst_byte_idx) {
+      const size_t block_idx = dst_byte_idx / block_length_in_bytes;
+      const size_t nr_idx = block_idx % KAI_NR;
+      const uint8_t stored = dst_row[dst_byte_idx] ^ 0x88;
+      const int u_lo = stored & 0x0F;
+      const int u_hi = (stored >> 4) & 0x0F;
+      sums[nr_idx] += (u_lo - 8) + (u_hi - 8);
+    }
+
+    int32_t *sums_dst = (int32_t *)(dst_row + nibble_bytes_per_super_row);
+    float *scales_dst = (float *)(dst_row + nibble_bytes_per_super_row +
+                                  KAI_NR * sizeof(int32_t));
+    float *bias_dst = scales_dst + KAI_NR;
+    for (size_t i = 0; i < KAI_NR; ++i) {
+      sums_dst[i] = sums[i] * 16;
+      // The scale goes through fp16 first, as the fp16-scale record did.
+      const size_t n_idx = std::min(n_first + i, rows_count - 1);
+      const float s =
+        compute_fp16_to_fp32(compute_fp32_to_fp16(fp32_scales[n_idx]));
+      scales_dst[i] = s * 0.0625F;
+      bias_dst[i] = 0.0F;
+    }
+  }
+}
+
 size_t Int4Utils::plainNibbleBytes(size_t rows_count, size_t columns_count) {
   return rows_count * ((columns_count + 1) / 2);
 }

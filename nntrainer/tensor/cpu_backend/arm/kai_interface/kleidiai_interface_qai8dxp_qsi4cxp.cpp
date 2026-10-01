@@ -229,14 +229,30 @@ void __kai_rhs_pack_qsi4cxp_qs4cxs1s0(size_t n, size_t k,
     nxk_params.lhs_zero_point = 1;
     nxk_params.rhs_zero_point = 8;
 
-    // use custom optimized rhs pack
-    kai_run_rhs_pack_nxk_qsi4cxp_qs4cxs1s0_neon(
-      1, n, k, nr, kr, sr,                     // Packing arguments
-      (const uint8_t *)(rhs_native_mtx_qs4cx), // RHS
-      NULL,                                    // Bias
-      (const float *)(rhs_scales_f32),         // Scale
-      rhs_packed_mtx_qs4cx,                    // RHS packed
-      0, &nxk_params);
+    // use custom optimized rhs pack, split over the thread pool. Every packed
+    // row block of nr rows reads only its own nr source rows and scales, so
+    // packing [n0, n0 + rows) on its own writes exactly the bytes the
+    // whole-matrix call writes at that offset: the only cross-row step, the
+    // clamp of a padded row to the last valid one, still lands on row n - 1
+    // for the final block. Each task covers a multiple of nr rows.
+    const size_t rhs_stride = (k + 1) / 2;
+    const size_t rows_per_task = nr * std::max<size_t>(1, 64 / nr);
+    const size_t tasks = (n + rows_per_task - 1) / rows_per_task;
+    const uint8_t *rhs = (const uint8_t *)(rhs_native_mtx_qs4cx);
+    const float *scales = (const float *)(rhs_scales_f32);
+    uint8_t *packed = (uint8_t *)(rhs_packed_mtx_qs4cx);
+    nntrainer::ThreadManager::Global().parallel_for(0, tasks, [&](size_t t) {
+      const size_t n0 = t * rows_per_task;
+      const size_t rows = std::min(rows_per_task, n - n0);
+      kai_run_rhs_pack_nxk_qsi4cxp_qs4cxs1s0_neon(
+        1, rows, k, nr, kr, sr, // Packing arguments
+        rhs + n0 * rhs_stride,  // RHS
+        NULL,                   // Bias
+        scales + n0,            // Scale
+        packed + kai_get_rhs_packed_offset_rhs_pack_nxk_qsi4cxp_qs4cxs1s0(
+                   n0, k, nr, kr, sr), // RHS packed
+        0, &nxk_params);
+    });
   } else {
     struct kai_rhs_pack_kxn_qsi4cxp_qs4cxs1s0_params kxn_params;
     kxn_params.lhs_zero_point = 1;

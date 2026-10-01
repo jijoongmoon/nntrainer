@@ -11,6 +11,7 @@
 
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <numeric>
 
 #include <chrono>
@@ -1074,14 +1075,29 @@ Tensor &FloatTensor::dotQs4cx(Tensor const &input, Tensor &output, bool trans,
   size_t opt_kernel_idx = (M == 1) ? 2 : 8;
 
   /**
-   * @note Packing the rhs once after load is a caller-driven optimization
-   * (Tensor::pack(), reached through the layer's pack() hook), not a
-   * precondition of this operator: a QS4CX weight that was only loaded is a
-   * complete operand. Take the pre-packed kernel when the pack is there and
-   * the entry point that packs the rhs itself when it is not, which is what
-   * the x86 branch below already does unconditionally. Both spell the same
-   * ukernel with the same rhs bytes, so only the cost differs.
+   * @note A QS4CX weight that was only loaded is a complete operand, but the
+   * KAI GEMM needs its rhs packed, and re-packing it on every call costs a
+   * full allocation, fill and free of the packed weight per FC per token. So
+   * pack it once, here, when the load path did not already (Tensor::pack(),
+   * reached through the layer's pack() hook), and keep the pack with the
+   * weight, the same way HalfTensor::dot keeps its fp16-activation pack. The
+   * packed bytes are the ones the per-call entry point builds, so only the
+   * cost changes. The unlocked check is a double-checked lock over the
+   * release/acquire flag QS4CX_Tensor publishes the pack with.
+   *
+   * A virtual (on-demand mapped) weight is the exception: its plain bytes
+   * come and go with the mapping, and caching a pack for each one would keep
+   * the whole set resident, which is what mapping it on demand avoids. It
+   * keeps packing per call. So does ARMv7, which has no KAI packer.
    */
+#if !defined(ARMV7)
+  if (!input.isPacked() && !input.isVirtual()) {
+    static std::mutex qs4cx_pack_mtx;
+    std::lock_guard<std::mutex> lk(qs4cx_pack_mtx);
+    if (!input.isPacked())
+      const_cast<Tensor &>(input).pack();
+  }
+#endif
   if (input.isPacked()) {
     gemm_qai8dxp_qsi4cxp(M, N, K, lhs, input.getPackedData<char>(), out,
                          opt_kernel_idx);
