@@ -164,21 +164,40 @@ historical; the crate is the source of truth for every platform). Meson copies i
 into `<builddir>/Applications/CausalLM/libtokenizers_c.a` and links the copy, so
 no build step names a tracked path as a link input.
 
-Never write into `Applications/CausalLM/lib/`. A modified archive there shows up
-as a dirty 36+ MB tracked file that blocks `git checkout`. To link an archive
-you built yourself - for example after changing `tokenizers_c_win/src/lib.rs`,
-or for a toolchain the tracked archive does not match - pass it explicitly:
+The tracked archive is a convenience, so that a checkout builds without a Rust
+toolchain. `Applications/CausalLM/tools/build_tokenizers_c.sh` regenerates it
+from the crate: `cargo build --locked` pins every dependency to
+`tokenizers_c_win/Cargo.lock`, build-machine paths are remapped out of the
+archive and debug sections are stripped, so the same rustc and C compiler give
+the same bytes on any machine. It also removes the LLVM bitcode sections
+(`.llvmbc`/`.llvmcmd`) that the precompiled Rust standard library carries for
+LTO and a C/C++ link never reads, about a third of the archive, and fails if the
+result is larger than 30 MiB. The script prints the rustc version, the size and
+the sha256 of what it built. Requirements: Rust (https://rustup.rs/), plus the NDK
+for Android.
 
 ```bash
-$ cargo build --release --locked \
-      --manifest-path Applications/CausalLM/tokenizers_c_win/Cargo.toml \
-      --target-dir build/tokenizers_c_host
+# x86_64 Linux -> Applications/CausalLM/tokenizers-build/x86_64-unknown-linux-gnu/
+$ Applications/CausalLM/tools/build_tokenizers_c.sh
+# Android arm64 -> Applications/CausalLM/tokenizers-build/aarch64-linux-android/
+$ ANDROID_NDK=/path/to/ndk Applications/CausalLM/tools/build_tokenizers_c.sh --abi=arm64-v8a
+```
+
+Never write into `Applications/CausalLM/lib/` by hand. A modified archive there
+shows up as a dirty 20+ MB tracked file that blocks `git checkout`. To link an
+archive you built yourself - for example after changing
+`tokenizers_c_win/src/lib.rs`, or for a toolchain the tracked archive does not
+match - pass it explicitly:
+
+```bash
 $ meson setup build -Denable-transformer=true \
-      -Dcausallm-tokenizer-lib=$PWD/build/tokenizers_c_host/release/libtokenizers_c.a
+      -Dcausallm-tokenizer-lib=$PWD/Applications/CausalLM/tokenizers-build/x86_64-unknown-linux-gnu/libtokenizers_c.a
 ```
 
 Refreshing the tracked archive itself is a deliberate, reviewed commit (the
-archive has to be rebuilt whenever the crate gains symbols), not a build step.
+archive has to be rebuilt whenever the crate gains symbols), not a build step:
+run the script with `--update-prebuilt` and commit the result together with the
+rustc version, size and sha256 it printed.
 
 ### 3. Windows Build & Test
 

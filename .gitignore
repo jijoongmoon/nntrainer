@@ -66,6 +66,7 @@ Applications/CausalLM/res/lfm2_vl/*
 !Applications/CausalLM/res/lfm2_vl/*.py
 Applications/**/tokenizers-cpp-build/*
 Applications/**/tokenizers-android-build/*
+Applications/**/tokenizers-build/*
 
 # CTag
 /tags

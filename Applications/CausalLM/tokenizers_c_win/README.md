@@ -5,10 +5,11 @@ A thin C ABI over the `tokenizers` Rust crate, vendored here with a
 
 ## The `_win` suffix is historical
 
-This crate is the source of truth for **both** consumers, not just Windows:
+This crate is the source of truth for every consumer, not just Windows:
 
 | consumer | script | artifact |
 |---|---|---|
+| Linux (and the tracked `../lib/libtokenizers_c.a`) | `../tools/build_tokenizers_c.sh` | `libtokenizers_c.a` |
 | Windows / MSVC | `../build_tokenizer_windows.ps1` | `tokenizers_c.lib` |
 | Android / NDK  | `../build_tokenizer_android.sh`  | `libtokenizers_android_c.a` |
 
