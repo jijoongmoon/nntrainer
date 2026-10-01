@@ -18,12 +18,22 @@
   defined(__ANDROID__) || defined(__arm__) || defined(_M_ARM) ||               \
   defined(_M_ARM64)
 #include <arm_compute_backend.h>
+#define NNTR_CPU_HAS_Q6_K_Q8_K_DOT 1
 #elif defined(__x86_64__) || defined(__i586__) || defined(_M_X64) ||           \
   defined(_M_IX86)
 #include <x86_compute_backend.h>
+#define NNTR_CPU_HAS_Q6_K_Q8_K_DOT 1
 #else
 #include <fallback.h>
 #endif
+
+/**
+ * @def NNTR_CPU_HAS_Q6_K_Q8_K_DOT
+ * @brief Defined when gemm_q6_K / dot_q6_K_q8_K are implemented (the ggml
+ * q6_K x q8_K integer dot, on the ARM and x86 backends). The generic fallback
+ * backend leaves them NYI, so callers that have an fp32 alternative test this
+ * at compile time instead of catching the NYI throw.
+ */
 
 // Expose the ComputeOps dispatch table (and init_backend declaration) to any
 // consumer that already includes cpu_backend.h.

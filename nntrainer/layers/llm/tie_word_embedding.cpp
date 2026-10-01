@@ -585,10 +585,10 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
         }
       });
     } else if (weight.getDataType() == nntrainer::TensorDim::DataType::Q6_K) {
-      // Q6_K manual lm_head. Mirror the Q4_0 path: dequant each vocab row to
-      // fp32, then sdot against the (single) input row. Avoids Tensor::dot,
-      // which can crash on gpu-context-allocated tensors when this layer is
-      // registered on the OpenCL context.
+      // Q6_K manual lm_head on raw pointers. Avoids Tensor::dot, which
+      // dispatches the tensors' attached op table and can throw on
+      // gpu-context-allocated tensors when this layer is registered on the
+      // OpenCL context. The host arm calls the CPU backend directly.
       const unsigned int hidden_size = input_step.width();
       const unsigned int vocab_size = weight.height();
       NNTR_THROW_IF(weight.width() != hidden_size ||
@@ -691,7 +691,36 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
 #endif
       (void)lmhead_gpu;
 
-      if (!gpu_done) {
+#ifdef NNTR_CPU_HAS_Q6_K_Q8_K_DOT
+      // Host GEMV: quantize the hidden row to q8_K once per token, then one
+      // integer q6_K x q8_K dot per vocab row, threaded over the rows
+      // (gemm_q6_K with M == 1). This is the llama.cpp scheme and the one the
+      // fused Tensor::dot (dotQnK) path used before the lm_head was rewritten
+      // as a per-row dequantize + fp32 sdot loop. Dequantizing every row
+      // streams the whole table through fp32 each token and costs about 2x
+      // decode on Qwen3-class tied heads.
+      bool host_q8k_done = false;
+      if (!gpu_done && (hidden_size % 256) == 0) {
+        std::vector<float> logits_f32(out_fp16 ? vocab_size : 0);
+        float *dst = out_fp16 ? logits_f32.data() : logits;
+        nntrainer::gemm_q6_K<float>(1, vocab_size, hidden_size, input_data,
+                                    hidden_size, weight_data, hidden_size, dst,
+                                    vocab_size);
+#ifdef ENABLE_FP16
+        if (out_fp16) {
+          for (unsigned int v = 0; v < vocab_size; ++v)
+            logits16[v] = static_cast<_FP16>(logits_f32[v]);
+        }
+#endif
+        host_q8k_done = true;
+      }
+#else
+      const bool host_q8k_done = false;
+#endif
+
+      if (!gpu_done && !host_q8k_done) {
+        // fp32 fallback: no q6_K x q8_K dot on this backend (or a hidden size
+        // that is not a whole number of 256-element blocks).
         auto &tm = nntrainer::ThreadManager::Global();
         const unsigned int compute_thread_num = tm.getComputeThreadCount();
         const unsigned int thread_num =

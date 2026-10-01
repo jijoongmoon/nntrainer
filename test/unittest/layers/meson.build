@@ -112,7 +112,8 @@ test_target = [
   'unittest_layers_multi_head_attention.cpp',
   'unittest_layers_positional_encoding.cpp',
   'unittest_layers_upsample2d.cpp',
-  'unittest_layers_sigmoid_gate.cpp'
+  'unittest_layers_sigmoid_gate.cpp',
+  'unittest_layers_tie_word_embedding.cpp'
 ]
 
 if get_option('enable-opencl')
