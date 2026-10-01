@@ -26,7 +26,10 @@ For more details, please refer to the [Model Documentation](models/README.md).
 Measured on a **Galaxy S26 Ultra (SM-S948U)**, CPU backend, with **Qwen3-0.6B**
 quantized to **Q4_0** FC weights + **Q6_K** embedding / LM head. `prefill` =
 prompt-encode throughput, `decode` = autoregressive generation throughput
-(32 new tokens). Flash (GEMM) attention engages for prompts ≥ 32 tokens.
+(32 new tokens). On ARM the prefill attention takes the flash (GEMM) path for
+prompts of 32 tokens or more, and the decode step stays on the per-row path.
+`"use_flash_attention": false` in `nntr_config.json` keeps the prefill on the
+per-row path as well (default `true`).
 
 | Activation | Threads | Prompt | Prefill (tok/s) | Decode (tok/s) |
 | --- | --- | --- | --- | --- |

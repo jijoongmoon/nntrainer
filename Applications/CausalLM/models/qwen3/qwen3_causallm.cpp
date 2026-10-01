@@ -107,6 +107,16 @@ Tensor Qwen3Transformer::createAttention(const int layer_id, int seq_len,
       withKey("max_position_embeddings", MAX_POSITION_EMBEDDINGS),
       withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
       withKey("is_causal", IS_CAUSAL ? "true" : "false"),
+      // nntr_config "use_flash_attention" (default true) runs the cpu-engine
+      // prefill through the host flash (GEMM) arm; false keeps it on the
+      // per-row path. q_norm/k_norm above are separate layers, so both arms
+      // read the same normalised Q/K, and RoPE is applied inside mha_core
+      // before either. On the gpu and cuda engines this property also opens
+      // the device attention arms, which are not validated for this model
+      // yet, so it stays off there.
+      withKey("use_gemm_attention",
+              (USE_FLASH_ATTENTION && causallm_engine() == "cpu") ? "true"
+                                                                  : "false"),
       // Decode-GPU: qwen3 flash decode attention DIVERGES (a separate
       // head_dim=128 bug) even with host RoPE, so keep BOTH the decode flash
       // attention (B) and the GPU-RoPE-decode (A) OFF for now (explicit; both
