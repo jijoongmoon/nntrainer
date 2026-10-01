@@ -200,6 +200,22 @@ bool clmem_raise_cl(const Tensor &t, unsigned int valid_bytes);
 bool clmem_lower_cl(const Tensor &t, unsigned int valid_bytes);
 
 /**
+ * @brief Read one byte range of a boundary tensor's device buffer back into
+ *        the same range of its host mirror (a partial cl_mem -> host LOWER).
+ *
+ * clmem_lower_cl() for a consumer that reads only part of the tensor, such as
+ * the lm_head, which reads the last row of the final norm's output. The read
+ * is blocking on the in-order queue, so it lands after every command already
+ * enqueued -- including the kernel that produces the range.
+ *
+ * @param[in] t tensor to lower (offset-0 view); a non-cl_mem tensor is a no-op
+ * @param[in] byte_offset first byte of the range, from the start of @a t
+ * @param[in] bytes length of the range
+ * @return true when bytes were moved
+ */
+bool clmem_lower_range_cl(const Tensor &t, size_t byte_offset, size_t bytes);
+
+/**
  * @brief Residual copy / accumulate for operands on the device plane.
  *
  * Both operands must be device-visible -- on the device plane, or SVM. Once

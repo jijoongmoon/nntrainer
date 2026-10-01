@@ -2278,6 +2278,35 @@ bool clmem_lower_cl(const Tensor &t, unsigned int valid_bytes) {
                              t.getName());
   return true;
 }
+bool clmem_lower_range_cl(const Tensor &t, size_t byte_offset, size_t bytes) {
+  if (!t.isClMem())
+    return false;
+  void *sub = t.getClMem();
+  if (sub == nullptr || bytes == 0)
+    return false;
+  // See clmem_raise_cl: offset-0 views only, loud failure otherwise.
+  if (t.getOffset() != 0)
+    throw std::runtime_error(
+      "clmem_lower_range_cl: nonzero-offset view unsupported");
+  if (byte_offset > t.bytes() || bytes > t.bytes() - byte_offset)
+    throw std::out_of_range("clmem_lower_range_cl: range outside " +
+                            t.getName());
+  auto *cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  if (!cc)
+    throw std::runtime_error("clmem_lower_range_cl: no GPU context");
+  // Blocking, like clmem_lower_cl: the bytes are in host memory, and every
+  // command enqueued before this one has finished, when the call returns.
+  if (opencl::clEnqueueReadBuffer(
+        cc->command_queue_inst_.GetCommandQueue(), static_cast<cl_mem>(sub),
+        CL_TRUE, byte_offset, bytes, t.getData<uint8_t>() + byte_offset, 0,
+        nullptr, nullptr) != CL_SUCCESS)
+    throw std::runtime_error("clmem_lower_range_cl: buffer read-back failed "
+                             "for " +
+                             t.getName());
+  return true;
+}
+
 /**
  * Debug: write rows of a layer output to NNTR_DUMP_ROWS_DIR. Inert unless the
  * caller (neuralnet.cpp) saw the env set. Reads a device-plane tensor into a

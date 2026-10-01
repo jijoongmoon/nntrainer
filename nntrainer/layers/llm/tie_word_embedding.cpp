@@ -15,6 +15,7 @@
 // The OpenCL GPU lm_head GEMVs (lmhead_gemv_*_cl). Guarded so the FP32 CPU
 // build (enable-opencl=false, which is what the causallm model unittests use)
 // compiles tie as a host-only lm_head.
+#include <blas_kernel_interface.h> // clmem_lower_range_cl
 #include <blas_kernels.h>
 #include <engine.h>
 #include <env_compat.h>
@@ -513,6 +514,23 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
       b * input_dim.getFeatureLen() + (to - from - 1) * input_.width(), true);
     nntrainer::Tensor hidden_step = hidden_.getSharedDataTensor(
       hidden_step_dim, b * hidden_dim.getFeatureLen(), true);
+
+#if defined(ENABLE_OPENCL)
+    // The input is the final norm's output, which the residency planner may
+    // keep on the device plane (GPU_CLMEM) because it is a declared LOWER
+    // boundary: its host consumer promises to read it back explicitly. Every
+    // arm below reads input_step on the host, so read the row back first. The
+    // read is blocking on the in-order queue, so it also waits for the norm
+    // kernel that writes the row. Without it the host converts whatever the
+    // shared plane held before that kernel ran.
+    if (input_.isClMem())
+      nntrainer::clmem_lower_range_cl(
+        input_,
+        (b * input_dim.getFeatureLen() +
+         static_cast<size_t>(to - from - 1) * input_.width()) *
+          input_dim.getDataTypeSize(),
+        input_step.bytes());
+#endif
 
     ///@note Since tieword embedding shares the weight with embedding,
     /// the weight is transposed. Thus, the dot product should be consider
