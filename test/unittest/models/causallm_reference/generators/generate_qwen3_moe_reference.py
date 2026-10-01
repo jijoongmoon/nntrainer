@@ -48,6 +48,9 @@ TINY_CONFIG = dict(
     tie_word_embeddings=True,
     num_experts=4,
     num_experts_per_tok=2,
+    # The nntrainer MoE layer always renormalizes the top-k router weights,
+    # as the released Qwen3-MoE checkpoints do; the HF config default is False.
+    norm_topk_prob=True,
     moe_intermediate_size=64,
     attention_dropout=0.0,
 )
@@ -216,6 +219,7 @@ def write_nntr_configs(out_dir: pathlib.Path, bin_name: str,
         "num_key_value_heads": 4,
         "num_experts": 4,
         "num_experts_per_tok": 2,
+        "norm_topk_prob": True,
         "rms_norm_eps": 1e-5,
         "rope_theta": 10000,
         "tie_word_embeddings": True,
