@@ -88,6 +88,7 @@ void clLaunchStatDump(const char *phase);
 #include <cuda_attention.h>
 #include <cuda_context_manager.h>
 #include <cuda_elementwise.h>
+#include <cuda_emb_gather.h> // [reload] gather LUT teardown
 #include <cuda_fc_qs4cx.h> // [lmhead-tie-lut] tied-head LUT registration
 #include <cuda_runtime.h>
 #include <cuda_stream_manager.h>
@@ -2130,10 +2131,12 @@ void CausalLM::releaseDeviceCaches() {
   // model's worth of device packs per cycle nor takes a stale hit and computes
   // with the previous model's weights. Each hook is a pure reset that makes no
   // driver call when its lane was never used, so a CPU/OpenCL-only process
-  // never pokes cudart. Only the CUDA caches are handled here; the OpenCL
-  // process-global caches (v8c weight packs and their scratch) have no
-  // release hook on this tree.
+  // never pokes cudart. The OpenCL caches follow below.
   nntrainer::cuda::cuda_fc_qs4cx_release_weight_caches();
+  // The gather LUTs first: the embedding LUT they read may be the tied head's
+  // VRAM copy, which the next call frees.
+  nntrainer::cuda::emb_gather_release_luts();
+  nntrainer::cuda::cuda_fc_lmhead_tie_lut_release();
   nntrainer::cuda::cuda_attention_release_caches();
   nntrainer::cuda_reset_decode_graph_cache();
 #endif

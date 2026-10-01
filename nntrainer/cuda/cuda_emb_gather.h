@@ -63,7 +63,10 @@ namespace nntrainer::cuda {
  * @param out_dim  columns per row (nibbles)
  * @param nblocks  scale blocks per row (1 = one scale per row)
  * @return handle >= 0 on success, -1 when unavailable (no HMM, env off,
- *         geometry mismatch, allocation/compile failure)
+ *         geometry mismatch, allocation/compile failure). A table already
+ *         registered returns its handle only when the payload and scale
+ *         pointers, the geometry and a fingerprint of the leading bytes all
+ *         match; anything else is registered anew.
  */
 int emb_gather_register_lut(const void *payload, size_t payload_bytes,
                             const float *scales, size_t scale_count,
@@ -109,6 +112,17 @@ void emb_gather_notify_token(unsigned tok);
  */
 bool emb_gather_dispatch_s4(int handle, float layer_scale, void *out,
                             bool fp16_out);
+
+/**
+ * @brief Model-teardown hook: forget every registered LUT. The tables are the
+ *        model's (a file mmap and a heap vector, released with it) and the
+ *        tied-head VRAM copy a LUT may read is freed by the same teardown, so
+ *        an entry that survives is a dangling registration -- and a hit for
+ *        the next load that gets the same payload address back. Keeps the
+ *        process-lifetime id slot, side stream and warm buffers. Call only
+ *        when no run is in flight, before the tied-head copy is released.
+ */
+void emb_gather_release_luts();
 
 /**
  * @brief M2-B cached-graph lifecycle: true while a captured decode graph is

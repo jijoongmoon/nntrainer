@@ -207,6 +207,17 @@ bool cuda_fc_lmhead_tie_lut_register(
   const void *weight_key, const void *lut_payload, size_t payload_bytes,
   const float *scales_fp32, size_t scale_count, unsigned int N, unsigned int K);
 
+/**
+ * @brief [lmhead-tie-lut] Model-teardown hook: free the tied head's VRAM LUT
+ *        copy (N*K/2 bytes + N scales) and empty the slot. Without it the copy
+ *        outlives the model: the next load of a different model leaks it, and
+ *        the next load of a head with the same pointer and shape takes the
+ *        idempotent hit with the old bytes. Call after
+ *        emb_gather_release_luts() (a gather LUT may read this copy) and only
+ *        when no run is in flight. No driver call when nothing is registered.
+ */
+void cuda_fc_lmhead_tie_lut_release();
+
 /** @brief [lmhead-tie-lut] True once a tied-head LUT is registered. */
 bool cuda_fc_lmhead_tie_lut_ready();
 
@@ -229,7 +240,8 @@ bool cuda_fc_lmhead_tie_gemv_fp16(const void *weight_key,
  *        payload pointer, so the on-GPU embedding gather (cuda_emb_gather) can
  *        read the resident copy instead of HMM zero-copy faulting over the
  *        file mmap -- same bytes, no cold-fault. @p dev_payload / @p
- *        dev_scales receive device pointers valid for the process lifetime.
+ *        dev_scales receive device pointers valid until
+ *        cuda_fc_lmhead_tie_lut_release() (model teardown).
  * @return true on a hit.
  */
 bool cuda_fc_lmhead_tie_lut_device_copy(const void *host_payload,

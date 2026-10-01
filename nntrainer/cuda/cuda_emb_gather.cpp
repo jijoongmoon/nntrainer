@@ -114,6 +114,17 @@ __global__ void emb_gather_s4_f32(const unsigned char *lut,
 namespace {
 
 struct GatherLut {
+  // What the caller registered, compared on every registration. The payload
+  // alone is not an identity: the table is a file mmap and the scales a heap
+  // vector, both released with the model, so the next load can get the same
+  // payload address back for a different table -- or the same table with its
+  // scales elsewhere.
+  const void *key_payload = nullptr;
+  const float *key_scales = nullptr;
+  size_t payload_bytes = 0;
+  uint64_t fingerprint = 0;
+  // What the kernel reads: the registered pointers, or the tied head's VRAM
+  // copy of the same bytes.
   const uint8_t *payload = nullptr;
   const float *scales = nullptr;
   unsigned n_rows = 0;
@@ -174,6 +185,25 @@ bool hmm_pageable_access() {
     return v == 1;
   }();
   return ok;
+}
+
+// Cheap content check for a registration hit: FNV-1a over the first page of
+// the payload and the first scales. One host page of the mmap is touched,
+// which the host prefill dequant faults in anyway.
+uint64_t lut_fingerprint(const void *payload, size_t payload_bytes,
+                         const float *scales, size_t scale_count) {
+  uint64_t h = 1469598103934665603ull;
+  auto mix = [&h](const unsigned char *p, size_t n) {
+    for (size_t i = 0; i < n; ++i) {
+      h ^= p[i];
+      h *= 1099511628211ull;
+    }
+  };
+  mix(static_cast<const unsigned char *>(payload),
+      payload_bytes < 4096 ? payload_bytes : 4096);
+  mix(reinterpret_cast<const unsigned char *>(scales),
+      (scale_count < 256 ? scale_count : 256) * sizeof(float));
+  return h;
 }
 
 // Best-effort: map-on-demand hint + page warm. Failures are swallowed -- the
@@ -246,9 +276,15 @@ int emb_gather_register_lut(const void *payload, size_t payload_bytes,
   if (StreamManager::Global().isCapturing())
     return -1;
 
-  for (size_t i = 0; i < g_luts.size(); ++i)
-    if (g_luts[i].payload == payload)
+  const uint64_t fp =
+    lut_fingerprint(payload, payload_bytes, scales, scale_count);
+  for (size_t i = 0; i < g_luts.size(); ++i) {
+    const GatherLut &l = g_luts[i];
+    if (l.key_payload == payload && l.key_scales == scales &&
+        l.payload_bytes == payload_bytes && l.n_rows == n_rows &&
+        l.out_dim == out_dim && l.nblocks == nblocks && l.fingerprint == fp)
       return (int)i;
+  }
 
   // Shared id slot + side stream (once).
   if (g_tok_dev == nullptr &&
@@ -284,6 +320,10 @@ int emb_gather_register_lut(const void *payload, size_t payload_bytes,
   }
 
   GatherLut lut;
+  lut.key_payload = payload;
+  lut.key_scales = scales;
+  lut.payload_bytes = payload_bytes;
+  lut.fingerprint = fp;
   lut.payload = static_cast<const uint8_t *>(payload);
   lut.scales = scales;
   lut.n_rows = n_rows;
@@ -473,6 +513,20 @@ bool emb_gather_dispatch_s4(int handle, float layer_scale, void *out,
     return false;
   sm.maybeFinish();
   return true;
+}
+
+void emb_gather_release_luts() {
+  // Makes no driver call when nothing was registered: a process that never
+  // gathered on the GPU must not be the one that first pokes cudart.
+  if (g_luts.empty())
+    return;
+  // A page-warm prefetch on the side stream may still be reading a table
+  // that is about to be unmapped.
+  if (g_side_stream != nullptr) {
+    cudaStreamSynchronize(g_side_stream);
+    cudaGetLastError();
+  }
+  g_luts.clear();
 }
 
 void emb_gather_set_graph_live(bool live) {

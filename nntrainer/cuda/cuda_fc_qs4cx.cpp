@@ -2353,7 +2353,8 @@ bool cuda_fc_lmhead_tie_lut_register(const void *weight_key,
     return false;
   std::lock_guard<std::mutex> lk(g_tied_mtx);
   if (g_tied_lut.dev_payload != nullptr)
-    return g_tied_lut.weight_key == weight_key && g_tied_lut.N == N &&
+    return g_tied_lut.weight_key == weight_key &&
+           g_tied_lut.host_payload == lut_payload && g_tied_lut.N == N &&
            g_tied_lut.K == K; // idempotent for the same head
   // Compile the kernel NOW: the first dispatch may be inside a captured
   // decode graph, where an NVRTC module load is illegal.
@@ -2396,6 +2397,16 @@ bool cuda_fc_lmhead_tie_lut_register(const void *weight_key,
           "dp4a cache will not be built",
           payload_bytes >> 20, (sizeof(float) * (size_t)N) >> 10, N, K);
   return true;
+}
+
+void cuda_fc_lmhead_tie_lut_release() {
+  std::lock_guard<std::mutex> lk(g_tied_mtx);
+  if (g_tied_lut.dev_payload == nullptr)
+    return; // never registered: no driver call
+  cudaFree(g_tied_lut.dev_payload);
+  cudaFree(g_tied_lut.dev_scales);
+  cudaGetLastError();
+  g_tied_lut = TiedHeadLut{};
 }
 
 bool cuda_fc_lmhead_tie_lut_ready() {
