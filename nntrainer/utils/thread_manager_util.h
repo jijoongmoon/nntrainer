@@ -46,6 +46,18 @@ std::vector<uint32_t> parseCpuList(const std::string &s);
 uint32_t getPhysicalCoreCount();
 
 /**
+ * @brief default number of compute threads (main thread included) when
+ * neither NNTR_NUM_THREADS nor the nntr-num-threads build option names one.
+ *
+ * x86: the physical cores this process may run on (affinity mask, SMT
+ * siblings counted once), capped at 16. The CPU kernels are compute-bound,
+ * so throughput follows the core count; past 16 the shared memory bandwidth
+ * and the pool's spin-wait stop paying back.
+ * Others: std::thread::hardware_concurrency() / 2, as before.
+ */
+uint32_t getDefaultComputeThreadCount();
+
+/**
  * @brief return list of cores in performance order
  */
 std::vector<uint32_t> getCoresByPerformance();

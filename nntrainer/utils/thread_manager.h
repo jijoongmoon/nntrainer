@@ -98,8 +98,9 @@ private:
    * @brief return number of compute worker threads
    * priority order:
    *   1. environment variable NNTR_NUM_THREADS
-   *   2. compile flag NNTR_NUM_THREADS
-   *   3. std::thread::hardware_concurrency() / 2
+   *   2. compile flag NNTR_NUM_THREADS, when > 0 (-Dnntr-num-threads)
+   *   3. getDefaultComputeThreadCount(): on x86 the usable physical cores
+   *      (capped at 16), elsewhere std::thread::hardware_concurrency() / 2
    */
   static uint32_t defaultComputeThreads() {
     auto nntr_num_threads = std::getenv("NNTR_NUM_THREADS");
@@ -110,9 +111,7 @@ private:
 #if defined(NNTR_NUM_THREADS) && NNTR_NUM_THREADS > 0
     return NNTR_NUM_THREADS;
 #else
-    /// @todo use performance core only for x86
-    uint32_t hw = std::thread::hardware_concurrency();
-    return hw > 0 ? hw / 2 : 1;
+    return getDefaultComputeThreadCount();
 #endif
   }
 };

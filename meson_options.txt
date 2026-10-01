@@ -47,7 +47,10 @@ option('tizen-version-major', type: 'integer', min : 4, max : 9999, value: 9999)
 option('tizen-version-minor', type: 'integer', min : 0, max : 9999, value: 0)
 option('openblas-num-threads', type: 'integer', min : 0, max : 9999, value: 0)
 #This is for the multi-threading in nntrainer
-option('nntr-num-threads', type: 'integer', min : 0, max : 9999, value: 4)
+# 0 = auto: on x86 the ThreadManager pool uses the usable physical cores at
+# run time (capped at 16); other architectures keep 4. NNTR_NUM_THREADS in
+# the environment overrides either.
+option('nntr-num-threads', type: 'integer', min : 0, max : 9999, value: 0)
 option('hgemm-experimental-kernel', type: 'boolean', value: false)
 
 # test related option

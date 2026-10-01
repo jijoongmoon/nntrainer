@@ -12,6 +12,15 @@
 
 #include "thread_manager_util.h"
 
+#if defined(__linux__) || defined(__ANDROID__)
+#include <sched.h>
+#elif defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 namespace {
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) ||             \
   defined(_M_IX86)
@@ -89,9 +98,43 @@ uint32_t getPhysicalCoreCount() {
     return std::thread::hardware_concurrency();
   }
 #elif defined(_WIN32)
-  // todo support windows
-  return std::thread::hardware_concurrency();
+  // One RelationProcessorCore record per physical core, SMT or not.
+  DWORD len = 0;
+  GetLogicalProcessorInformation(nullptr, &len);
+  std::vector<SYSTEM_LOGICAL_PROCESSOR_INFORMATION> info(
+    len / sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION));
+  uint32_t cores = 0;
+  if (!info.empty() && GetLogicalProcessorInformation(info.data(), &len)) {
+    for (const auto &rec : info)
+      if (rec.Relationship == RelationProcessorCore)
+        ++cores;
+  }
+  return cores > 0 ? cores : std::thread::hardware_concurrency();
 #endif
+}
+
+uint32_t getDefaultComputeThreadCount() {
+  if constexpr (is_x86) {
+    constexpr uint32_t max_threads = 16;
+    uint32_t n = getPhysicalCoreCount();
+#if defined(__linux__) || defined(__ANDROID__)
+    // A process confined by taskset / cgroup cpusets sees fewer CPUs than
+    // the machine has; count only those (one per core under SMT).
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+      uint32_t allowed = static_cast<uint32_t>(CPU_COUNT(&set));
+      if (readUInt("/sys/devices/system/cpu/smt/active") == 1)
+        allowed = (allowed + 1) / 2;
+      if (allowed > 0)
+        n = std::min(n, allowed);
+    }
+#endif
+    return std::max(1u, std::min(n, max_threads));
+  } else {
+    uint32_t hw = std::thread::hardware_concurrency();
+    return hw > 1 ? hw / 2 : 1;
+  }
 }
 
 std::vector<uint32_t> getCoresByPerformance() {

@@ -557,8 +557,13 @@ if get_option('enable-blas')
   extra_defines += '-DHGEMM_EXPERIMENTAL_KERNEL=@0@'.format(get_option('hgemm-experimental-kernel'))
 endif
 
-extra_defines += '-DNNTR_NUM_THREADS=@0@'.format(get_option('nntr-num-threads'))
-message('set nntrainer num threads=@0@'.format(get_option('nntr-num-threads')))
+nntr_num_threads = get_option('nntr-num-threads')
+if nntr_num_threads == 0 and not (arch == 'x86' or arch == 'x86_64')
+  # auto is resolved at run time on x86 only; elsewhere keep the old default
+  nntr_num_threads = 4
+endif
+extra_defines += '-DNNTR_NUM_THREADS=@0@'.format(nntr_num_threads)
+message('set nntrainer num threads=@0@ (0 = physical cores at run time)'.format(nntr_num_threads))
 
 if get_option('enable-profile')
   extra_defines += '-DPROFILE=1'

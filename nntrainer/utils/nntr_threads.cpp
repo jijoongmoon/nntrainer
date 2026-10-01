@@ -13,8 +13,12 @@
 #include <algorithm>
 #include <nntr_threads.h>
 
-#ifdef NNTR_NUM_THREADS
+#if defined(NNTR_NUM_THREADS) && NNTR_NUM_THREADS > 0
 static const unsigned int nntr_num_threads = NNTR_NUM_THREADS;
+#elif defined(NNTR_NUM_THREADS)
+// -Dnntr-num-threads=0 (auto) sizes the ThreadManager pool at run time;
+// the per-batch workers here keep the previous fixed default.
+static const unsigned int nntr_num_threads = 4;
 #else
 static const unsigned int nntr_num_threads = 1;
 #endif
