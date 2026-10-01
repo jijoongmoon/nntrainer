@@ -28,6 +28,18 @@ if arch == 'aarch64' or arm_arch_opt != 'none'
 elif arch == 'x86_64' or arch == 'x86'
   # AVX/AVX2/AVX512 implementation for x86_64
   ggml_impl_interface_sources += 'nntr_ggml_impl_avx.cpp'
+  if enable_avxvnni_dispatch
+    # Second build of the Q4_0 8x8 int8 kernels with -mavxvnni, chosen at run
+    # time by cpuid (see nntr_ggml_impl_avx.cpp). Its own target, so the flag
+    # never reaches code that runs on AVX2-only CPUs.
+    nntrainer_link_whole += static_library('nntr_ggml_impl_avxvnni',
+      'nntr_ggml_impl_avxvnni.cpp',
+      cpp_args: ['-mavxvnni'],
+      dependencies: nntrainer_base_deps,
+      include_directories: [nntrainer_inc, include_directories('.', '../..', '../../..')],
+      pic: true,
+    )
+  endif
 elif arch == 'arm'
   ggml_impl_interface_sources += 'nntr_ggml_impl_fallback.cpp'
 else

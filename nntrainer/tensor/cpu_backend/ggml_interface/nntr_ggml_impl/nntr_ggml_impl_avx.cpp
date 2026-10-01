@@ -28,6 +28,35 @@
 #include <nntr_ggml_impl.h>
 #include <nntr_ggml_impl_utils.h>
 
+// The two Q4_0 8x8 int8 kernels, nntr_gemm_q4_0_8x8_q8_0() and
+// nntr_gemv_q4_0_8x8_q8_0(), are compiled twice: here for plain AVX2 (suffix
+// _avx2), and again by nntr_ggml_impl_avxvnni.cpp with -mavxvnni, which
+// defines NNTR_GGML_AVXVNNI_VARIANT so that only these two are built, with
+// the suffix _avxvnni and the AVX-VNNI branch of mul_sum_i8_pairs_*. The
+// public entry points at the bottom of this file pick one at run time from
+// cpuid, so a binary with the VNNI variant still runs on AVX2-only CPUs. The
+// integer dot products are exact either way: the variants agree bit for bit.
+#ifdef NNTR_GGML_AVXVNNI_VARIANT
+#define NNTR_Q4_0_8X8_FN(name) name##_avxvnni
+#else
+#define NNTR_Q4_0_8X8_FN(name) name##_avx2
+#endif
+
+/** @brief Q4_0 8x8 GEMM body; see the note above for the variant suffix */
+void NNTR_Q4_0_8X8_FN(nntr_gemm_q4_0_8x8_q8_0)(int n, float *__restrict s,
+                                               size_t bs,
+                                               const void *__restrict vx,
+                                               const void *__restrict vy,
+                                               int nr, int nc);
+/** @brief Q4_0 8x8 GEMV body; see the note above for the variant suffix */
+void NNTR_Q4_0_8X8_FN(nntr_gemv_q4_0_8x8_q8_0)(int n, float *__restrict s,
+                                               size_t bs,
+                                               const void *__restrict vx,
+                                               const void *__restrict vy,
+                                               int nr, int nc);
+
+#ifndef NNTR_GGML_AVXVNNI_VARIANT
+
 void nntr_gemv_q4_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
                              const void *__restrict vx,
                              const void *__restrict vy, int nr, int nc) {
@@ -132,9 +161,13 @@ void nntr_gemm_q4_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
   }
 }
 
-void nntr_gemm_q4_0_8x8_q8_0(int n, float *__restrict s, size_t bs,
-                             const void *__restrict vx,
-                             const void *__restrict vy, int nr, int nc) {
+#endif // NNTR_GGML_AVXVNNI_VARIANT
+
+void NNTR_Q4_0_8X8_FN(nntr_gemm_q4_0_8x8_q8_0)(int n, float *__restrict s,
+                                               size_t bs,
+                                               const void *__restrict vx,
+                                               const void *__restrict vy,
+                                               int nr, int nc) {
   const int qk = QK8_0;
   const int nb = n / qk;
   const int ncols_interleaved = 8;
@@ -938,6 +971,8 @@ void nntr_gemm_q4_0_8x8_q8_0(int n, float *__restrict s, size_t bs,
     }
   }
 }
+
+#ifndef NNTR_GGML_AVXVNNI_VARIANT
 
 //============================================================================
 // GEMM/GEMV - Q8_0 4x4
@@ -3792,9 +3827,13 @@ void nntr_vec_dot_q6_K_q8_K(int n, float *__restrict s, size_t bs,
   *s = hsum_float_8(acc);
 }
 
-void nntr_gemv_q4_0_8x8_q8_0(int n, float *__restrict s, size_t bs,
-                             const void *__restrict vx,
-                             const void *__restrict vy, int nr, int nc) {
+#endif // NNTR_GGML_AVXVNNI_VARIANT
+
+void NNTR_Q4_0_8X8_FN(nntr_gemv_q4_0_8x8_q8_0)(int n, float *__restrict s,
+                                               size_t bs,
+                                               const void *__restrict vx,
+                                               const void *__restrict vy,
+                                               int nr, int nc) {
   const int qk = QK8_0;
   const int nb = n / qk;
   const int ncols_interleaved = 8;
@@ -3969,3 +4008,51 @@ void nntr_gemv_q4_0_8x8_q8_0(int n, float *__restrict s, size_t bs,
   }
   return;
 }
+
+#ifndef NNTR_GGML_AVXVNNI_VARIANT
+#ifdef NNTR_HAVE_AVXVNNI_TU
+#include <cpuid.h>
+
+/**
+ * @brief true when the CPU runs AVX-VNNI (CPUID.(EAX=7,ECX=1):EAX[4]).
+ * The AVX2 build already presumes the OS saves the YMM state.
+ */
+static bool nntr_cpu_has_avxvnni() {
+  unsigned int a = 0, b = 0, c = 0, d = 0;
+  if (!__get_cpuid_count(7, 1, &a, &b, &c, &d))
+    return false;
+  return (a >> 4) & 1u;
+}
+
+/** @brief AVX-VNNI bodies, built in nntr_ggml_impl_avxvnni.cpp */
+void nntr_gemm_q4_0_8x8_q8_0_avxvnni(int n, float *__restrict s, size_t bs,
+                                     const void *__restrict vx,
+                                     const void *__restrict vy, int nr, int nc);
+/** @brief AVX-VNNI bodies, built in nntr_ggml_impl_avxvnni.cpp */
+void nntr_gemv_q4_0_8x8_q8_0_avxvnni(int n, float *__restrict s, size_t bs,
+                                     const void *__restrict vx,
+                                     const void *__restrict vy, int nr, int nc);
+
+static const bool nntr_use_avxvnni = nntr_cpu_has_avxvnni();
+#endif
+
+void nntr_gemm_q4_0_8x8_q8_0(int n, float *__restrict s, size_t bs,
+                             const void *__restrict vx,
+                             const void *__restrict vy, int nr, int nc) {
+#ifdef NNTR_HAVE_AVXVNNI_TU
+  if (nntr_use_avxvnni)
+    return nntr_gemm_q4_0_8x8_q8_0_avxvnni(n, s, bs, vx, vy, nr, nc);
+#endif
+  nntr_gemm_q4_0_8x8_q8_0_avx2(n, s, bs, vx, vy, nr, nc);
+}
+
+void nntr_gemv_q4_0_8x8_q8_0(int n, float *__restrict s, size_t bs,
+                             const void *__restrict vx,
+                             const void *__restrict vy, int nr, int nc) {
+#ifdef NNTR_HAVE_AVXVNNI_TU
+  if (nntr_use_avxvnni)
+    return nntr_gemv_q4_0_8x8_q8_0_avxvnni(n, s, bs, vx, vy, nr, nc);
+#endif
+  nntr_gemv_q4_0_8x8_q8_0_avx2(n, s, bs, vx, vy, nr, nc);
+}
+#endif // NNTR_GGML_AVXVNNI_VARIANT

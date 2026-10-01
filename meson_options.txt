@@ -52,6 +52,9 @@ option('openblas-num-threads', type: 'integer', min : 0, max : 9999, value: 0)
 # the environment overrides either.
 option('nntr-num-threads', type: 'integer', min : 0, max : 9999, value: 0)
 option('hgemm-experimental-kernel', type: 'boolean', value: false)
+# x86 (GCC/Clang): also build the Q4_0 int8 kernels with -mavxvnni and use
+# them when the CPU reports AVX-VNNI. auto = when the compiler supports it.
+option('enable-avxvnni', type: 'feature', value: 'auto')
 
 # test related option
 option('reduce-tolerance', type: 'boolean', value: true)

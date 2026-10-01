@@ -121,6 +121,7 @@ if get_option('platform') == 'windows'
   endif
 endif
 
+enable_avxvnni_dispatch = false
 if arch == 'arm' or arch == 'aarch64' or get_option('platform') == 'android'
   message('Build for ARM architecture')
   if arch == 'arm'
@@ -135,6 +136,17 @@ elif arch == 'x86' or arch == 'x86_64'
   else
     add_project_arguments(['-mavx2', '-mfma', '-mf16c'], language: ['c','cpp'])
     message('-mavx2, -mfma, -mf16c added for AVX hardware acceleration.')
+    # AVX-VNNI: build the Q4_0 int8 kernels a second time with -mavxvnni and
+    # pick that build at run time when cpuid reports the extension.
+    if not get_option('enable-avxvnni').disabled()
+      if cxx.has_argument('-mavxvnni')
+        enable_avxvnni_dispatch = true
+        extra_defines += '-DNNTR_HAVE_AVXVNNI_TU=1'
+        message('AVX-VNNI kernels added (selected at run time by cpuid).')
+      elif get_option('enable-avxvnni').enabled()
+        error('enable-avxvnni=enabled but the compiler does not take -mavxvnni')
+      endif
+    endif
   endif
 endif
 

@@ -12,6 +12,9 @@ nntrainer_inc_abs = [
 ]
 
 nntrainer_sources = []
+# Static libraries built with their own compiler flags (e.g. an ISA variant
+# picked at run time) and linked whole into libnntrainer.
+nntrainer_link_whole = []
 nntrainer_headers = [
    meson.current_source_dir() / 'nntrainer_log.h',
    meson.current_source_dir() / 'nntrainer_logger.h',
@@ -135,6 +138,7 @@ else
 
   nntrainer_static = static_library('nntrainer',
     nntrainer_sources,
+    link_whole: nntrainer_link_whole,
     dependencies: nntrainer_base_deps,
     include_directories: nntrainer_inc,
     install: true,
@@ -150,6 +154,7 @@ else
 
     nntrainer_shared = shared_library('nntrainer',
       nntrainer_sources,
+      link_whole: nntrainer_link_whole,
       dependencies: nntrainer_base_deps,
       include_directories: nntrainer_inc,
       install: true,
@@ -159,6 +164,7 @@ else
   else
     nntrainer_shared = shared_library('nntrainer',
       nntrainer_sources,
+      link_whole: nntrainer_link_whole,
       dependencies: nntrainer_base_deps,
       include_directories: nntrainer_inc,
       install: true,
