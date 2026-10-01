@@ -4519,8 +4519,20 @@ void MHACoreLayer::gemm_attention(nntrainer::Tensor &query_step,
     O = attention_output_step.getData<float>();
   }
 
-  // tile sizes (cache-resident S); overridable via env for tuning
+  // tile sizes (cache-resident S); overridable via env for tuning.
+  // ARM: a 128-key block keeps the per-thread score and accumulator tiles
+  // inside the core's L1/L2, and a 64-query block gives the causal prefill
+  // more, smaller work units to balance across the threads. With the former
+  // 256 x 512 tiles the host flash prefill was slower than the per-row path on
+  // an aarch64 phone (1K prompt, 7 threads, Qwen3-0.6B QS4CX-FP32: 658 vs
+  // 700 tok/s); with 64 x 128 it runs at 822 tok/s, and a dense 1.5B FP16
+  // model goes from 263 to 293 tok/s.
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) ||             \
+  defined(_M_IX86)
   unsigned int Bq = 256, Bk = 512;
+#else
+  unsigned int Bq = 64, Bk = 128;
+#endif
   if (const char *e = std::getenv("VJEPA_BQ"))
     Bq = static_cast<unsigned int>(std::stoul(e));
   if (const char *e = std::getenv("VJEPA_BK"))
