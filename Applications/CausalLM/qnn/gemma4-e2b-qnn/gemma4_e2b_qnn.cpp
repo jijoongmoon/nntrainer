@@ -1130,6 +1130,7 @@ void Gemma4_E2B_QNN::run(const WSTR prompt, bool /*do_sample*/,
   resetKvCache();
 
   stop_requested_.store(false, std::memory_order_release);
+  reseed_sampling_rng(); // same seed every run (generate_qnn_utils.h)
 
   std::string prefill_graph = graphs_to_use[0];
   std::string generation_graph = graphs_to_use[1];

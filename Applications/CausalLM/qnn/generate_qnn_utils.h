@@ -30,12 +30,24 @@
 #include "graph_parser.h"
 #include "qnn_compat_types.h"
 #include <model.h>
+#include <token_sampler.h>
 #include <tokenizers_cpp.h>
 
 using ModelHandle = std::unique_ptr<ml::train::Model>;
 using IO_TensorType = causallm::IO_TensorType;
 
-extern std::mt19937 rng;
+/**
+ * @brief Sampling RNG used by sample(). Same engine and default seed as the
+ *        CausalLM sampler (token_sampler.h); reseed_sampling_rng() resets it
+ *        at the start of every run.
+ */
+extern causallm::SamplingRng rng;
+
+/**
+ * @brief Re-seed rng with causallm::kDefaultSamplingSeed, so the same input
+ *        gives the same tokens on every run of the same hardware.
+ */
+void reseed_sampling_rng();
 
 /**
  * @brief Run a QNN graph through the main nntrainer Model::inference API.

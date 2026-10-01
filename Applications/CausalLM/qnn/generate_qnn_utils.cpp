@@ -26,7 +26,10 @@
 #include <model.h>
 #include <tokenizers_cpp.h>
 
-std::mt19937 rng;
+// One fixed seed shared with the CausalLM sampler; re-seeded per run.
+causallm::SamplingRng rng{causallm::kDefaultSamplingSeed};
+
+void reseed_sampling_rng() { rng.seed(causallm::kDefaultSamplingSeed); }
 
 std::vector<IO_TensorType>
 run_qnn_inference(ModelHandle &model, unsigned int batch,
@@ -529,8 +532,14 @@ int sample(uint16_t *pointer, int length, int *tokens, int number_of_tokens,
       logits[i] = logits[i] / temperature;
     top_indices_and_logits[i] = {i, logits[i]};
   }
+  // Higher logit first, lower token id on an exact tie: the order (and so the
+  // top-p cut and the draw) is fully determined.
   sort(top_indices_and_logits.begin(), top_indices_and_logits.end(),
-       [](auto &a, auto &b) { return a.second > b.second; });
+       [&indices](auto &a, auto &b) {
+         if (a.second != b.second)
+           return a.second > b.second;
+         return indices[a.first] < indices[b.first];
+       });
 
   const float max_logit = top_indices_and_logits[0].second;
   std::vector<float> probs(length);
@@ -575,6 +584,8 @@ int sample(uint16_t *pointer, int length, int *tokens, int number_of_tokens,
     logits[i] /= final_sum_exp;
 
   // Sample
-  std::discrete_distribution<int> dist(logits.data(), logits.data() + length);
-  return indices[dist(rng)];
+  // Inverse CDF in double (token_sampler.h): identical on every C++ runtime,
+  // which std::discrete_distribution is not.
+  std::vector<double> weights(logits.begin(), logits.begin() + length);
+  return indices[causallm::sampleIndex(weights.data(), weights.size(), rng)];
 }
