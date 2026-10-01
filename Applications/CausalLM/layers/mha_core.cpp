@@ -18,6 +18,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <engine.h>
 #include <env_compat.h>
 #include <kv_ring.h> // causallm::kvRingCap (shared with models/transformer.h)
 #include <mutex>
@@ -68,6 +69,46 @@ static unsigned int min_prefill_thr(unsigned int head_dim) {
   if (nntr_env_on("NNTR_MHA_GPU"))
     return 1u;
   return 32u;
+#endif
+}
+
+// Whether a device attention arm can run in this process: the OpenCL arm
+// (NNTR_MHA_GPU on the gpu engine, whose context is registered) or the CUDA
+// arm (NNTR_CUDA_ATTN on the cuda engine). False on the cpu engine, whatever
+// the env and the model properties say. Latched like the env gates it combines
+// (the engine is fixed for the process).
+static bool mha_device_attention_on() {
+  static const bool on = []() {
+    const std::string eng = nntr_engine_env();
+    if (eng == "cpu")
+      return false;
+    if (eng == "cuda")
+      return nntr_env_on("NNTR_CUDA_ATTN");
+#if defined(ENABLE_OPENCL)
+    return nntr_env_on("NNTR_MHA_GPU") &&
+           nntrainer::Engine::Global().isContextRegistered("gpu");
+#else
+    return false;
+#endif
+  }();
+  return on;
+}
+
+// Which HOST arm a decode step (M=1) takes when no device arm runs it.
+// ARM: the per-row path (the NEON compute_kcaches /
+// compute_fp16vcache_transposed kernels). The host flash path spends M=1 in a
+// blocked fp16 GEMM fallback plus its thread hand-off, and measured 2.5-5x
+// slower there (KleidiAI CPU decode, 1K summary prompt: 12.5 vs 62.5 TPS on a
+// dense 1.5B model, 7.5 vs 18.6 TPS on a 2B-class model).
+// x86: the host flash path. x86 has only the scalar per-row fallbacks below,
+// and with them the per-row arm measured 4-6 % slower than the flash arm's
+// FP32 GEMM (4.62 vs 4.90 and 1.96 vs 2.04 TPS on the same two models).
+static constexpr bool host_decode_prefers_per_row() {
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) ||             \
+  defined(_M_IX86)
+  return false;
+#else
+  return true;
 #endif
 }
 
@@ -3311,8 +3352,10 @@ void MHACoreLayer::one_batch_incremental_forwarding(
 
   // Optional flash GEMM attention path. Handles both non-causal (encoder)
   // and causal-prefill paths, supports GQA and sliding window. Gated on a
-  // minimum prefill length: for decode (step_size == 1) the per-row dot
-  // path is preferred (no benefit from blocking + softmax bookkeeping).
+  // minimum prefill length. Decode (step_size == 1) enters it when a device
+  // attention arm can run (mha_device_attention_on()); with no device arm it
+  // takes the faster host arm for this platform
+  // (host_decode_prefers_per_row(): the per-row dot path below on ARM).
   const unsigned int FLASH_MIN_PREFILL =
     min_prefill_thr((unsigned int)head_dim); // env NNTR_MIN_PREFILL
   // S3 (decode GPU attention): NNTR_MHA_GPU_DECODE lets step_size==1 (decode)
@@ -3335,7 +3378,13 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   // which faults on a device-only activation pool (NNTR_CUDA_DEV_ACT) and was
   // the short-prompt crash. OpenCL is unaffected (NNTR_CUDA_ATTN is cuda-only).
   static const bool _cuda_attn_on = nntr_env_on("NNTR_CUDA_ATTN");
-  if (use_gemm_attention &&
+  // The decode term above (gpu_decode_attn, a model property) says nothing
+  // about the engine, so on a cpu-engine run it sent every decode step of
+  // such a model to the HOST flash path. Without a device arm a decode step
+  // now takes the platform's faster host arm instead.
+  const bool per_row_decode = step_size == 1 && !mha_device_attention_on() &&
+                              host_decode_prefers_per_row();
+  if (use_gemm_attention && !per_row_decode &&
       (step_size >= FLASH_MIN_PREFILL || (_mha_gpu_decode && step_size == 1) ||
        _cuda_attn_on)) {
     // GPU two-1x1-conv attention path (paper section 3.7). Env-gated via

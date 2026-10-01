@@ -771,9 +771,11 @@ protected:
   float ATTN_LOGIT_SOFTCAPPING = 0.0f; /**< attention logit softcapping */
   bool IS_CAUSAL = true;
   bool USE_FLASH_ATTENTION = true; /**< Enable flash GEMM attention path for
-                                        prefill (decode always uses the
-                                        per-row dot path). Defaults to true;
-                                        read from nntr_config.json key
+                                        prefill. Decode uses it only when a
+                                        GPU attention arm runs it, or on x86
+                                        CPU where it beats the per-row dot
+                                        path. Defaults to true; read from
+                                        nntr_config.json key
                                         "use_flash_attention". */
 
   // Performance metrics
