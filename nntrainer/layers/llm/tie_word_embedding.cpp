@@ -16,6 +16,8 @@
 // build (enable-opencl=false, which is what the causallm model unittests use)
 // compiles tie as a host-only lm_head.
 #include <blas_kernels.h>
+#include <engine.h>
+#include <env_compat.h>
 #endif
 #include <cpu_backend.h>
 #include <layer_context.h>
@@ -86,6 +88,27 @@ void tie_emb_stage_h2d_wait() {
 namespace nntrainer {
 
 static constexpr size_t SINGLE_INOUT_IDX = 0;
+
+#if defined(ENABLE_OPENCL)
+/**
+ * @brief Whether this run resolved to the OpenCL gpu engine, i.e. the engine
+ *        whose context the lmhead_gemv_*_cl GEMVs dispatch on.
+ * @details An OpenCL build also runs the cpu engine (NNTR_ENGINE=cpu) and, on
+ *          a cuda+opencl build, the cuda engine. Neither registers the "gpu"
+ *          context, and the GEMVs reach it through getRegisteredContext(),
+ *          which throws "[Engine] gpu Context is not registered". On those
+ *          engines the host loop is the lm_head; NNTR_LMHEAD_GPU only chooses
+ *          between the two on the gpu engine.
+ */
+static bool lmhead_opencl_engine() {
+  static const bool on = []() {
+    const std::string eng = nntr_engine_env();
+    return eng != "cpu" && eng != "cuda" &&
+           Engine::Global().isContextRegistered("gpu");
+  }();
+  return on;
+}
+#endif
 
 enum TieWordEmbeddingParams {
   weight,
@@ -630,8 +653,13 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
       // NNTR_LMHEAD_GPU=0/1 as an explicit kill switch / opt-in; falls back to
       // the host loop on any failure. The logits differ from the host loop
       // only in fp32 summation order, so greedy token-ID equality is the
-      // validation gate.
+      // validation gate. Only on the OpenCL gpu engine: the env does not
+      // reach a context the run did not bring up.
       static const int lmhead_gpu = []() {
+#if defined(ENABLE_OPENCL)
+        if (!lmhead_opencl_engine())
+          return 0;
+#endif
         if (const char *e = std::getenv("NNTR_LMHEAD_GPU"))
           return std::atoi(e);
         // Track the GPU-FC default: the lm_head GEMV is the dominant decode
@@ -699,6 +727,10 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
       const bool out_fp16 =
         hidden_step.getDataType() == nntrainer::TensorDim::DataType::FP16;
       static const int lmhead_gpu_fp32 = []() {
+#if defined(ENABLE_OPENCL)
+        if (!lmhead_opencl_engine()) // same engine rule as the Q6_K GEMV
+          return 0;
+#endif
         if (const char *e = std::getenv("NNTR_LMHEAD_GPU"))
           return std::atoi(e);
         const char *fc = std::getenv("NNTR_FC_INT8_GPU");
