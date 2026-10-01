@@ -930,7 +930,13 @@ static ErrorCode load_into_handle(CausalLmModel &h, BackendType compute,
 
   std::lock_guard<std::mutex> lock(h.mtx);
   try {
+    // Loading into a handle that still holds models is a reload: release the
+    // device caches the old models seeded once they are gone, exactly as
+    // unloadModelHandle() does, before this load recycles their addresses.
+    const bool reload = !h.models.empty();
     h.models.clear();
+    if (reload)
+      causallm::CausalLM::releaseDeviceCaches();
     h.architectures.clear();
     h.model_dirs.clear();
     h.initialization_duration_ms.clear();
@@ -2322,6 +2328,10 @@ ErrorCode unloadModelHandle(CausalLmHandle handle) {
   handle->initialization_duration_ms.clear();
   handle->initialized = false;
   reset_handle_session_state(*handle);
+  // The model objects are gone; drop the process-global device caches their
+  // weights seeded (keyed by host addresses) before a next load recycles those
+  // addresses. See CausalLM::releaseDeviceCaches().
+  causallm::CausalLM::releaseDeviceCaches();
   return CAUSAL_LM_ERROR_NONE;
 }
 
@@ -2341,6 +2351,7 @@ ErrorCode destroyModelHandle(CausalLmHandle handle) {
     handle->initialization_duration_ms.clear();
     handle->initialized = false;
     reset_handle_session_state(*handle);
+    causallm::CausalLM::releaseDeviceCaches(); // see unloadModelHandle
   }
   delete handle;
   return CAUSAL_LM_ERROR_NONE;
