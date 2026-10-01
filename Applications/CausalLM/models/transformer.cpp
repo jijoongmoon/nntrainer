@@ -955,13 +955,13 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
 Tensor Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
                               Tensor input) {
 
-  // Create gate BEFORE up: the model loader assigns file offsets in graph
-  // creation order (positional, not by name), and the converters write the
-  // FFN weights gate_proj -> up_proj -> down_proj (the HF convention). If up
-  // is created first, ffn_up loads the gate_proj bytes and ffn_gate loads the
-  // up_proj bytes, so swiglu computes silu(up)*gate instead of silu(gate)*up
-  // -- coherent-looking but wrong (the global gate/up swap; Gemma2/3 avoided
-  // it by overriding createMlp gate-first).
+  // A positional .bin is read in graph order, and the graph is collected by
+  // walking back from the output through each layer's inputs in order, so
+  // swiglu({gate, up}) loads ffn_gate before ffn_up whatever order the two
+  // are created in. The converters therefore write gate_proj -> up_proj ->
+  // down_proj (the HF order, as for Gemma's createMlp). A file written up ->
+  // gate loads each projection into the other and computes silu(up) * gate:
+  // plausible-looking text that is wrong.
   LayerHandle ffn_gate(createLayer(
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_gate"),
