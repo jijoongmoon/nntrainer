@@ -40,68 +40,35 @@ namespace nntrainer::opencl {
 namespace {
 
 /**
- * @brief Whether this device needs an explicit flush between a kernel that
- *        writes shared virtual memory and the kernel that reads it.
+ * @brief Whether to drain the queue after every dispatch that touches shared
+ *        virtual memory.
  *
- * An in-order queue does not by itself make a coarse-grain shared-memory
- * handoff visible to the next kernel; fine-grain buffer memory is coherent by
- * definition and needs nothing. CL_DEVICE_SVM_FINE_GRAIN_BUFFER is the
- * queryable difference, so the decision is derived from that capability and
- * from nothing else.
+ * Off by default; NNTR_XE3_SYNC=1 turns it on. It used to default on for every
+ * device without fine-grain SVM (Xe3), where it cost a clFinish per
+ * shared-memory dispatch -- 218 of 461 per decoded token on a 1.5B model. Two
+ * things were measured before turning it off.
  *
- * There is deliberately no vendor clause. What is being worked around is a
- * property of coarse-grain shared memory, which the queue does not order;
- * scoping the repair to the one device it was first measured on would leave
- * every other coarse-grain device racing. A coarse-grain device need not be
- * Intel, and this backend probes non-Intel ICDs (Adreno) as well, so a vendor
- * clause could exclude a primary target from the fix; a device that reports a
- * fine-grain capability gets no drain whatever its vendor. "Not observed
- * elsewhere" is an absence of measurement rather than a distinction a reader
- * can act on, and what it would leave in place is a wrong result, not a slow
- * one. The cost where the drain was not needed is one clFinish per dispatch
- * that touched shared memory: throughput, measurable, and recoverable.
+ * Kernel to kernel, the in-order queue already orders coarse-grain SVM: with
+ * the drain off, a 1.5B dense model and a 2B per-layer-embedding model gave the
+ * same tokens as with it, run after run.
  *
- * Both fine-grain capabilities count. A device advertising FINE_GRAIN_SYSTEM
- * without FINE_GRAIN_BUFFER is coherent just the same, and testing only the
- * buffer bit would classify it coarse-grain and drain it for nothing.
+ * The one ordering the drain was really providing is a shared-memory unmap
+ * enqueued behind a kernel that is still running. With the drain off, Gemma-4
+ * produced different text run to run until that unmap waited for the queue
+ * (enqueueSVMUnmap below). With that in place the drain is redundant, and it
+ * stays here only as a diagnostic.
  *
- * Resolved once per process, on the first dispatch rather than at init: the
- * device info is not populated before then, and a null device_info latches
- * false for the life of the process. NNTR_XE3_SYNC overrides the whole
- * derivation, and is read before it, so that case is recoverable without a
- * rebuild.
+ * Resolved once per process.
  */
 bool needsCoarseSVMDrain() {
   static const bool drain = []() {
-    // NNTR_XE3_SYNC: explicit override, consulted FIRST. The capability
-    // derivation below is the right default, but it can only speak once the
-    // device has been probed -- and this predicate resolves ONCE. A dispatch
-    // that beats the device info into existence latches "no drain" for the
-    // life of the process, silently, and a coarse-grain device then reads a
-    // buffer the GPU has not finished writing. The override exists precisely
-    // for that case, so it must not depend on the thing it works around.
-    if (const char *e = std::getenv("NNTR_XE3_SYNC")) {
-      const bool on = std::atoi(e) != 0;
-      ml_logi("NNTR_XE3_SYNC=%s overrides the shared-memory drain: %s", e,
-              on ? "on" : "off");
-      return on;
-    }
-    const auto *device_info = ContextManager::Global().getDeviceInfo();
-    if (!device_info) {
-      // Fail safe to off, but say so: this disables a coherence drain, which
-      // is not something to discover from wrong output.
-      ml_logw("No device info when resolving the shared-memory drain; it is "
-              "off for this process. Set NNTR_XE3_SYNC=1 if the GPU output "
-              "races.");
-      return false;
-    }
-    const cl_device_svm_capabilities svm =
-      device_info->getDeviceSVMCapabilities();
-    const bool fine_grain = (svm & (CL_DEVICE_SVM_FINE_GRAIN_BUFFER |
-                                    CL_DEVICE_SVM_FINE_GRAIN_SYSTEM)) != 0;
-    ml_logd("SVM capabilities 0x%x (fine grain %d): shared-memory drain %s",
-            (unsigned)svm, (int)fine_grain, fine_grain ? "off" : "on");
-    return !fine_grain;
+    const char *e = std::getenv("NNTR_XE3_SYNC");
+    const bool on = e != nullptr && std::atoi(e) != 0;
+    if (on)
+      ml_logi("NNTR_XE3_SYNC=%s: draining the queue after every "
+              "shared-memory dispatch",
+              e);
+    return on;
   }();
   return drain;
 }
@@ -109,9 +76,9 @@ bool needsCoarseSVMDrain() {
 /**
  * @brief Whether the device's shared virtual memory is coarse-grain only.
  *
- * The capability half of needsCoarseSVMDrain() without its override: the
- * unmap ordering below is a correctness dependency, not a throughput lever, so
- * NNTR_XE3_SYNC does not turn it off. Unknown device info answers true and is
+ * Neither fine-grain capability (buffer or system) is reported. The unmap
+ * ordering below is a correctness dependency, not a throughput lever, so no
+ * environment variable turns it off. Unknown device info answers true and is
  * not latched -- the cost of a wrong "true" is one clFinish on an idle queue.
  */
 bool coarseGrainSVMOnly() {

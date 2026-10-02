@@ -47,9 +47,8 @@ ninja -C build_cl Applications/CausalLM/nntr_causallm
 #       -Denable-transformer=true -Dwerror=false --buildtype=release
 
 # Run (canonical Intel env). The int8 FC GEMM, the SVM KV cache and the cl_mem
-# activation pool are on by default; the buffer (non-image) v8c path, XMX and
-# the Xe3 coarse-grain-SVM drain are derived from device caps. Only GPU
-# attention is opt-in.
+# activation pool are on by default; the buffer (non-image) v8c path and XMX
+# are derived from device caps. Only GPU attention is opt-in.
 NNTR_MHA_GPU=1 \
   ./build_cl/Applications/CausalLM/nntr_causallm <MODEL_DIR> ["prompt"]
 ```
@@ -116,7 +115,7 @@ setting to override it (e.g. `=0` for an A/B run).
 | `NNTR_GPU_CLMEM_POOL` | default on | default on | `NNTR_CUDA_DEV_ACT` (auto on discrete) |
 | `NNTR_V8C_BUF` | caps → image2d | caps → buffer/dp4a | — |
 | `NNTR_KV_IMG_ATTN` | `1` (image2d KV) | — | — |
-| `NNTR_XE3_SYNC` | caps (fine-grain SVM ⇒ off) | caps (coarse-grain SVM, e.g. Xe3 ⇒ drain) | — |
+| `NNTR_XE3_SYNC` | off (`=1` drains) | off (`=1` drains) | — |
 | GEMM family | dp4a (image) | **XMX auto** (caps) → dp4a | cuBLAS IMMA + block-Q |
 
 **Long context.** The sliding-window KV ring and chunked prefill are off by
@@ -483,9 +482,11 @@ Intel selects one of two GEMM families by capability and always uses the buffer
   the residency model relies on (Meteor Lake's fine-grained SVM did — this is a
   new-ISA regression). The fix is a `clFinish` at the producer→consumer
   boundary; without it the consumer reads stale output and the model emits
-  garbage. It is on by default for any device without fine-grain SVM
-  (`needsCoarseSVMDrain()` in `opencl_command_queue_manager.cpp`), and
-  `NNTR_XE3_SYNC` overrides that derivation either way.
+  garbage. The per-dispatch drain that used to provide it
+  (`needsCoarseSVMDrain()` in `opencl_command_queue_manager.cpp`) is off by
+  default now: what it was really ordering is a shared-memory unmap enqueued
+  behind a running kernel, and `enqueueSVMUnmap()` now waits for the queue
+  itself on a coarse-grain device. `NNTR_XE3_SYNC=1` restores the drain.
 
 ### 7.3 NVIDIA CUDA — RTX (discrete) and Orin (integrated)
 
@@ -561,7 +562,7 @@ The full list is in the source (`grep -rn std::getenv`).
 | `NNTR_MHA_GPU` / `NNTR_MHA_GPU_DECODE` | GPU attention; the `_DECODE` form extends it (and GPU-RoPE + flash-decode) to the `M=1` step. | OpenCL |
 | `NNTR_GPU_SVM_POOL` | SVM-resident KV cache on the OpenCL engine (default on; `=0` ⇒ host KV cache). | OpenCL |
 | `NNTR_GPU_CLMEM_POOL` | Device `cl_mem` activation pool (FC consumes producer's output directly). Default on; `=0` ⇒ plain SVM pool. | OpenCL |
-| `NNTR_XE3_SYNC` | Override the producer→consumer `clFinish`, which defaults on for devices without fine-grain SVM (e.g. Xe3). | OpenCL |
+| `NNTR_XE3_SYNC` | `=1`: `clFinish` after every dispatch that touches shared memory (off by default; a diagnostic). | OpenCL |
 | `NNTR_FC_XMX` / `NNTR_FC_XMX_FORCE` | `NNTR_FC_XMX=0` disables the caps-derived (`caps().dpas`) XMX default; `NNTR_FC_XMX_FORCE=1` skips the capability check. | Intel-XMX |
 | `NNTR_GEMV_COOP` | 64-wide K-split cooperative decode GEMV (default on). | OpenCL |
 | `NNTR_ROPE_LUT_CAP` / `NNTR_NO_GPU_ROPE` | Override the GPU-RoPE LUT cap / disable GPU RoPE entirely. | OpenCL |
@@ -621,7 +622,7 @@ that one `.so` needs pushing.
 |---------|-------------|
 | `allocateAndBindKVCache: cache placeholder dtype mismatch` (abort at layer 0) | **Stale `libccapi-nntrainer.so` on the device.** The KV-placeholder dtype is decided by the Tensor-API graph compile in libccapi; an old copy gives `kp=FP32 ≠ kc=FP16`. Push the fresh libccapi (verify with `md5sum`). |
 | Output collapses to a single repeated token | `NNTR_GPU_CLMEM_POOL=0` is set (the pool is on by default and needed for coherence on both OpenCL backends). |
-| Garbage on **Xe3** specifically | `NNTR_XE3_SYNC=0` is set, or the drain resolved off (a "No device info" warning); set `NNTR_XE3_SYNC=1` (Panther Lake SVM coherence regression). |
+| Garbage on **Xe3** specifically | Try `NNTR_XE3_SYNC=1` (drain after every shared-memory dispatch). If that fixes it, a host-side shared-memory access is missing its ordering against the queue; report it. |
 | `Failed to open file` (tokenizer) | `tokenizer_file` points at a device path; set the local absolute path. |
 | Silent garbage after editing a `.cl` kernel (Android) | A stale embedded kernel string. Rebuild with `build_android.sh` (Meson regenerates the kernel sources) rather than the test-only `jni/Android.mk` ndk-build harness. |
 | `dlopen`/undefined-symbol for `clSVM*` on Android | `libnntrainer.so` was built without OpenCL. Reconfigure `builddir` with `-Denable-opencl=true` and `ninja install`. |
@@ -669,7 +670,8 @@ edits to models or core. Status:
 
 **Env-knob status.** *Retired to caps-default* (env now an override): `NNTR_FC_XMX`,
 `NNTR_CUDA_GEMM_ATTN`, `NNTR_V8C_BUF` (from `DeviceCaps::image_v8c`, set by
-vendor id), `NNTR_XE3_SYNC` (from the device's fine-grain-SVM capability).
+vendor id).
+*Default off* (env `=1` to opt in): `NNTR_XE3_SYNC`.
 *Default on* (env only for an `=0` A/B): `NNTR_FC_INT8_GPU`, `NNTR_GPU_SVM_POOL`,
 `NNTR_GPU_CLMEM_POOL`. *Never an env flag* (structural): q/k/v-norm residency
 (`engine=` property). *No-op alias*: `NNTR_FC_GPU` (real gate `NNTR_FC_INT8_GPU`).

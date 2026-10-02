@@ -2138,11 +2138,12 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
     // planner sub-buffer), and on the in-order queue a device-buffer handoff
     // needs no drain. Where the FC does touch shared memory -- an SVM input
     // staged by v8c_copy_svm_to_clmem, an SVM output written by
-    // v8c_write_output_resident -- those copy kernels bind SVM arguments, so
-    // the capability-derived drain in CommandQueueManager (needsCoarseSVMDrain)
-    // already finishes the queue after them on a coarse-grain device.
+    // v8c_write_output_resident -- those copy kernels are ordered by the
+    // in-order queue, and the shared-memory unmap that hands the plane over
+    // waits for the queue on a coarse-grain device (enqueueSVMUnmap).
     //
-    // Measured on an Intel Xe3 iGPU with that drain in place: skipping this
+    // Measured on an Intel Xe3 iGPU with the per-dispatch drain in place
+    // (NNTR_XE3_SYNC, then on by default): skipping this
     // sync left the generated token sequence unchanged on three models (a
     // dense 1.5B model on the XMX and dp4a lanes, a 2B-class model with
     // per-layer embeddings, and Gemma-4), 1K-token summarization prompts,
