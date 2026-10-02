@@ -13,6 +13,7 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ ubuntu-22.04 ]
         # The third entry builds and RUNS the whole suite with _FP16 bound to
@@ -22,7 +23,10 @@ jobs:
         # differs: the MSVC job that selects the wrapper for real is
         # compile-and-link only, and unittest_half_fp16 exercises Half in
         # isolation rather than the tree's thousands of _FP16 uses.
-        meson_options: [ "-Denable-fp16=false", "-Denable-fp16=true", "-Denable-fp16=true -Dfp16-impl=wrapper" ]
+        # The fourth entry builds and RUNS integration_test_fsu.cpp (FSU is
+        # off by default and was otherwise only compiled by the nightly
+        # build, so a regression there was invisible to PR CI).
+        meson_options: [ "-Denable-fp16=false", "-Denable-fp16=true", "-Denable-fp16=true -Dfp16-impl=wrapper", "-Denable-fp16=false -Denable-fsu=true" ]
 
     steps:
     - uses: actions/checkout@v4
