@@ -16,6 +16,7 @@
 #include "opencl_context_manager.h"
 #include "opencl_loader.h"
 
+#include <atomic>
 #include <cstdlib>
 
 #include <nntrainer_error.h>
@@ -104,6 +105,39 @@ bool needsCoarseSVMDrain() {
   }();
   return drain;
 }
+
+/**
+ * @brief Whether the device's shared virtual memory is coarse-grain only.
+ *
+ * The capability half of needsCoarseSVMDrain() without its override: the
+ * unmap ordering below is a correctness dependency, not a throughput lever, so
+ * NNTR_XE3_SYNC does not turn it off. Unknown device info answers true and is
+ * not latched -- the cost of a wrong "true" is one clFinish on an idle queue.
+ */
+bool coarseGrainSVMOnly() {
+  static std::atomic<int> state{-1};
+  const int s = state.load(std::memory_order_relaxed);
+  if (s >= 0)
+    return s != 0;
+  const auto *device_info = ContextManager::Global().getDeviceInfo();
+  if (!device_info)
+    return true;
+  const cl_device_svm_capabilities svm =
+    device_info->getDeviceSVMCapabilities();
+  const bool coarse = (svm & (CL_DEVICE_SVM_FINE_GRAIN_BUFFER |
+                              CL_DEVICE_SVM_FINE_GRAIN_SYSTEM)) == 0;
+  state.store(coarse ? 1 : 0, std::memory_order_relaxed);
+  return coarse;
+}
+
+/**
+ * @brief True while a kernel enqueued on the queue may still be running: set by
+ * every NDRange enqueue that was not followed by a drain here, cleared by a
+ * drain here or by a blocking map (which waits for everything before it).
+ * Another clFinish elsewhere leaves it set; the cost of that is one clFinish
+ * on an idle queue before the next shared-memory unmap, never a missed one.
+ */
+std::atomic<bool> s_kernels_in_flight{false};
 
 } // namespace
 
@@ -407,10 +441,29 @@ bool CommandQueueManager::enqueueSVMMap(void *svm_ptr, size_t size,
       error_code, OpenCLErrorCodeToString(error_code));
     return false;
   }
+  // A blocking map returns only after every earlier command has completed.
+  if (blocking == CL_TRUE)
+    s_kernels_in_flight.store(false, std::memory_order_relaxed);
   return true;
 }
 
 bool CommandQueueManager::enqueueSVMUnmap(void *svm_ptr, cl_event *event) {
+  // On a coarse-grain device, a shared-memory unmap enqueued behind kernels
+  // that are still running is not ordered after them in practice, although
+  // the queue is in-order: measured on Xe3, the residual add that hands a
+  // host-written operand to the device (unmap, copy kernel, map) read
+  // different bytes run to run whenever the kernel before it (the per-layer
+  // projection norm) had not finished, and identical bytes when the queue
+  // was drained first or the unmap was left out. The per-dispatch drain
+  // (needsCoarseSVMDrain) hid this by keeping the queue idle at every unmap;
+  // this is the one ordering that drain was providing, kept on its own so the
+  // drain can be turned off without it.
+  if (s_kernels_in_flight.load(std::memory_order_relaxed) &&
+      coarseGrainSVMOnly()) {
+    clFinish(command_queue_);
+    Kernel::clearUndrainedSvmPlanes();
+    s_kernels_in_flight.store(false, std::memory_order_relaxed);
+  }
   cl_int error_code =
     clEnqueueSVMUnmap(command_queue_, svm_ptr, 0, nullptr, event);
 
@@ -485,6 +538,9 @@ bool CommandQueueManager::DispatchCommand(
   if (touched_svm && needsCoarseSVMDrain()) {
     clFinish(command_queue_);
     Kernel::clearUndrainedSvmPlanes();
+    s_kernels_in_flight.store(false, std::memory_order_relaxed);
+  } else {
+    s_kernels_in_flight.store(true, std::memory_order_relaxed);
   }
 
   return true;
@@ -540,6 +596,9 @@ bool CommandQueueManager::DispatchCommand(
   if (touched_svm && needsCoarseSVMDrain()) {
     clFinish(command_queue_);
     Kernel::clearUndrainedSvmPlanes();
+    s_kernels_in_flight.store(false, std::memory_order_relaxed);
+  } else {
+    s_kernels_in_flight.store(true, std::memory_order_relaxed);
   }
 
   return true;
@@ -581,6 +640,9 @@ void CommandQueueManager::enqueueKernel(const cl_kernel kernel,
   if (touched_svm && needsCoarseSVMDrain()) {
     clFinish(command_queue_);
     Kernel::clearUndrainedSvmPlanes();
+    s_kernels_in_flight.store(false, std::memory_order_relaxed);
+  } else {
+    s_kernels_in_flight.store(true, std::memory_order_relaxed);
   }
 }
 
