@@ -131,6 +131,80 @@ static constexpr bool host_decode_prefers_per_row() {
 
 #include <cstdint>
 
+#if defined(ENABLE_OPENCL)
+namespace {
+
+/**
+ * @brief The FP16 operand planes an FP32-activation layer narrowed on the
+ *        device, while no host reader has waited for them yet.
+ * @details MHACoreLayer::incremental_forwarding fills Q/K/V there with
+ * kernels it does not drain, because the device attention arms that normally
+ * read them are on the same in-order queue. A host arm of
+ * one_batch_incremental_forwarding (host RoPE, host attention) is the one
+ * reader that is not, and it calls settle_act_stage_for_host() first.
+ */
+struct ActStageHostState {
+  void *ptr[4] = {nullptr, nullptr, nullptr, nullptr};
+  size_t bytes[4] = {0, 0, 0, 0};
+  bool pending = false; ///< written on the device, not yet mapped for the host
+  bool mapped = false;  ///< mapped for the host, unmap after the layer
+};
+
+thread_local ActStageHostState s_act_stage;
+
+/**
+ * @brief Map the pending FP16 operand planes for the host. Blocking, so the
+ *        narrowing kernels have finished when it returns. A no-op unless an
+ *        FP32-activation layer staged its operands on the device.
+ */
+void settle_act_stage_for_host() {
+  if (!s_act_stage.pending)
+    return;
+  for (unsigned int i = 0; i < 4; ++i)
+    nntrainer::cl_svm_map_force(s_act_stage.ptr[i], s_act_stage.bytes[i],
+                                /*read_only=*/false);
+  s_act_stage.pending = false;
+  s_act_stage.mapped = true;
+}
+
+/**
+ * @brief Holds shared-virtual-memory operands for a host reader or writer.
+ * @details add() maps an operand that lives in shared virtual memory,
+ * blocking, so the kernels that write it have finished and the host sees
+ * their bytes; the destructor hands every mapped operand back to the device.
+ * Operands in host memory are left alone, so this is free on the cpu engine.
+ */
+class HostSvmAccess {
+public:
+  HostSvmAccess() = default;
+  HostSvmAccess(const HostSvmAccess &) = delete;
+  HostSvmAccess &operator=(const HostSvmAccess &) = delete;
+  ~HostSvmAccess() {
+    for (void *p : mapped_)
+      nntrainer::cl_svm_unmap_force(p);
+  }
+
+  /**
+   * @brief Map @a t for the host when it is in shared virtual memory.
+   * @param t operand
+   * @param read_only true when the host only reads it
+   */
+  void add(const nntrainer::Tensor &t, bool read_only) {
+    const auto md = t.getMemoryData();
+    if (!md || !md->isSVM() || t.isClMem())
+      return;
+    void *p = t.getData();
+    nntrainer::cl_svm_map_force(p, t.bytes(), read_only);
+    mapped_.push_back(p);
+  }
+
+private:
+  std::vector<void *> mapped_;
+};
+
+} // namespace
+#endif // ENABLE_OPENCL
+
 #if (defined(__x86_64__) || defined(__i386__) || defined(_M_X64) ||            \
      defined(_M_IX86)) &&                                                      \
   defined(ENABLE_FP16)
@@ -1335,6 +1409,22 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
       output_step_dim, batch * output_dim.getFeatureLen(), true);
 
     if (query_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
+#if defined(ENABLE_OPENCL) && defined(ENABLE_FP16)
+      // FP32 operands: the device route, else the host arms with their
+      // operands held for the host (see incremental_forwarding()).
+      if (attention_fp32_on_device(
+            batch, from, from, to, query_step, key_step, value_step,
+            output_step, cache_key, cache_value, cache_key_dim,
+            cache_key_step_dim, cache_value_dim, cache_value_step_dim))
+        continue;
+      // The host arms below read Q/K/V and write O on the host: wait for their
+      // producers and hold the planes for the host until the layer is done.
+      HostSvmAccess host_io;
+      host_io.add(query_step, /*read_only=*/true);
+      host_io.add(key_step, /*read_only=*/true);
+      host_io.add(value_step, /*read_only=*/true);
+      host_io.add(output_step, /*read_only=*/false);
+#endif
 #if ENABLE_FP16 && defined(__ANDROID__)
       nntrainer::TensorDim Q_step_dim = query_step_dim;
       nntrainer::TensorDim K_step_dim = key_step_dim;
@@ -1513,6 +1603,29 @@ void MHACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       output_step_dim, batch * output_dim.getFeatureLen(), true);
 
     if (query_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
+#if defined(ENABLE_OPENCL) && defined(ENABLE_FP16)
+      // FP32-activation model with the device attention on. The device arms
+      // (RoPE, image / flash attention) take FP16 operands in shared virtual
+      // memory, and this layer's operands are FP32. The host path below reads
+      // Q/K/V while the projections that write them can still be in the queue
+      // (V comes straight from its projection, so it was read stale), and on
+      // ARM its FP16 copies are host heap that no device arm can take, so
+      // decode also lands on the slow host arm. Narrow on the device into
+      // FP16 planes instead, run the same path as an FP16-activation model and
+      // widen O back on the device.
+      if (attention_fp32_on_device(
+            batch, _from, from, to, query_step, key_step, value_step,
+            output_step, cache_key, cache_value, cache_key_dim,
+            cache_key_step_dim, cache_value_dim, cache_value_step_dim))
+        continue;
+      // The host arms below read Q/K/V and write O on the host: wait for their
+      // producers and hold the planes for the host until the layer is done.
+      HostSvmAccess host_io;
+      host_io.add(query_step, /*read_only=*/true);
+      host_io.add(key_step, /*read_only=*/true);
+      host_io.add(value_step, /*read_only=*/true);
+      host_io.add(output_step, /*read_only=*/false);
+#endif
 #if ENABLE_FP16 && defined(__ANDROID__)
       nntrainer::TensorDim Q_step_dim = query_step_dim;
       nntrainer::TensorDim K_step_dim = key_step_dim;
@@ -1567,6 +1680,81 @@ void MHACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   // increase cache size
   cache_index += step_size;
 }
+
+#if defined(ENABLE_OPENCL) && defined(ENABLE_FP16)
+bool MHACoreLayer::attention_fp32_on_device(
+  const unsigned int batch, const unsigned int _from, const unsigned int from,
+  const unsigned int to, nntrainer::Tensor &query_step,
+  nntrainer::Tensor &key_step, nntrainer::Tensor &value_step,
+  nntrainer::Tensor &attention_output_step, nntrainer::Tensor &cache_key,
+  nntrainer::Tensor &cache_value, ml::train::TensorDim &cache_key_dim,
+  ml::train::TensorDim &cache_key_step_dim,
+  ml::train::TensorDim &cache_value_dim,
+  ml::train::TensorDim &cache_value_step_dim) {
+  if (!use_gemm_attention || kv_int8 || use_sink ||
+      !mha_device_attention_on() || nntr_engine_env() == "cuda")
+    return false;
+  auto svm_plane = [](const nntrainer::Tensor &t) {
+    const auto md = t.getMemoryData();
+    return md && md->isSVM() && !t.isClMem();
+  };
+  if (!svm_plane(query_step) || !svm_plane(key_step) ||
+      !svm_plane(value_step) || !svm_plane(attention_output_step) ||
+      !svm_plane(cache_key) || !svm_plane(cache_value) ||
+      cache_key.getDataType() != ml::train::TensorDim::DataType::FP16 ||
+      cache_value.getDataType() != ml::train::TensorDim::DataType::FP16)
+    return false;
+
+  // One FP16 plane per operand, grow-only: the prefill step is the largest
+  // and comes first, so decode steps reuse it.
+  const nntrainer::Tensor *src[4] = {&query_step, &key_step, &value_step,
+                                     &attention_output_step};
+  nntrainer::Tensor half[4];
+  std::shared_ptr<nntrainer::MemoryData> plane[4];
+  for (unsigned int i = 0; i < 4; ++i) {
+    nntrainer::TensorDim d = src[i]->getDim();
+    d.setDataType(ml::train::TensorDim::DataType::FP16);
+    plane[i] =
+      nntrainer::fp16_act_stage_svm(i, d.getDataLen() * sizeof(uint16_t));
+    if (!plane[i])
+      return false;
+    half[i] = nntrainer::Tensor(d, false);
+    half[i].setData(plane[i], 0);
+  }
+  for (unsigned int i = 0; i < 3; ++i) {
+    if (!nntrainer::gpu_cast_f32_to_f16_cl(
+          src[i]->getData<float>(), half[i].getData<uint16_t>(),
+          static_cast<unsigned int>(src[i]->size())))
+      return false;
+  }
+
+  for (unsigned int i = 0; i < 4; ++i) {
+    s_act_stage.ptr[i] = half[i].getData<uint16_t>();
+    s_act_stage.bytes[i] = half[i].bytes();
+  }
+  s_act_stage.pending = true;
+  s_act_stage.mapped = false;
+  one_batch_incremental_forwarding(batch, _from, from, to, half[0], half[1],
+                                   half[2], half[3], cache_key, cache_value,
+                                   cache_key_dim, cache_key_step_dim,
+                                   cache_value_dim, cache_value_step_dim);
+  s_act_stage.pending = false;
+  if (s_act_stage.mapped) {
+    // A host arm took this call and mapped the planes: give them back
+    // before the device reads O.
+    for (unsigned int i = 0; i < 4; ++i)
+      nntrainer::cl_svm_unmap_force(s_act_stage.ptr[i]);
+    s_act_stage.mapped = false;
+  }
+  NNTR_THROW_IF(!nntrainer::gpu_cast_f16_to_f32_cl(
+                  half[3].getData<uint16_t>(),
+                  attention_output_step.getData<float>(),
+                  static_cast<unsigned int>(attention_output_step.size())),
+                std::runtime_error)
+    << "mha_core: widening the FP16 attention output on the device failed";
+  return true;
+}
+#endif
 
 /**
  * @brief Function to compute Attention Scores using Tensor inputs. Wrapper
@@ -2127,9 +2315,17 @@ void MHACoreLayer::one_batch_incremental_forwarding(
     const bool _rope_len_ok =
       ((to - from) >= ROPE_MIN_PREFILL && !(_img_arm && (to - from) == 1)) ||
       (_gpu_rope_decode && (to - from) == 1);
+    // The kernels bind Q and K as shared or device memory; a host-heap operand
+    // (the ARM host copy of an FP32-activation layer) is neither, and binding
+    // it as a shared pointer rotated nothing the attention then read.
+    auto device_addressable = [](const nntrainer::Tensor &t) {
+      const auto md = t.getMemoryData();
+      return t.isClMem() || (md && md->isSVM());
+    };
     if (!_gpu_rope_off && _mha_gpu_on && use_gemm_attention && !kv_int8 &&
         !kv_ohwi_now && _rope_len_ok &&
-        query_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
+        query_step.getDataType() == ml::train::TensorDim::DataType::FP16 &&
+        device_addressable(query_step) && device_addressable(key_step)) {
       // Flat [max_pos, half_d] cos/sin LUT (fp16 bits) from the cached trig
       // table. Built once (cached by theta/head_dim/max_pos) so the GPU RoPE
       // path has no per-call flatten; rope_inplace_f16_cl uploads it once.
@@ -2624,6 +2820,9 @@ void MHACoreLayer::one_batch_incremental_forwarding(
     if (!gpu_rope_done) {
       // Host RoPE reads/writes Q/K/V on the host: lower first (decode and any
       // GPU-RoPE-ineligible path).
+#if defined(ENABLE_OPENCL)
+      settle_act_stage_for_host();
+#endif
       // NNTR_ROPE_TPROF: per-token wall time of the host-RoPE lower_q+lower_kv
       // drains (decode only). Accumulated across layers; printed each decode
       // token (reset). Measures whether GPU-RoPE-for-OHWI is worth the work.
@@ -4215,6 +4414,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
     // host, not on that queue: settle the queue once first.
     if (kv_write_undrained)
       nntrainer::cl_queue_finish();
+    settle_act_stage_for_host();
 #endif
     lower_q();
     sync_kv_slab(cache_from);
@@ -4234,6 +4434,9 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   mha_ring_assert_host_path_ok(kv_ring_cap, "host decode attention");
   mha_assert_host_readable(query_step, b_cached_key, b_cached_value,
                            attention_output_step, "host per-row attention");
+#if defined(ENABLE_OPENCL)
+  settle_act_stage_for_host();
+#endif
   lower_q();
   // MHA_CLMEM: decode reads the whole prefix from the concat slab; gather
   // the prefill rows (mirror-only during the prefill window) back once.

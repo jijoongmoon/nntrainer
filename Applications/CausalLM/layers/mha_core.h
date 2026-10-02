@@ -407,6 +407,30 @@ public:
     ml::train::TensorDim &cache_key_step_dim,
     ml::train::TensorDim &cache_value_dim,
     ml::train::TensorDim &cache_value_step_dim, nntrainer::Tensor &sink_step);
+
+  /**
+   * @brief Run one batch of an FP32-activation layer on the device attention.
+   * @details The device arms (RoPE, image / flash attention) take FP16
+   * operands in shared virtual memory. This narrows Q/K/V into FP16 planes on
+   * the device, runs one_batch_incremental_forwarding on them as for an
+   * FP16-activation model, and widens O back into @a attention_output_step on
+   * the device, so no operand is read on the host. The arguments are those of
+   * one_batch_incremental_forwarding, with FP32 step operands.
+   * @return false, with nothing enqueued that a host arm would read, when this
+   *         call cannot take it: no OpenCL device attention in this run, an
+   *         int8 KV cache or an attention sink, or operands that are not
+   *         plain shared virtual memory. The caller then runs its host path.
+   */
+  bool attention_fp32_on_device(
+    const unsigned int batch, const unsigned int _from, const unsigned int from,
+    const unsigned int to, nntrainer::Tensor &query_step,
+    nntrainer::Tensor &key_step, nntrainer::Tensor &value_step,
+    nntrainer::Tensor &attention_output_step, nntrainer::Tensor &cache_key,
+    nntrainer::Tensor &cache_value, ml::train::TensorDim &cache_key_dim,
+    ml::train::TensorDim &cache_key_step_dim,
+    ml::train::TensorDim &cache_value_dim,
+    ml::train::TensorDim &cache_value_step_dim);
+
   /**
    * @copydoc Layer::incremental_forwarding(RunLayerContext &context, unsigned
    * int from, unsigned int to, bool training)
