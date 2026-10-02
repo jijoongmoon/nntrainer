@@ -955,13 +955,12 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
       withKey("max_position_embeddings", MAX_POSITION_EMBEDDINGS),
       withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
       withKey("is_causal", IS_CAUSAL ? "true" : "false"),
-      // nntr_config "use_flash_attention" (default true) runs the cpu-engine
-      // prefill through the host flash (GEMM) arm; false keeps it on the
-      // per-row path. The device attention arms this property also opens on
-      // the gpu and cuda engines are not validated for the generic model.
+      // nntr_config "use_flash_attention" (default true) selects the flash
+      // (GEMM) arm: the host one on the cpu engine, the device attention on a
+      // GPU engine whose arm can run; false keeps the per-row host path. See
+      // causallm_gemm_attention().
       withKey("use_gemm_attention",
-              (USE_FLASH_ATTENTION && causallm_engine() == "cpu") ? "true"
-                                                                  : "false"),
+              causallm_gemm_attention(USE_FLASH_ATTENTION) ? "true" : "false"),
     }));
   Tensor a = wireAttentionKVCache(layer_id, n_heads, mha, q, k, v,
                                   /*use_int8=*/false);

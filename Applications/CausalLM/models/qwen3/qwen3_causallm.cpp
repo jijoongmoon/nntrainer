@@ -107,24 +107,22 @@ Tensor Qwen3Transformer::createAttention(const int layer_id, int seq_len,
       withKey("max_position_embeddings", MAX_POSITION_EMBEDDINGS),
       withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
       withKey("is_causal", IS_CAUSAL ? "true" : "false"),
-      // nntr_config "use_flash_attention" (default true) runs the cpu-engine
-      // prefill through the host flash (GEMM) arm; false keeps it on the
-      // per-row path. q_norm/k_norm above are separate layers, so both arms
-      // read the same normalised Q/K, and RoPE is applied inside mha_core
-      // before either. On the gpu and cuda engines this property also opens
-      // the device attention arms, which are not validated for this model
-      // yet, so it stays off there.
+      // nntr_config "use_flash_attention" (default true) selects the flash
+      // (GEMM) arm: the host one on the cpu engine, and on a GPU engine the
+      // device attention (cuda_attention, or the OpenCL flash / image arm
+      // under NNTR_MHA_GPU) for prefill and decode. false keeps the per-row
+      // host path, which cannot read a device-only activation pool. q_norm /
+      // k_norm above are separate layers, so every arm reads the same
+      // normalised Q/K, and RoPE is applied inside mha_core before any of
+      // them. See causallm_gemm_attention().
       withKey("use_gemm_attention",
-              (USE_FLASH_ATTENTION && causallm_engine() == "cpu") ? "true"
-                                                                  : "false"),
-      // Decode-GPU: qwen3 flash decode attention DIVERGES (a separate
-      // head_dim=128 bug) even with host RoPE, so keep BOTH the decode flash
-      // attention (B) and the GPU-RoPE-decode (A) OFF for now (explicit; both
-      // default false anyway). NNTR_MHA_GPU_DECODE env still forces them on for
-      // testing.
-      // derive from getModelFeatures() (single source). Values
-      // unchanged (qwen3: host decode, head_dim=128 diverges), so
-      // token-identical.
+              causallm_gemm_attention(USE_FLASH_ATTENTION) ? "true" : "false"),
+      // Decode properties from getModelFeatures() (single source): qwen3 keeps
+      // them off, so the decode RoPE stays on the host. They do not decide
+      // where decode attention runs once use_gemm_attention is on: the cuda
+      // engine routes every step to its device arm, and with NNTR_MHA_GPU the
+      // minimum flash step is 1 (x86, and ARM), so decode takes the OpenCL
+      // arm too.
       withKey("gpu_decode_attn",
               getModelFeatures().decode_gpu ? "true" : "false"),
       withKey("gpu_decode_rope",

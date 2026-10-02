@@ -122,6 +122,30 @@ inline std::string causallm_engine() {
 }
 
 /**
+ * @brief Whether a model builder should set mha_core's use_gemm_attention.
+ * @param use_flash the model's "use_flash_attention" (nntr_config, default
+ *        true).
+ * @return use_flash on the cpu engine (the host flash arm), and on a GPU
+ *         engine when its device attention arm can run: NNTR_CUDA_ATTN on the
+ *         cuda engine (defaulted on by the CUDA context), NNTR_MHA_GPU on the
+ *         gpu engine. False otherwise.
+ * @note On the cuda engine the activations can live in device-only memory
+ *       (NNTR_CUDA_DEV_ACT), which the host per-row attention cannot read, so
+ *       a model that leaves this off there cannot run. On the gpu engine
+ *       without NNTR_MHA_GPU the per-row path is kept, as before.
+ */
+inline bool causallm_gemm_attention(bool use_flash) {
+  if (!use_flash)
+    return false;
+  const std::string eng = causallm_engine();
+  if (eng == "cpu")
+    return true;
+  if (eng == "cuda")
+    return nntr_env_on("NNTR_CUDA_ATTN");
+  return nntr_env_on("NNTR_MHA_GPU");
+}
+
+/**
  * @brief generate multi tokens from logits
  * @note This function apply repetition penalty, bad words penalty, and sort to
  * generate multiple tokens
