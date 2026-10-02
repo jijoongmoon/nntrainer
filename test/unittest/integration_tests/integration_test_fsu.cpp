@@ -32,6 +32,50 @@ std::vector<float> fsu_answer;
 
 void RemoveWeightFile(std::string file_path) { remove(file_path.c_str()); }
 
+/**
+ * @brief Input dtype for a model_tensor_type ("<weight>-<activation>").
+ * @note The input layer keeps the dtype it is declared with, so an FP16
+ * activation model has to ask for an FP16 input explicitly.
+ */
+static std::string inputDtype(const std::string &weight_act_type) {
+  return weight_act_type.substr(weight_act_type.find('-') + 1);
+}
+
+/**
+ * @brief Run one inference on the input 0, 1, ..., feature_size - 1 and
+ * return the output as floats.
+ * @note The float* inference API maps the caller's buffers with the model's
+ * own input/output dtype, so an FP16 activation model is fed and read
+ * through _FP16 buffers rather than float ones.
+ */
+static std::vector<float> RunInference(ml::train::Model &model,
+                                       unsigned int feature_size,
+                                       const std::string &weight_act_type) {
+  std::vector<float> result;
+  result.reserve(feature_size);
+#ifdef ENABLE_FP16
+  if (inputDtype(weight_act_type) == "FP16") {
+    std::vector<_FP16> input(feature_size);
+    for (unsigned int j = 0; j < feature_size; ++j)
+      input[j] = static_cast<_FP16>(static_cast<float>(j));
+    std::vector<float *> in = {reinterpret_cast<float *>(input.data())};
+    std::vector<float *> answer = model.inference(1, in);
+    const _FP16 *out = reinterpret_cast<const _FP16 *>(answer[0]);
+    for (unsigned int i = 0; i < feature_size; i++)
+      result.push_back(static_cast<float>(out[i]));
+    return result;
+  }
+#endif
+  std::vector<float> input(feature_size);
+  for (unsigned int j = 0; j < feature_size; ++j)
+    input[j] = static_cast<float>(j);
+  std::vector<float *> in = {input.data()};
+  std::vector<float *> answer = model.inference(1, in);
+  for (unsigned int i = 0; i < feature_size; i++)
+    result.push_back(answer[0][i]);
+  return result;
+}
+
 void MakeWeight(unsigned int feature_size, unsigned int layer_num,
                 unsigned int look_ahead, std::string file_path,
                 std::string weight_act_type) {
@@ -39,9 +83,10 @@ void MakeWeight(unsigned int feature_size, unsigned int layer_num,
   ModelHandle _model = ml::train::createModel(
     ml::train::ModelType::NEURAL_NET, {nntrainer::withKey("loss", "mse")});
   _model->addLayer(ml::train::createLayer(
-    "input", {nntrainer::withKey("name", "input0"),
-              nntrainer::withKey("input_shape",
-                                 "1:1:" + std::to_string(feature_size))}));
+    "input",
+    {nntrainer::withKey("name", "input0"),
+     nntrainer::withKey("input_shape", "1:1:" + std::to_string(feature_size)),
+     nntrainer::withKey("input_dtype", inputDtype(weight_act_type))}));
 
   for (unsigned int i = 0; i < layer_num; i++) {
     _model->addLayer(ml::train::createLayer(
@@ -71,9 +116,10 @@ void MakeAnswer(unsigned int feature_size, unsigned int layer_num,
   ModelHandle _model = ml::train::createModel(
     ml::train::ModelType::NEURAL_NET, {nntrainer::withKey("loss", "mse")});
   _model->addLayer(ml::train::createLayer(
-    "input", {nntrainer::withKey("name", "input0"),
-              nntrainer::withKey("input_shape",
-                                 "1:1:" + std::to_string(feature_size))}));
+    "input",
+    {nntrainer::withKey("name", "input0"),
+     nntrainer::withKey("input_shape", "1:1:" + std::to_string(feature_size)),
+     nntrainer::withKey("input_dtype", inputDtype(weight_act_type))}));
 
   for (unsigned int i = 0; i < layer_num; i++) {
     _model->addLayer(ml::train::createLayer(
@@ -95,21 +141,7 @@ void MakeAnswer(unsigned int feature_size, unsigned int layer_num,
   EXPECT_EQ(status, ML_ERROR_NONE);
   _model->load(file_path);
 
-  float *input = new float[feature_size];
-  for (unsigned int j = 0; j < feature_size; ++j)
-    input[j] = static_cast<float>(j);
-
-  std::vector<float *> in;
-  std::vector<float *> answer;
-
-  in.push_back(input);
-
-  answer = _model->inference(1, in);
-  for (unsigned int i = 0; i < feature_size; i++)
-    ori_answer.push_back(answer[0][i]);
-
-  in.clear();
-  delete[] input;
+  ori_answer = RunInference(*_model, feature_size, weight_act_type);
 }
 
 void MakeAndRunModel(unsigned int feature_size, unsigned int layer_num,
@@ -119,9 +151,10 @@ void MakeAndRunModel(unsigned int feature_size, unsigned int layer_num,
   ModelHandle _model = ml::train::createModel(
     ml::train::ModelType::NEURAL_NET, {nntrainer::withKey("loss", "mse")});
   _model->addLayer(ml::train::createLayer(
-    "input", {nntrainer::withKey("name", "input0"),
-              nntrainer::withKey("input_shape",
-                                 "1:1:" + std::to_string(feature_size))}));
+    "input",
+    {nntrainer::withKey("name", "input0"),
+     nntrainer::withKey("input_shape", "1:1:" + std::to_string(feature_size)),
+     nntrainer::withKey("input_dtype", inputDtype(weight_act_type))}));
 
   for (unsigned int i = 0; i < layer_num; i++) {
     _model->addLayer(ml::train::createLayer(
@@ -144,21 +177,7 @@ void MakeAndRunModel(unsigned int feature_size, unsigned int layer_num,
   EXPECT_EQ(status, ML_ERROR_NONE);
   _model->load(file_path);
 
-  float *input = new float[feature_size];
-  for (unsigned int j = 0; j < feature_size; ++j)
-    input[j] = static_cast<float>(j);
-
-  std::vector<float *> in;
-  std::vector<float *> answer;
-
-  in.push_back(input);
-
-  answer = _model->inference(1, in);
-  for (unsigned int i = 0; i < feature_size; i++)
-    fsu_answer.push_back(answer[0][i]);
-
-  in.clear();
-  delete[] input;
+  fsu_answer = RunInference(*_model, feature_size, weight_act_type);
 }
 
 /**
