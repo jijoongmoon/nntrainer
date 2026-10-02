@@ -2685,13 +2685,14 @@ bool cuda_fc_qs4cx_gemm_fp16_naive(const unsigned short *Xh,
 
 // ---------------------------------------------------------------------------
 // Q6_K lm_head GEMV (port of the OpenCL kernel_mul_mv_q6_K_f32 = llama.cpp's
-// mul_mv_q6_K). One CUDA block = N_SIMDGROUP(2) output rows x N_SIMDWIDTH(16)
-// lanes; the 16 lanes split each 256-element super-block, accumulate over all
-// blocks of the row, then reduce. Reads the FP16 hidden + (managed) Q6_K weight
-// directly on the device and writes FP16 logits to the device output -- no host
-// bounce, so it works under a device-only activation pool (NNTR_CUDA_DEV_ACT)
-// where the host Q6_K GEMV would fault. gemma2/qwen3 keep the Q6_K lm_head;
-// this is the GPU path gemma4 gets from its QS4CX untied lm_head.
+// mul_mv_q6_K). One CUDA block = Q6K_GEMV_ROWS(8) output rows x
+// N_SIMDWIDTH(16) lanes; the 16 lanes split each 256-element super-block,
+// accumulate over all blocks of the row, then reduce. Reads the FP16 hidden +
+// (managed) Q6_K weight directly on the device and writes FP16 logits to the
+// device output -- no host bounce, so it works under a device-only activation
+// pool (NNTR_CUDA_DEV_ACT) where the host Q6_K GEMV would fault. gemma2/qwen3
+// keep the Q6_K lm_head; this is the GPU path gemma4 gets from its QS4CX untied
+// lm_head.
 static const char *Q6K_GEMV_SRC = R"CU(
 #define QK_K 256
 typedef unsigned char  u8;
@@ -2734,16 +2735,25 @@ __device__ __forceinline__ u16 f2h(float f) {
   return (u16)(sign | half);
 }
 
+// Eight rows per 128-thread block, 16 lanes per row. The hidden row is
+// widened to fp32 once per block into shared memory (it used to be widened
+// again by every row), and each row reduces with shuffles inside its 16-lane
+// segment: lane l adds lane l+off for off = 8, 4, 2, 1, the additions the
+// shared-memory tree made, so the logits are bit-identical.
+#define Q6K_GEMV_ROWS 8
+#define Q6K_GEMV_MAX_H 4096
 extern "C" __global__ void q6k_gemv(const void *src0, const u16 *src1, u16 *dst,
                                     int ne00, int ne01) {
   const int N_SIMDWIDTH = 16;
-  __shared__ float red[2][16];
+  __shared__ float ys[Q6K_GEMV_MAX_H];
+  for (int k = threadIdx.x; k < ne00; k += blockDim.x)
+    ys[k] = h2f(src1[k]);
+  __syncthreads();
   int nb = ne00 / QK_K;
   int row_group = threadIdx.x / N_SIMDWIDTH;
   int lane = threadIdx.x % N_SIMDWIDTH;
-  int row = blockIdx.x * 2 + row_group;
+  int row = blockIdx.x * Q6K_GEMV_ROWS + row_group;
   const block_q6_K *x = (const block_q6_K *)src0 + (long)row * nb;
-  const u16 *yy = src1;
   u8 kmask1 = 0x03, kmask2 = 0x0C, kmask3 = 0x30, kmask4 = 0xC0;
   int tid = lane;
   int ip = tid / 8, il = tid % 8, l0 = 4 * il;
@@ -2754,30 +2764,33 @@ extern "C" __global__ void q6k_gemv(const void *src0, const u16 *src1, u16 *dst,
   float sumf = 0.0f;
   if (row < ne01) {
     for (int i = 0; i < nb; i++) {
-      const u8 *q1 = x[i].ql + q_offset_l;
-      const u8 *q2 = q1 + QK_K / 8;
-      const u8 *qh = x[i].qh + q_offset_h;
+      // A block is 210 bytes, so it is only 2-byte aligned: the four bytes
+      // each lane takes from ql / ql+32 / qh are read as two 16-bit words.
+      const u16 *q1w = (const u16 *)(x[i].ql + q_offset_l);
+      const u16 *q2w = (const u16 *)(x[i].ql + q_offset_l + QK_K / 8);
+      const u16 *qhw = (const u16 *)(x[i].qh + q_offset_h);
+      const u16 a0 = q1w[0], a1 = q1w[1], b0 = q2w[0], b1 = q2w[1];
+      const u16 h0 = qhw[0], h1 = qhw[1];
+      const u8 q1[4] = {(u8)a0, (u8)(a0 >> 8), (u8)a1, (u8)(a1 >> 8)};
+      const u8 q2[4] = {(u8)b0, (u8)(b0 >> 8), (u8)b1, (u8)(b1 >> 8)};
+      const u8 qh[4] = {(u8)h0, (u8)(h0 >> 8), (u8)h1, (u8)(h1 >> 8)};
       const s8 *sc = x[i].scales + is;
-      const u16 *y = yy + i * QK_K + y_offset;
+      const float *y = ys + i * QK_K + y_offset;
       float dall = h2f(x[i].d);
       float s0 = 0, s1 = 0, s2 = 0, s3 = 0;
       for (int j = 0; j < 4; j++) {
-        s0 += h2f(y[j + 0])  * ((float)((q1[j] & 0xF) | ((qh[j] & kmask1) << 4)) - 32.f);
-        s1 += h2f(y[j + 32]) * ((float)((q2[j] & 0xF) | ((qh[j] & kmask2) << 2)) - 32.f);
-        s2 += h2f(y[j + 64]) * ((float)((q1[j] >> 4)  | ((qh[j] & kmask3) >> 0)) - 32.f);
-        s3 += h2f(y[j + 96]) * ((float)((q2[j] >> 4)  | ((qh[j] & kmask4) >> 2)) - 32.f);
+        s0 += y[j + 0]  * ((float)((q1[j] & 0xF) | ((qh[j] & kmask1) << 4)) - 32.f);
+        s1 += y[j + 32] * ((float)((q2[j] & 0xF) | ((qh[j] & kmask2) << 2)) - 32.f);
+        s2 += y[j + 64] * ((float)((q1[j] >> 4)  | ((qh[j] & kmask3) >> 0)) - 32.f);
+        s3 += y[j + 96] * ((float)((q2[j] >> 4)  | ((qh[j] & kmask4) >> 2)) - 32.f);
       }
       sumf += dall * (s0 * sc[0] + s1 * sc[2] + s2 * sc[4] + s3 * sc[6]);
     }
   }
-  red[row_group][lane] = sumf;
-  __syncthreads();
-  for (int off = N_SIMDWIDTH / 2; off > 0; off >>= 1) {
-    if (lane < off) red[row_group][lane] += red[row_group][lane + off];
-    __syncthreads();
-  }
+  for (int off = N_SIMDWIDTH / 2; off > 0; off >>= 1)
+    sumf += __shfl_down_sync(0xffffffffu, sumf, off, N_SIMDWIDTH);
   if (lane == 0 && row < ne01)
-    dst[row] = f2h(red[row_group][0]);
+    dst[row] = f2h(sumf);
 }
 )CU";
 
@@ -2785,7 +2798,7 @@ bool lmhead_gemv_q6_k_cuda(const void *w_q6k_dev,
                            const unsigned short *hidden_fp16_dev,
                            unsigned short *logits_fp16_dev, int vocab,
                            int hidden) {
-  if (vocab <= 0 || hidden <= 0 || (hidden % 256) != 0)
+  if (vocab <= 0 || hidden <= 0 || (hidden % 256) != 0 || hidden > 4096)
     return false;
   auto kernel =
     CudaContext::Global().registerCudaKernel(Q6K_GEMV_SRC, "q6k_gemv");
@@ -2796,8 +2809,8 @@ bool lmhead_gemv_q6_k_cuda(const void *w_q6k_dev,
   kernel->SetKernelArguments(2, &logits_fp16_dev, sizeof(logits_fp16_dev));
   kernel->SetKernelArguments(3, &hidden, sizeof(hidden));
   kernel->SetKernelArguments(4, &vocab, sizeof(vocab));
-  const int block[3] = {32, 1, 1};
-  const int grid[3] = {(vocab + 1) / 2, 1, 1};
+  const int block[3] = {128, 1, 1}; // Q6K_GEMV_ROWS rows of 16 lanes
+  const int grid[3] = {(vocab + 7) / 8, 1, 1};
   if (!StreamManager::Global().DispatchCommand(*kernel, grid, block))
     return false;
   maybe_finish();

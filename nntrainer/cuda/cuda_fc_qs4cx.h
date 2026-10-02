@@ -447,7 +447,8 @@ bool cuda_fc_qs4cx_gemm_fp16_naive(const unsigned short *Xh,
  * @param w_q6k_dev       Q6_K weight, [vocab, hidden] row-major, device/managed
  * @param hidden_fp16_dev FP16 hidden (single row), device-resident, len=hidden
  * @param logits_fp16_dev FP16 logits out, device-resident, len=vocab
- * @return true on success; false (caller falls back to host) if hidden%256!=0
+ * @return true on success; false (caller falls back to host) if hidden%256!=0,
+ *         hidden > 4096 (the kernel stages the hidden row in shared memory)
  *         or the kernel could not be dispatched.
  */
 bool lmhead_gemv_q6_k_cuda(const void *w_q6k_dev,
