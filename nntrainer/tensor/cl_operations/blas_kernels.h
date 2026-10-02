@@ -920,5 +920,31 @@ void cl_svm_map_force(void *ptr, size_t bytes, bool read_only);
  */
 void cl_svm_unmap_force(void *ptr);
 
+/**
+ * @brief Whether a kernel may still be running on the gpu queue.
+ * @details False when the last thing the queue did was drain (a blocking map
+ * or read, or a finish): every shared-memory output a kernel produced is then
+ * complete and mapped back for the host, so a host op can read it directly.
+ * False when there is no GPU context.
+ */
+bool cl_queue_may_be_busy();
+
+/**
+ * @brief Prepare a shared-virtual-memory region for a host write.
+ * @details On a coarse-grain device the host may write only through a mapping:
+ * map it (blocking) and leave it mapped, which is the state the device op that
+ * consumes it expects to release. Nothing to do on a fine-grain device.
+ */
+void cl_svm_host_write_begin(void *ptr, size_t bytes);
+
+/**
+ * @brief Finish a host write to a shared-virtual-memory region.
+ * @details On a fine-grain device, map it back without waiting so it rests in
+ * the state a kernel's output rests in, and the device op that consumes it
+ * finds a mapping to release. Nothing to do on a coarse-grain device (begin
+ * already mapped it).
+ */
+void cl_svm_host_write_end(void *ptr, size_t bytes);
+
 } // namespace nntrainer
 #endif /* __BLAS_KERNELS_H__ */

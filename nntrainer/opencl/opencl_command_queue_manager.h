@@ -181,6 +181,22 @@ public:
   bool enqueueSVMUnmap(void *svm_ptr, cl_event *event = nullptr);
 
   /**
+   * @brief Whether a kernel enqueued on this queue may still be running.
+   * @details Set by every dispatch not followed by a drain here; cleared by a
+   * drain or a blocking map. A host reader of a shared-memory operand needs to
+   * wait for its producer only while this is set.
+   * @return true when a kernel may still be in flight
+   */
+  bool kernelsMayBeInFlight() const;
+
+  /**
+   * @brief Whether the device's shared virtual memory is coarse-grain only,
+   *        so the host must map a region before it reads or writes it.
+   * @return true when neither fine-grain capability is reported
+   */
+  bool coarseGrainSVM() const;
+
+  /**
    * @brief Function to initiate execution of the command queue.
    *
    * @param kernel OpenCL kernel

@@ -530,6 +530,24 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
          static_cast<size_t>(to - from - 1) * input_.width()) *
           input_dim.getDataTypeSize(),
         input_step.bytes());
+    // An FP32-activation norm output stays on the shared plane instead, and
+    // the norm maps it back for the host without waiting. Map the row here,
+    // blocking, so the host reads it after the norm has run; hand it back
+    // once the lm_head is done with it.
+    const auto in_md = input_.getMemoryData();
+    void *svm_row = (!input_.isClMem() && in_md && in_md->isSVM())
+                      ? input_step.getData<uint8_t>()
+                      : nullptr;
+    if (svm_row != nullptr)
+      nntrainer::cl_svm_map_force(svm_row, input_step.bytes(),
+                                  /*read_only=*/true);
+    struct SvmRowRelease {
+      void *p;
+      ~SvmRowRelease() {
+        if (p != nullptr)
+          nntrainer::cl_svm_unmap_force(p);
+      }
+    } svm_row_release{svm_row};
 #endif
 
     ///@note Since tieword embedding shares the weight with embedding,

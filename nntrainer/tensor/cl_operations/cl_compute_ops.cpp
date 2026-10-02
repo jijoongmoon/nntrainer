@@ -58,6 +58,74 @@
 
 namespace nntrainer {
 
+namespace {
+
+/**
+ * @brief Whether a Q4_0 tensor in this build has the q4_0x8 layout the
+ *        device Q4_0 GEMM unpacks. The CPU backend repacks Q4_0 per ISA:
+ *        q4_0x4 on ARM, q4_0x8 on x86 and in the generic fallback.
+ */
+constexpr bool q4_0_device_layout() {
+#if defined(__aarch64__) || defined(__arm__) || defined(_M_ARM64)
+  return false;
+#else
+  return true;
+#endif
+}
+
+/**
+ * @brief Holds an operand of a host computation on the gpu engine.
+ * @details The operands of the host arms here (an FC dot the device does not
+ * cover, the FP32 residual add) usually live in shared virtual memory, and the
+ * ones a kernel produced may still be in the queue: a projection or a norm
+ * maps its output back for the host without waiting. While a kernel may be in
+ * flight, the operand is mapped first -- the map blocks until the queue has
+ * run up to it -- and released when the host is done. An output the host
+ * writes is left mapped for the host afterwards, as a kernel maps its output
+ * back, so the device op that consumes it finds it mapped and releases it.
+ * Operands in host memory are left alone.
+ */
+class HostOperand {
+public:
+  /**
+   * @param t operand
+   * @param host_writes true for an output the host writes
+   */
+  HostOperand(const Tensor &t, bool host_writes) {
+    const auto md = t.getMemoryData();
+    if (!md || !md->isSVM() || t.isClMem())
+      return;
+    ptr_ = t.getData();
+    bytes_ = t.bytes();
+    host_writes_ = host_writes;
+    // A kernel still in the queue may write this region (its producer) or
+    // read it (a pool region the planner gave an earlier tensor too): wait
+    // for the queue before the host touches it.
+    if (cl_queue_may_be_busy()) {
+      cl_svm_map_force(ptr_, bytes_, /*read_only=*/!host_writes);
+      mapped_ = true;
+    }
+    if (host_writes)
+      cl_svm_host_write_begin(ptr_, bytes_);
+  }
+  HostOperand(const HostOperand &) = delete;
+  HostOperand &operator=(const HostOperand &) = delete;
+  ~HostOperand() {
+    if (mapped_)
+      cl_svm_unmap_force(ptr_);
+    if (host_writes_)
+      cl_svm_host_write_end(ptr_, bytes_);
+  }
+
+private:
+  void *ptr_ = nullptr;
+  size_t bytes_ = 0;
+  bool mapped_ = false;
+  bool host_writes_ = false;
+};
+
+} // namespace
+
 /**
  * @brief OpenCL ComputeOps table: the accelerator-backed subset of the
  *        ComputeOps interface, dispatched through ClContext's ContextData.
@@ -65,7 +133,13 @@ namespace nntrainer {
 class ClComputeOps : public ComputeOps {
 public:
   // ── Accelerator-only Q4_0 / INT4 GEMM/GEMV ────────────────
-  bool supports_gemm_q4_0_batch_fp32() const override { return true; }
+  // The device Q4_0 GEMM unpacks the weight from the q4_0x8 interleave
+  // (unpack_q4_0x8_transpose16). That is the layout a Q4_0 tensor has in an
+  // x86 (and generic) build; an ARM build stores q4_0x4, which the unpack
+  // misreads into non-finite outputs. Leave Q4_0 to the CPU table there.
+  bool supports_gemm_q4_0_batch_fp32() const override {
+    return q4_0_device_layout();
+  }
   void gemm_q4_0_batch_fp32(std::vector<void *> matAdata, float *matBdata,
                             std::vector<float *> matCdata, unsigned int M,
                             std::vector<unsigned int> N,
@@ -73,7 +147,9 @@ public:
     nntrainer::gemm_q4_0_async_cl(matAdata, matBdata, matCdata, M, N, K);
   }
 
-  bool supports_gemm_q4_0_accel_fp32() const override { return true; }
+  bool supports_gemm_q4_0_accel_fp32() const override {
+    return q4_0_device_layout();
+  }
   void gemm_q4_0_accel_fp32(void *matAdata, float *matBdata, float *matCdata,
                             unsigned int M, unsigned int N,
                             unsigned int K) override {
@@ -142,7 +218,7 @@ public:
       return;
 
     switch (weight.getDataType()) {
-    case ml::train::TensorDim::DataType::QS4CX:
+    case ml::train::TensorDim::DataType::QS4CX: {
       // This is the fallback boundary the plain-payload release is guarded
       // at: once the v8c repack exists, NNTR_V8C_DROP_PLAIN may have handed
       // the nibbles' pages back, and the host dot below would then multiply
@@ -150,16 +226,22 @@ public:
       // loudly instead. Free when nothing was ever dropped (one atomic load).
       refuseIfQs4cxPayloadDropped(weight.getData<uint8_t>(),
                                   "ClComputeOps::fc host fallback");
+      HostOperand host_in(input, /*host_writes=*/false);
+      HostOperand host_out(output, /*host_writes=*/true);
       input.dot(weight, output, false, false);
       break;
+    }
     case ml::train::TensorDim::DataType::QINT4:
     case ml::train::TensorDim::DataType::Q4_0:
     case ml::train::TensorDim::DataType::Q4_K:
-    case ml::train::TensorDim::DataType::Q6_K:
+    case ml::train::TensorDim::DataType::Q6_K: {
       // A quantized weight has no GPU kernel once v8c declines it: dispatch
       // the host dot, which knows every quantization the CPU backend does.
+      HostOperand host_in(input, /*host_writes=*/false);
+      HostOperand host_out(output, /*host_writes=*/true);
       input.dot(weight, output, false, false);
       break;
+    }
     default:
       nntrainer::dotCl(input, weight, output);
       break;
@@ -288,6 +370,11 @@ public:
     if (hidden.getDataType() == fp32 && input.getDataType() == fp32 &&
         hidden.size() == input.size()) {
       const size_t n = hidden.size();
+      // The host loop reads and writes the shared plane: wait for the kernels
+      // that produced the operands (a projection maps its output back for the
+      // host without waiting).
+      HostOperand host_in(input, /*host_writes=*/false);
+      HostOperand host_out(hidden, /*host_writes=*/true);
       float *out = hidden.getData<float>();
       const float *in = input.getData<float>();
       if (!accumulate) {

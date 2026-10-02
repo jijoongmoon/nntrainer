@@ -444,6 +444,14 @@ bool CommandQueueManager::enqueueSVMUnmap(void *svm_ptr, cl_event *event) {
   return true;
 }
 
+bool CommandQueueManager::kernelsMayBeInFlight() const {
+  return s_kernels_in_flight.load(std::memory_order_relaxed);
+}
+
+bool CommandQueueManager::coarseGrainSVM() const {
+  return coarseGrainSVMOnly();
+}
+
 /**
  * @brief Function to initiate execution of the command queue.
  *

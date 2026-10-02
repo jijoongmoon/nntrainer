@@ -398,6 +398,13 @@ inline static void rmsnorm_cl_internal(ClContext::SharedPtrClKernel kernel,
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
 
   if (use_svm) {
+    // The shared-memory protocol of the other SVM ops: take the operands back
+    // from the host before the kernel binds them. The input is usually the
+    // output of a projection that mapped it for the host when it finished;
+    // on a coarse-grain device a kernel that reads a region the host still
+    // holds mapped reads stale bytes. The result is mapped back below.
+    blas_cc->command_queue_inst_.enqueueSVMUnmap(const_cast<T *>(input));
+    blas_cc->command_queue_inst_.enqueueSVMUnmap(result);
     if (!kernel->SetKernelSVMArguments(0, input)) {
       return;
     }

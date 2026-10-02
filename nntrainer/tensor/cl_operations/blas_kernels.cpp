@@ -4845,4 +4845,29 @@ void cl_svm_unmap_force(void *ptr) {
     blas_cc->command_queue_inst_.enqueueSVMUnmap(ptr);
 }
 
+bool cl_queue_may_be_busy() {
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  return blas_cc != nullptr &&
+         blas_cc->command_queue_inst_.kernelsMayBeInFlight();
+}
+
+void cl_svm_host_write_begin(void *ptr, size_t bytes) {
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  if (blas_cc && ptr && bytes && blas_cc->command_queue_inst_.coarseGrainSVM())
+    blas_cc->command_queue_inst_.enqueueSVMMap(ptr, bytes,
+                                               /*read_only=*/false);
+}
+
+void cl_svm_host_write_end(void *ptr, size_t bytes) {
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  if (blas_cc && ptr && bytes && !blas_cc->command_queue_inst_.coarseGrainSVM())
+    blas_cc->command_queue_inst_.enqueueSVMMap(ptr, bytes,
+                                               /*read_only=*/false,
+                                               /*event=*/nullptr,
+                                               /*async=*/true);
+}
+
 } // namespace nntrainer
