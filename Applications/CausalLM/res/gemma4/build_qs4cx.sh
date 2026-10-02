@@ -11,7 +11,9 @@
 #      Gemma4 always re-emits a dedicated lm_head slot (output_of_causallm), so
 #      the source is "untied" and the lm_head can be quantized independently.
 #   2. nntr_quantize       : --fc_dtype QS4CX --embd_dtype Q6_K --lmhead_dtype QS4CX
-#                            => model_tensor_type QS4CX-FP16, untied QS4CX lm_head
+#                            => model_tensor_type QS4CX-FP16, untied QS4CX lm_head;
+#                            embedding + per-layer embedding as mmap'd sidecars
+#                            (default; pass --no_sidecar for one .bin)
 #
 # Usage:
 #   build_qs4cx.sh <hf_gemma4_e2b_dir> <out_dir> [nntr_quantize_binary]

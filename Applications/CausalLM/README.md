@@ -377,6 +377,9 @@ nntr_quantize <model_path> [options]
 | `--output_format <bin\|safetensors>` | Output weight container format | `bin` |
 | `--config <path>` | Use a target `nntr_config.json` for dtype settings | – |
 | `--isa <x86|ARM|DEFAULT>` | Target ISA for quantization | `DEFAULT` |
+| `--no_sidecar` | Keep the embedding and per-layer-embedding tables inside the `.bin` (see below) | sidecar when eligible |
+| `--no_ple_sidecar` / `--no_embd_sidecar` | Keep only that one table inside the `.bin` | sidecar when eligible |
+| `--ple_sidecar` / `--embd_sidecar` | Require that table in a sidecar; fail if the model is not eligible | – |
 
 > The input weight format (`.bin` or `.safetensors`) is auto-detected from the
 > file referenced by `model_file_name` in `nntr_config.json`, so any of the four
@@ -403,11 +406,38 @@ nntr_quantize /path/to/qwen3-4b --config /path/to/target_nntr_config.json
 nntr_quantize /path/to/qwen3-4b --fc_dtype Q4_0 --output_format safetensors
 ```
 
+### Embedding sidecar (default)
+
+When the embedding is quantized to `Q4_0` or `Q6_K` and the output is a `.bin`,
+`nntr_quantize` writes two tables to their own files next to the model file
+instead of into it:
+
+- the per-layer-embedding (PLE) table of a model that has one
+  (`hidden_size_per_layer_input` in `config.json`, e.g. Gemma-4):
+  `<bin>_ple.bin` + `<bin>_ple.json`, named by `ple_file_name`;
+- the `embedding0` token-embedding table of a model with an untied lm_head
+  (`lmhead_untie: true`): `<bin>_embd.bin` + `<bin>_embd.json`, named by
+  `embedding_file_name`.
+
+The runtime mmaps these files and reads only the rows of the tokens it sees, so
+no backend keeps a resident copy of the table. The tokens are identical to the
+in-file layout. For Gemma-4 (QS4CX FC / lm_head, Q6_K embedding) this moves
+about 2.1 GiB out of the model file and, on the same binary and 1K prompt,
+lowers peak host or device memory by 40-64 % and model init by 36-76 % on the
+x86 and Arm CPU, OpenCL and CUDA backends. A tied lm_head reads every embedding row at each decode step, so
+`embedding0` stays in the model file for tied models; models without the
+qualifying tables (Qwen3, Gemma-3, ...) are written exactly as before. Pass
+`--no_sidecar` to keep the former single-file layout. Both layouts load: the
+runtime follows `ple_file_name` / `embedding_file_name` in `nntr_config.json`,
+resolved against the model directory, and reads the tables from the `.bin`
+when the keys are absent.
+
 ### Output
 
 The utility produces:
 1. A quantized `.bin` weight file (filename auto-generated or specified via `--output_bin`)
 2. A new `nntr_config_quantized.json` (or `nntr_config.json` if output directory differs from source)
+3. For an eligible model, the embedding sidecar files described above
 
 After quantization, run the quantized model:
 ```bash

@@ -50,6 +50,11 @@ nntr_quantize stage \
 `nntr_quantize` writes the output `.bin` plus an `nntr_config.json` with
 `model_tensor_type: QS4CX-FP16`, `fc_layer_dtype: QS4CX`, `embedding_dtype:
 Q6_K`, `lmhead_dtype: QS4CX` — matching the tested `gemma4_e2b_qint4fp16_lmint4`
-model. Set `tokenizer_file` to the deployed `tokenizer.json` path. `init_seq_len`
+model. By default the Q6_K token embedding (untied lm_head) and the per-layer
+embedding table go to mmap'd sidecar files next to the `.bin`
+(`<bin>_embd.{bin,json}`, `<bin>_ple.{bin,json}`, named by
+`embedding_file_name` / `ple_file_name`): the `.bin` shrinks from about 3.2 GiB
+to 1.1 GiB, and peak memory (-40 to -64 %) and init (-36 to -76 %) drop on
+every backend with identical tokens. Add `--no_sidecar` for the former single-file layout. Set `tokenizer_file` to the deployed `tokenizer.json` path. `init_seq_len`
 / `max_seq_len` are deployment knobs (raise `init_seq_len` to 1024 for an
 uncapped 1K prefill).

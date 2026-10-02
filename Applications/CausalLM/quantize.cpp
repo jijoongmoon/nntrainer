@@ -37,6 +37,11 @@
  *     --lmhead_dtype <type> Target dtype for LM head layer (default: FP32)
  *     --output_bin <name> Output weight filename (auto-generated if omitted)
  *     --output_format <fmt> Output container: 'bin' (default) or 'safetensors'
+ *     --no_sidecar        Keep the embedding / per-layer-embedding tables
+ *                         inside the .bin. By default they are written to an
+ *                         mmap'd sidecar file whenever the model qualifies
+ *                         (Q4_0/Q6_K embedding; untied lm_head for embedding0;
+ *                         a per-layer-embedding model for the PLE table).
  *
  *   Supported data types: FP32, FP16, Q4_0, Q4_K, Q6_K
  *
@@ -442,27 +447,39 @@ void printUsage(const char *prog) {
     << "                        individual dtype options. The fc_layer_dtype,\n"
     << "                        embedding_dtype, and lmhead_dtype fields\n"
     << "                        from this config will be used.\n"
-    << "  --ple_sidecar         Write the per-layer-embedding (PLE) table to "
-       "a\n"
-    << "                        sidecar file (<bin>_ple.bin + _ple.json GGML\n"
-    << "                        manifest) instead of embedding it in the "
-       "model\n"
-    << "                        .bin; the output config gains ple_file_name "
-       "so\n"
-    << "                        the runtime mmaps it and dequantizes rows on\n"
-    << "                        demand. gemma4 only; requires Q4_0 or\n"
-    << "                        Q6_K --embd_dtype and 'bin' output format.\n"
-    << "                        Also works on an already-quantized source "
-       "with\n"
-    << "                        matching dtypes (pure repack, bit-identical).\n"
+    << "  --ple_sidecar         Require the per-layer-embedding (PLE) table\n"
+    << "                        in a sidecar file (<bin>_ple.bin + _ple.json "
+       "GGML\n"
+    << "                        manifest); fail if the model does not "
+       "qualify.\n"
     << "  --embd_sidecar        Same for the embedding0 token-embedding table\n"
-    << "                        (<bin>_embd.bin + _embd.json; output config\n"
-    << "                        gains embedding_file_name). Requires an "
-       "UNTIED\n"
-    << "                        lm_head (lmhead_untie=true) — a tied head "
-       "scans\n"
-    << "                        every table row per decode step, so a sidecar\n"
-    << "                        saves nothing. Composes with --ple_sidecar.\n"
+    << "                        (<bin>_embd.bin + _embd.json).\n"
+    << "  --no_ple_sidecar      Keep the PLE table inside the model .bin.\n"
+    << "  --no_embd_sidecar     Keep the embedding0 table inside the model "
+       ".bin.\n"
+    << "  --no_sidecar          Both of the above (the former default "
+       "layout).\n"
+    << "                        By default each table goes to a sidecar "
+       "whenever\n"
+    << "                        the model qualifies, and stays in the .bin\n"
+    << "                        otherwise. A sidecar is mmapped by the runtime "
+       "and\n"
+    << "                        only the rows of the tokens seen are read, so\n"
+    << "                        no backend keeps a resident copy. It needs a\n"
+    << "                        Q4_0 or Q6_K --embd_dtype and the 'bin' "
+       "output\n"
+    << "                        format; the PLE table needs a model with\n"
+    << "                        hidden_size_per_layer_input (Gemma-4), and\n"
+    << "                        embedding0 needs an UNTIED lm_head\n"
+    << "                        (lmhead_untie=true) - a tied head scans every\n"
+    << "                        table row per decode step, so a sidecar saves\n"
+    << "                        nothing. The output nntr_config.json names "
+       "the\n"
+    << "                        sidecar (ple_file_name / "
+       "embedding_file_name).\n"
+    << "                        An already-quantized source with matching "
+       "dtypes\n"
+    << "                        is repacked bit-identically.\n"
     << "  --help, -h            Show this help message\n"
     << "\n"
     << "Supported data types: FP32, FP16, Q4_0, Q6_K, Q4_K, QS4CX\n"
@@ -657,6 +674,24 @@ void addSentenceTransformerLayerDtypes(std::map<std::string, DataType> &map,
   }
 }
 
+/**
+ * @brief How a table that can live in an mmap'd sidecar file is written.
+ *        kAuto (default): sidecar when the model qualifies, in-bin otherwise.
+ *        kOn: sidecar required (an unqualified model is an error).
+ *        kOff: always inside the model file.
+ */
+enum class SidecarMode { kAuto, kOn, kOff };
+
+/**
+ * @brief Strip a trailing ".bin" from the output weight file name.
+ */
+std::string sidecarBaseName(const std::string &bin_name) {
+  auto pos = bin_name.rfind(".bin");
+  if (pos != std::string::npos && pos + 4 == bin_name.size())
+    return bin_name.substr(0, pos);
+  return bin_name;
+}
+
 } // anonymous namespace
 
 int main(int argc, char *argv[]) {
@@ -681,8 +716,8 @@ int main(int argc, char *argv[]) {
   std::string output_bin_name = "";
   std::string target_config_path = "";
   std::string output_format = "bin";
-  bool ple_sidecar = false;
-  bool embd_sidecar = false;
+  SidecarMode ple_mode = SidecarMode::kAuto;
+  SidecarMode embd_mode = SidecarMode::kAuto;
 
   for (int i = 2; i < argc; ++i) {
     std::string arg = argv[i];
@@ -708,9 +743,16 @@ int main(int argc, char *argv[]) {
     } else if (arg == "--config" && i + 1 < argc) {
       target_config_path = argv[++i];
     } else if (arg == "--ple_sidecar") {
-      ple_sidecar = true;
+      ple_mode = SidecarMode::kOn;
     } else if (arg == "--embd_sidecar") {
-      embd_sidecar = true;
+      embd_mode = SidecarMode::kOn;
+    } else if (arg == "--no_ple_sidecar") {
+      ple_mode = SidecarMode::kOff;
+    } else if (arg == "--no_embd_sidecar") {
+      embd_mode = SidecarMode::kOff;
+    } else if (arg == "--no_sidecar") {
+      ple_mode = SidecarMode::kOff;
+      embd_mode = SidecarMode::kOff;
     } else if (arg == "--container" && i + 1 < argc) {
       std::string container = argv[++i];
       if (container == "plain") {
@@ -827,60 +869,75 @@ int main(int argc, char *argv[]) {
     std::string src_weight_path = model_path + "/" + original_bin;
     std::string dst_weight_path = output_dir + "/" + output_bin_name;
 
-    // PLE sidecar extraction: names derived from the output bin; the payload
-    // path is injected into nntr_cfg so the model wires sidecar_export_path
-    // onto the per_layer_input_embedding layer during save.
-    std::string ple_payload_name, ple_manifest_name;
-    if (ple_sidecar) {
+    // Sidecar layout for the PLE and embedding0 tables. By default (kAuto)
+    // a table goes to its own mmap'd file whenever the model qualifies: the
+    // runtime then reads only the rows of the tokens it sees instead of every
+    // backend keeping a resident copy of the whole table (for Gemma-4 with a
+    // Q6_K embedding that is about 2.1 GiB). The payload path is injected
+    // into nntr_cfg so the model wires sidecar_export_path onto the layer
+    // during save. --ple_sidecar / --embd_sidecar turn an unqualified model
+    // into an error; --no_*sidecar keep the table inside the model file.
+    const bool quantized_embd =
+      (embd_dtype == DataType::Q4_0 || embd_dtype == DataType::Q6_K);
+    auto sidecar_blocker = [&](bool table_present, const char *absent_why,
+                               const char *existing_key) -> std::string {
       if (output_format != "bin")
-        throw std::invalid_argument(
-          "--ple_sidecar supports only the 'bin' output format");
-      if (embd_dtype != DataType::Q4_0 && embd_dtype != DataType::Q6_K)
-        throw std::invalid_argument(
-          "--ple_sidecar requires --embd_dtype Q4_0 or Q6_K (got " +
-          dataTypeToStr(embd_dtype) + ")");
-      if (!nntr_cfg.value("ple_file_name", std::string()).empty())
-        throw std::invalid_argument(
-          "source model already uses a PLE sidecar (ple_file_name set); "
-          "nothing to extract");
-      std::string base = output_bin_name;
-      auto pos = base.rfind(".bin");
-      if (pos != std::string::npos && pos + 4 == base.size())
-        base = base.substr(0, pos);
-      ple_payload_name = base + "_ple.bin";
-      ple_manifest_name = base + "_ple.json";
-      nntr_cfg["ple_sidecar_export"] = output_dir + "/" + ple_payload_name;
-    }
+        return "supports only the 'bin' output format";
+      if (!quantized_embd)
+        return "requires --embd_dtype Q4_0 or Q6_K (got " +
+               dataTypeToStr(embd_dtype) + ")";
+      if (!table_present)
+        return absent_why;
+      if (!nntr_cfg.value(existing_key, std::string()).empty())
+        return std::string("source model already uses a sidecar (") +
+               existing_key + " set); nothing to extract";
+      return "";
+    };
+    auto resolve_mode = [](SidecarMode mode, const std::string &blocker,
+                           const char *flag) {
+      if (mode == SidecarMode::kOff)
+        return false;
+      if (blocker.empty())
+        return true;
+      if (mode == SidecarMode::kOn)
+        throw std::invalid_argument(std::string(flag) + " " + blocker);
+      return false;
+    };
 
-    // embedding0 sidecar: same scheme, gated on an UNTIED lm_head (a tied
-    // head shares the table and scans every row per decode step — a sidecar
-    // would fault the whole file back in and save nothing).
-    std::string embd_payload_name, embd_manifest_name;
-    if (embd_sidecar) {
-      if (output_format != "bin")
-        throw std::invalid_argument(
-          "--embd_sidecar supports only the 'bin' output format");
-      if (embd_dtype != DataType::Q4_0 && embd_dtype != DataType::Q6_K)
-        throw std::invalid_argument(
-          "--embd_sidecar requires --embd_dtype Q4_0 or Q6_K (got " +
-          dataTypeToStr(embd_dtype) + ")");
-      if (!(nntr_cfg.contains("lmhead_untie") &&
-            nntr_cfg["lmhead_untie"].get<bool>()))
-        throw std::invalid_argument(
-          "--embd_sidecar requires an untied lm_head (lmhead_untie=true); a "
-          "tied lm_head shares the embedding table and would gain nothing");
-      if (!nntr_cfg.value("embedding_file_name", std::string()).empty())
-        throw std::invalid_argument(
-          "source model already uses an embedding sidecar "
-          "(embedding_file_name set); nothing to extract");
-      std::string base = output_bin_name;
-      auto pos = base.rfind(".bin");
-      if (pos != std::string::npos && pos + 4 == base.size())
-        base = base.substr(0, pos);
-      embd_payload_name = base + "_embd.bin";
-      embd_manifest_name = base + "_embd.json";
+    const bool has_ple = cfg.contains("hidden_size_per_layer_input") &&
+                         cfg["hidden_size_per_layer_input"].is_number() &&
+                         cfg["hidden_size_per_layer_input"].get<int>() > 0;
+    bool ple_sidecar =
+      resolve_mode(ple_mode,
+                   sidecar_blocker(has_ple,
+                                   "requires a model with per-layer embeddings "
+                                   "(config.json hidden_size_per_layer_input)",
+                                   "ple_file_name"),
+                   "--ple_sidecar");
+
+    // embedding0 is gated on an UNTIED lm_head: a tied head shares the table
+    // and scans every row per decode step, so a sidecar would fault the
+    // whole file back in and save nothing.
+    const bool untied =
+      nntr_cfg.contains("lmhead_untie") && nntr_cfg["lmhead_untie"].get<bool>();
+    bool embd_sidecar = resolve_mode(
+      embd_mode,
+      sidecar_blocker(untied,
+                      "requires an untied lm_head (lmhead_untie=true); a "
+                      "tied lm_head shares the embedding table and would "
+                      "gain nothing",
+                      "embedding_file_name"),
+      "--embd_sidecar");
+
+    const std::string sidecar_base = sidecarBaseName(output_bin_name);
+    const std::string ple_payload_name = sidecar_base + "_ple.bin";
+    const std::string ple_manifest_name = sidecar_base + "_ple.json";
+    const std::string embd_payload_name = sidecar_base + "_embd.bin";
+    const std::string embd_manifest_name = sidecar_base + "_embd.json";
+    if (ple_sidecar)
+      nntr_cfg["ple_sidecar_export"] = output_dir + "/" + ple_payload_name;
+    if (embd_sidecar)
       nntr_cfg["embd_sidecar_export"] = output_dir + "/" + embd_payload_name;
-    }
 
     int num_layers = cfg["num_hidden_layers"].get<int>();
     std::string architecture =
@@ -894,6 +951,14 @@ int main(int argc, char *argv[]) {
     std::cout << "  Embed dtype:  " << dataTypeToStr(embd_dtype) << "\n";
     std::cout << "  LMHead dtype: " << dataTypeToStr(lmhead_dtype) << "\n";
     std::cout << "  Target ISA:   " << isaToStr(target_isa) << "\n";
+    std::cout << "  PLE table:    "
+              << (ple_sidecar ? "sidecar " + ple_manifest_name
+                              : std::string(has_ple ? "in model file" : "-"))
+              << "\n";
+    std::cout << "  Embd table:   "
+              << (embd_sidecar ? "sidecar " + embd_manifest_name
+                               : std::string("in model file"))
+              << "\n";
     std::cout << "\n";
 
     // =========================================================================
@@ -976,19 +1041,32 @@ int main(int argc, char *argv[]) {
     model->save_weight(dst_weight_path, DataType::NONE, layer_dtype_map,
                        target_isa);
 
+    // An architecture that does not route the table to the sidecar leaves it
+    // in the model file; that is only an error when the sidecar was required.
+    auto sidecar_written = [&](bool &enabled, SidecarMode mode,
+                               const std::string &payload_name,
+                               const std::string &what) {
+      if (!enabled)
+        return;
+      const std::string path = output_dir + "/" + payload_name;
+      if (std::filesystem::exists(path) && std::filesystem::file_size(path) > 0)
+        return;
+      if (mode == SidecarMode::kOn)
+        throw std::runtime_error(what + " sidecar was not written - does " +
+                                 architecture + " route it to a sidecar?");
+      std::filesystem::remove(path);
+      std::cout << "  " << what << " table kept in the model file ("
+                << architecture << " writes no sidecar for it)\n";
+      enabled = false;
+    };
+    sidecar_written(ple_sidecar, ple_mode, ple_payload_name, "PLE");
+    sidecar_written(embd_sidecar, embd_mode, embd_payload_name, "embedding");
+
     if (ple_sidecar) {
       const std::string ple_payload_path = output_dir + "/" + ple_payload_name;
-      if (!std::filesystem::exists(ple_payload_path) ||
-          std::filesystem::file_size(ple_payload_path) == 0)
-        throw std::runtime_error(
-          "PLE sidecar was not written — does this architecture (" +
-          architecture + ") build a per_layer_input_embedding layer?");
 
       // Manifest: GGML row payload; rows/size cross-checked by the loader
       // against the payload byte count.
-      if (!cfg.contains("hidden_size_per_layer_input"))
-        throw std::runtime_error(
-          "--ple_sidecar: config.json lacks hidden_size_per_layer_input");
       const bool q6k = (embd_dtype == DataType::Q6_K);
       const size_t out_dim = static_cast<size_t>(num_layers) *
                              cfg["hidden_size_per_layer_input"].get<size_t>();
@@ -1018,12 +1096,6 @@ int main(int argc, char *argv[]) {
     if (embd_sidecar) {
       const std::string embd_payload_path =
         output_dir + "/" + embd_payload_name;
-      if (!std::filesystem::exists(embd_payload_path) ||
-          std::filesystem::file_size(embd_payload_path) == 0)
-        throw std::runtime_error(
-          "embedding sidecar was not written — embedding0 must be an untied "
-          "embedding_layer for architecture " +
-          architecture);
 
       const bool q6k = (embd_dtype == DataType::Q6_K);
       const size_t hidden = cfg["hidden_size"].get<size_t>();
