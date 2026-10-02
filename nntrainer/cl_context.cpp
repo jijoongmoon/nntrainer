@@ -26,6 +26,7 @@
 #include <concat_cl.h>
 #include <cstdlib>
 #include <embedding_pool_cl_op.h>
+#include <env_compat.h>
 #include <fc_layer_cl.h>
 #include <geglu_cl_op.h>
 #include <geglu_layer.h>
@@ -211,6 +212,26 @@ void ClContext::initialize() noexcept {
     // and its log line are in place before any kernel is registered. caps()
     // is the one place it is filled.
     (void)caps();
+
+    // Device defaults for the gpu engine, the same arrangement as the CUDA
+    // context's: a bare run gets the device attention instead of the host
+    // per-row loop, with setenv(..., overwrite=0) so an explicit setting,
+    // "=0" included, still wins (the readers are value-checked, see
+    // nntr_env_on()). NNTR_MHA_GPU opens the OpenCL attention arms in
+    // mha_core (flash prefill/decode, and the image arm below); without it a
+    // 0.6B model's 1K prefill spent 2.6 of its 2.9 s in the host attention on
+    // an Intel Xe iGPU. NNTR_KV_IMG_ATTN selects the image (texture-read)
+    // attention, which builds on Adreno only. Not on a cpu or cuda engine run
+    // that brought this context up anyway (NNTR_CL_EAGER_CTX).
+    {
+      const std::string eng = nntr_engine_env();
+      if (eng != "cpu" && eng != "cuda") {
+        constexpr uint32_t qualcomm_vendor_id = 0x5143; // Adreno
+        setenv("NNTR_MHA_GPU", "1", 0);
+        if (caps().vendor_id == qualcomm_vendor_id)
+          setenv("NNTR_KV_IMG_ATTN", "1", 0);
+      }
+    }
 
     if (KERNEL_CACHE_ENABLED && kernelCacheDir().empty()) {
       ml_logi("Kernel binary cache disabled (NNTR_KERNEL_CACHE_DIR=off, or no "

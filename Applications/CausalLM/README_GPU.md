@@ -110,11 +110,11 @@ setting to override it (e.g. `=0` for an A/B run).
 |---|---|---|---|
 | `NNTR_ENGINE` | — (gpu default) | — (gpu default) | `cuda` |
 | `NNTR_FC_INT8_GPU` | default on | default on | — (FC is `cuda_fc`) |
-| `NNTR_MHA_GPU` | `1` | `1` | `NNTR_CUDA_ATTN` (auto) |
+| `NNTR_MHA_GPU` | default on | default on | `NNTR_CUDA_ATTN` (auto) |
 | `NNTR_GPU_SVM_POOL` | default on (SVM KV cache) | default on (SVM KV cache) | — (UVM) |
 | `NNTR_GPU_CLMEM_POOL` | default on | default on | `NNTR_CUDA_DEV_ACT` (auto on discrete) |
 | `NNTR_V8C_BUF` | caps → image2d | caps → buffer/dp4a | — |
-| `NNTR_KV_IMG_ATTN` | `1` (image2d KV) | — | — |
+| `NNTR_KV_IMG_ATTN` | default on (image2d KV) | — | — |
 | `NNTR_XE3_SYNC` | off (`=1` drains) | off (`=1` drains) | — |
 | GEMM family | dp4a (image) | **XMX auto** (caps) → dp4a | cuBLAS IMMA + block-Q |
 
@@ -673,7 +673,8 @@ edits to models or core. Status:
 vendor id).
 *Default off* (env `=1` to opt in): `NNTR_XE3_SYNC`.
 *Default on* (env only for an `=0` A/B): `NNTR_FC_INT8_GPU`, `NNTR_GPU_SVM_POOL`,
-`NNTR_GPU_CLMEM_POOL`. *Never an env flag* (structural): q/k/v-norm residency
-(`engine=` property). *No-op alias*: `NNTR_FC_GPU` (real gate `NNTR_FC_INT8_GPU`).
-*Still required*: `NNTR_KV_IMG_ATTN` (the NEO `read_imageui`-compile quirk, both
-devices advertise image2d) and `NNTR_MHA_GPU` as the canonical run set.
+`NNTR_GPU_CLMEM_POOL`, `NNTR_MHA_GPU` (gpu engine), `NNTR_KV_IMG_ATTN` (gpu
+engine on Adreno; set by `ClContext::initialize`). *Never an env flag*
+(structural): q/k/v-norm residency (`engine=` property). *No-op alias*: `NNTR_FC_GPU` (real gate `NNTR_FC_INT8_GPU`).
+`NNTR_KV_IMG_ATTN` is defaulted by vendor id rather than by an image capability
+(the NEO `read_imageui`-compile quirk: both devices advertise image2d).
