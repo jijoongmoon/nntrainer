@@ -148,8 +148,13 @@ void dispatchGatedClKernel(const ClContext::SharedPtrClKernel &kernel,
   if (use_svm) {
     // Only a shared-plane result comes back to the host; a device-plane one is
     // read by the next kernel from the buffer it was just written to.
+    // Mapped back without waiting, as a projection maps its output: its
+    // consumer is the down projection, a device op that unmaps it in queue
+    // order, and a host reader maps it itself. Blocking here stalled the host
+    // once per layer per token.
     if (dev.out == nullptr &&
-        !cl_context->command_queue_inst_.enqueueSVMMap(out, bytes, true))
+        !cl_context->command_queue_inst_.enqueueSVMMap(
+          out, bytes, true, /*event=*/nullptr, /*async=*/true))
       ml_loge("gated op: failed to map the SVM result");
   } else if (!buffers.getOutBufferA()->ReadDataRegion(
                cl_context->command_queue_inst_, bytes, out)) {

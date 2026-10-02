@@ -279,6 +279,18 @@ public:
   }
   void swiglu(const Tensor &in1, const Tensor &in2, Tensor &out,
               unsigned int active_rows, unsigned int row_offset) override {
+    // FP32 operands the host just produced, with nothing left in the queue
+    // (an FP32 model whose projections run on the host): gate them on the
+    // host too, where the down projection that reads the result runs.
+    const auto fp32 = ml::train::TensorDim::DataType::FP32;
+    if (in1.getDataType() == fp32 && in2.getDataType() == fp32 &&
+        out.getDataType() == fp32 && !cl_queue_may_be_busy()) {
+      HostOperand h1(in1, /*host_writes=*/false);
+      HostOperand h2(in2, /*host_writes=*/false);
+      HostOperand ho(out, /*host_writes=*/true);
+      get_cpu_ops()->swiglu(in1, in2, out, active_rows, row_offset);
+      return;
+    }
     nntrainer::swiglu_cl_op(in1, in2, out, active_rows, row_offset);
   }
   // The two sigmoid-gated members of the family: sigmoid_glu multiplies the
@@ -370,9 +382,19 @@ public:
     if (hidden.getDataType() == fp32 && input.getDataType() == fp32 &&
         hidden.size() == input.size()) {
       const size_t n = hidden.size();
-      // The host loop reads and writes the shared plane: wait for the kernels
-      // that produced the operands (a projection maps its output back for the
-      // host without waiting).
+      // Both on the shared plane (the activations of an FP32 model) with a
+      // producer still in the queue: add on the device, in queue order, so
+      // the host does not wait for it. Otherwise the host loop: its operands
+      // are complete (or it waits for them), and an add the host runs next to
+      // its own projections needs no device round trip.
+      const auto hmd = hidden.getMemoryData();
+      const auto imd = input.getMemoryData();
+      if (hmd && imd && hmd->isSVM() && imd->isSVM() && !hidden.isClMem() &&
+          !input.isClMem() && cl_queue_may_be_busy() &&
+          nntrainer::residual_f32_svm_cl(
+            input.getData<float>(), hidden.getData<float>(),
+            static_cast<unsigned int>(n), accumulate))
+        return;
       HostOperand host_in(input, /*host_writes=*/false);
       HostOperand host_out(hidden, /*host_writes=*/true);
       float *out = hidden.getData<float>();

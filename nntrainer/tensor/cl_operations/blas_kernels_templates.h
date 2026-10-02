@@ -469,7 +469,14 @@ inline static void rmsnorm_cl_internal(ClContext::SharedPtrClKernel kernel,
       return;
     }
   } else {
-    blas_cc->command_queue_inst_.enqueueSVMMap(result, size_in, false);
+    // Mapped back without waiting, as a projection maps its output: the next
+    // device op unmaps it in queue order, and a host reader maps it itself
+    // (blocking), so no reader sees it early. A blocking map here stalled the
+    // host on every norm -- four per layer per token.
+    blas_cc->command_queue_inst_.enqueueSVMMap(result, size_in,
+                                               /*read_only=*/false,
+                                               /*event=*/nullptr,
+                                               /*async=*/true);
   }
 }
 

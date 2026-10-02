@@ -435,10 +435,19 @@ bool CommandQueueManager::enqueueSVMUnmap(void *svm_ptr, cl_event *event) {
     clEnqueueSVMUnmap(command_queue_, svm_ptr, 0, nullptr, event);
 
   if (error_code != CL_SUCCESS) {
-    ml_loge(
-      "Failed to unmap SVM memory (clEnqueueSVMUnmap). OpenCL error code: "
-      "%d : %s",
-      error_code, OpenCLErrorCodeToString(error_code));
+    // CL_INVALID_VALUE on a real pointer is the runtime saying the region is
+    // not mapped (Adreno reports it; Intel accepts the call). Callers unmap
+    // every shared operand before a dispatch whether or not the host holds
+    // it, so this is routine there, and logging it as an error cost an
+    // FP32-activation decode a log write per operand. Still reported to the
+    // caller.
+    if (error_code == CL_INVALID_VALUE && svm_ptr != nullptr)
+      ml_logd("clEnqueueSVMUnmap: %p is not mapped", svm_ptr);
+    else
+      ml_loge(
+        "Failed to unmap SVM memory (clEnqueueSVMUnmap). OpenCL error code: "
+        "%d : %s",
+        error_code, OpenCLErrorCodeToString(error_code));
     return false;
   }
   return true;

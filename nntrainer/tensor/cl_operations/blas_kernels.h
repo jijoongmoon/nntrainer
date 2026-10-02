@@ -921,6 +921,19 @@ void cl_svm_map_force(void *ptr, size_t bytes, bool read_only);
 void cl_svm_unmap_force(void *ptr);
 
 /**
+ * @brief FP32 residual on the device, SVM to SVM: out = in, or out += in when
+ *        @a accumulate. The same float add as the host loop it replaces.
+ * @details For the residual of an FP32-activation model on the gpu engine.
+ * Both operands follow the shared-memory protocol of the other SVM ops:
+ * unmapped for the kernel, mapped back after it without waiting; a host
+ * reader maps them itself.
+ * @return false when the kernel could not be built or bound (the caller then
+ *         keeps its host loop)
+ */
+bool residual_f32_svm_cl(const float *in, float *out, unsigned int N,
+                         bool accumulate);
+
+/**
  * @brief Whether a kernel may still be running on the gpu queue.
  * @details False when the last thing the queue did was drain (a blocking map
  * or read, or a finish): every shared-memory output a kernel produced is then

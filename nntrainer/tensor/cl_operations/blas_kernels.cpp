@@ -22,6 +22,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <fp16.h>
@@ -1130,11 +1131,73 @@ void addition_cl(const float *input, float *res, unsigned int size_input,
                               size_res, use_svm);
 }
 
+static const std::string residual_f32_kernel = R"CL(
+__kernel void residual_f32(__global const float *in, __global float *out,
+                           const int N, const int accumulate) {
+  const int i = get_global_id(0);
+  if (i < N)
+    out[i] = accumulate ? out[i] + in[i] : in[i];
+}
+)CL";
+
+bool residual_f32_svm_cl(const float *in, float *out, unsigned int N,
+                         bool accumulate) {
+  if (N == 0 || in == nullptr || out == nullptr)
+    return false;
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  if (blas_cc == nullptr)
+    return false;
+  ClContext::SharedPtrClKernel kp =
+    blas_cc->registerClKernel(residual_f32_kernel, "residual_f32");
+  if (!kp)
+    return false;
+  const size_t bytes = (size_t)N * sizeof(float);
+  int Ni = static_cast<int>(N);
+  int acc = accumulate ? 1 : 0;
+  auto &q = blas_cc->command_queue_inst_;
+  q.enqueueSVMUnmap(const_cast<float *>(in));
+  q.enqueueSVMUnmap(out);
+  if (!kp->SetKernelSVMArguments(0, in) || !kp->SetKernelSVMArguments(1, out) ||
+      !kp->SetKernelArguments(2, &Ni, sizeof(int)) ||
+      !kp->SetKernelArguments(3, &acc, sizeof(int)))
+    return false;
+  constexpr size_t LWS = 64;
+  std::array<size_t, 3> gws = {(((size_t)N + LWS - 1) / LWS) * LWS, 1, 1};
+  std::array<size_t, 3> lws = {LWS, 1, 1};
+  q.enqueueKernel(kp->GetKernel(), 3, gws.data(), lws.data(), 0, nullptr,
+                  nullptr);
+  q.enqueueSVMMap(const_cast<float *>(in), bytes, /*read_only=*/true,
+                  /*event=*/nullptr, /*async=*/true);
+  q.enqueueSVMMap(out, bytes, /*read_only=*/false, /*event=*/nullptr,
+                  /*async=*/true);
+  return true;
+}
+
 void rmsnorm_cl(const float *input, const float *gamma, float *result,
                 const float epsilon, unsigned int height, unsigned int width,
                 bool use_svm) {
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+
+  // The input was produced on the host and nothing is left in the queue (an
+  // FP32 model whose projections run on the host): normalise it there. On the
+  // device the host consumer that usually follows would wait for this kernel.
+  if (use_svm && !cl_queue_may_be_busy()) {
+    cl_svm_host_write_begin(result, (size_t)height * width * sizeof(float));
+    for (unsigned int r = 0; r < height; ++r) {
+      const float *x = input + (size_t)r * width;
+      float *y = result + (size_t)r * width;
+      float ss = 0.0f;
+      for (unsigned int i = 0; i < width; ++i)
+        ss += x[i] * x[i];
+      const float scale = 1.0f / std::sqrt(ss / width + epsilon);
+      for (unsigned int i = 0; i < width; ++i)
+        y[i] = x[i] * scale * gamma[i];
+    }
+    cl_svm_host_write_end(result, (size_t)height * width * sizeof(float));
+    return;
+  }
 
   ClContext::SharedPtrClKernel kernel_rmsnorm_ptr =
     blas_cc->registerClKernel(rmsnorm_kernel, "rmsnorm_cl");

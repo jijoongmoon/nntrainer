@@ -260,7 +260,10 @@ void RMSNormLayerCl::incremental_forwarding(nntrainer::RunLayerContext &context,
   auto &epsilon = std::get<props::Epsilon>(rmsnorm_props).get();
 
   if (in_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
-    rmsnormProcess(in, out, gamma, epsilon);
+    // Only the step's rows: the whole input is the full prefill height, and a
+    // decode step normalising all of it read and wrote ~1000 stale rows per
+    // norm.
+    rmsnormProcess(in_step, out_step, gamma, epsilon);
   } else {
 #ifdef ENABLE_FP16
     rmsnormProcess_fp16(in, out, gamma, epsilon);
