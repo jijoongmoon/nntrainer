@@ -84,6 +84,28 @@ void FullyConnectedLayer::finalize(InitLayerContext &context) {
   bool is_nchw = (context.getFormat() == Tformat::NCHW);
   /** set output dimensions */
   auto const &in_dim = context.getInputDimensions()[0];
+
+  /// The CPU kernels take the input in the activation dtype. With an FP32
+  /// input in an FP16-activation model the dot is dispatched on the FP32
+  /// input and writes FP32 results into the FP16 output, so the layer returns
+  /// NaN or garbage without an error. The input layer keeps the dtype it is
+  /// declared with, so an FP16 model fed straight from an input layer has to
+  /// declare input_dtype=FP16 there.
+  const auto act_dtype = context.getActivationDataType();
+  const auto in_dtype = in_dim.getDataType();
+  const auto float_name = [](TensorDim::DataType t) -> const char * {
+    return t == TensorDim::DataType::FP32   ? "FP32"
+           : t == TensorDim::DataType::FP16 ? "FP16"
+                                            : nullptr;
+  };
+  NNTR_THROW_IF(float_name(act_dtype) && float_name(in_dtype) &&
+                  in_dtype != act_dtype,
+                std::invalid_argument)
+    << "fully_connected layer '" << context.getName() << "': input dtype is "
+    << float_name(in_dtype) << " but the model activation dtype is "
+    << float_name(act_dtype) << "; feed it in " << float_name(act_dtype)
+    << " (e.g. input_dtype=" << float_name(act_dtype) << " on the input layer)";
+
   output_dims[0] = in_dim;
   is_nchw ? output_dims[0].width(unit) : output_dims[0].channel(unit);
 

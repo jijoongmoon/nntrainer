@@ -403,6 +403,11 @@ public:
    * @param[in] label labels as a list of each label data
    * @retval list of output as float *
    * @note The output memory must not be freed by the caller
+   * @note The buffers are not converted: input i is read with the dtype of
+   * getInputDimension()[i] and each output pointer holds data of the output
+   * tensor's dtype (e.g. _FP16 for an input declared input_dtype=FP16 or an
+   * FP16-activation model). The pointer type cannot carry the dtype, so a
+   * buffer of another dtype is not detected here.
    */
   virtual std::vector<float *>
   inference(unsigned int batch, const std::vector<float *> &input,

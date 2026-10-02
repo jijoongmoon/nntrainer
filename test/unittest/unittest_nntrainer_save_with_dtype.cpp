@@ -1273,7 +1273,8 @@ TEST(SaveWithDtypeInference, save_q4_0_bias_stays_fp32_under_fp16_act_p) {
   {
     auto nn_a16 = std::make_unique<nntrainer::NeuralNetwork>();
     nn_a16->addLayer(ml::train::layer::Input(
-      {"name=input", "input_shape=1:1:" + std::to_string(K)}));
+      {"name=input", "input_shape=1:1:" + std::to_string(K),
+       "input_dtype=FP16"}));
     nn_a16->addLayer(ml::train::layer::FullyConnected(
       {"name=dense", "unit=" + std::to_string(N)}));
     nn_a16->setProperty(
@@ -1314,9 +1315,13 @@ TEST(SaveWithDtypeInference, save_q4_0_bias_stays_fp32_under_fp16_act_p) {
   // Read it back at both activation dtypes. The bias must be FP32 in both, so
   // both readers walk the same offsets and consume the whole body.
   for (const char *tensor_type : {"Q4_0-FP32", "Q4_0-FP16"}) {
+    // The input layer keeps its declared dtype: declare it in the activation
+    // dtype, which is what the first dense layer takes.
+    const std::string act = std::string(tensor_type).substr(5);
     auto nn_q = std::make_unique<nntrainer::NeuralNetwork>();
     nn_q->addLayer(ml::train::layer::Input(
-      {"name=input", "input_shape=1:1:" + std::to_string(K)}));
+      {"name=input", "input_shape=1:1:" + std::to_string(K),
+       "input_dtype=" + act}));
     nn_q->addLayer(ml::train::layer::FullyConnected(
       {"name=dense1", "unit=" + std::to_string(N)}));
     nn_q->addLayer(ml::train::layer::FullyConnected(

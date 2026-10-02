@@ -2343,6 +2343,18 @@ void NeuralNetwork::saveModelIni(const std::string &file_path) {
   interpreter.serialize(graph_representation, file_path);
 }
 
+/**
+ * @brief Name of a tensor data type for an error message
+ */
+static std::string dtypeName(TensorDim::DataType type) {
+  try {
+    return str_converter<enum_class_prop_tag, TensorDataTypeInfo>::to_string(
+      type);
+  } catch (std::invalid_argument &) {
+    return "dtype " + std::to_string(static_cast<int>(type));
+  }
+}
+
 bool NeuralNetwork::validateInput(sharedConstTensors X) {
   auto input_dim = getInputDimension();
   if (X.size() != input_dim.size()) {
@@ -2351,7 +2363,18 @@ bool NeuralNetwork::validateInput(sharedConstTensors X) {
     return false;
   }
 
+  const auto &input_names = model_graph.getInputList();
   for (unsigned int dim = 0; dim < input_dim.size(); dim++) {
+    /// A dtype mismatch is not converted: the tensor would be bound with the
+    /// model's element size and read as garbage, so name both dtypes.
+    const auto expected = input_dim[dim].getDataType();
+    const auto given = X[dim]->getDataType();
+    NNTR_THROW_IF(expected != given, std::invalid_argument)
+      << "input " << dim << " ("
+      << (dim < input_names.size() ? input_names[dim] : std::string("?"))
+      << "): the model expects " << dtypeName(expected) << " data but "
+      << dtypeName(given) << " was given";
+
     if (input_dim[dim] != X[dim]->getDim()) {
       ml_loge("Error: provided input shape does not match required shape");
       std::stringstream ss;
