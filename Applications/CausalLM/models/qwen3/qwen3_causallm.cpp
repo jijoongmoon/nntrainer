@@ -117,8 +117,10 @@ Tensor Qwen3Transformer::createAttention(const int layer_id, int seq_len,
       // them. See causallm_gemm_attention().
       withKey("use_gemm_attention",
               causallm_gemm_attention(USE_FLASH_ATTENTION) ? "true" : "false"),
-      // Decode properties from getModelFeatures() (single source): qwen3 keeps
-      // them off, so the decode RoPE stays on the host. They do not decide
+      // Decode properties from getModelFeatures() (single source): qwen3
+      // turns them on, as Gemma-4 does, so the decode RoPE runs on the device
+      // (the fused rotate-and-commit on the Adreno image arm) instead of
+      // reading Q and K back to the host in every layer. They do not decide
       // where decode attention runs once use_gemm_attention is on: the cuda
       // engine routes every step to its device arm, and with NNTR_MHA_GPU the
       // minimum flash step is 1 (x86, and ARM), so decode takes the OpenCL
