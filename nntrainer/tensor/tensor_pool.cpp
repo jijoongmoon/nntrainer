@@ -333,9 +333,14 @@ void TensorPool::allocate(bool init) {
       continue;
     }
     spec.tensor->setData(mem_pool->getMemory(details->token), 0, init);
+    /** Read the bound address straight off the MemoryData. Tensor::getData()
+     *  validates the memory first, and for a cache-pool (FSU) tensor that is
+     *  a swap-in from the weight file, whose offsets are not known until
+     *  load() -- so a log line must not be the thing that touches it. */
+    auto bound = spec.tensor->getMemoryData();
     ml_logi("Memory Alloc Details (Tensor): %s : %zu : address %p",
             spec.tensor->getName().c_str(), spec.tensor->getMemoryBytes(),
-            spec.tensor->getData());
+            bound ? bound->getAddr<void>() : nullptr);
 
     /** Record the placement on the freshly bound MemoryData. Views share that
      *  MemoryData through syncDependents below, so they inherit it and cannot
@@ -384,8 +389,7 @@ void TensorPool::allocate(bool init) {
                      (int)(spec.tensor->getDataType() ==
                            ml::train::TensorDim::DataType::FP16),
                      (int)(spec.tensor->getInitializer() != Initializer::NONE),
-                     dev, spec.tensor->getData(),
-                     spec.tensor->getMemoryBytes());
+                     dev, md->getAddr<void>(), spec.tensor->getMemoryBytes());
         std::fflush(stderr);
       }
     }
