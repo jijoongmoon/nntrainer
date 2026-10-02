@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <basic_planner.h>
 #include <blas_kernel_interface.h>
 #include <blas_kernels.h> // v8c_use_buffer_path()
 #include <chrono>
@@ -26,6 +27,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <memory>
+#include <memory_pool.h>
 #include <mutex>
 #include <nntrainer_log.h>
 #include <opencl_kernel.h>
@@ -1140,6 +1143,128 @@ void attention_prewarm_programs(ClContext &cc) {
   // rope_inplace_kernel also hosts scatter_copy_f16 / k_scatter_ohwi /
   // v_scatter_ohwi_t; one registration builds the shared program.
   cc.registerClKernel(rope_inplace_kernel, "rope_inplace_f16", ropeCopts());
+}
+
+namespace {
+
+/**
+ * @brief FP16 planes for the FP32-activation attention operands, one pool per
+ *        operand slot so a plane is never shared with another tensor.
+ */
+struct ActStage {
+  std::unique_ptr<MemoryPool> pool[4];
+  std::shared_ptr<MemoryData> mem[4];
+  size_t cap[4] = {0, 0, 0, 0};
+};
+
+ActStage &act_stage() {
+  static ActStage s;
+  return s;
+}
+
+const std::string act_cast_kernel = R"CL(
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+__kernel void cast_f32_to_f16(__global const float *in, __global half *out,
+                              const int N) {
+  const int i = get_global_id(0);
+  if (i < N)
+    vstore_half_rte(in[i], i, out);
+}
+__kernel void cast_f16_to_f32(__global const half *in, __global float *out,
+                              const int N) {
+  const int i = get_global_id(0);
+  if (i < N)
+    out[i] = vload_half(i, in);
+}
+)CL";
+
+/**
+ * @brief Run one cast kernel. @a act is the FP32 activation operand (the
+ *        input of a narrowing, the output of a widening) and @a act_bytes its
+ *        size.
+ * @details The activation follows the shared-memory protocol every SVM op in
+ * this backend keeps: the op that dispatches on it unmaps it first and maps it
+ * back (asynchronously) after. Its producer -- a projection or a norm -- left
+ * it mapped for the host, and on a coarse-grain device a kernel that reads a
+ * mapped region reads stale bytes. The FP16 plane is device-only and is not
+ * mapped at rest.
+ */
+bool act_cast_dispatch(const char *name, const void *in, void *out,
+                       unsigned int N, void *act, size_t act_bytes) {
+  if (N == 0 || in == nullptr || out == nullptr)
+    return false;
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  if (blas_cc == nullptr)
+    return false;
+  ClContext::SharedPtrClKernel kp =
+    blas_cc->registerClKernel(act_cast_kernel, name);
+  if (!kp)
+    return false;
+  int Ni = static_cast<int>(N);
+  blas_cc->command_queue_inst_.enqueueSVMUnmap(act);
+  if (!kp->SetKernelSVMArguments(0, in) || !kp->SetKernelSVMArguments(1, out) ||
+      !kp->SetKernelArguments(2, &Ni, sizeof(int)))
+    return false;
+  constexpr size_t LWS = 64;
+  std::array<size_t, 3> gws = {(((size_t)N + LWS - 1) / LWS) * LWS, 1, 1};
+  std::array<size_t, 3> lws = {LWS, 1, 1};
+  blas_cc->command_queue_inst_.enqueueKernel(kp->GetKernel(), 3, gws.data(),
+                                             lws.data(), 0, nullptr, nullptr);
+  blas_cc->command_queue_inst_.enqueueSVMMap(act, act_bytes,
+                                             /*read_only=*/true,
+                                             /*event=*/nullptr,
+                                             /*async=*/true);
+  return true;
+}
+
+} // namespace
+
+std::shared_ptr<MemoryData> fp16_act_stage_svm(unsigned int slot,
+                                               size_t bytes) {
+  if (slot >= 4 || bytes == 0)
+    return nullptr;
+  ActStage &s = act_stage();
+  if (s.mem[slot] && s.cap[slot] >= bytes)
+    return s.mem[slot];
+  auto *cc = Engine::Global().getRegisteredContext("gpu");
+  if (cc == nullptr)
+    return nullptr;
+  // The gpu context's own allocator, through a memory pool: the pool is what
+  // marks the plane as shared virtual memory for the device arms that check.
+  std::shared_ptr<MemAllocator> alloc = cc->getMemAllocator();
+  if (!alloc || !alloc->isSVM())
+    return nullptr;
+  if (s.mem[slot]) {
+    // Growing: the in-order queue may still hold work on the old plane.
+    auto *blas_cc = static_cast<ClContext *>(cc);
+    opencl::clFinish(blas_cc->command_queue_inst_.GetCommandQueue());
+    s.mem[slot].reset();
+    s.pool[slot].reset();
+    s.cap[slot] = 0;
+  }
+  opencl::ClMemAcctScope _acct("scratch:attn");
+  auto pool = std::make_unique<MemoryPool>(alloc);
+  const unsigned int idx = pool->requestMemory(bytes, 0, 1);
+  pool->planLayout(BasicPlanner());
+  pool->allocate();
+  std::shared_ptr<MemoryData> mem = pool->getMemory(idx);
+  if (!mem || !mem->isSVM() || mem->getAddr() == nullptr)
+    return nullptr;
+  s.pool[slot] = std::move(pool);
+  s.mem[slot] = mem;
+  s.cap[slot] = bytes;
+  return mem;
+}
+
+bool gpu_cast_f32_to_f16_cl(const float *in, uint16_t *out, unsigned int N) {
+  return act_cast_dispatch("cast_f32_to_f16", in, out, N,
+                           const_cast<float *>(in), (size_t)N * sizeof(float));
+}
+
+bool gpu_cast_f16_to_f32_cl(const uint16_t *in, float *out, unsigned int N) {
+  return act_cast_dispatch("cast_f16_to_f32", in, out, N, out,
+                           (size_t)N * sizeof(float));
 }
 
 bool ensure_cl_stage_buf(void **buf, size_t *cap, size_t bytes) {
@@ -5169,6 +5294,16 @@ void cl_attention_release_caches() {
     ts.v_ohwi_buf = nullptr;
     ts.v_ohwi_HD_KV = 0;
     ts.v_ohwi_S_max = 0;
+  }
+  // The FP16 operand planes of the FP32-activation attention. Rebuilt on the
+  // next call that needs one.
+  {
+    ActStage &as = act_stage();
+    for (unsigned int i = 0; i < 4; ++i) {
+      as.mem[i].reset();
+      as.pool[i].reset();
+      as.cap[i] = 0;
+    }
   }
   // A teardown is a handle-epoch boundary for this file's memos too.
   opencl::clBumpHandleEpoch();

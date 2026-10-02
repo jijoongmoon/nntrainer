@@ -16,6 +16,8 @@
 
 #include <cl_context.h>
 #include <engine.h>
+#include <memory>
+#include <memory_data.h>
 #include <opencl_buffer.h>
 #include <opencl_kernel.h>
 
@@ -189,6 +191,42 @@ bool gpu_copy_f16_row_cl(const uint16_t *in, uint16_t *out_base, unsigned int N,
 /// buffer is recreated only when `bytes` outgrows *cap. Returns false on
 /// allocation failure (*buf left null; caller falls back to the SVM path).
 bool ensure_cl_stage_buf(void **buf, size_t *cap, size_t bytes);
+
+/**
+ * @brief FP16 shared-virtual-memory staging for one attention operand of an
+ *        FP32-activation model.
+ * @details The device attention arms take FP16 Q/K/V/O in SVM. A model whose
+ * activations are FP32 hands mha_core FP32 tensors, so it narrows them into
+ * these planes on the device (gpu_cast_f32_to_f16_cl) instead of copying them
+ * through the host. One plane per slot (0..3 = Q, K, V, O), shared by every
+ * layer: the queue is in order and the layers run one after another. Grow-only
+ * and released by cl_attention_release_caches().
+ * @param slot operand slot, 0..3
+ * @param bytes size the caller needs
+ * @return the plane (MemoryData::isSVM() true), or nullptr when the slot is
+ *         out of range, the gpu context does not allocate shared virtual
+ *         memory or the allocation failed (the caller then keeps its host
+ *         path)
+ */
+std::shared_ptr<MemoryData> fp16_act_stage_svm(unsigned int slot, size_t bytes);
+
+/**
+ * @brief Narrow N FP32 values to FP16 on the device, SVM to SVM.
+ * @details Round to nearest even, the same as the host conversion it replaces.
+ * Enqueued on the in-order queue without a drain: its readers are the device
+ * kernels that follow it. @a in is an activation in the backend's shared
+ * memory protocol (unmapped for the kernel, mapped back after it).
+ * @return false when the kernel could not be built or bound
+ */
+bool gpu_cast_f32_to_f16_cl(const float *in, uint16_t *out, unsigned int N);
+
+/**
+ * @brief Widen N FP16 values to FP32 on the device, SVM to SVM.
+ * @details Enqueued without a drain, like gpu_cast_f32_to_f16_cl; @a out is
+ * the activation that follows the shared memory protocol.
+ * @return false when the kernel could not be built or bound
+ */
+bool gpu_cast_f16_to_f32_cl(const uint16_t *in, float *out, unsigned int N);
 
 /// int8-KV variant of two_conv_attention_prefill_f16_cl. Same shapes,
 /// but K/V are stored as signed int8 bytes with a per-(token, head)
