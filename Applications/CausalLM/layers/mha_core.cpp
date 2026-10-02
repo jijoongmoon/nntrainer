@@ -776,6 +776,30 @@ static void mha_ring_assert_host_path_ok(unsigned int ring_cap,
        "NNTR_CUDA_ATTN=1 on NNTR_ENGINE=cuda) or set NNTR_KV_WINDOW_RING=0.";
 }
 
+// The host attention paths read Q and the K/V cache and write O on the CPU.
+// A tensor in a device-only pool (NNTR_CUDA_DEV_ACT activations,
+// NNTR_CUDA_KV_DEV cache) is not host-addressable, and reading it there is a
+// SIGSEGV in a worker thread. Stop with the reason instead.
+static void mha_assert_host_readable(const nntrainer::Tensor &q,
+                                     const nntrainer::Tensor &k,
+                                     const nntrainer::Tensor &v,
+                                     const nntrainer::Tensor &o,
+                                     const char *where) {
+  auto device_only = [](const nntrainer::Tensor &t) {
+    const auto md = t.getMemoryData();
+    return md && !md->isHostAddressable();
+  };
+  NNTR_THROW_IF(device_only(q) || device_only(k) || device_only(v) ||
+                  device_only(o),
+                std::runtime_error)
+    << where << ": the query, KV cache or output is in device-only memory "
+    << "(q=" << device_only(q) << " k=" << device_only(k)
+    << " v=" << device_only(v) << " o=" << device_only(o)
+    << "), which the host attention cannot read. On NNTR_ENGINE=cuda the "
+       "layer needs use_gemm_attention=true with NNTR_CUDA_ATTN on, or "
+       "NNTR_CUDA_DEV_ACT=0 / NNTR_CUDA_KV_DEV=0 for host-readable buffers.";
+}
+
 // The Adreno image attention needs a K/V mirror per layer, and the mirror is an
 // image2d whose size the device bounds. When it cannot be built the layer runs
 // the buffer (flash) arm instead, which is several times slower; that used to
@@ -4208,6 +4232,8 @@ void MHACoreLayer::one_batch_incremental_forwarding(
 
   // Host (decode) attention reads Q and writes O on the host.
   mha_ring_assert_host_path_ok(kv_ring_cap, "host decode attention");
+  mha_assert_host_readable(query_step, b_cached_key, b_cached_value,
+                           attention_output_step, "host per-row attention");
   lower_q();
   // MHA_CLMEM: decode reads the whole prefix from the concat slab; gather
   // the prefill rows (mirror-only during the prefill window) back once.
@@ -4612,6 +4638,8 @@ void MHACoreLayer::gemm_attention(nntrainer::Tensor &query_step,
   // way it did before.
   mha_ring_assert_host_path_ok(kv_ring_cap, N_q > 1 ? "host prefill attention"
                                                     : "host decode attention");
+  mha_assert_host_readable(query_step, b_cached_key, b_cached_value,
+                           attention_output_step, "host flash attention");
 
   // Phase 1: de-interleave heads once into shared contiguous buffers.
   // K/V always kept as raw FP16 bits (uint16). Q either FP32 (V-JEPA
