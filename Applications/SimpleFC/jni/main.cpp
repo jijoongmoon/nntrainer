@@ -32,13 +32,30 @@ using ml::train::LayerHandle;
 using ml::train::Tensor;
 using ModelHandle = std::unique_ptr<ml::train::Model>;
 
+#ifdef ENABLE_FP16
+/** @brief element type of the input: the model runs in FP16 */
+using InputT = _FP16;
+/** @brief declared dtype of the input */
+static constexpr auto input_dtype = ml::train::TensorDim::DataType::FP16;
+#else
+/** @brief element type of the input (FP16 is not built in) */
+using InputT = float;
+/** @brief declared dtype of the input */
+static constexpr auto input_dtype = ml::train::TensorDim::DataType::FP32;
+#endif
+
 /**
  * @brief Build symbolic tensor graph for SimpleFC
  *
  * @return {input_tensor, output_tensor}
  */
 std::pair<Tensor, Tensor> buildGraph() {
-  auto x = Tensor({1, 1, 1024, 1024}, "input0");
+  // The model runs in FP16 (model_tensor_type=FP16-FP16) and the input layer
+  // keeps the dtype it is declared with, so declare the input FP16 as well.
+  auto x = Tensor(
+    ml::train::TensorDim({1, 1, 1024, 1024},
+                         {ml::train::TensorDim::Format::NCHW, input_dtype}),
+    "input0");
 
   auto h = x;
   for (int i = 0; i < 56; i++) {
@@ -107,15 +124,16 @@ void createAndRun(unsigned int epochs, unsigned int batch_size,
 
   const unsigned int feature_size = 1 * 1024 * 1024;
 
-  std::vector<float> input(feature_size);
+  // The float* inference API reads the buffer in the input's declared dtype.
+  std::vector<InputT> input(feature_size);
 
   for (unsigned int j = 0; j < feature_size; ++j)
-    input[j] = (j / (float)feature_size);
+    input[j] = static_cast<InputT>(j / (float)feature_size);
 
   std::vector<float *> in;
   std::vector<float *> answer;
 
-  in.push_back(input.data());
+  in.push_back(reinterpret_cast<float *>(input.data()));
 
   auto start = std::chrono::system_clock::now();
   std::time_t start_time = std::chrono::system_clock::to_time_t(start);
