@@ -3356,6 +3356,134 @@ __kernel void q6k_gemv_lmhead(__global const uchar *W,   // [V rows][H/256 block
 }
 )CL";
 
+// The same GEMV for a device with Intel subgroups. A 16-lane subgroup owns a
+// row: lane u keeps the (n-half, l-quad) unit of the kernel above, walks every
+// block of the row and the subgroup reduces with sub_group_reduce_add, so a
+// 64-WI workgroup carries four rows and has no barrier. The table it reads is
+// a device copy whose 210-byte blocks are padded to 212 bytes. In the stored
+// layout every odd block starts 2 bytes off a word, so the uchar4 field loads
+// above become byte gathers; padded, each field is one aligned word load.
+// On an Intel Xe iGPU, for a 151936 x 1024 table (128 MB), the kernel above
+// takes 10.9 ms, this kernel on the stored layout 4.9 ms and on the padded
+// copy 1.9 ms. The per-element math is the kernel above's; only the fp32
+// summation order differs.
+static const std::string lmhead_q6k_gemv_sg16_kernel = R"CL(
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+#pragma OPENCL EXTENSION cl_intel_subgroups : enable
+#pragma OPENCL EXTENSION cl_intel_required_subgroup_size : enable
+__attribute__((intel_reqd_sub_group_size(16)))
+__kernel void q6k_gemv_lmhead_sg16(__global const uchar *W,  // [V][H/256][212 B]
+                                   __global const float *x,   // [H]
+                                   __global float *logits,    // [V]
+                                   const int V, const int H) {
+  const int row =
+    (int)(get_group_id(0) * get_num_sub_groups() + get_sub_group_id());
+  if (row >= V) return;
+  const int u = (int)get_sub_group_local_id(); // 0..15
+  const int nb = H >> 8;
+  // 212-byte blocks: ql[128] qh[64] scales[16] d[2] pad[2], word aligned.
+  __global const uint *rb =
+    (__global const uint *)(W + (size_t)row * (size_t)(nb * 212));
+  const int nh = u >> 3;
+  const int q = u & 7;
+  const int is = q >> 2;
+  float sum = 0.0f;
+  for (int bi = 0; bi < nb; ++bi) {
+    __global const uint *blk = rb + bi * 53;
+    const int4 lo = convert_int4(as_uchar4(blk[(nh << 4) + q]));
+    const int4 hi = convert_int4(as_uchar4(blk[(nh << 4) + 8 + q]));
+    const int4 h = convert_int4(as_uchar4(blk[32 + (nh << 3) + q]));
+    const char8 sc =
+      as_char8((uint2)(blk[48 + (nh << 1)], blk[49 + (nh << 1)]));
+    const float d = vload_half(0, (__global const half *)(blk + 52));
+    const float s0 = d * (float)(is ? sc.s1 : sc.s0);
+    const float s2 = d * (float)(is ? sc.s3 : sc.s2);
+    const float s4 = d * (float)(is ? sc.s5 : sc.s4);
+    const float s6 = d * (float)(is ? sc.s7 : sc.s6);
+    const int yb = (bi << 8) + (nh << 7) + (q << 2);
+    const float4 a1 = convert_float4(((lo & 0xF) | ((h & 3) << 4)) - 32);
+    const float4 a2 = convert_float4(((hi & 0xF) | (((h >> 2) & 3) << 4)) - 32);
+    const float4 a3 = convert_float4(((lo >> 4) | (((h >> 4) & 3) << 4)) - 32);
+    const float4 a4 = convert_float4(((hi >> 4) | (((h >> 6) & 3) << 4)) - 32);
+    const float4 x1 = vload4(0, x + yb);
+    const float4 x2 = vload4(0, x + yb + 32);
+    const float4 x3 = vload4(0, x + yb + 64);
+    const float4 x4 = vload4(0, x + yb + 96);
+    sum += s0 * dot(a1, x1) + s2 * dot(a2, x2) + s4 * dot(a3, x3) +
+           s6 * dot(a4, x4);
+  }
+  sum = sub_group_reduce_add(sum);
+  if (u == 0) logits[row] = sum;
+}
+)CL";
+
+// The same GEMV on the 212-byte copy for a device without Intel subgroups:
+// 16 lanes per row as in q6k_gemv_lmhead_sg16, four rows per 64-WI
+// workgroup, and the 16 partial sums of a row reduced through local memory.
+// The bytes are taken out of the word loads with shifts: the uchar4 / char8
+// vector casts of the kernel above fail clBuildProgram on Adreno
+// (CL_OUT_OF_HOST_MEMORY). On an Adreno 840, for the 151936 x 1024 table,
+// q6k_gemv_lmhead takes 6.1-6.9 ms and this kernel 2.7-2.8 ms.
+static const std::string lmhead_q6k_gemv_a4_kernel = R"CL(
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+__kernel void q6k_gemv_lmhead_a4(__global const uchar *W,  // [V][H/256][212 B]
+                                 __global const float *x,   // [H]
+                                 __global float *logits,    // [V]
+                                 const int V, const int H) {
+  const int t = get_local_id(0); // 0..63
+  const int rl = t >> 4;         // row within the workgroup
+  const int u = t & 15;
+  const int row = get_group_id(0) * 4 + rl;
+  const int nb = H >> 8;
+  const int nh = u >> 3;
+  const int q = u & 7;
+  const int is = q >> 2;
+  float sum = 0.0f;
+  if (row < V) {
+    __global const uint *rb =
+      (__global const uint *)(W + (size_t)row * (size_t)(nb * 212));
+    for (int bi = 0; bi < nb; ++bi) {
+      __global const uint *blk = rb + bi * 53;
+      const uint wl = blk[(nh << 4) + q];
+      const uint wh = blk[(nh << 4) + 8 + q];
+      const uint wq = blk[32 + (nh << 3) + q];
+      const uint s01 = blk[48 + (nh << 1)] >> (is << 3);
+      const uint s45 = blk[49 + (nh << 1)] >> (is << 3);
+      const float d = vload_half(0, (__global const half *)(blk + 52));
+      const float s0 = d * (float)(((int)(s01 << 24)) >> 24);
+      const float s2 = d * (float)(((int)(s01 << 8)) >> 24);
+      const float s4 = d * (float)(((int)(s45 << 24)) >> 24);
+      const float s6 = d * (float)(((int)(s45 << 8)) >> 24);
+      const int yb = (bi << 8) + (nh << 7) + (q << 2);
+      float acc0 = 0.0f, acc2 = 0.0f, acc4 = 0.0f, acc6 = 0.0f;
+      for (int j = 0; j < 4; ++j) {
+        const int sh = j << 3;
+        const int l = (int)((wl >> sh) & 0xFF);
+        const int hh = (int)((wh >> sh) & 0xFF);
+        const int qq = (int)((wq >> sh) & 0xFF);
+        const int v0 = ((l & 0xF) | ((qq & 3) << 4)) - 32;
+        const int v2 = ((hh & 0xF) | (((qq >> 2) & 3) << 4)) - 32;
+        const int v4 = ((l >> 4) | (((qq >> 4) & 3) << 4)) - 32;
+        const int v6 = ((hh >> 4) | (((qq >> 6) & 3) << 4)) - 32;
+        acc0 += x[yb + j] * (float)v0;
+        acc2 += x[yb + 32 + j] * (float)v2;
+        acc4 += x[yb + 64 + j] * (float)v4;
+        acc6 += x[yb + 96 + j] * (float)v6;
+      }
+      sum += s0 * acc0 + s2 * acc2 + s4 * acc4 + s6 * acc6;
+    }
+  }
+  __local float red[64];
+  red[t] = sum;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (int off = 8; off > 0; off >>= 1) {
+    if (u < off) red[t] += red[t + off];
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  if (u == 0 && row < V) logits[row] = red[t];
+}
+)CL";
+
 bool lmhead_gemv_q6_k_cl(const void *w_q6k_host, const float *act_f32_host,
                          float *logits_f32_host, unsigned int vocab,
                          unsigned int hidden) {
@@ -3370,6 +3498,33 @@ bool lmhead_gemv_q6_k_cl(const void *w_q6k_host, const float *act_f32_host,
   if (!ctx || !q)
     return false;
 
+  // q6k_gemv_lmhead_sg16 with Intel subgroups, else q6k_gemv_lmhead_a4, both
+  // on a 212-byte-block copy of the table. A failed build of either is latched
+  // and falls through to the next; q6k_gemv_lmhead on the table as stored is
+  // the last resort.
+  static bool sg16_ok = blas_cc->caps().subgroups;
+  ClContext::SharedPtrClKernel kp;
+  bool padded = false;
+  if (sg16_ok) {
+    kp = blas_cc->registerClKernel(lmhead_q6k_gemv_sg16_kernel,
+                                   "q6k_gemv_lmhead_sg16");
+    padded = sg16_ok = (kp != nullptr);
+  }
+  static bool a4_ok = true;
+  if (!kp && a4_ok) {
+    kp = blas_cc->registerClKernel(lmhead_q6k_gemv_a4_kernel,
+                                   "q6k_gemv_lmhead_a4");
+    padded = a4_ok = (kp != nullptr);
+  }
+  if (!kp)
+    kp = blas_cc->registerClKernel(lmhead_q6k_gemv_kernel, "q6k_gemv_lmhead");
+  if (!kp) {
+    static int logged = 0;
+    if (!logged++)
+      std::fprintf(stderr, "[lmhead-q6k] registerClKernel failed\n");
+    return false;
+  }
+
   // Per-weight device residency (the Q6_K table never changes after load):
   // weight + act + logits buffers keyed by the weight host pointer.
   // [reload] File scope, not a function-local static, so
@@ -3379,12 +3534,41 @@ bool lmhead_gemv_q6_k_cl(const void *w_q6k_host, const float *act_f32_host,
   // hook runs with no run in flight.
   LmheadEntry &e = g_lmhead_q6k_cache[w_q6k_host];
   const size_t nb = hidden / 256;
-  const size_t w_bytes = (size_t)vocab * nb * 210;
+  const size_t n_blocks = (size_t)vocab * nb;
+  const size_t w_bytes = n_blocks * (padded ? 212 : 210);
   cl_int err = CL_SUCCESS;
   if (e.w == nullptr) {
-    e.w =
-      opencl::clCreateBufferT(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                              w_bytes, const_cast<void *>(w_q6k_host), &err);
+    if (padded) {
+      // Write the padded copy straight into the mapped buffer: one pass over
+      // the table, no host staging copy.
+      e.w = opencl::clCreateBufferT(
+        ctx, CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR, w_bytes, nullptr, &err);
+      if (err == CL_SUCCESS && e.w) {
+        uint8_t *dst = static_cast<uint8_t *>(opencl::clEnqueueMapBuffer(
+          q, e.w, CL_TRUE, CL_MAP_WRITE_INVALIDATE_REGION, 0, w_bytes, 0,
+          nullptr, nullptr, &err));
+        if (err == CL_SUCCESS && dst) {
+          const uint8_t *src = static_cast<const uint8_t *>(w_q6k_host);
+          for (size_t b = 0; b < n_blocks; ++b) {
+            std::memcpy(dst + b * 212, src + b * 210, 210);
+            dst[b * 212 + 210] = 0;
+            dst[b * 212 + 211] = 0;
+          }
+          err =
+            opencl::clEnqueueUnmapMemObject(q, e.w, dst, 0, nullptr, nullptr);
+        } else if (err == CL_SUCCESS) {
+          err = CL_MAP_FAILURE;
+        }
+        if (err != CL_SUCCESS) {
+          opencl::clReleaseMemObjectT(e.w);
+          e.w = nullptr;
+        }
+      }
+    } else {
+      e.w =
+        opencl::clCreateBufferT(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                w_bytes, const_cast<void *>(w_q6k_host), &err);
+    }
     if (err != CL_SUCCESS || !e.w) {
       std::fprintf(stderr, "[lmhead-q6k] weight clCreateBuffer(%zu B) err=%d\n",
                    w_bytes, err);
@@ -3408,15 +3592,6 @@ bool lmhead_gemv_q6_k_cl(const void *w_q6k_host, const float *act_f32_host,
     }
   }
 
-  ClContext::SharedPtrClKernel kp =
-    blas_cc->registerClKernel(lmhead_q6k_gemv_kernel, "q6k_gemv_lmhead");
-  if (!kp) {
-    static int logged = 0;
-    if (!logged++)
-      std::fprintf(stderr, "[lmhead-q6k] registerClKernel failed\n");
-    return false;
-  }
-
   if (opencl::clEnqueueWriteBuffer(q, e.x, CL_FALSE, 0, sizeof(float) * hidden,
                                    act_f32_host, 0, nullptr,
                                    nullptr) != CL_SUCCESS) {
@@ -3433,7 +3608,10 @@ bool lmhead_gemv_q6_k_cl(const void *w_q6k_host, const float *act_f32_host,
         kp->SetKernelArguments(a++, &Hi, sizeof(int))))
     return false;
 
-  std::array<size_t, 3> gws = {(size_t)vocab * 64, 1, 1};
+  // Every kernel runs 64-WI workgroups: one row each for q6k_gemv_lmhead,
+  // four rows of 16 lanes for the two kernels on the padded copy.
+  std::array<size_t, 3> gws = {
+    padded ? (size_t)((vocab + 3) / 4) * 64 : (size_t)vocab * 64, 1, 1};
   std::array<size_t, 3> lws = {64, 1, 1};
   static const bool split_tprof = std::getenv("NNTR_LMHEAD_TPROF") != nullptr;
   const auto t_pre_kernel = std::chrono::steady_clock::now();
